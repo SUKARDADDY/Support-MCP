@@ -1,0 +1,37 @@
+# Support-MCP relay Worker.
+# Before the first deploy, replace the three REPLACE_ME values (see README,
+# "Deploy your own"). The account comes from `wrangler login` or
+# CLOUDFLARE_ACCOUNT_ID, so it is not pinned here.
+name = "support-mcp"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = false
+routes = [{ pattern = "support.REPLACE_ME.example", custom_domain = true }]
+
+[observability]
+enabled = true
+
+[vars]
+# Your Zero Trust team domain and the AUD tag of the Access app guarding /mcp.
+ACCESS_TEAM_DOMAIN = "REPLACE_ME.cloudflareaccess.com"
+ACCESS_AUD = "REPLACE_ME"
+
+# Durable Objects: one Session per pairing code, one shared Registry.
+[[durable_objects.bindings]]
+name = "SESSION"
+class_name = "Session"
+
+[[durable_objects.bindings]]
+name = "REGISTRY"
+class_name = "Registry"
+
+# Free plan requires SQLite-backed Durable Objects.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Session", "Registry"]
+
+# Import the PowerShell agent template as text.
+[[rules]]
+type = "Text"
+globs = ["**/*.ps1"]
+fallthrough = true

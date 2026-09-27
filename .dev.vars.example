@@ -1,0 +1,4 @@
+# Copy to .dev.vars for `wrangler dev`. Both are honoured ONLY when the request
+# host is localhost / 127.0.0.1; the deployed hostname can never satisfy them.
+DEV_SKIP_ACCESS=1
+SESSION_TTL_MS=120000

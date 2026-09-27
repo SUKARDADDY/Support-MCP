@@ -1,0 +1,17 @@
+{
+  "name": "support-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Consent-based, self-expiring Windows remote support sessions, operated by an AI agent over MCP. Cloudflare Worker + Durable Objects + a PowerShell agent.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SUKARDADDY/Support-MCP.git"
+  },
+  "scripts": {
+    "test": "node --test",
+    "dev": "wrangler dev",
+    "dry-run": "wrangler deploy --dry-run --outdir /tmp/support-mcp-dry"
+  }
+}
