@@ -38,8 +38,8 @@ work in the request path; use the WebSocket Hibernation API
 | Route | Auth | Behaviour |
 |---|---|---|
 | `GET /healthz` | public | `{"ok":true,"service":"support-mcp","stage":"relay-v1"}` |
-| `GET /j/<code>` | public | **GET only.** code valid+unused → 200 `text/plain` agent script with placeholders filled, code consumed; else 404 `text/plain` `Write-Host 'This support link is invalid or expired.'` (runnable, harmless). Any other method → 405 `text/plain` (harmless one-liner, `Allow: GET`) and the code is **not** consumed. Malformed percent-encoding → the same harmless 404 script, never 500. |
-| `GET /ws?sid=<sid>` + `X-Attach-Key: <key>` | attach key | WebSocket upgrade for the agent; 401 on bad/missing key, on a `key` query param, or on a bad sid; 410 if session ended/expired |
+| `GET /j/<code>` | public | **GET only, https only.** The code is consumed only for a request whose `User-Agent` contains `PowerShell/` (`irm` sends `WindowsPowerShell/5.1.x` or `PowerShell/7.x`). Code valid+unused → 200 `text/plain` agent script with placeholders filled, code consumed; else 404 `text/plain` `Write-Host 'This support link is invalid or expired.'` (runnable, harmless). Any other `User-Agent` (a chat link preview, a browser) → 200 `text/plain`, `Cache-Control: no-store`, a one-line `Write-Host` telling the reader to paste the command into PowerShell, and the Durable Object is **not** touched. Over plain `http:` on any host except `localhost` / `127.0.0.1` → 200 `text/plain` `Write-Host` line asking for the https link, code **not** consumed. Any other method → 405 `text/plain` (harmless one-liner, `Allow: GET`) and the code is **not** consumed. Malformed percent-encoding → the same harmless 404 script, never 500. The `User-Agent` test keeps previews from burning the code. It is not a security control, since any client can send the header. |
+| `GET /ws?sid=<sid>` + `X-Attach-Key: <key>` | attach key | WebSocket upgrade for the agent; 403 over plain `http:` on any host except `localhost` / `127.0.0.1`; 401 on bad/missing key, on a `key` query param, or on a bad sid; 410 if session ended/expired |
 | `POST /mcp` | Access JWT | MCP JSON-RPC 2.0 |
 | anything else | — | 404 |
 
@@ -48,9 +48,11 @@ work in the request path; use the WebSocket Hibernation API
 only its SHA-256. **The attach key travels only in the `X-Attach-Key` request
 header** (never the query string, which lands in access logs); a request that
 puts `key` in the query is rejected 401. The script embeds `sid`, `key`,
-`origin` (scheme+host of the `/j` request, so local dev works); `expires_at` is
-NOT known yet (set on attach) and the agent persists it to `config.json` on
-welcome. The served script is wrapped in `& { … }` so nothing leaks into the
+`origin`: `https://<host>` for every host except `localhost` / `127.0.0.1`,
+where it is the scheme+host of the request so local dev works over http (the
+agent derives its `ws://` or `wss://` URL from it, so a real host never runs
+over cleartext); `expires_at` is NOT known yet (set on attach) and the agent
+persists it to `config.json` on welcome. The served script is wrapped in `& { … }` so nothing leaks into the
 customer's console.
 
 ## Access check (`/mcp`)
@@ -81,7 +83,7 @@ the audit log for `session_create`, `run`, `put_file`, `get_file`, `session_end`
 ## Session state machine (Session DO)
 
 `pending` (code minted, 10 min TTL) → `consumed` (script fetched, awaiting WS,
-TTL 30 min to first attach) → `attached` (expires_at = first attach + 24 h,
+TTL 2 h to first attach) → `attached` (expires_at = first attach + 24 h,
 fixed; reattach does not extend) → `ended` (terminal: expired, `session_end`,
 customer End/close). A DO alarm fires at the current deadline; on fire, a
 non-attached session past TTL → `ended`; attached past expires_at → send
@@ -91,7 +93,17 @@ ending early. `/consume`, `/ws`, `/status`, `/command` and `/end` also check the
 governing deadline inline and expire the session if it has already passed, so a
 late alarm never lets an expired session act. `ended` is permanent: `/j` 404,
 `/ws` 410, `run`/files return an error. `/create` refuses (409) if the DO
-already holds state.
+already holds state. `/consume` mints the key and hashes it before it reads the
+state, so two concurrent consumes cannot both see `pending`: the second gets
+`not-pending`. `/ws` checks the deadline and state again after it hashes the
+attach key, because hashing yields to other requests. An operator end or the
+alarm during that await still returns 410, so a late attach never resumes an
+ended session. On the first attach the registry push runs after the socket is
+accepted, so an end that lands during it also closes the new socket.
+
+`session_status` includes `startup_expires_at` while the state is `consumed`.
+It is the deadline for the first connection, in Unix milliseconds, and is
+`null` in all other states.
 
 Only the newest agent socket is live: sockets are tagged with an attach
 generation (`acceptWebSocket(server,[tag])`) and storage `ws_tag` names the
@@ -99,11 +111,17 @@ current one. Commands go only to the current socket. A new valid attach closes
 **every** older socket and fails their in-flight requests with `agent
 disconnected`; `end`/expire/customer-end send `end` to and close **every**
 socket. When a socket closes or errors, its own pending requests fail
-immediately with `agent disconnected`.
+immediately with `agent disconnected`. A `result` resolves a pending request
+only when it arrives on the socket that request was sent to, and the relay
+ignores any other message from a socket that is not the current one.
 
 Audit log: DO SQLite table `log(ts INTEGER ms, kind TEXT, detail TEXT)`;
 kinds `created, consumed, hello, attached, detached, run, put_file, get_file,
-ended`. Command text is logged; file content is not (path + byte count only).
+ended`. Command text is logged, cut to 512 characters; file content is not
+(path + byte count only). A `hello` row holds the stored, truncated machine
+(100), user (100), ps (40) and agent (40) values, never the raw message. The
+relay accepts one `hello` per socket: storage key `hello_tag` holds the tag of
+the socket that has already sent one, and a reattach gets a new tag.
 The `ended` row records the reason (`code TTL`, `consume TTL`, `expired`,
 `ended_by_operator`, `customer`) and `session_status` returns it as
 `ended_reason`. Rows for the caller-attributed kinds are prefixed `[<caller>]`.
@@ -156,7 +174,7 @@ text content item, not JSON-RPC errors.
 |---|---|---|
 | `session_create` | `label?` string | `{session_id, one_liner, code_expires_at}`; one-liner = `irm <origin>/j/<code> \| iex` |
 | `session_list` | — | sessions from Registry with state + expires_at + machine |
-| `session_status` | `session_id`, `log_tail?` (default 20) | state, machine, user, expires_at, attached now?, last log rows |
+| `session_status` | `session_id`, `log_tail?` (default 20) | state, machine, user, expires_at, startup_expires_at, attached now?, last log rows |
 | `run` | `session_id`, `command`, `timeout_s?` | exit_code (null if timed out), stdout, stderr, timed_out |
 | `put_file` | `session_id`, `path`, `data_b64`, `append?` | bytes |
 | `get_file` | `session_id`, `path`, `offset?`, `length?` | data_b64, size, eof |
@@ -174,19 +192,26 @@ the sid, so two sessions on one PC never collide: folder
 
 1. **Bootstrap** (what `irm | iex` runs in the customer's console): write itself
    (from the embedded base64 body) plus `config.json` (`sid, key, origin,
-   expires_at`) to `%LOCALAPPDATA%\SupportMCP\<sid8>\`, register per-user
-   logon reattach (`HKCU\…\Run` value `SupportMCP-<sid8>`), then start the
-   `-Run` agent and print one line. **If the pasted console is elevated**
-   (current token is in the Administrators role), do not run anything elevated:
-   launch the `-Run` agent as the interactive user at a limited run level via a
-   one-shot scheduled task (`New-ScheduledTaskPrincipal -RunLevel Limited
-   -LogonType Interactive`; register → start → unregister) and print a line
-   saying so.
+   expires_at, connect_by`) to `%LOCALAPPDATA%\SupportMCP\<sid8>\`, then start
+   the `-Run` agent and print one line. `connect_by` is the local first-connect
+   deadline in Unix ms, bootstrap time + 2 hours, equal to the relay's
+   `CONSUMED_TTL_MS`. The bootstrap does **not** write the logon Run value (the
+   `-Run` role does, see below). **If the pasted console is elevated** (current
+   token is in the Administrators role), do not run anything elevated: launch the
+   `-Run` agent as the interactive user at a limited run level via a one-shot
+   scheduled task (`New-ScheduledTaskPrincipal -RunLevel Limited -LogonType
+   Interactive`; register → start; a `finally` always unregisters it) and print
+   a line saying so. If the launch throws, nothing is running, so the bootstrap
+   runs the cleanup to remove the folder it wrote.
 2. **Run**: WinForms window, TopMost on first show, title `Support
    session`, a label `Support session active until HH:mm` (local time, after
    welcome), a read-only log box (each command / file op one line, timestamped),
    an **End session** button. **Refuses to run if its own token is elevated**
-   (clean exit + a line in `agent.log`), as a backstop. WebSocket via
+   as a backstop: with UAC off, or on the built-in Administrator account, the
+   limited launch task still gets a full token. The refusal runs the cleanup
+   (below) and exits, so the folder and any task are removed and no logon entry
+   is left. Once it passes that check, the role writes the per-user logon
+   reattach (`HKCU\…\Run` value `SupportMCP-<sid8>`). WebSocket via
    `System.Net.WebSockets.ClientWebSocket` with the key in the `X-Attach-Key`
    header; connect/reconnect/probe are non-blocking (connect task polled from the
    timer, probe ≤3 s and off the hot path) so the UI never stalls. Receive is
@@ -200,7 +225,14 @@ the sid, so two sessions on one PC never collide: folder
    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable` so
    it fires on battery / after sleep) that runs the cleanup. A restarted agent
    whose persisted `expires_at` has already passed cleans up by itself without
-   the relay. Reconnect with backoff (5 s → 60 s) on drop while not expired; a
+   the relay. While `expires_at` is still null (no welcome yet), `connect_by`
+   plays that part: a start or a timer tick after `connect_by` runs the cleanup
+   and exits, and the window registers the same fallback task with its trigger
+   at `connect_by`, so cleanup happens even if the agent is killed. Welcome
+   re-registers the task (`-Force` replaces it) at the real `expires_at`; if
+   that registration fails, the `connect_by` task is removed so it cannot end a
+   live session early. A config with no `connect_by` (older agent) just has no
+   first-connect deadline. Reconnect with backoff (5 s → 60 s) on drop while not expired; a
    410/401 from the `/ws` probe = session over → cleanup. FormClosing on a
    Windows shutdown / Task Manager kill / `Application.Exit` closes **without**
    ending the session (reattach after reboot must work); only a user close
@@ -229,6 +261,14 @@ the sid, so two sessions on one PC never collide: folder
    cleans up, `/ws` then 410.
 7. Kill the agent process mid-session → fallback task still removes everything
    at expiry (shortened TTL).
+8. Never-connected agent: run the one-liner against a relay that is then taken
+   down, edit `connect_by` in `config.json` to a few minutes ahead and restart
+   the agent. At that time the window closes (or the fallback task fires if the
+   agent was killed), and the folder, Run value and task are gone. Starting the
+   agent after `connect_by` has passed cleans up at once.
+9. Elevated console with UAC off (or the built-in Administrator): paste the
+   one-liner. No window opens, and a few seconds later the folder, the Run
+   value and the `SupportMCPLaunch-` and `SupportMCPCleanup-` tasks are gone.
 
 ## Must keep
 

@@ -95,6 +95,126 @@ test('/j with malformed percent-encoding => harmless 404 script, not 500', async
   assert.match(await r.text(), /^Write-Host 'This support link is invalid or expired\.'/);
 });
 
+// A Session binding that records every touch and answers /consume.
+const SID = 'c'.repeat(64);
+const KEY = 'd'.repeat(64);
+const CODE = 'abcdefghijklmnop';
+function consumableEnv() {
+  const calls = [];
+  return {
+    calls,
+    env: {
+      ...env,
+      SESSION: {
+        idFromName: (name) => {
+          calls.push(`idFromName ${name}`);
+          return { toString: () => SID };
+        },
+        idFromString: trap,
+        get: () => ({
+          fetch: async (u) => {
+            calls.push(`fetch ${u}`);
+            return Response.json({ ok: true, key: KEY });
+          },
+        }),
+      },
+    },
+  };
+}
+const PS51 = 'Mozilla/5.0 (Windows NT 10.0; Microsoft Windows 10.0.19045; en-US) WindowsPowerShell/5.1.19041.4648';
+const PS7 = 'Mozilla/5.0 (Windows NT 10.0; Microsoft Windows 10.0.19045; en-US) PowerShell/7.4.1';
+
+test('/j from a link preview or browser => harmless text, code not consumed', async () => {
+  const agents = [
+    'Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Microsoft Teams',
+    'WhatsApp/2.23.20.0 A',
+    'TelegramBot (like TwitterBot)',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36',
+    'curl/8.5.0',
+    null,
+  ];
+  for (const ua of agents) {
+    const { env: e, calls } = consumableEnv();
+    const r = await handler.fetch(new Request(`${PROD}/j/${CODE}`, { headers: ua ? { 'user-agent': ua } : {} }), e);
+    assert.equal(r.status, 200, String(ua));
+    assert.equal(r.headers.get('cache-control'), 'no-store');
+    const body = await r.text();
+    assert.match(body, /^Write-Host '.*Paste the whole command into PowerShell/);
+    assert.doesNotMatch(body, new RegExp(KEY));
+    assert.deepEqual(calls, [], `Durable Object touched for ${ua}`);
+  }
+});
+
+test('/j from irm in Windows PowerShell 5.1 and PowerShell 7 serves the script and consumes the code', async () => {
+  for (const ua of [PS51, PS7]) {
+    const { env: e, calls } = consumableEnv();
+    const r = await handler.fetch(new Request(`${PROD}/j/${CODE}`, { headers: { 'user-agent': ua } }), e);
+    assert.equal(r.status, 200, ua);
+    assert.equal(r.headers.get('cache-control'), 'no-store');
+    const body = await r.text();
+    assert.ok(body.includes(`$Sid = '${SID}'`));
+    assert.ok(body.includes(`$Key = '${KEY}'`));
+    assert.ok(body.includes("$Origin = 'https://support.example.com'"));
+    assert.deepEqual(calls, [`idFromName ${CODE}`, 'fetch https://do/consume'], ua);
+  }
+});
+
+test('/j over plain http on a real host => use-https script, code not consumed', async () => {
+  const { env: e, calls } = consumableEnv();
+  const r = await handler.fetch(
+    new Request(`http://support.example.com/j/${CODE}`, { headers: { 'user-agent': PS51 } }),
+    e,
+  );
+  assert.equal(r.status, 200);
+  assert.equal(r.headers.get('cache-control'), 'no-store');
+  const body = await r.text();
+  assert.match(body, /^Write-Host 'This support link must use https\./);
+  assert.doesNotMatch(body, new RegExp(KEY));
+  assert.deepEqual(calls, []);
+});
+
+test('/j keeps the origin it arrived on for loopback dev, and pins https elsewhere', async () => {
+  const dev = consumableEnv();
+  const local = await handler.fetch(
+    new Request(`http://127.0.0.1:8787/j/${CODE}`, { headers: { 'user-agent': PS51 } }),
+    dev.env,
+  );
+  assert.equal(local.status, 200);
+  assert.ok((await local.text()).includes("$Origin = 'http://127.0.0.1:8787'"));
+  assert.equal(dev.calls.length, 2);
+
+  const prod = consumableEnv();
+  const withPort = await handler.fetch(
+    new Request(`https://support.example.com:8443/j/${CODE}`, { headers: { 'user-agent': PS7 } }),
+    prod.env,
+  );
+  assert.ok((await withPort.text()).includes("$Origin = 'https://support.example.com:8443'"));
+});
+
+test('/ws over plain http on a real host => 403 before any Durable Object work', async () => {
+  const r = await handler.fetch(
+    new Request(`http://support.example.com/ws?sid=${SID}`, { headers: { 'x-attach-key': KEY } }),
+    env,
+  );
+  assert.equal(r.status, 403);
+});
+
+test('/ws over http on loopback still reaches the Session', async () => {
+  const seen = [];
+  const e = {
+    ...env,
+    SESSION: {
+      idFromName: trap,
+      idFromString: (sid) => sid,
+      get: () => ({ fetch: async (req) => { seen.push(new URL(req.url).pathname); return new Response('gone', { status: 410 }); } }),
+    },
+  };
+  const r = await handler.fetch(new Request(`http://localhost:8787/ws?sid=${SID}`), e);
+  assert.equal(r.status, 410);
+  assert.deepEqual(seen, ['/ws']);
+});
+
 test('/ws with the key in the query string => 401', async () => {
   const sid = 'a'.repeat(64);
   const r = await handler.fetch(new Request(`${PROD}/ws?sid=${sid}&key=${'b'.repeat(64)}`), env);

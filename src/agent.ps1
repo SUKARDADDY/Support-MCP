@@ -77,11 +77,15 @@ if (-not $Run) {
     New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
     $agentPath = Get-AgentPath
     [IO.File]::WriteAllBytes($agentPath, [Convert]::FromBase64String($AgentB64))
-    $cfg = New-Object psobject -Property @{ sid = $Sid; key = $Key; origin = $Origin; expires_at = $null }
+    # Local first-connect deadline (Unix ms): bootstrap time + 2 hours. expires_at
+    # stays null until the first welcome, so this is the only local limit on an
+    # agent that never connects. Keep the 2 hours equal to CONSUMED_TTL_MS in
+    # src/session.js, the relay's own first-attach window.
+    $connectBy = [DateTimeOffset]::UtcNow.AddHours(2).ToUnixTimeMilliseconds()
+    $cfg = New-Object psobject -Property @{ sid = $Sid; key = $Key; origin = $Origin; expires_at = $null; connect_by = $connectBy }
     [IO.File]::WriteAllText((Join-Path $AppDir 'config.json'), ($cfg | ConvertTo-Json))
-    # per-user logon reattach (HKCU Run always runs un-elevated at logon)
-    $launch = ('powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "{0}" -Run' -f $agentPath)
-    Set-ItemProperty -Path $RunKey -Name $RunValue -Value $launch
+    # The logon Run value is written by the -Run role once it knows it is not
+    # elevated, so a run that refuses to start never leaves a logon entry behind.
 
     if (Test-Elevated) {
         # The customer pasted us into an elevated console. Nothing here may run
@@ -96,10 +100,13 @@ if (-not $Run) {
             Register-ScheduledTask -TaskName $launchTask -Action $act -Principal $prin -Settings $set -Force -ErrorAction Stop | Out-Null
             Start-ScheduledTask -TaskName $launchTask
             Start-Sleep -Seconds 2
-            Unregister-ScheduledTask -TaskName $launchTask -Confirm:$false -ErrorAction SilentlyContinue
             Write-Host 'You launched this as Administrator; starting the support agent un-elevated. A window will open.'
         } catch {
+            # Nothing started, so remove the folder the bootstrap just wrote.
+            Invoke-Cleanup
             Write-Host 'Could not start the support agent un-elevated. Please paste the command into a normal (non-Administrator) PowerShell window.'
+        } finally {
+            try { Unregister-ScheduledTask -TaskName $launchTask -Confirm:$false -ErrorAction SilentlyContinue } catch {}
         }
         return
     }
@@ -113,14 +120,23 @@ if (-not $Run) {
 }
 
 # ===================================================================== RUN role
-# Backstop for B4: even the on-disk agent refuses to run elevated.
+# Backstop for B4: even the on-disk agent refuses to run elevated. With UAC off
+# or the built-in Administrator account, the limited one-shot launch task still
+# gets a full token and lands here. Remove everything this session installed,
+# so nothing is left to start it again at logon. (The agent.log line would live
+# in the folder being deleted, so none is written.)
 if (Test-Elevated) {
-    try {
-        New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
-        Add-Content -Path (Join-Path $AppDir 'agent.log') -Value ('{0} refusing to run elevated' -f (Get-Date).ToString('s'))
-    } catch {}
+    Invoke-Cleanup
     return
 }
+
+# Per-user logon reattach (HKCU Run always runs un-elevated at logon). Written
+# here, after the elevation check, so a refused run never creates it. Cleanup,
+# the expiry checks below and a server end all remove it.
+try {
+    $launch = ('powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "{0}" -Run' -f (Get-AgentPath))
+    Set-ItemProperty -Path $RunKey -Name $RunValue -Value $launch
+} catch {}
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -140,10 +156,11 @@ $script:rseg       = [System.ArraySegment[byte]]::new($script:rbuf)
 $script:rms        = New-Object System.IO.MemoryStream
 $script:expiresAt  = $null          # DateTime (local)
 $script:expiresMs  = $null          # long (unix ms), persisted to config.json
+$script:connectBy  = $null          # DateTime (local): first-connect deadline, used while expiresAt is null
 $script:ending     = $false
 $script:backoff    = 5
 $script:nextConnAt = Get-Date
-$script:taskDone   = $false
+$script:taskAt     = $null          # DateTime the fallback task is registered for
 
 # B1 self-cleanup: a restarted agent whose stored expiry has passed tears itself
 # down without needing the relay.
@@ -152,6 +169,12 @@ if ($cfg.expires_at) {
     if ([long]$cfg.expires_at -le $nowMs) { Invoke-Cleanup; return }
     $script:expiresMs = [long]$cfg.expires_at
     $script:expiresAt = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$cfg.expires_at).LocalDateTime
+} elseif ($cfg.connect_by) {
+    # Never connected: expires_at is still null, so connect_by (written by the
+    # bootstrap) is the only local deadline. Past it, tear down without the relay.
+    $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    if ([long]$cfg.connect_by -le $nowMs) { Invoke-Cleanup; return }
+    $script:connectBy = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$cfg.connect_by).LocalDateTime
 }
 
 function Save-Config {
@@ -478,18 +501,30 @@ function Do-GetFile($m) {
 }
 
 # ------------------------------------------------------------- fallback task (A)
+# Fires at expires_at once the relay has authorised the session. Before the first
+# welcome there is no expires_at, so it fires at connect_by instead, and cleanup
+# still happens for an agent that never connects. Register-ScheduledTask -Force
+# replaces the task of the same name, so the welcome call moves it from
+# connect_by to the real expiry.
 function Register-FallbackTask {
-    if ($script:taskDone -or $null -eq $script:expiresAt) { return }
+    $at = $script:expiresAt
+    if ($null -eq $at) { $at = $script:connectBy }
+    if ($null -eq $at -or $script:taskAt -eq $at) { return }
     try {
         $agentPath = Get-AgentPath
         $act = New-ScheduledTaskAction -Execute 'powershell.exe' `
             -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Cleanup' -f $agentPath)
-        $trg = New-ScheduledTaskTrigger -Once -At $script:expiresAt
+        $trg = New-ScheduledTaskTrigger -Once -At $at
         # Must fire even on battery / if the machine was asleep at the deadline.
         $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
         Register-ScheduledTask -TaskName $TaskName -Action $act -Trigger $trg -Settings $set -Force -ErrorAction Stop | Out-Null
-        $script:taskDone = $true
+        $script:taskAt = $at
     } catch {
+        # A connect_by task left in place would end a live session early; drop it.
+        if ($null -ne $script:taskAt) {
+            try { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+            $script:taskAt = $null
+        }
         Append-Log 'Note: fallback cleanup task could not be registered.'
     }
 }
@@ -512,6 +547,11 @@ function Tick {
         if ($script:ending) { return }
         # expiry guard (belt and braces; server also sends 'end')
         if ($null -ne $script:expiresAt -and (Get-Date) -ge $script:expiresAt) { Finish-Cleanup; return }
+        # never connected: expires_at is still null, so connect_by is the deadline
+        if ($null -eq $script:expiresAt -and $null -ne $script:connectBy -and (Get-Date) -ge $script:connectBy) {
+            Append-Log 'No connection within 2 hours. Session closed.'
+            Finish-Cleanup; return
+        }
 
         if ($script:connecting) {
             if ($null -ne $script:connectTask -and $script:connectTask.IsCompleted) {
@@ -620,6 +660,8 @@ $script:form.Add_Shown({
     $script:form.TopMost = $false
     Append-Log 'Connecting...'
     $script:nextConnAt = Get-Date   # the tick starts the (non-blocking) connect
+    # Not yet connected: arm the fallback cleanup at connect_by (welcome moves it).
+    if ($null -eq $script:expiresAt) { Register-FallbackTask }
 })
 
 $script:timer = New-Object System.Windows.Forms.Timer

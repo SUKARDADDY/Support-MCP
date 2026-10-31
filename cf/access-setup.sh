@@ -27,7 +27,9 @@ set -euo pipefail
 API="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/access"
 HOST="$SUPPORT_HOST"; APP_NAME="support-mcp"; ST_NAME="support-mcp-client"
 OWNER="$SUPPORT_OPERATOR_EMAIL"; ENV_OUT="${SUPPORT_MCP_ENV:-$HOME/.config/support-mcp/access.env}"
-cf() { curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H "content-type: application/json" "$@"; }
+# The token goes to curl through a config file read from a process substitution
+# (printf is a builtin), so it never appears in argv or in `ps` output.
+cf() { curl -sS -K <(printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN") -H "content-type: application/json" "$@"; }
 ok() { python3 -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get("success") else (print(json.dumps(d.get("errors")), file=sys.stderr) or 1))'; }
 
 # 1. service token (create only if absent; the secret is unrecoverable later)

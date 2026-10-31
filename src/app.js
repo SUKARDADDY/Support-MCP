@@ -4,7 +4,13 @@
 // wires it to the real agent template.
 import { verifyAccessJwt, importRsaJwk, localBypassAllowed, callerIdentity } from './jwt.js';
 import { handleRpc } from './mcp.js';
-import { buildBootstrap, INVALID_LINK_SCRIPT, METHOD_NOT_ALLOWED_SCRIPT } from './template.js';
+import {
+  buildBootstrap,
+  INVALID_LINK_SCRIPT,
+  METHOD_NOT_ALLOWED_SCRIPT,
+  NOT_POWERSHELL_SCRIPT,
+  USE_HTTPS_SCRIPT,
+} from './template.js';
 
 const CODE_ALPHABET = 'abcdefghijklmnopqrstuvwxyz234567'; // RFC4648 base32, lowercased
 function newCode() {
@@ -154,10 +160,22 @@ function isJsonContentType(request) {
 }
 
 // ---- routes ----------------------------------------------------------------
+const isLoopback = (hostname) => hostname === 'localhost' || hostname === '127.0.0.1';
+
+// `irm` sends WindowsPowerShell/5.1.x (Windows PowerShell) or PowerShell/7.x.
+// Chat link previews (Slack, Teams, WhatsApp, Telegram) fetch with a plain GET
+// and their own User-Agent. This keeps them from burning the one-time code. It
+// is not a security check: anyone can send this header, and the code is already
+// the secret.
+const isPowerShellClient = (request) => (request.headers.get('user-agent') || '').includes('PowerShell/');
+
 async function handleJ(request, env, url, origin, agentText) {
   // Only GET consumes the code. Any other method (HEAD from a link preview,
   // POST from a scanner) gets a harmless 405 and leaves the code untouched.
   if (request.method !== 'GET') return psText(request.method === 'HEAD' ? null : METHOD_NOT_ALLOWED_SCRIPT, 405, { allow: 'GET' });
+  // The script carries the attach key and runs the whole session over `origin`.
+  // Over plain http that is ws:// in cleartext, so refuse before the code is used.
+  if (url.protocol !== 'https:' && !isLoopback(url.hostname)) return psText(USE_HTTPS_SCRIPT, 200);
   let code;
   try {
     code = decodeURIComponent(url.pathname.slice(3));
@@ -165,6 +183,8 @@ async function handleJ(request, env, url, origin, agentText) {
     return psText(INVALID_LINK_SCRIPT, 404);
   }
   if (!/^[a-z2-7]{16}$/.test(code)) return psText(INVALID_LINK_SCRIPT, 404);
+  // A GET that is not from PowerShell (a link preview) must not consume the code.
+  if (!isPowerShellClient(request)) return psText(NOT_POWERSHELL_SCRIPT, 200);
   const id = env.SESSION.idFromName(code);
   const r = await env.SESSION.get(id).fetch('https://do/consume', { method: 'POST', body: '{}' });
   const out = await r.json();
@@ -179,6 +199,8 @@ async function handleJ(request, env, url, origin, agentText) {
 }
 
 function handleWs(request, env, url) {
+  // Never carry the attach key over cleartext http (loopback dev excepted).
+  if (url.protocol !== 'https:' && !isLoopback(url.hostname)) return new Response('https required', { status: 403 });
   // The attach key travels ONLY in the X-Attach-Key header; a key in the query
   // string (which lands in access logs) is refused outright.
   if (url.searchParams.has('key')) return new Response('unauthorized', { status: 401 });
@@ -219,7 +241,9 @@ export function createHandler(agentText) {
     async fetch(request, env) {
       const url = new URL(request.url);
       const p = url.pathname;
-      const origin = `${url.protocol}//${url.host}`;
+      // The agent derives its ws:// or wss:// URL from this origin, so any real
+      // host is pinned to https. Only loopback dev keeps whatever it arrived on.
+      const origin = isLoopback(url.hostname) ? `${url.protocol}//${url.host}` : `https://${url.host}`;
       const devTtlMs =
         localBypassAllowed(env, url.hostname) && env.SESSION_TTL_MS ? Number(env.SESSION_TTL_MS) : 0;
 

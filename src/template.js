@@ -52,3 +52,7 @@ export function buildBootstrap(agentText, { sid, key, origin }) {
 
 export const INVALID_LINK_SCRIPT = "Write-Host 'This support link is invalid or expired.'\n";
 export const METHOD_NOT_ALLOWED_SCRIPT = "Write-Host 'This support link only works with irm.'\n";
+export const NOT_POWERSHELL_SCRIPT =
+  "Write-Host 'This is a support link. Paste the whole command into PowerShell instead of opening the link.'\n";
+export const USE_HTTPS_SCRIPT =
+  "Write-Host 'This support link must use https. Paste the command again with https:// at the start of the address.'\n";

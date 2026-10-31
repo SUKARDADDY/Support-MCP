@@ -4,7 +4,8 @@ Remote support for Windows PCs, run by an AI agent over the Model Context
 Protocol. The customer pastes one line into PowerShell. A small window opens on
 their screen and shows every command as it runs. The operator, which in my case
 is Claude Code, gets seven MCP tools to run commands and move files on that PC.
-The session ends itself after 24 hours and leaves nothing installed.
+The session ends itself after 24 hours and removes the agent's own files,
+logon entry and scheduled task.
 
 I built it because I support Windows point-of-sale machines, and every
 screen-sharing tool I tried wanted an installer, an account, or a person on the
@@ -30,6 +31,16 @@ PowerShell 5.1 script with no dependencies beyond what ships with Windows.
    clicks **End session**, or when 24 hours pass. The agent then deletes its
    folder, its logon entry and its scheduled task.
 
+The pairing link is valid for 10 minutes and can be fetched once. Only a
+request from PowerShell uses the code up. A chat app that previews the link
+gets a short harmless message instead. After the script is fetched, the PC has
+two hours to make its first connection. `session_status` reports that deadline
+as `startup_expires_at` while the session waits, and `null` in every other
+state. The agent keeps the same two-hour limit on its own clock (`connect_by`
+in its config), so a PC that never connects cleans up even if the relay is
+gone. Once connected, the session lasts up to 24 hours, and a reconnect doesn't
+extend that.
+
 ## Architecture
 
 ```mermaid
@@ -44,8 +55,8 @@ flowchart LR
 | Path | Auth | Purpose |
 |---|---|---|
 | `GET /healthz` | public | liveness |
-| `GET /j/<code>` | public, single use | serves the agent script with the session values filled in |
-| `GET /ws?sid=` | attach key in a header | agent WebSocket, using the hibernation API |
+| `GET /j/<code>` | public, single use, https only | serves the agent script with the session values filled in, to PowerShell clients only |
+| `GET /ws?sid=` | attach key in a header, https only | agent WebSocket, using the hibernation API |
 | `POST /mcp` | Cloudflare Access | MCP JSON-RPC 2.0, stateless HTTP |
 
 The Worker itself is the MCP server. There is no local bridge process. Each
@@ -68,7 +79,7 @@ alarm for expiry. A second Durable Object keeps the list for `session_list`.
 |---|---|
 | `session_create` | returns `{session_id, one_liner, code_expires_at}` |
 | `session_list` | every session with its state, expiry and machine |
-| `session_status` | state, machine, user, expiry, whether the agent is attached, last audit rows |
+| `session_status` | state, machine, user, expiry, `startup_expires_at` while waiting, whether the agent is attached, last audit rows |
 | `run` | runs PowerShell as the signed-in user; returns exit code, stdout, stderr, timed_out |
 | `put_file` | writes base64 data to a path, with append for chunking |
 | `get_file` | reads a byte range as base64, with `eof` for chunking |
@@ -86,12 +97,26 @@ starts from what that script may and may not do.
   the window asks before it ends the session.
 - **No elevation.** The agent refuses to start if its own process is elevated.
   If the customer pasted into an admin console, the bootstrap starts the agent
-  through a one-shot scheduled task at the limited run level. When admin rights
-  are needed, the operator can ask Windows for a UAC prompt, and the customer
-  decides whether to click Yes.
+  through a one-shot scheduled task at the limited run level. With UAC turned
+  off, or on the built-in Administrator account, that task still gets a full
+  token. The agent then removes everything it installed and exits, and the
+  logon entry is only written after the elevation check passes. When admin
+  rights are needed, the operator can ask Windows for a UAC prompt, and the
+  customer decides whether to click Yes.
 - **Pairing codes can't be guessed.** A code is 16 base32 characters, 80 bits,
   single use, and valid for 10 minutes. The customer pastes it and never types
   it, so its length costs nothing.
+- **Link previews can't use up a code.** Slack, Teams, WhatsApp and Telegram
+  fetch links with a plain `GET`. The relay serves the script, and consumes the
+  code, only when the `User-Agent` contains `PowerShell/`, which is what `irm`
+  sends in Windows PowerShell 5.1 and PowerShell 7. Any other request gets a
+  `Write-Host` line telling the reader to paste the command into PowerShell. This
+  protects the code from bots, not from someone who sets the header on purpose.
+- **https only.** The script carries the attach key and runs the whole session
+  over the origin it was served from, so the relay builds that origin as
+  `https://<host>` for every host except `localhost` and `127.0.0.1`. A `/j`
+  request over plain http gets a `Write-Host` line asking for the https link,
+  and the code stays unused. `/ws` over plain http gets a 403.
 - **The attach key never goes in a URL.** It is 32 random bytes, sent only in
   the `X-Attach-Key` header so it stays out of access logs, and the relay
   stores only its SHA-256. A request with the key in the query string is
@@ -111,13 +136,29 @@ starts from what that script may and may not do.
   a reattach does not extend it. Every handler checks the deadline inline, so a
   late alarm can't let an expired session act.
 - **Cleanup has three layers.** The relay alarm sends `end`. The agent
-  remembers its own expiry and cleans up on restart. A per-user scheduled task
-  runs the cleanup at expiry even if the agent was killed, and it still fires
-  on battery or after sleep.
+  remembers its own deadline and cleans up on restart. That deadline is the
+  session expiry once connected, and `connect_by` (two hours after the script
+  ran) until then. A per-user scheduled task runs the cleanup at the same
+  deadline even if the agent was killed, and it still fires on battery or after
+  sleep. The first welcome from the relay moves the task from `connect_by` to
+  the real expiry.
 - **Everything is audited.** Each session records created, consumed, attached,
-  every `run` with its command text, file operations with path and size but not
-  content, and the reason it ended. Rows for operator actions name the caller
-  identity from the JWT.
+  every `run` with its command text (cut to 512 characters), file operations
+  with path and size but not content, and the reason it ended. Rows for
+  operator actions name the caller identity from the JWT. The machine, user
+  and PowerShell version the agent reports are cut to 100, 100 and 40
+  characters, and only the first `hello` on each socket counts.
+- **Session output is untrusted input.** Everything that comes back from a
+  session is written by the customer's PC: stdout, stderr, file contents, and
+  the machine and user names. Treat it as untrusted text that may try to steer
+  the operator's AI agent. That agent can have a shell on the operator's own
+  machine, so do not run it with tool calls auto-approved.
+- **The window shows, it does not enforce.** The window shows what the operator
+  does. It does not stop an operator acting in bad faith: commands run with the
+  signed-in user's rights, and what they change stays changed. "Removes the
+  agent's own files" covers only the agent's folder, logon entry and scheduled
+  tasks. It does not undo files an operator wrote, software it installed or
+  settings it changed.
 
 ## A real session
 
@@ -164,7 +205,12 @@ You need a Cloudflare account with a zone for the hostname, Node 22 and
    prints the app's AUD tag at the end.
 2. **Fill in `wrangler.toml`.** Set the route hostname, `ACCESS_TEAM_DOMAIN`
    and `ACCESS_AUD`, then run `npx wrangler deploy`.
-3. **Connect Claude Code.** The headers helper reads the secret at connect
+3. **Harden the zone.** Turn on **Always Use HTTPS** for the zone (SSL/TLS,
+   Edge Certificates), so a link pasted without `https://` is redirected. The
+   relay refuses `/j` and `/ws` over plain http either way. The relay does no
+   rate limiting of its own, so add a Cloudflare rate-limiting rule on `/j` and
+   `/ws`.
+4. **Connect Claude Code.** The headers helper reads the secret at connect
    time, so it never lands in `~/.claude.json`:
    ```sh
    claude mcp add-json -s user support-mcp \
@@ -174,23 +220,39 @@ You need a Cloudflare account with a zone for the hostname, Node 22 and
 ## Develop and test
 
 ```sh
-node --test                          # 36 unit and route tests, no network
+node --test                          # 56 unit and route tests, no network
 npx wrangler deploy --dry-run --outdir /tmp/support-mcp-dry
 cp .dev.vars.example .dev.vars && npx wrangler dev --port 8787
 ```
 
 `.dev.vars` skips Access and shortens the session TTL, but only when the
 request host is `localhost` or `127.0.0.1`. The deployed hostname can never
-satisfy that check. `wrangler dev` presents the custom-domain route's hostname
-to the Worker, so to exercise `/mcp` locally, run it against a copy of the
-config with the `routes` line removed.
+satisfy that check. Keep `wrangler dev` on loopback, its default: the bypass
+trusts the `Host` header, so anyone who can reach a dev server on another
+interface could send `Host: localhost` and skip Access.
 
-The route tests import the real router with Durable Object bindings that throw
-if touched. That proves the Access gate, the `Origin` check and the method
-checks all run before any session state is read.
+`wrangler dev` presents the custom-domain route's hostname to the Worker, so to
+exercise `/mcp`, `/j` or `/ws` locally, run it against a copy of the config
+with the `routes` line removed. Over plain http the relay serves only
+`localhost` and `127.0.0.1`.
+
+The route tests import the real router. Most give it Durable Object bindings
+that throw if touched. That proves the Access gate, the `Origin` check, the
+method checks, the https check and the link-preview check all run before any
+session state is read. The few `/j` tests that must reach a session use a stub
+binding that records every call.
 
 The wire protocol, the state machine and the acceptance checks are in
 [`docs/relay-v1-spec.md`](docs/relay-v1-spec.md).
+
+## Responsible use
+
+- Use it only on a computer whose owner has asked for support and agreed to
+  the session.
+- The visible window and the **End session** button are the consent mechanism.
+  They show the customer every command and let them stop the session at any
+  time. Please keep them visible in any fork.
+- You are responsible for following the law where you and the customer are.
 
 ## Limits
 
@@ -203,7 +265,10 @@ The wire protocol, the state machine and the acceptance checks are in
   are no per-operator permissions.
 - Command output is capped at 256 KiB per stream and files move in chunks of
   about 512 KiB.
+- Where an administrator has turned on PowerShell script block logging, Windows
+  may record the served script, including the attach key, in the PowerShell
+  Operational event log. The key stays valid for the life of the session.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). To report a vulnerability, see [SECURITY.md](SECURITY.md).

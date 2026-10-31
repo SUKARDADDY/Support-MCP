@@ -9,7 +9,10 @@
 // every socket so a half-dead predecessor can never swallow them.
 
 const CODE_TTL_MS = 10 * 60 * 1000; // pending -> consume window
-const CONSUMED_TTL_MS = 30 * 60 * 1000; // consumed -> first attach window
+// consumed -> first attach window. src/agent.ps1 writes the same two hours into
+// config.json as `connect_by`, so an agent that never connects also stops itself.
+// Change both together.
+const CONSUMED_TTL_MS = 2 * 60 * 60 * 1000;
 const ATTACHED_LIFE_MS = 24 * 60 * 60 * 1000; // attach -> expiry, fixed
 const RESULT_SLACK_MS = 15 * 1000; // relay waits timeout_s + this
 export const GET_FILE_MAX = 524288; // bytes per get_file chunk
@@ -198,12 +201,16 @@ export class Session {
   }
 
   async doConsume() {
+    // Hash first. Hashing yields to other requests, so doing it between the state
+    // check and the write would let two concurrent consumes both see `pending`
+    // and both mint a key. From the state read to the write there is only
+    // storage I/O, which does not interleave.
+    const key = hex32();
+    const keyHash = await sha256Hex(key);
     if (await this.expireIfDue()) return Response.json({ ok: false, reason: 'expired' });
     const state = await this.get('state');
     if (state !== 'pending') return Response.json({ ok: false, reason: 'not-pending' });
     const now = Date.now();
-    const key = hex32();
-    const keyHash = await sha256Hex(key);
     const deadline = now + this.ttlMs(CONSUMED_TTL_MS);
     await this.setMany({
       state: 'consumed',
@@ -222,7 +229,7 @@ export class Session {
     // relies on 410 (ended) / 401 (pending or bad key) to mean "session over"
     // and 426 to mean "alive, please upgrade". So check state and key first.
     await this.expireIfDue();
-    const state = await this.get('state');
+    let state = await this.get('state');
     if (state === 'ended' || state === undefined) return new Response('gone', { status: 410 });
     if (state === 'pending') return new Response('unauthorized', { status: 401 });
     const key = request.headers.get('X-Attach-Key') || '';
@@ -230,6 +237,11 @@ export class Session {
     if (!wantHash || (await sha256Hex(key)) !== wantHash) {
       return new Response('unauthorized', { status: 401 });
     }
+    // Hashing yields to other requests. An operator end or alarm during that
+    // await must remain terminal, so a late attach can't resurrect the session.
+    await this.expireIfDue();
+    state = await this.get('state');
+    if (state === 'ended' || state === undefined) return new Response('gone', { status: 410 });
     if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('expected websocket', { status: 426 });
     }
@@ -243,12 +255,12 @@ export class Session {
     this.closeAll(null, 'replaced');
     this.failPending(() => true, 'agent disconnected');
 
-    if (state === 'consumed') {
+    const firstAttach = state === 'consumed';
+    if (firstAttach) {
       expiresAt = now + this.ttlMs(ATTACHED_LIFE_MS);
       await this.setMany({ state: 'attached', attached_first_at: now, expires_at: expiresAt, ws_gen: gen, ws_tag: tag });
       this.logRow('attached', tag);
       await this.ctx.storage.setAlarm(expiresAt);
-      await this.pushRegistry();
     } else {
       // reattach: do NOT extend expiry
       await this.setMany({ ws_gen: gen, ws_tag: tag });
@@ -260,6 +272,10 @@ export class Session {
     const server = pair[1];
     this.ctx.acceptWebSocket(server, [tag]);
     server.send(JSON.stringify({ type: 'welcome', expires_at: expiresAt }));
+    // The registry push is a network call that yields. It runs after the accept,
+    // so an end that lands during it also closes this socket. Before the accept
+    // it could not, and the socket would join an ended session.
+    if (firstAttach) await this.pushRegistry();
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -267,7 +283,7 @@ export class Session {
     await this.expireIfDue();
     const tail = Math.max(0, Math.min(500, Number(url.searchParams.get('log_tail') || 20) || 0));
     const s = await this.ctx.storage.get([
-      'state', 'machine', 'user', 'expires_at', 'ps', 'code', 'ended_reason',
+      'state', 'machine', 'user', 'expires_at', 'ps', 'code', 'ended_reason', 'consumed_expires_at',
     ]);
     const rows = tail
       ? this.sql.exec(`SELECT ts,kind,detail FROM log ORDER BY ts DESC LIMIT ?`, tail).toArray().reverse()
@@ -278,6 +294,7 @@ export class Session {
       user: s.get('user') ?? null,
       ps: s.get('ps') ?? null,
       expires_at: s.get('expires_at') ?? null,
+      startup_expires_at: s.get('state') === 'consumed' ? s.get('consumed_expires_at') ?? null : null,
       ended_reason: s.get('ended_reason') ?? null,
       attached: !!(await this.currentSocket()),
       log: rows,
@@ -401,12 +418,13 @@ export class Session {
     }
     if (msg.type === 'result' && msg.id) {
       const p = this.pending.get(msg.id);
-      if (p) {
+      if (p && p.tag === this.socketTag(ws)) {
         this.pending.delete(msg.id);
         p.resolve(msg);
       }
       return;
     }
+    if (this.socketTag(ws) !== await this.get('ws_tag')) return;
     const state = await this.get('state');
     if (state === 'ended') {
       try {
@@ -415,12 +433,17 @@ export class Session {
       return;
     }
     if (msg.type === 'hello') {
-      await this.setMany({
-        machine: truncate(String(msg.machine ?? ''), 100) || null,
-        user: truncate(String(msg.user ?? ''), 100) || null,
-        ps: truncate(String(msg.ps ?? ''), 40) || null,
-      });
-      this.logRow('hello', `${msg.machine ?? '?'}\\${msg.user ?? '?'} ps=${msg.ps ?? '?'} agent=${msg.agent ?? '?'}`);
+      // One hello per socket. The tag names the socket's attach generation, so
+      // `hello_tag` records which socket has already introduced itself. It sits
+      // in storage, not memory, so it survives hibernation. A reattach gets a
+      // new tag and may say hello once more.
+      if ((await this.get('hello_tag')) === this.socketTag(ws)) return;
+      const machine = truncate(String(msg.machine ?? ''), 100) || null;
+      const user = truncate(String(msg.user ?? ''), 100) || null;
+      const ps = truncate(String(msg.ps ?? ''), 40) || null;
+      const agent = truncate(String(msg.agent ?? ''), 40) || null;
+      await this.setMany({ machine, user, ps, hello_tag: this.socketTag(ws) });
+      this.logRow('hello', `${machine ?? '?'}\\${user ?? '?'} ps=${ps ?? '?'} agent=${agent ?? '?'}`);
       await this.pushRegistry();
       return;
     }
