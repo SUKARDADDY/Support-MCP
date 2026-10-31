@@ -71,14 +71,17 @@ test('served script is wrapped in & { } so nothing leaks into the console', () =
 const agentSrc = readFileSync(new URL('../src/agent.ps1', import.meta.url), 'utf8');
 const sessionSrc = readFileSync(new URL('../src/session.js', import.meta.url), 'utf8');
 
-test('agent.ps1 writes the logon Run value once, only in the -Run role after the elevation refusal', () => {
+test('agent.ps1 writes the logon Run value once, only in the -Run role after the elevation refusal and the connect_by check', () => {
   const runRole = agentSrc.search(/^# =+ RUN role$/m);
   const refusal = agentSrc.search(/^if \(Test-Elevated\) \{\r?\n\s+Invoke-Cleanup\r?\n\s+return\r?\n\}/m);
+  const connectByCheck = agentSrc.search(/\[long\]\$cfg\.connect_by -le \$nowMs\) \{ Invoke-Cleanup; return \}/);
   const writes = [...agentSrc.matchAll(/Set-ItemProperty -Path \$RunKey/g)].map((m) => m.index);
   assert.ok(runRole > 0, 'RUN role marker');
   assert.ok(refusal > runRole, 'the -Run role cleans up and returns when elevated');
+  assert.ok(connectByCheck > refusal, 'the -Run role cleans up and returns when connect_by has passed');
   assert.equal(writes.length, 1);
   assert.ok(writes[0] > refusal, 'the Run value is written after the elevation refusal');
+  assert.ok(writes[0] > connectByCheck, 'the Run value is written after the connect_by check');
 });
 
 test('agent.ps1 connect_by window matches the relay first-attach window', () => {

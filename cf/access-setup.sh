@@ -30,6 +30,16 @@ OWNER="$SUPPORT_OPERATOR_EMAIL"; ENV_OUT="${SUPPORT_MCP_ENV:-$HOME/.config/suppo
 # The token goes to curl through a config file read from a process substitution
 # (printf is a builtin), so it never appears in argv or in `ps` output.
 cf() { curl -sS -K <(printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN") -H "content-type: application/json" "$@"; }
+# Reads the create-token API response on stdin and writes the env file. umask only
+# sets the mode of a file the shell creates, so an existing 0644 file would keep
+# it: remove the old file first, write under umask 077, then chmod 600 anyway.
+# The secret travels only through the pipe and the file, never argv.
+write_env_file() {
+  rm -f "$ENV_OUT"
+  ( umask 077
+    HOST="$HOST" python3 -c 'import os,sys,json; r=json.load(sys.stdin)["result"]; print("# Cloudflare Access service token for the MCP client on %s/mcp\n# Send as headers CF-Access-Client-Id / CF-Access-Client-Secret. Created by cf/access-setup.sh.\nCF_ACCESS_CLIENT_ID=%s\nCF_ACCESS_CLIENT_SECRET=%s" % (os.environ["HOST"], r["client_id"], r["client_secret"]))' > "$ENV_OUT" )
+  chmod 600 "$ENV_OUT"
+}
 ok() { python3 -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get("success") else (print(json.dumps(d.get("errors")), file=sys.stderr) or 1))'; }
 
 # 1. service token (create only if absent; the secret is unrecoverable later)
@@ -39,7 +49,7 @@ if [ -z "$ST_ID" ]; then
   echo "$RESP" | ok
   ST_ID=$(echo "$RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["id"])')
   umask 077; mkdir -p "$(dirname "$ENV_OUT")"
-  echo "$RESP" | HOST="$HOST" python3 -c 'import os,sys,json; r=json.load(sys.stdin)["result"]; print("# Cloudflare Access service token for the MCP client on %s/mcp\n# Send as headers CF-Access-Client-Id / CF-Access-Client-Secret. Created by cf/access-setup.sh.\nCF_ACCESS_CLIENT_ID=%s\nCF_ACCESS_CLIENT_SECRET=%s" % (os.environ["HOST"], r["client_id"], r["client_secret"]))' > "$ENV_OUT"
+  echo "$RESP" | write_env_file
   echo "service token created: $ST_ID (secret written to $ENV_OUT)"
 else
   echo "service token exists: $ST_ID (secret unchanged; rotate via dashboard if lost)"

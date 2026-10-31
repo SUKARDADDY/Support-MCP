@@ -263,8 +263,20 @@ The wire protocol, the state machine and the acceptance checks are in
   some machines.
 - It is built for one operator, or a few people sharing one Access app. There
   are no per-operator permissions.
-- Command output is capped at 256 KiB per stream and files move in chunks of
-  about 512 KiB.
+- Command output is capped at 262,144 characters per stream, and the whole
+  result frame is trimmed to fit the WebSocket message limit. Files move in
+  chunks of about 512 KiB.
+- If a command leaves a background process running that keeps its output open,
+  the agent waits about 5 seconds after the command exits and stops that
+  process if it can find it. Output on a stream that process still holds open
+  is discarded, and the result is marked with an `[output incomplete]` note. A
+  process started with `Start-Process -NoNewWindow` and no `-Wait` is stopped
+  about 5 seconds after the command returns, so use `-Wait`, or plain
+  `Start-Process` (which does not share the output pipe), for programs that
+  must keep running.
+- If Task Scheduler is unavailable, no fallback cleanup task exists, whether
+  the agent has connected or not. An agent that is killed is then cleaned up
+  the next time it starts after its deadline, normally at logon.
 - Where an administrator has turned on PowerShell script block logging, Windows
   may record the served script, including the attach key, in the PowerShell
   Operational event log. The key stays valid for the life of the session.

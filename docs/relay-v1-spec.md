@@ -133,7 +133,7 @@ Relay → agent:
 {"type":"welcome","expires_at":<ms>}
 {"type":"run","id":"<uuid>","command":"<ps>","timeout_s":<1..600, default 60>}
 {"type":"put_file","id":"<uuid>","path":"<abs>","data_b64":"...","append":<bool>}
-{"type":"get_file","id":"<uuid>","path":"<abs>","offset":<int>,"length":<int ≤ 524288>}
+{"type":"get_file","id":"<uuid>","path":"<abs>","offset":<int64>,"length":<int ≤ 524288>}
 {"type":"end","reason":"expired"|"ended_by_operator"}
 ```
 Agent → relay:
@@ -141,7 +141,7 @@ Agent → relay:
 {"type":"hello","machine":"<COMPUTERNAME>","user":"<USERNAME>","ps":"<PSVersion>","agent":"1"}
 {"type":"result","id":"<uuid>","ok":true,"exit_code":<int|null>,"stdout":"...","stderr":"...","timed_out":<bool>}
 {"type":"result","id":"<uuid>","ok":true,"bytes":<int>}                       (put_file)
-{"type":"result","id":"<uuid>","ok":true,"data_b64":"...","size":<total int>,"eof":<bool>}  (get_file)
+{"type":"result","id":"<uuid>","ok":true,"data_b64":"...","size":<total int64>,"eof":<bool>}  (get_file)
 {"type":"result","id":"<uuid>","ok":false,"error":"<text>"}
 {"type":"end","reason":"customer"}
 ```
@@ -150,10 +150,20 @@ whole child process tree and reports `timed_out:true` with **`exit_code:null`**
 (the relay/MCP passes the null through). `stdout`/`stderr` are captured as plain
 text (child runs `powershell -OutputFormat Text` with `$ProgressPreference=
 'SilentlyContinue'`, so no "Preparing modules" record; PS 5.1 still emits stderr as CLIXML under `-EncodedCommand`, so the agent decodes it to plain text — every stream, native stderr kept verbatim, progress dropped), each
-truncated agent-side to 256 KiB with a `[truncated]` marker. The agent then
+truncated agent-side to 262,144 characters (not bytes) with a `[truncated]`
+marker. The agent then
 budgets the **whole serialized frame** by UTF-8 bytes: if a frame would exceed
 ~900 KB it shrinks stdout/stderr (keeping the marker) and re-serializes, so no
-frame nears the ~1 MiB WebSocket message limit. Relay waits for a matching
+frame nears the ~1 MiB WebSocket message limit. If a command leaves a
+background process holding the output pipes open, the agent does not wait for
+them. It gives the streams 5 s after the child exits (or until the job's own
+deadline, if that comes first), stops any children the exited child left
+running that it can find, waits 1 s more, then sends the result with the real
+`exit_code` and `timed_out:false`, an empty string for any stream that never
+finished, and `[output incomplete: a background process kept the output open]`
+appended to `stderr`. A timeout kill gets the same 5 s bound. The agent reads a
+stream's result only once its task is complete, so a leftover process cannot
+freeze the window, the WebSocket pump or End session. Relay waits for a matching
 `result` up to `timeout_s + 15` s, else returns a timeout error to MCP. If no
 agent is attached, tools error immediately with `agent not attached`.
 
@@ -201,8 +211,9 @@ the sid, so two sessions on one PC never collide: folder
    `-Run` agent as the interactive user at a limited run level via a one-shot
    scheduled task (`New-ScheduledTaskPrincipal -RunLevel Limited -LogonType
    Interactive`; register → start; a `finally` always unregisters it) and print
-   a line saying so. If the launch throws, nothing is running, so the bootstrap
-   runs the cleanup to remove the folder it wrote.
+   a line saying so. If that launch, or the plain launch of the `-Run` agent in
+   a non-elevated console, throws, nothing is running, so the bootstrap runs the
+   cleanup to remove the folder it wrote and prints a failure line.
 2. **Run**: WinForms window, TopMost on first show, title `Support
    session`, a label `Support session active until HH:mm` (local time, after
    welcome), a read-only log box (each command / file op one line, timestamped),
@@ -211,14 +222,21 @@ the sid, so two sessions on one PC never collide: folder
    limited launch task still gets a full token. The refusal runs the cleanup
    (below) and exits, so the folder and any task are removed and no logon entry
    is left. Once it passes that check, the role writes the per-user logon
-   reattach (`HKCU\…\Run` value `SupportMCP-<sid8>`). WebSocket via
+   reattach (`HKCU\…\Run` value `SupportMCP-<sid8>`), but only after it has
+   loaded `config.json` and passed the `expires_at` / `connect_by` checks
+   below, so a broken or already-expired start never creates it. WebSocket via
    `System.Net.WebSockets.ClientWebSocket` with the key in the `X-Attach-Key`
-   header; connect/reconnect/probe are non-blocking (connect task polled from the
-   timer, probe ≤3 s and off the hot path) so the UI never stalls. Receive is
+   header; connect and reconnect are non-blocking (the connect task is polled
+   from the timer). The `/ws` probe runs only after a drop or a failed connect.
+   The UI thread's network and query waits all have a bound: a send waits up to
+   5 s and then aborts the socket, the close handshake up to 2 s, the probe up
+   to about 15 s when DNS stalls (`Invoke-WebRequest -TimeoutSec 3` does not
+   bound name resolution), and the orphan WMI query up to about 3 s. Receive is
    polled from a `Windows.Forms.Timer`, draining every completed receive per
    tick. Commands run as a child `powershell.exe -NoProfile -NonInteractive
    -OutputFormat Text -EncodedCommand` (a `System.Diagnostics.Process` with both
-   streams read async; the whole tree is killed via `taskkill /T /F` at timeout).
+   streams read async and polled from the timer; the whole tree is killed via
+   `taskkill /T /F` at timeout).
    On welcome, persist `expires_at` to `config.json` and register the **fallback
    task** `SupportMCPCleanup-<sid8>` (per-user, `Register-ScheduledTask`,
    one-time trigger at `expires_at`, with `New-ScheduledTaskSettingsSet

@@ -52,6 +52,33 @@ function Stop-Tree($proc) {
     try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
 }
 
+# Once a process has exited, taskkill /T can no longer walk its tree, but a child
+# it left behind still records the dead parent PID in Win32_Process. Kill those
+# children (and their trees). PIDs get reused, so only children created while
+# the process was alive count. Best effort: a grandchild whose own parent already
+# exited has no link back to $proc and is not found. The query is time-limited.
+function Stop-Orphans($proc) {
+    if ($null -eq $proc) { return }
+    try {
+        $from = $proc.StartTime.AddMilliseconds(-50)
+        $to = $proc.ExitTime.AddSeconds(2)
+        $kids = Get-CimInstance -ClassName Win32_Process -Filter ('ParentProcessId = {0}' -f $proc.Id) -OperationTimeoutSec 3 -ErrorAction Stop
+        foreach ($k in @($kids)) {
+            if ($k.CreationDate -lt $from -or $k.CreationDate -gt $to) { continue }
+            $kp = $null
+            try {
+                $kp = [System.Diagnostics.Process]::GetProcessById([int]$k.ProcessId)
+                # The orphan may have exited since the query and its PID been reused.
+                # Hold a handle so the PID cannot change hands, then kill only if the
+                # process started when WMI says the child did. Any error skips it.
+                $null = $kp.Handle
+                if ([Math]::Abs(($kp.StartTime - $k.CreationDate).TotalSeconds) -le 1) { Stop-Tree $kp }
+            } catch {}
+            if ($null -ne $kp) { try { $kp.Dispose() } catch {} }
+        }
+    } catch {}
+}
+
 function Invoke-Cleanup {
     if ($null -ne $script:jobs) {
         foreach ($id in @($script:jobs.Keys)) {
@@ -85,7 +112,8 @@ if (-not $Run) {
     $cfg = New-Object psobject -Property @{ sid = $Sid; key = $Key; origin = $Origin; expires_at = $null; connect_by = $connectBy }
     [IO.File]::WriteAllText((Join-Path $AppDir 'config.json'), ($cfg | ConvertTo-Json))
     # The logon Run value is written by the -Run role once it knows it is not
-    # elevated, so a run that refuses to start never leaves a logon entry behind.
+    # elevated, has loaded its config and is inside its deadlines, so a run that
+    # refuses to start never leaves a logon entry behind.
 
     if (Test-Elevated) {
         # The customer pasted us into an elevated console. Nothing here may run
@@ -111,11 +139,17 @@ if (-not $Run) {
         return
     }
 
-    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-WindowStyle', 'Hidden',
-        '-File', ('"{0}"' -f $agentPath), '-Run'
-    ) | Out-Null
-    Write-Host 'Support session starting. A window will open.'
+    try {
+        Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-WindowStyle', 'Hidden',
+            '-File', ('"{0}"' -f $agentPath), '-Run'
+        ) | Out-Null
+        Write-Host 'Support session starting. A window will open.'
+    } catch {
+        # Nothing started, so remove the folder the bootstrap just wrote.
+        Invoke-Cleanup
+        Write-Host 'Could not start the support agent. Please ask for a new support command.'
+    }
     return
 }
 
@@ -130,14 +164,6 @@ if (Test-Elevated) {
     return
 }
 
-# Per-user logon reattach (HKCU Run always runs un-elevated at logon). Written
-# here, after the elevation check, so a refused run never creates it. Cleanup,
-# the expiry checks below and a server end all remove it.
-try {
-    $launch = ('powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "{0}" -Run' -f (Get-AgentPath))
-    Set-ItemProperty -Path $RunKey -Name $RunValue -Value $launch
-} catch {}
-
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -146,7 +172,7 @@ $cfgPath = Join-Path (Split-Path -Parent $PSCommandPath) 'config.json'
 $cfg = Get-Content -Raw -Path $cfgPath | ConvertFrom-Json
 $Sid = $cfg.sid; $Key = $cfg.key; $Origin = $cfg.origin
 
-$script:jobs       = @{}            # id -> @{ proc; outTask; errTask; deadline; type }
+$script:jobs       = @{}            # id -> @{ proc; outTask; errTask; deadline; type; endedAt; timedOut; sweptAt }
 $script:ws         = $null
 $script:connectTask = $null
 $script:connecting = $false
@@ -177,6 +203,15 @@ if ($cfg.expires_at) {
     $script:connectBy = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$cfg.connect_by).LocalDateTime
 }
 
+# Per-user logon reattach (HKCU Run always runs un-elevated at logon). Written
+# only now: after the elevation check, a successful config load and the expiry
+# checks above, so a refused, broken or already-expired run never creates it.
+# Cleanup, the expiry checks and a server end all remove it.
+try {
+    $launch = ('powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "{0}" -Run' -f (Get-AgentPath))
+    Set-ItemProperty -Path $RunKey -Name $RunValue -Value $launch
+} catch {}
+
 function Save-Config {
     try {
         $c = New-Object psobject -Property @{ sid = $Sid; key = $Key; origin = $Origin; expires_at = $script:expiresMs }
@@ -206,14 +241,22 @@ function Send-Frame($obj) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($txt)
     $seg = [System.ArraySegment[byte]]::new($bytes)
     try {
-        $script:ws.SendAsync($seg, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, [Threading.CancellationToken]::None).Wait()
+        $sent = $script:ws.SendAsync($seg, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, [Threading.CancellationToken]::None).Wait(5000)
+        if (-not $sent) {
+            # A slow or dead link must not freeze the UI thread (End session sends
+            # through here too). Abort leaves the state at not-Open, so the next
+            # Tick runs Handle-Disconnect. Calling it from here would make End
+            # session wait on a probe and would run it twice from On-Connected.
+            try { $script:ws.Abort() } catch {}
+        }
     } catch {}
 }
 
 # --- run-result frame with a serialized-byte budget (B6) ----------------------
-# Cap each stream at 256 KiB of characters first, then shrink stdout/stderr and
-# re-serialize until the whole UTF-8 frame is under ~900 KB (WebSocket messages
-# have a ~1 MiB limit and JSON escaping / UTF-8 inflate the payload).
+# Cap each stream at CharCap (262,144 characters, not bytes) first, then shrink
+# stdout/stderr and re-serialize until the whole UTF-8 frame is under ~900 KB
+# (WebSocket messages have a ~1 MiB limit and JSON escaping / UTF-8 inflate the
+# payload).
 $script:CharCap  = 262144
 $script:ByteMax  = 900000
 $script:Marker   = [Environment]::NewLine + '[truncated]'
@@ -260,7 +303,8 @@ function Start-Receive {
 
 # ---- probe /ws over plain HTTP to tell "session over" from a transient drop ---
 # DO returns 410 (ended), 401 (pending/bad key), 426 (alive, needs upgrade).
-# Short (<=3 s) and only off the reconnect path, so the UI never stalls for long.
+# Runs only after a drop or a failed connect. -TimeoutSec 3 does not bound DNS
+# resolution, so a stalled lookup can hold the UI for about 15 s.
 function Probe-Over {
     try {
         Invoke-WebRequest -Uri (Get-ProbeUrl) -Method Get -UseBasicParsing -TimeoutSec 3 `
@@ -368,15 +412,18 @@ function Start-RunJob($m) {
         $p = New-Object System.Diagnostics.Process
         $p.StartInfo = $psi
         [void]$p.Start()
-        # Read both streams async so a child that fills a pipe can't deadlock and
-        # the UI never blocks waiting on it.
+        # Read both streams async so a child that fills a pipe can't deadlock.
+        # Pump-Jobs only reads a task's Result once it IsCompleted: a background
+        # process the command leaves running can hold the pipes open after the
+        # child exits, and such a task would never finish.
         $outTask = $p.StandardOutput.ReadToEndAsync()
         $errTask = $p.StandardError.ReadToEndAsync()
     } catch {
         Send-Frame (New-Object psobject -Property @{ type = 'result'; id = $id; ok = $false; error = ('spawn failed: ' + $_.Exception.Message) })
         return
     }
-    $script:jobs[$id] = @{ proc = $p; outTask = $outTask; errTask = $errTask; deadline = (Get-Date).AddSeconds($timeout); type = 'run' }
+    $script:jobs[$id] = @{ proc = $p; outTask = $outTask; errTask = $errTask; deadline = (Get-Date).AddSeconds($timeout); type = 'run'
+                           endedAt = $null; timedOut = $false; sweptAt = $null }
 }
 
 # Child stderr under -EncodedCommand arrives as '#< CLIXML' + <Objs>...</Objs>,
@@ -423,29 +470,63 @@ function ConvertFrom-CliXmlStderr([string]$raw) {
     }
 }
 
+# After a job's process has exited (or been killed on timeout) its stdout/stderr
+# tasks normally finish within a tick. A background process the command left
+# running can keep the pipes open, so the wait is bounded: DrainSecs after the
+# exit, or the job's own deadline if that comes first (never less than
+# DrainGraceSecs; a killed job has no deadline left and gets the full DrainSecs).
+# Then Stop-Orphans runs once and the tasks get DrainGraceSecs more to finish,
+# after which the result goes out with whatever completed. The UI thread never
+# waits on a task.
+$script:DrainSecs      = 5
+$script:DrainGraceSecs = 1
+$script:IncompleteMark = '[output incomplete: a background process kept the output open]'
+
 function Pump-Jobs {
     if ($script:jobs.Count -eq 0) { return }
     foreach ($id in @($script:jobs.Keys)) {
         $j = $script:jobs[$id]
-        $done = $false; $timedOut = $false
-        if ($j.proc.HasExited) {
-            $done = $true
-        } elseif ((Get-Date) -gt $j.deadline) {
-            Stop-Tree $j.proc          # kill the whole child tree on timeout
-            $done = $true; $timedOut = $true
+        $now = Get-Date
+        if ($null -eq $j.endedAt) {
+            $exited = $true
+            try { $exited = $j.proc.HasExited } catch {}
+            if ($exited) {
+                $j.endedAt = $now
+            } elseif ($now -gt $j.deadline) {
+                Stop-Tree $j.proc          # kill the whole child tree on timeout
+                $j.endedAt = $now; $j.timedOut = $true
+            } else {
+                continue
+            }
         }
-        if (-not $done) { continue }
+        # Draining: both stream tasks must be complete before their Result is read.
+        if (-not ($j.outTask.IsCompleted -and $j.errTask.IsCompleted)) {
+            if ($null -eq $j.sweptAt) {
+                $limit = $j.endedAt.AddSeconds($script:DrainSecs)
+                if (-not $j.timedOut -and $j.deadline -lt $limit) { $limit = $j.deadline }
+                $floor = $j.endedAt.AddSeconds($script:DrainGraceSecs)
+                if ($limit -lt $floor) { $limit = $floor }
+                if ($now -lt $limit) { continue }
+                Stop-Orphans $j.proc       # kill what still holds the pipes, then re-check
+                $j.sweptAt = Get-Date
+                continue
+            }
+            if ($now -lt $j.sweptAt.AddSeconds($script:DrainGraceSecs)) { continue }
+        }
         $script:jobs.Remove($id)   # first, so a later throw can't wedge the job into retrying every tick
-        try { [void]$j.proc.WaitForExit(2000) } catch {}
-        $so = ''; $se = ''
-        try { $so = $j.outTask.Result } catch {}
-        try { $se = $j.errTask.Result } catch {}
+        $so = ''; $se = ''; $incomplete = $false
+        if ($j.outTask.IsCompleted) { try { $so = $j.outTask.Result } catch {} } else { $incomplete = $true }
+        if ($j.errTask.IsCompleted) { try { $se = $j.errTask.Result } catch {} } else { $incomplete = $true }
         try { $se = (ConvertFrom-CliXmlStderr $se) -replace ('(?m)^' + [regex]::Escape($script:RunPreamble) + '\r?\n'), '' } catch {}
+        if ($incomplete) {
+            if ($se.Length -gt 0 -and -not $se.EndsWith("`n")) { $se += [Environment]::NewLine }
+            $se += $script:IncompleteMark
+        }
         # exit_code null on timeout (A3); otherwise the child's real code (A1).
         $exit = $null
-        if (-not $timedOut) { try { $exit = [int]$j.proc.ExitCode } catch { $exit = $null } }
+        if (-not $j.timedOut) { try { $exit = [int]$j.proc.ExitCode } catch { $exit = $null } }
         try { $j.proc.Dispose() } catch {}
-        Send-RunResult $id $exit $so $se $timedOut
+        Send-RunResult $id $exit $so $se $j.timedOut
     }
 }
 
@@ -472,15 +553,15 @@ function Do-GetFile($m) {
     $id = [string]$m.id
     Append-Log ('get_file: {0}' -f $m.path)
     try {
-        $offset = 0; if ($m.offset) { $offset = [int]$m.offset }
+        $offset = [long]0; if ($m.offset) { $offset = [long]$m.offset }
         $length = 524288; if ($m.length) { $length = [int]$m.length }
         if ($length -gt 524288) { $length = 524288 }
         $fs = [System.IO.File]::Open([string]$m.path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
         try {
-            $size = $fs.Length
+            $size = [long]$fs.Length
             if ($offset -gt $size) { $offset = $size }
             [void]$fs.Seek($offset, [System.IO.SeekOrigin]::Begin)
-            $toRead = [Math]::Min($length, $size - $offset)
+            $toRead = [int][Math]::Min([long]$length, $size - $offset)
             $buf = New-Object 'byte[]' $toRead
             $read = 0
             while ($read -lt $toRead) {
@@ -493,7 +574,7 @@ function Do-GetFile($m) {
         $eof = ($offset + $read) -ge $size
         Send-Frame (New-Object psobject -Property @{
             type = 'result'; id = $id; ok = $true;
-            data_b64 = [Convert]::ToBase64String($buf); size = [int]$size; eof = [bool]$eof
+            data_b64 = [Convert]::ToBase64String($buf); size = [long]$size; eof = [bool]$eof
         })
     } catch {
         Send-Frame (New-Object psobject -Property @{ type = 'result'; id = $id; ok = $false; error = $_.Exception.Message })
