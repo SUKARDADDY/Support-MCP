@@ -281,6 +281,11 @@ The wire protocol, the state machine and the acceptance checks are in
   may record the served script, including the attach key, in the PowerShell
   Operational event log. The key stays valid for the life of the session.
 
+## Contributing
+
+Only collaborators can open pull requests here. To suggest a change or report
+a bug, open an issue. To report a vulnerability, see [SECURITY.md](SECURITY.md).
+
 ## License
 
-[MIT](LICENSE). To report a vulnerability, see [SECURITY.md](SECURITY.md).
+[MIT](LICENSE).

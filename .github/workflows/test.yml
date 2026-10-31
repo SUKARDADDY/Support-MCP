@@ -3,13 +3,21 @@ name: test
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# This runs on our own runner, so outside code must never reach it. Two
+# repository settings are the gate: only collaborators can open pull requests,
+# and a workflow from any outside contributor waits for approval. The `if`
+# below is a second line for pull requests from forks. A fork can edit this
+# file, so it is not a boundary on its own.
 jobs:
   test:
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, support-mcp]
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
         with:
