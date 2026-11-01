@@ -234,6 +234,30 @@ function Append-Log([string]$line) {
     $script:logBox.AppendText(('[{0}] {1}{2}' -f $t, $line, [Environment]::NewLine))
 }
 
+# Headline and detail of the notice. State is 'connecting', 'connected' or
+# 'reconnecting'. The until-time comes from expiresAt, so it only shows once the
+# session has been authorized.
+function Set-Status([string]$state) {
+    $until = ''
+    if ($null -ne $script:expiresAt) {
+        $until = ('Session active until {0}. You can end it at any time.' -f $script:expiresAt.ToString('HH:mm'))
+    }
+    switch ($state) {
+        'connected' {
+            $script:headLbl.Text = 'A remote support agent is connected to your machine.'
+            $script:detailLbl.Text = $until
+        }
+        'reconnecting' {
+            $script:headLbl.Text = 'Remote support is reconnecting...'
+            $script:detailLbl.Text = $until
+        }
+        default {
+            $script:headLbl.Text = 'Connecting to remote support...'
+            $script:detailLbl.Text = 'This window stays open while support is connected.'
+        }
+    }
+}
+
 function Send-Frame($obj) {
     if ($null -eq $script:ws) { return }
     if ($script:ws.State -ne [System.Net.WebSockets.WebSocketState]::Open) { return }
@@ -357,6 +381,7 @@ function Handle-Disconnect {
     if ($script:ending) { return }
     if (Probe-Over) { Append-Log 'Session ended by server.'; Finish-Cleanup; return }
     $script:nextConnAt = (Get-Date).AddSeconds($script:backoff)
+    if ($null -ne $script:expiresAt) { Set-Status 'reconnecting' }
     Append-Log ('Disconnected. Reconnecting in {0}s.' -f $script:backoff)
     $script:backoff = [Math]::Min(60, $script:backoff * 2)
 }
@@ -370,7 +395,7 @@ function Process-Message([string]$txt) {
             $script:expiresMs = [long]$m.expires_at
             $script:expiresAt = [DateTimeOffset]::FromUnixTimeMilliseconds([long]$m.expires_at).LocalDateTime
             Save-Config
-            $script:statusLbl.Text = ('Support session active until {0}' -f $script:expiresAt.ToString('HH:mm'))
+            Set-Status 'connected'
             Register-FallbackTask
             Append-Log 'Session authorized.'
         }
@@ -645,6 +670,7 @@ function Tick {
                     $script:ws = $null
                     if (Probe-Over) { Append-Log 'Session ended by server.'; Finish-Cleanup; return }
                     $script:nextConnAt = (Get-Date).AddSeconds($script:backoff)
+                    if ($null -ne $script:expiresAt) { Set-Status 'reconnecting' }
                     Append-Log ('Disconnected. Reconnecting in {0}s.' -f $script:backoff)
                     $script:backoff = [Math]::Min(60, $script:backoff * 2)
                 }
@@ -683,30 +709,120 @@ function Tick {
 }
 
 # ------------------------------------------------------------------------- UI
+# A small fixed-size notice. The command log stays available behind the
+# 'Show activity' link so the customer can always see what support does.
 $script:form = New-Object System.Windows.Forms.Form
-$script:form.Text = 'Support session'
-$script:form.Size = New-Object System.Drawing.Size(560, 400)
+$script:form.Text = 'Remote support'
+$script:form.AutoScaleDimensions = New-Object System.Drawing.SizeF(96, 96)
+$script:form.AutoScaleMode = 'Dpi'
+$script:form.FormBorderStyle = 'FixedDialog'
+$script:form.MaximizeBox = $false
+$script:form.MinimizeBox = $true
 $script:form.StartPosition = 'CenterScreen'
+$script:form.AutoSize = $true
+$script:form.AutoSizeMode = 'GrowAndShrink'
 $script:form.TopMost = $true
 
-$script:statusLbl = New-Object System.Windows.Forms.Label
-$script:statusLbl.Text = 'Support session starting...'
-$script:statusLbl.AutoSize = $false
-$script:statusLbl.Dock = 'Top'
-$script:statusLbl.Height = 28
-$script:statusLbl.TextAlign = 'MiddleLeft'
-$script:statusLbl.Padding = New-Object System.Windows.Forms.Padding(8, 4, 8, 0)
+# Root layout: message row, log row (hidden until toggled), button row.
+$root = New-Object System.Windows.Forms.TableLayoutPanel
+$root.ColumnCount = 1
+$root.RowCount = 3
+$root.AutoSize = $true
+$root.AutoSizeMode = 'GrowAndShrink'
+$root.MinimumSize = New-Object System.Drawing.Size(440, 0)
+$root.Padding = New-Object System.Windows.Forms.Padding(16, 16, 16, 12)
+[void]$root.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+for ($i = 0; $i -lt 3; $i++) {
+    [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+}
 
+# Message row: info icon on the left, headline and detail on the right.
+$msgRow = New-Object System.Windows.Forms.TableLayoutPanel
+$msgRow.ColumnCount = 2
+$msgRow.RowCount = 1
+$msgRow.AutoSize = $true
+$msgRow.AutoSizeMode = 'GrowAndShrink'
+$msgRow.Dock = 'Fill'
+$msgRow.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 12)
+[void]$msgRow.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$msgRow.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+
+$iconBox = New-Object System.Windows.Forms.PictureBox
+$iconBox.Image = [System.Drawing.SystemIcons]::Information.ToBitmap()
+$iconBox.SizeMode = 'CenterImage'
+$iconBox.Size = New-Object System.Drawing.Size(40, 40)
+$iconBox.Margin = New-Object System.Windows.Forms.Padding(0, 0, 12, 0)
+
+$textCol = New-Object System.Windows.Forms.FlowLayoutPanel
+$textCol.FlowDirection = 'TopDown'
+$textCol.WrapContents = $false
+$textCol.AutoSize = $true
+$textCol.AutoSizeMode = 'GrowAndShrink'
+$textCol.Margin = New-Object System.Windows.Forms.Padding(0)
+
+$script:headLbl = New-Object System.Windows.Forms.Label
+$script:headLbl.Font = New-Object System.Drawing.Font('Segoe UI', [single]11, [System.Drawing.FontStyle]::Bold)
+$script:headLbl.AutoSize = $true
+$script:headLbl.MaximumSize = New-Object System.Drawing.Size(340, 0)
+$script:headLbl.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 6)
+
+$script:detailLbl = New-Object System.Windows.Forms.Label
+$script:detailLbl.Font = New-Object System.Drawing.Font('Segoe UI', [single]9)
+$script:detailLbl.AutoSize = $true
+$script:detailLbl.MaximumSize = New-Object System.Drawing.Size(340, 0)
+$script:detailLbl.Margin = New-Object System.Windows.Forms.Padding(0)
+
+[void]$textCol.Controls.Add($script:headLbl)
+[void]$textCol.Controls.Add($script:detailLbl)
+[void]$msgRow.Controls.Add($iconBox, 0, 0)
+[void]$msgRow.Controls.Add($textCol, 1, 0)
+
+# Command log: hidden until the customer clicks 'Show activity'.
 $script:logBox = New-Object System.Windows.Forms.TextBox
 $script:logBox.Multiline = $true
 $script:logBox.ReadOnly = $true
 $script:logBox.ScrollBars = 'Vertical'
 $script:logBox.Dock = 'Fill'
+$script:logBox.Height = 180
+$script:logBox.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 12)
+$script:logBox.Visible = $false
+
+# Button row: activity link on the left, End session on the right.
+$btnRow = New-Object System.Windows.Forms.TableLayoutPanel
+$btnRow.ColumnCount = 2
+$btnRow.RowCount = 1
+$btnRow.AutoSize = $true
+$btnRow.AutoSizeMode = 'GrowAndShrink'
+$btnRow.Dock = 'Fill'
+$btnRow.Margin = New-Object System.Windows.Forms.Padding(0)
+[void]$btnRow.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$btnRow.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+
+$script:activityLink = New-Object System.Windows.Forms.LinkLabel
+$script:activityLink.Text = 'Show activity'
+$script:activityLink.AutoSize = $true
+$script:activityLink.Anchor = 'Left'
+$script:activityLink.Margin = New-Object System.Windows.Forms.Padding(0)
+$script:activityLink.Add_LinkClicked({
+    # The form is AutoSize, so showing or hiding the log grows or shrinks it.
+    if ($script:logBox.Visible) {
+        $script:logBox.Visible = $false
+        $script:activityLink.Text = 'Show activity'
+    } else {
+        $script:logBox.Visible = $true
+        $script:activityLink.Text = 'Hide activity'
+        $script:logBox.SelectionStart = $script:logBox.TextLength
+        $script:logBox.ScrollToCaret()
+    }
+})
 
 $endBtn = New-Object System.Windows.Forms.Button
 $endBtn.Text = 'End session'
-$endBtn.Dock = 'Bottom'
-$endBtn.Height = 36
+$endBtn.AutoSize = $true
+$endBtn.AutoSizeMode = 'GrowAndShrink'
+$endBtn.Padding = New-Object System.Windows.Forms.Padding(8, 2, 8, 2)
+$endBtn.Anchor = 'Right'
+$endBtn.Margin = New-Object System.Windows.Forms.Padding(12, 0, 0, 0)
 $endBtn.Add_Click({
     $ans = [System.Windows.Forms.MessageBox]::Show('End the support session now?', 'Support session', 'YesNo', 'Question')
     if ($ans -eq 'Yes') {
@@ -715,9 +831,15 @@ $endBtn.Add_Click({
     }
 })
 
-$script:form.Controls.Add($script:logBox)
-$script:form.Controls.Add($script:statusLbl)
-$script:form.Controls.Add($endBtn)
+[void]$btnRow.Controls.Add($script:activityLink, 0, 0)
+[void]$btnRow.Controls.Add($endBtn, 1, 0)
+
+[void]$root.Controls.Add($msgRow, 0, 0)
+[void]$root.Controls.Add($script:logBox, 0, 1)
+[void]$root.Controls.Add($btnRow, 0, 2)
+$script:form.Controls.Add($root)
+
+Set-Status 'connecting'
 
 $script:form.Add_FormClosing({
     # A shutdown / Task Manager kill / Application.Exit must close WITHOUT ending

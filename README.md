@@ -3,7 +3,7 @@
 # Support-MCP
 
 **Let an AI agent fix a Windows PC.**<br>
-The customer pastes one line. A window on their screen shows every command as it runs.<br>
+The customer pastes one line. A notice on their screen says a support agent is connected, and a link lists every command.<br>
 They can stop it at any time, and after 24 hours it removes itself.
 
 [![test](https://github.com/SUKARDADDY/Support-MCP/actions/workflows/test.yml/badge.svg)](https://github.com/SUKARDADDY/Support-MCP/actions/workflows/test.yml)
@@ -12,7 +12,7 @@ They can stop it at any time, and after 24 hours it removes itself.
 [![PowerShell 5.1](https://img.shields.io/badge/PowerShell-5.1-5391FE)](src/agent.ps1)
 [![MCP](https://img.shields.io/badge/MCP-7%20tools-d97757)](#mcp-tools)
 
-<img src="docs/hero.svg" alt="Claude Code calls session_create, run and put_file. A Cloudflare Worker relays them to the customer's PC, where a Support session window lists each command as it runs." width="100%">
+<img src="docs/hero.svg" alt="Claude Code calls session_create, run and put_file. A Cloudflare Worker relays them to the customer's PC, where a Remote support notice says an agent is connected. Its Show activity link lists each command." width="100%">
 
 <sub>An illustration based on the <a href="#a-real-session">first real session</a>.</sub>
 
@@ -32,8 +32,9 @@ it, and let an agent do the diagnosis while I watch.
 - **One line, nothing to install.** The agent is a single PowerShell 5.1 script
   with no dependencies beyond what ships with Windows. No account, no codes to
   read out.
-- **The customer sees everything.** Every command and file operation appears in
-  their window as it happens, above an **End session** button.
+- **The customer sees everything.** A small window says a remote support agent
+  is connected and has an **End session** button. Its **Show activity** link
+  lists every command and file operation as it happens.
 - **Never elevated.** The agent refuses to run elevated. When a command asks
   for admin rights, Windows shows a UAC prompt and the customer decides.
 - **Gone in 24 hours.** The session ends itself and removes the agent's folder,
@@ -49,10 +50,11 @@ it, and let an agent do the diagnosis while I watch.
    irm https://support.example.com/j/zp5z7xuckhrm6s7t | iex
    ```
 2. The customer pastes it. The script copies itself to
-   `%LOCALAPPDATA%\SupportMCP\<id>\`, opens a window titled "Support session",
-   and connects back over a WebSocket.
+   `%LOCALAPPDATA%\SupportMCP\<id>\`, opens a small window titled "Remote support"
+   that says a support agent is connected, and connects back over a WebSocket.
 3. The operator calls `run`, `put_file` and `get_file`. Each one appears as a
-   timestamped line in the customer's window.
+   timestamped line in the window's activity list, which the customer opens
+   with **Show activity**.
 4. The session ends when the operator calls `session_end`, when the customer
    clicks **End session**, or when 24 hours pass. The agent then deletes its
    folder, its logon entry and its scheduled task.
@@ -69,10 +71,10 @@ sequenceDiagram
   PC->>W: GET /j/CODE from PowerShell
   W-->>PC: agent script, and the code is used up
   PC->>W: WebSocket /ws with the attach key in a header
-  Note over PC: The Support session window opens, with an End session button
+  Note over PC: The Remote support window opens, with Show activity and End session
   Op->>W: run, put_file or get_file
   W->>PC: command
-  Note over PC: Shown in the window as it runs
+  Note over PC: Listed under Show activity as it runs
   PC-->>W: exit code, stdout, stderr
   W-->>Op: result
   Op->>W: session_end
@@ -169,9 +171,10 @@ alarm for expiry. A second Durable Object keeps the list for `session_list`.
 The customer pastes a script from the internet into PowerShell, so the design
 starts from what that script may and may not do.
 
-- **Consent is visible.** The window stays on top when it first opens, lists
-  every command and file operation, and has an **End session** button. Closing
-  the window asks before it ends the session.
+- **Consent is visible.** The window stays on top when it first opens and says
+  a remote support agent is connected. Its **Show activity** link lists every
+  command and file operation, and its **End session** button stops the session.
+  Closing the window asks before it ends the session.
 - **No elevation.** The agent refuses to start if its own process is elevated.
   If the customer pasted into an admin console, the bootstrap starts the agent
   through a one-shot scheduled task at the limited run level. With UAC turned
@@ -230,8 +233,8 @@ starts from what that script may and may not do.
   the machine and user names. Treat it as untrusted text that may try to steer
   the operator's AI agent. That agent can have a shell on the operator's own
   machine, so do not run it with tool calls auto-approved.
-- **The window shows, it does not enforce.** The window shows what the operator
-  does. It does not stop an operator acting in bad faith: commands run with the
+- **The window shows, it does not enforce.** The window says an agent is
+  connected, and **Show activity** lists what the operator does. It does not stop an operator acting in bad faith: commands run with the
   signed-in user's rights, and what they change stays changed. "Removes the
   agent's own files" covers only the agent's folder, logon entry and scheduled
   tasks. It does not undo files an operator wrote, software it installed or
@@ -326,9 +329,9 @@ The wire protocol, the state machine and the acceptance checks are in
 
 - Use it only on a computer whose owner has asked for support and agreed to
   the session.
-- The visible window and the **End session** button are the consent mechanism.
-  They show the customer every command and let them stop the session at any
-  time. Please keep them visible in any fork.
+- The visible window, its **Show activity** list and the **End session** button
+  are the consent mechanism. They tell the customer an agent is connected, show
+  every command, and let them stop the session at any time. Please keep them visible in any fork.
 - You are responsible for following the law where you and the customer are.
 
 ## Contributing
