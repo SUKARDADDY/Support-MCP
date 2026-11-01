@@ -10,5 +10,6 @@ choose **Report a vulnerability**, and describe the problem. Include the steps
 to reproduce it and the commit you tested. Please don't open a public issue or
 pull request for a vulnerability.
 
-The relay Worker, the PowerShell agent and the scripts in `cf/` are in scope.
+The relay Worker, the Windows app, the PowerShell agent and the scripts in `cf/`
+and `scripts/` are in scope.
 Test only against your own deployment, never someone else's.

@@ -50,9 +50,50 @@ export function buildBootstrap(agentText, { sid, key, origin }) {
   return '& {\n' + subst(agentText).replace(/\{\{AGENT_B64\}\}/g, b64) + '\n}\n';
 }
 
+// ---- Windows modes ----------------------------------------------------------
+// `app` (the default): the customer downloads a session-specific .NET app that
+// talks to the relay over HTTPS polling. `powershell`: the one-line paste.
+// `legacy` and `standard` are accepted as aliases for `app` and `powershell`.
+const WINDOWS_MODE_ALIASES = { app: 'app', legacy: 'app', powershell: 'powershell', standard: 'powershell' };
+
+export function normalizeWindowsMode(mode) {
+  const canonical = Object.prototype.hasOwnProperty.call(WINDOWS_MODE_ALIASES, mode) ? WINDOWS_MODE_ALIASES[mode] : undefined;
+  if (!canonical) throw new Error('windows_mode must be app or powershell');
+  return canonical;
+}
+
+// The `?client=` value on a /j link. Same names as windows_mode, same aliases.
+export function clientMode(value) {
+  return Object.prototype.hasOwnProperty.call(WINDOWS_MODE_ALIASES, value) && WINDOWS_MODE_ALIASES[value] === 'app' ? 'app' : null;
+}
+
+// The tail of every downloaded app: configuration JSON, its length as a
+// little-endian uint32, then this magic string. The app reads it from its own file.
+export const APP_CONFIG_FOOTER = 'SUPPORTMCPCFG1';
+
+// A session-specific .NET executable: the shared bundle with only validated
+// pairing configuration appended. The attach key never appears in a URL or argv.
+export function buildAppDownload(bundle, { sid, key, origin, startup_expires_at }) {
+  validateSid(sid);
+  validateKey(key);
+  validateOrigin(origin);
+  if (!Number.isSafeInteger(startup_expires_at) || startup_expires_at <= 0) throw new Error('bad startup deadline');
+  const binary = Uint8Array.from(atob(bundle.exe_b64), (c) => c.charCodeAt(0));
+  if (binary[0] !== 77 || binary[1] !== 90) throw new Error('bad app executable');
+  const config = new TextEncoder().encode(JSON.stringify({ sid, key, origin, startup_expires_at }));
+  const footer = new TextEncoder().encode(APP_CONFIG_FOOTER);
+  const out = new Uint8Array(binary.length + config.length + 4 + footer.length);
+  out.set(binary);
+  out.set(config, binary.length);
+  new DataView(out.buffer).setUint32(binary.length + config.length, config.length, true);
+  out.set(footer, binary.length + config.length + 4);
+  return out;
+}
+
 export const INVALID_LINK_SCRIPT = "Write-Host 'This support link is invalid or expired.'\n";
 export const METHOD_NOT_ALLOWED_SCRIPT = "Write-Host 'This support link only works with irm.'\n";
 export const NOT_POWERSHELL_SCRIPT =
   "Write-Host 'This is a support link. Paste the whole command into PowerShell instead of opening the link.'\n";
+export const USE_HTTPS_TEXT = 'This support link must use https. Open the link again with https:// at the start of the address.\n';
 export const USE_HTTPS_SCRIPT =
   "Write-Host 'This support link must use https. Paste the command again with https:// at the start of the address.'\n";
