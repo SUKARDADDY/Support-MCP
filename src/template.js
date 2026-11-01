@@ -73,14 +73,17 @@ export const APP_CONFIG_FOOTER = 'SUPPORTMCPCFG1';
 
 // A session-specific .NET executable: the shared bundle with only validated
 // pairing configuration appended. The attach key never appears in a URL or argv.
-export function buildAppDownload(bundle, { sid, key, origin, startup_expires_at }) {
+export function buildAppDownload(bundle, { sid, key, origin, startup_expires_at, startup_ms }) {
   validateSid(sid);
   validateKey(key);
   validateOrigin(origin);
   if (!Number.isSafeInteger(startup_expires_at) || startup_expires_at <= 0) throw new Error('bad startup deadline');
   const binary = Uint8Array.from(atob(bundle.exe_b64), (c) => c.charCodeAt(0));
   if (binary[0] !== 77 || binary[1] !== 90) throw new Error('bad app executable');
-  const config = new TextEncoder().encode(JSON.stringify({ sid, key, origin, startup_expires_at }));
+  // startup_ms (optional) is the first-connect budget left at download time. The
+  // app counts it on its own clock; startup_expires_at is an absolute fallback.
+  if (startup_ms !== undefined && (!Number.isSafeInteger(startup_ms) || startup_ms <= 0 || startup_ms > 7200000)) throw new Error('bad startup budget');
+  const config = new TextEncoder().encode(JSON.stringify({ sid, key, origin, startup_expires_at, ...(startup_ms === undefined ? {} : { startup_ms }) }));
   const footer = new TextEncoder().encode(APP_CONFIG_FOOTER);
   const out = new Uint8Array(binary.length + config.length + 4 + footer.length);
   out.set(binary);

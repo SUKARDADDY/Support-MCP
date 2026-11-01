@@ -479,8 +479,11 @@ export class Session {
       return Response.json({ type: 'end' });
     }
     if (b.type === 'poll') {
-      if (this.httpCommand) return Response.json(this.httpCommand.frame);
+      // A busy client already has its command, so a busy poll is only a sign of
+      // life. Answer it at once without sending the frame again. The client waits
+      // for its operation between busy polls, so this is not a tight loop.
       if (b.busy) return Response.json({ type: 'idle' });
+      if (this.httpCommand) return Response.json(this.httpCommand.frame);
       // One long poll per client. A retry releases its predecessor. The MCP
       // request and this fetch keep the in-memory result and poll state alive.
       this.replyToPoll({ type: 'idle' });

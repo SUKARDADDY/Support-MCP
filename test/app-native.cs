@@ -23,14 +23,20 @@ public sealed class FakeRelay : IDisposable {
     public readonly Client Agent;
     readonly Thread agentThread;
     public readonly ManualResetEvent Connected = new ManualResetEvent(false);
-    public FakeRelay() {
+    // Simulates a PC clock that runs ahead of the relay by this many milliseconds.
+    public long ClockSkew;
+    public volatile bool Refuse; // drop every request, so the client can never complete a handshake
+    public FakeRelay() : this(null) { }
+    public FakeRelay(Dictionary<string, object> config) {
         var tcp = new TcpListener(IPAddress.Loopback, 0); tcp.Start(); int port = ((IPEndPoint)tcp.LocalEndpoint).Port; tcp.Stop();
         Origin = "http://127.0.0.1:" + port;
         listener.Prefixes.Add(Origin + "/"); listener.Start();
         server = new Thread(Serve); server.IsBackground = true; server.Start();
-        Agent = new Client(Wire.Map("origin", Origin, "sid", new string('a', 64), "key", new string('b', 64), "startup_expires_at", Client.UnixNow() + 60000));
+        if (config != null) config["origin"] = Origin;
+        Agent = new Client(config ?? Wire.Map("origin", Origin, "sid", new string('a', 64), "key", new string('b', 64), "startup_expires_at", Client.UnixNow() + 60000));
         agentThread = new Thread(Agent.Run); agentThread.IsBackground = true;
     }
+    public void Launch() { agentThread.Start(); }
     public void Start() { agentThread.Start(); if (!Connected.WaitOne(10000)) throw new Exception("Client did not attach: " + Agent.LastError); }
     void Serve() {
         try { while (listener.IsListening) { var ctx = listener.GetContext(); ThreadPool.QueueUserWorkItem(delegate { Reply(ctx); }); } }
@@ -38,19 +44,20 @@ public sealed class FakeRelay : IDisposable {
     }
     void Reply(HttpListenerContext ctx) {
         try {
+            if (Refuse) { ctx.Response.Abort(); return; }
             if (ctx.Request.Headers["X-Attach-Key"] != new string('b', 64)) throw new Exception("Wrong auth header");
             string raw; using (var r = new StreamReader(ctx.Request.InputStream)) raw = r.ReadToEnd();
             var b = Wire.Json().Deserialize<Dictionary<string, object>>(raw);
             Dictionary<string, object> reply;
             lock (gate) {
                 if (End) reply = Wire.Map("type", "end");
-                else if (Wire.Text(b, "type") == "hello") { Elevated = Wire.Flag(b, "elevated"); reply = Wire.Map("type", "welcome", "generation", 1, "server_time", Client.UnixNow(), "expires_at", Client.UnixNow() + Lifetime); Connected.Set(); }
+                else if (Wire.Text(b, "type") == "hello") { Elevated = Wire.Flag(b, "elevated"); long serverNow = Client.UnixNow() - ClockSkew; reply = Wire.Map("type", "welcome", "generation", 1, "server_time", serverNow, "expires_at", serverNow + Lifetime); Connected.Set(); }
                 else if (Wire.Text(b, "type") == "end") { End = true; reply = Wire.Map("type", "end"); }
                 else if (Wire.Text(b, "type") == "result") {
                     Results++;
                     if (FailFirstResult) { FailFirstResult = false; ctx.Response.StatusCode = 500; ctx.Response.Close(); return; }
                     result = b; frame = null; reply = Wire.Map("type", "ack"); Monitor.PulseAll(gate);
-                } else { Polls++; reply = frame ?? Wire.Map("type", "idle"); }
+                } else { Polls++; reply = frame != null && !Wire.Flag(b, "busy") ? frame : Wire.Map("type", "idle"); }
             }
             if (Wire.Text(reply, "type") == "idle") Thread.Sleep(50);
             byte[] bytes = Encoding.UTF8.GetBytes(Wire.Json().Serialize(reply));
@@ -118,6 +125,10 @@ public static class AppTests {
                 byte[] last = Convert.FromBase64String(Wire.Text(r, "data_b64")); Assert(Wire.Flag(r, "eof"), "Last chunk");
                 for (int i = 0; i < data.Length; i++) Assert(data[i] == (i < first.Length ? first[i] : last[i - first.Length]), "Byte round trip");
                 r = relay.Call(Wire.Map("type", "get_file", "path", "relative.txt", "length", 1)); Assert(!Wire.Flag(r, "ok"), "Relative path refused");
+                int pollsBefore = relay.Polls;
+                r = relay.Call(Run("Start-Sleep -Seconds 4; [Console]::Write('slept')", 15));
+                Assert(Wire.Flag(r, "ok") && Decode(r, "stdout_b64") == "slept", "Long operation result");
+                Assert(relay.Polls - pollsBefore <= 4, "A busy client must wait for its operation instead of polling in a loop, polls: " + (relay.Polls - pollsBefore));
                 string counter = Path.Combine(dir, "executed.txt"); relay.FailFirstResult = true;
                 r = relay.Call(Run("Add-Content -LiteralPath '" + counter + "' -Value once", 10));
                 Assert(File.ReadAllLines(counter).Length == 1, "Result retries must not repeat execution");
@@ -139,6 +150,21 @@ public static class AppTests {
             using (var relay = new FakeRelay()) {
                 relay.Lifetime = 800; relay.Start(); relay.WaitExit(); Assert(relay.End, "Local expiry must end access");
                 Console.WriteLine("PASS local fixed expiry");
+            }
+            // A PC clock three hours ahead of the relay: the absolute startup deadline in the
+            // file is then already in the past on the PC. The relative budget must still win.
+            using (var relay = new FakeRelay(Wire.Map("sid", new string('a', 64), "key", new string('b', 64), "startup_expires_at", Client.UnixNow() - 10800000 + 60000, "startup_ms", 60000))) {
+                relay.ClockSkew = 10800000; relay.Lifetime = 600000; relay.Start();
+                for (int i = 0; i < 100 && relay.Agent.ExpiresLocal == DateTime.MinValue; i++) Thread.Sleep(50);
+                Assert(Math.Abs((relay.Agent.ExpiresLocal.ToUniversalTime() - DateTime.UtcNow).TotalMilliseconds - 600000) < 5000, "Ends-by-itself time must come from the relay's remaining time on the PC's own clock");
+                var r = relay.Call(Run("[Console]::Write('ok')", 10));
+                Assert(Wire.Flag(r, "ok") && Decode(r, "stdout_b64") == "ok", "A fast PC clock must not stop the client");
+                Console.WriteLine("PASS fast PC clock keeps the startup and session deadlines relative");
+            }
+            using (var relay = new FakeRelay(Wire.Map("sid", new string('a', 64), "key", new string('b', 64), "startup_expires_at", Client.UnixNow() - 10800000 + 60000))) {
+                relay.Refuse = true; relay.Launch();
+                relay.WaitExit(); // no handshake can finish, so only the startup deadline can stop it, and an absolute one that is already past does
+                Console.WriteLine("PASS absolute startup deadline is only a fallback");
             }
             using (var relay = new FakeRelay()) {
                 relay.Start(); relay.Agent.EndRemote = false; relay.Agent.Stop(); relay.WaitExit();

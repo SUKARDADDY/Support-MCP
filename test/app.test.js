@@ -348,3 +348,181 @@ test('/agent over http on loopback reaches the session, and passes the key only 
   assert.equal(r.headers.get('cache-control'), 'no-store');
   assert.deepEqual(seen, [['/agent', KEY, '{"type":"poll"}']]);
 });
+
+// ---- inline expiry in /agent ------------------------------------------------
+// These tests never call alarm(). The request itself must notice the deadline.
+const HOUR = 60 * 60 * 1000;
+
+function clocked(t) {
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  return { advance: (ms) => { now += ms; }, now: () => now };
+}
+
+// Runs `hook` inside the next SHA-256 the session computes, which is where
+// /agent yields to other requests between its first and second deadline check.
+function duringHash(t, hook) {
+  const subtle = globalThis.crypto.subtle, original = subtle.digest.bind(subtle);
+  let armed = true;
+  t.mock.method(subtle, 'digest', async (...args) => {
+    if (armed) { armed = false; await hook(); }
+    return original(...args);
+  });
+}
+
+async function attached(f) {
+  await f.req('/create', { sid: SID, windows_mode: 'app' });
+  const { key } = await (await f.req('/consume', { windows_mode: 'app' })).json();
+  return key;
+}
+
+test('/agent refuses a hello after the two-hour first-connect limit and ends the session', async (t) => {
+  const clock = clocked(t);
+  const f = fixture(), key = await attached(f);
+  clock.advance(2 * HOUR);
+  const r = await f.req('/agent', { type: 'hello', machine: 'late' }, key);
+  assert.equal(r.status, 410);
+  assert.equal(f.values.get('state'), 'ended');
+  assert.equal(f.values.get('ended_reason'), 'consume TTL');
+  assert.equal(f.values.get('machine'), null);
+  assert.ok(!f.logs.some((l) => l.kind === 'attached'));
+});
+
+test('/agent refuses every call after the 24-hour expiry and ends the session', async (t) => {
+  for (const message of [{ type: 'hello' }, { type: 'poll' }, { type: 'result', id: 'x' }, { type: 'end' }]) {
+    const clock = clocked(t);
+    const f = fixture(), key = await attached(f);
+    const { generation } = await (await f.req('/agent', { type: 'hello' }, key)).json();
+    clock.advance(24 * HOUR);
+    const r = await f.req('/agent', { generation, ...message }, key);
+    assert.equal(r.status, 410, message.type);
+    assert.equal(f.values.get('state'), 'ended', message.type);
+    assert.equal(f.values.get('ended_reason'), 'expired', message.type);
+    t.mock.restoreAll();
+  }
+});
+
+test('/agent answers an expired session before it looks at the key', async (t) => {
+  const clock = clocked(t);
+  const f = fixture(), key = await attached(f);
+  await f.req('/agent', { type: 'hello' }, key);
+  clock.advance(24 * HOUR);
+  // Same order as /ws: an ended session is 410 for everyone, a live one is 401 for a wrong key.
+  assert.equal((await f.req('/agent', { type: 'poll' }, 'wrong')).status, 410);
+  assert.equal(f.values.get('state'), 'ended');
+});
+
+test('/agent refuses a hello whose session expires while the relay is hashing the key', async (t) => {
+  const clock = clocked(t);
+  const f = fixture(), key = await attached(f);
+  duringHash(t, () => clock.advance(2 * HOUR));
+  const r = await f.req('/agent', { type: 'hello', machine: 'racing' }, key);
+  assert.equal(r.status, 410);
+  assert.equal(f.values.get('state'), 'ended');
+  assert.equal(f.values.get('ended_reason'), 'consume TTL');
+  assert.ok(!f.logs.some((l) => l.kind === 'attached'));
+});
+
+test('/agent refuses a hello that races an operator end', async (t) => {
+  const f = fixture(), key = await attached(f);
+  duringHash(t, async () => { await f.req('/end', {}); });
+  const r = await f.req('/agent', { type: 'hello', machine: 'racing' }, key);
+  assert.equal(r.status, 410);
+  assert.equal(f.values.get('state'), 'ended');
+  assert.equal(f.values.get('ended_reason'), 'ended_by_operator');
+  assert.ok(!f.logs.some((l) => l.kind === 'attached'));
+  assert.equal((await f.req('/agent', { type: 'hello' }, key)).status, 410);
+});
+
+// ---- same-origin POST without an Origin header -------------------------------
+test('the download POST accepts a matching Origin, or no Origin with a Referer from our own /j page', async () => {
+  const f = fixture(), handler = newHandler();
+  await f.req('/create', { sid: SID, windows_mode: 'app' });
+  const url = `${ORIGIN}/j/abcdefghijklmnop?client=app`;
+  const post = (headers) => handler.fetch(new Request(url, { method: 'POST', headers }), f.env);
+  const refused = [
+    ['Origin present but foreign, even with a good Referer', { origin: 'https://other.example', referer: url }],
+    ['Origin "null", even with a good Referer', { origin: 'null', referer: url }],
+    ['no Origin and a foreign Referer', { referer: 'https://other.example/j/abcdefghijklmnop' }],
+    ['no Origin and a Referer on a lookalike host', { referer: 'https://support.example.com.evil.example/j/abcdefghijklmnop' }],
+    ['no Origin and a Referer outside /j/', { referer: `${ORIGIN}/healthz` }],
+    ['neither Origin nor Referer', {}],
+  ];
+  for (const [name, headers] of refused) {
+    assert.equal((await post(headers)).status, 403, name);
+    assert.equal(f.values.get('state'), 'pending', name);
+  }
+  const ok = await post({ referer: url });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.headers.get('content-type'), 'application/octet-stream');
+  assert.equal(f.values.get('state'), 'consumed');
+  // Single use still holds on this path.
+  assert.equal((await post({ referer: url })).status, 409);
+
+  const g = fixture();
+  await g.req('/create', { sid: SID, windows_mode: 'app' });
+  const exact = await handler.fetch(new Request(url, { method: 'POST', headers: { origin: ORIGIN } }), g.env);
+  assert.equal(exact.status, 200);
+});
+
+// ---- relative startup budget --------------------------------------------------
+test('the download carries a relative startup budget next to the absolute deadline', async () => {
+  const f = fixture(), handler = newHandler();
+  await f.req('/create', { sid: SID, windows_mode: 'app' });
+  const url = `${ORIGIN}/j/abcdefghijklmnop?client=app`;
+  const body = Buffer.from(await (await handler.fetch(new Request(url, { method: 'POST', headers: { origin: ORIGIN } }), f.env)).arrayBuffer());
+  const tail = Buffer.byteLength('SUPPORTMCPCFG1') + 4;
+  const n = body.readUInt32LE(body.length - tail);
+  const config = JSON.parse(body.subarray(body.length - tail - n, body.length - tail));
+  assert.ok(Number.isSafeInteger(config.startup_ms) && config.startup_ms > 2 * HOUR - 60000 && config.startup_ms <= 2 * HOUR, String(config.startup_ms));
+  assert.ok(Math.abs(config.startup_expires_at - (Date.now() + config.startup_ms)) < 5000);
+});
+
+test('startup_ms is optional but validated when present', () => {
+  const base = { sid: SID, key: KEY, origin: ORIGIN, startup_expires_at: 12345 };
+  const config = (out) => { const b = Buffer.from(out); const tail = Buffer.byteLength('SUPPORTMCPCFG1') + 4; const n = b.readUInt32LE(b.length - tail); return JSON.parse(b.subarray(b.length - tail - n, b.length - tail)); };
+  assert.ok(!('startup_ms' in config(buildAppDownload(bundle, base))));
+  assert.equal(config(buildAppDownload(bundle, { ...base, startup_ms: 7200000 })).startup_ms, 7200000);
+  for (const bad of [0, -1, 7200001, 1.5, NaN, '60000', null]) assert.throws(() => buildAppDownload(bundle, { ...base, startup_ms: bad }), /bad startup budget/, String(bad));
+});
+
+// ---- busy polling -------------------------------------------------------------
+test('a busy poll is a sign of life: answered at once, never re-sent the frame, never parked', async () => {
+  const f = fixture(); const key = await attached(f);
+  const hello = await (await f.req('/agent', { type: 'hello' }, key)).json();
+  const command = f.req('/command', { op: 'run', command: 'whoami' });
+  while (!f.session.httpCommand) await new Promise((r) => setImmediate(r));
+  const busy = await (await f.req('/agent', { type: 'poll', generation: hello.generation, busy: true }, key)).json();
+  assert.deepEqual(busy, { type: 'idle' });
+  assert.equal(f.session.httpPoll, null, 'a busy poll is not parked');
+  const seenBefore = f.values.get('http_seen_at');
+  assert.ok(seenBefore > 0, 'a busy poll still counts as a sign of life');
+  const frame = await (await f.req('/agent', { type: 'poll', generation: hello.generation }, key)).json();
+  assert.equal(frame.type, 'run');
+  assert.equal((await (await f.req('/agent', { type: 'poll', generation: hello.generation, busy: true }, key)).json()).type, 'idle');
+  const result = { type: 'result', id: frame.id, generation: hello.generation, ok: true, stdout_b64: '', stderr_b64: '', exit_code: 0 };
+  await f.req('/agent', result, key);
+  assert.equal((await command).status, 200);
+  // After the result, an idle (not busy) poll long-polls as usual.
+  const poll = f.req('/agent', { type: 'poll', generation: hello.generation }, key);
+  while (!f.session.httpPoll) await new Promise((r) => setImmediate(r));
+  await f.req('/end', {});
+  assert.equal((await (await poll).json()).type, 'end');
+});
+
+// ---- /agent body size ---------------------------------------------------------
+test('/agent refuses a declared oversize body before reading any of it', async () => {
+  const handler = newHandler();
+  let pulled = false;
+  const env = { SESSION: { idFromString: () => { throw new Error('Durable Object touched'); }, get: () => { throw new Error('touched'); } } };
+  const body = new ReadableStream({ pull(controller) { pulled = true; controller.enqueue(new TextEncoder().encode('{}')); controller.close(); } }, { highWaterMark: 0 });
+  const r = await handler.fetch(new Request(`https://support.example.com/agent?sid=${SID}`, {
+    method: 'POST', duplex: 'half', body,
+    headers: { 'content-type': 'application/json', 'x-attach-key': KEY, 'content-length': '750001' },
+  }), env);
+  assert.equal(r.status, 413);
+  assert.equal(pulled, false, 'the body stream was never read');
+  // A body with no Content-Length is still checked after it is read.
+  const unsized = await handler.fetch(agentRequest(`https://support.example.com/agent?sid=${SID}`, { body: 'x'.repeat(750001) }), env);
+  assert.equal(unsized.status, 413);
+});

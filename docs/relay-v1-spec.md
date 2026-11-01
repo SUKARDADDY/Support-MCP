@@ -15,7 +15,7 @@ reports the canonical name as `windows_mode`.
 
 | `windows_mode` | Customer does | Clients | Transport |
 |---|---|---|---|
-| `app` (default) | opens a link, clicks a button, runs the downloaded `remote-support-<sid8>.exe`, clicks Allow | Windows 7 to 11, .NET Framework 4.5.2 or later, TLS 1.2 | HTTPS polling on `POST /agent` |
+| `app` (default) | opens a link, clicks a button, runs the downloaded `remote-support-<sid8>.exe`, clicks Allow | Windows 7 to 11 with .NET Framework 4.5.2 or later and TLS 1.2 (Windows 10 and 11 include them; 8.1 needs the 4.5.2 update; 7 needs both installed) | HTTPS polling on `POST /agent` |
 | `powershell` | pastes `irm <link> \| iex` | Windows 8 and later, Windows PowerShell 5.1 | WebSocket on `/ws` |
 
 `legacy` is accepted as an alias for `app` and `standard` for `powershell`, in
@@ -63,8 +63,8 @@ work in the request path; use the WebSocket Hibernation API
 |---|---|---|
 | `GET /healthz` | public | `{"ok":true,"service":"support-mcp","stage":"relay-v1"}` |
 | `GET /j/<code>` | public | **GET only, https only.** The code is consumed only for a request whose `User-Agent` contains `PowerShell/` (`irm` sends `WindowsPowerShell/5.1.x` or `PowerShell/7.x`). Code valid+unused → 200 `text/plain` agent script with placeholders filled, code consumed; else 404 `text/plain` `Write-Host 'This support link is invalid or expired.'` (runnable, harmless). Any other `User-Agent` (a chat link preview, a browser) → 200 `text/plain`, `Cache-Control: no-store`, a one-line `Write-Host` telling the reader to paste the command into PowerShell, and the Durable Object is **not** touched. Over plain `http:` on any host except `localhost` / `127.0.0.1` → 200 `text/plain` `Write-Host` line asking for the https link, code **not** consumed. Any other method → 405 `text/plain` (harmless one-liner, `Allow: GET`) and the code is **not** consumed. Malformed percent-encoding → the same harmless 404 script, never 500. The `User-Agent` test keeps previews from burning the code. It is not a security control, since any client can send the header. |
-| `GET /j/<code>?client=app` | public | The downloaded app. `legacy` is an alias for `app`; any other `client` value → 404. **https only**: over plain `http:` on any host except `localhost` / `127.0.0.1` → 403 `text/plain`, code **not** consumed. `GET` serves the download page (200 `text/html`, `Cache-Control: no-store`, `Referrer-Policy: same-origin`, a CSP with `default-src 'none'` and `form-action 'self'`) and **never consumes the code**, however often the page is opened or refreshed. Only a `POST` from the page's button consumes it, and only when its `Origin` header equals the relay's own origin (else 403, code unused). A first valid `POST` returns 200 `application/octet-stream` with `Content-Disposition: attachment; filename="remote-support-<sid8>.exe"`: the compiled app followed by the session configuration (below). The code is single use: a repeat after the download shows "Check your downloads" (409), an expired or ended one shows "This support link has expired" (410). A code made for a `powershell` session shows the expired page and stays unused. `HEAD` and every other method → 405 (`Allow: GET, POST`). |
-| `POST /agent?sid=<sid>` + `X-Attach-Key: <key>` | attach key | The app's transport, JSON in and out; below. 403 over plain `http:` on any host except `localhost` / `127.0.0.1`, 403 on any `Origin` header or a `key` query param, 405 on other methods, 415 on a non-JSON body, 413 over 750,000 characters, 401 on a bad sid, bad key, a `powershell` session or a session that is still `pending`, 409 on a stale generation, 410 when the session has ended. |
+| `GET /j/<code>?client=app` | public | The downloaded app. `legacy` is an alias for `app`; any other `client` value → 404. **https only**: over plain `http:` on any host except `localhost` / `127.0.0.1` → 403 `text/plain`, code **not** consumed. `GET` serves the download page (200 `text/html`, `Cache-Control: no-store`, `Referrer-Policy: same-origin`, a CSP with `default-src 'none'` and `form-action 'self'`) and **never consumes the code**, however often the page is opened or refreshed. Only a `POST` from the page's button consumes it. If the request has an `Origin` header it must equal the relay's own origin exactly. If it has none (IE11 on Windows 7 can omit it on a same-origin form POST), its `Referer` must start with `<origin>/j/`, which the page's `Referrer-Policy: same-origin` keeps on the click. A foreign `Origin`, a foreign or missing `Referer` without an `Origin`, or neither header → 403, code unused. A first valid `POST` returns 200 `application/octet-stream` with `Content-Disposition: attachment; filename="remote-support-<sid8>.exe"`: the compiled app followed by the session configuration (below). The code is single use: a repeat after the download shows "Check your downloads" (409), an expired or ended one shows "This support link has expired" (410). A code made for a `powershell` session shows the expired page and stays unused. `HEAD` and every other method → 405 (`Allow: GET, POST`). |
+| `POST /agent?sid=<sid>` + `X-Attach-Key: <key>` | attach key | The app's transport, JSON in and out; below. 403 over plain `http:` on any host except `localhost` / `127.0.0.1`, 403 on any `Origin` header or a `key` query param, 405 on other methods, 415 on a non-JSON body, 413 over 750,000 characters (checked against `Content-Length` before the body is read, and again after it is read when there is no `Content-Length`), 401 on a bad sid, bad key, a `powershell` session or a session that is still `pending`, 409 on a stale generation, 410 when the session has ended. |
 | `GET /ws?sid=<sid>` + `X-Attach-Key: <key>` | attach key | WebSocket upgrade for the agent; 403 over plain `http:` on any host except `localhost` / `127.0.0.1`; 401 on bad/missing key, on a `key` query param, on a bad sid, or on an `app` session; 410 if session ended/expired |
 | `POST /mcp` | Access JWT | MCP JSON-RPC 2.0 |
 | anything else | — | 404 |
@@ -82,12 +82,21 @@ persists it to `config.json` on welcome. The served script is wrapped in `& { �
 customer's console.
 
 The downloaded app embeds the same `sid`, `key` and `origin`, plus
-`startup_expires_at`, as a JSON footer on its own executable: the configuration
+`startup_expires_at` and `startup_ms`, as a JSON footer on its own executable: the configuration
 bytes, their length as a little-endian `uint32`, then the magic string
 `SUPPORTMCPCFG1`. Every value is validated before it is written (hex, hex, an
-`http(s)` origin, a positive integer). The attach key is in the file the
+`http(s)` origin, a positive integer; `startup_ms` is an integer from 1 to 7,200,000). The attach key is in the file the
 customer downloads and never in a URL or a command line. The app itself
 refuses any origin that is not `https`, except loopback for local testing.
+
+`startup_ms` is the first-connect budget left when the file was downloaded. The
+app counts it on its own clock from the moment it starts, so a PC whose clock is
+wrong cannot make it stop at once. `startup_expires_at` is the same deadline in
+the relay's Unix milliseconds. The app reads it only when `startup_ms` is
+missing. The relay enforces the 2 h limit itself, whatever the app does. The
+24-hour limit reaches the app as `expires_at` and `server_time` in the `welcome`
+reply. The app uses their difference, counted on its own clock, and shows "Ends
+by itself" as the PC's own clock plus that remaining time.
 
 ## Access check (`/mcp`)
 
@@ -180,8 +189,12 @@ with the key in `X-Attach-Key`, and the relay answers in JSON with
 - `poll` is a long poll. The relay holds one for up to 25 s and answers
   `{"type":"idle"}`, or with the waiting command frame as soon as there is one,
   or with `{"type":"end"}` when the session ends. A second poll releases the
-  first. `"busy":true` answers `idle` at once, so a client that is running a
-  command does not park a poll.
+  first. A poll with `"busy":true` means the client already holds its command. It
+  is answered `idle` at once, even while a command frame is waiting, so the
+  frame is not sent twice and no poll is parked. The app does not poll in a loop
+  while it works: it waits for its operation to finish and sends a busy poll
+  only every 2 s, as a sign of life that also lets it notice an operator end or expiry quickly. Any poll with the current generation
+  counts as a sign of life.
 - The command frames are the same `run`, `put_file` and `get_file` frames as on
   the WebSocket. At most one operation is in flight: a second `run`, `put_file`
   or `get_file` call from the operator while one is waiting returns the error

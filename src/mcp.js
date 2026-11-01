@@ -9,7 +9,7 @@ export const TOOLS = [
   {
     name: 'session_create',
     description:
-      'Create a Windows support session. By default (windows_mode app) the customer opens a link and downloads the support app, which works on Windows 7 to 11; the result has download_url and a Start-Process one_liner. With windows_mode powershell the one_liner is a PowerShell paste for Windows 8 and later.',
+      'Create a Windows support session. By default (windows_mode app) the customer opens a link and downloads the support app, which works on Windows 7 to 11; the result has download_url and a Start-Process one_liner. The app needs .NET Framework 4.5.2 or later and TLS 1.2, which Windows 10 and 11 include. Windows 8.1 needs the 4.5.2 update, and a Windows 7 PC needs .NET 4.5.2 installed and TLS 1.2 enabled first. With windows_mode powershell the one_liner is a PowerShell paste for Windows 8 and later.',
     inputSchema: {
       type: 'object',
       properties: {

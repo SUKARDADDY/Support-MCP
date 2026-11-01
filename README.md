@@ -9,7 +9,7 @@ They can stop it at any time, and after 24 hours access ends by itself.
 [![test](https://github.com/SUKARDADDY/Support-MCP/actions/workflows/test.yml/badge.svg)](https://github.com/SUKARDADDY/Support-MCP/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-3fb950)](LICENSE)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers%20%2B%20Durable%20Objects-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/durable-objects/)
-[![.NET Framework 4](https://img.shields.io/badge/.NET%20Framework-4-512BD4)](src/agent-app.cs)
+[![.NET Framework 4.5.2+](https://img.shields.io/badge/.NET%20Framework-4.5.2%2B-512BD4)](src/agent-app.cs)
 [![PowerShell 5.1](https://img.shields.io/badge/PowerShell-5.1-5391FE)](src/agent.ps1)
 [![MCP](https://img.shields.io/badge/MCP-7%20tools-d97757)](#mcp-tools)
 
@@ -31,9 +31,10 @@ and let an agent do the diagnosis while I watch.
 ## At a glance
 
 - **A link and one download.** The customer opens a link, downloads one small
-  executable and clicks **Allow**. It runs as the signed-in user, on Windows 7
-  through 11, with nothing installed and no account. There is no code to read
-  out. A PowerShell one-liner for Windows 8 and later is the
+  executable and clicks **Allow**. It runs as the signed-in user, with no
+  installer and no account, on Windows 10 and 11. Windows 7 and 8.1 need .NET
+  Framework 4.5.2 or later first (see [Limits](#limits)). There is no code to
+  read out. A PowerShell one-liner for Windows 8 and later is the
   [alternative](#the-powershell-alternative).
 - **The customer stays in control.** Nothing connects until they click **Allow**
   in a consent dialog, where **Don't allow** is the default. A window in the
@@ -165,7 +166,7 @@ canonical name.
 
 | Value | Customer does | Works on |
 |---|---|---|
-| `app` (default) | opens a link, downloads and runs the app, clicks Allow | Windows 7 to 11 |
+| `app` (default) | opens a link, downloads and runs the app, clicks Allow | Windows 7 to 11 (7 and 8.1 need .NET Framework 4.5.2 or later; 7 also needs TLS 1.2 enabled) |
 | `powershell` | pastes one line | Windows 8 and later |
 
 `legacy` is an alias for `app` and `standard` is an alias for `powershell`, so
@@ -248,9 +249,9 @@ alarm for expiry. A second Durable Object keeps the list for `session_list`.
 | `src/mcp.js` | JSON-RPC dispatch and the tool schemas |
 | `src/jwt.js` | RS256 verification of the Access JWT with WebCrypto |
 | `src/template.js` | builds the served script and the downloaded executable, validates every value placed in them, and maps the mode aliases |
-| `src/agent-app.cs` | the Windows app: .NET Framework 4 source, WPF window, consent dialog, HTTPS polling client |
+| `src/agent-app.cs` | the Windows app: C# source for .NET Framework 4.5.2 or later, WPF window, consent dialog, HTTPS polling client |
 | `src/agent-app.manifest` | the app's `asInvoker` manifest (never asks for elevation) |
-| `src/app-bundle.json` | the compiled x86 app with the SHA-256 of its source and manifest. Tests fail when it is stale |
+| `src/app-bundle.json` | the compiled x86 app with the SHA-256 of its source and manifest. Tests fail when the source changed without a rebuild |
 | `src/agent.ps1` | the PowerShell agent: bootstrap, run and cleanup roles in one file |
 | `scripts/build-app.ps1` | builds `src/app-bundle.json` on Windows with the built-in compiler |
 | `scripts/prepare-app-restart.ps1` | optional: one automatic reconnect after a restart the customer authorized |
@@ -418,8 +419,12 @@ deploy without Windows. You need Windows only to change the app: see
 ## Build the app
 
 `src/app-bundle.json` is the compiled app. It is built from `src/agent-app.cs`
-and `src/agent-app.manifest` on a Windows machine with the compiler that ships
-with .NET Framework 4, which is already on Windows 7 through 11:
+and `src/agent-app.manifest` on a Windows machine with the .NET Framework 4
+compiler (`csc.exe` v4.0.30319). The app needs .NET Framework 4.5.2 or later and
+TLS 1.2 at run time. Windows 10 and 11 include both. Windows 8.1 ships .NET 4.5.1
+and needs the 4.5.2 update. Windows 7 ships only .NET 3.5.1, so a Windows 7 PC
+needs .NET Framework 4.5.2 or later installed, and TLS 1.2 enabled, before the
+app will run:
 
 ```powershell
 powershell.exe -NoProfile -File scripts\build-app.ps1
@@ -428,8 +433,12 @@ powershell.exe -NoProfile -File scripts\build-app.ps1
 The script targets x86, references the WPF assemblies, embeds the `asInvoker`
 manifest, compiles with warnings as errors, and writes the executable (base64)
 and the SHA-256 of the source and manifest into the bundle. `node --test` fails
-when either hash no longer matches, so a changed source file cannot ship with a
-stale binary. Commit the rebuilt bundle with the source change.
+when either hash no longer matches, so it catches a source change that was
+committed without a rebuild. It cannot prove that the committed executable was
+compiled from that source: the test only compares the hashes the builder wrote,
+and compiler output is not reproducible. If you need that assurance, rebuild the
+executable yourself with `scripts/build-app.ps1` before you deploy, and commit
+or deploy your own bundle. Commit the rebuilt bundle with any source change.
 
 The native tests compile `test/app-native.cs` together with `src/agent-app.cs`
 on Windows, using the same references plus `/main:AppTests /target:exe`, and run
@@ -451,7 +460,7 @@ operator ending the session cancels it.
 ## Develop and test
 
 ```sh
-node --test                          # 74 unit and route tests, no network
+node --test                          # 84 unit and route tests, no network
 npx wrangler deploy --dry-run --outdir /tmp/support-mcp-dry
 cp .dev.vars.example .dev.vars && npx wrangler dev --port 8787
 ```
@@ -482,7 +491,10 @@ The wire protocol, the state machine and the acceptance checks are in
 ## Limits
 
 - Windows only. The app needs .NET Framework 4.5.2 or later and working TLS 1.2
-  with the normal Windows certificate checks, and runs on Windows 7 to 11. The
+  with the normal Windows certificate checks, and runs on Windows 7 to 11.
+  Windows 10 and 11 include both. Windows 8.1 ships .NET 4.5.1 and needs the
+  4.5.2 update. Windows 7 ships only .NET 3.5.1, so it needs .NET Framework
+  4.5.2 or later installed first, and TLS 1.2 enabled. The
   PowerShell agent targets Windows PowerShell 5.1, which ships with Windows 10
   and 11.
 - Nothing is signed. The app shows a SmartScreen warning (see

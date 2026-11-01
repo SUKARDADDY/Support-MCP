@@ -204,7 +204,11 @@ namespace SupportMcp {
         public volatile bool EndRemote = true;
         public Client(Dictionary<string, object> cfg) {
             config = cfg;
-            long remaining = Wire.Number(cfg, "startup_expires_at") - UnixNow();
+            // The relay sends the first-connect budget as milliseconds left when the
+            // file was downloaded, so a PC clock that is wrong cannot end the client
+            // at once. The absolute startup_expires_at is only a fallback for a
+            // config without it. The relay enforces the same limit on its own clock.
+            long remaining = cfg.ContainsKey("startup_ms") ? Wire.Number(cfg, "startup_ms") : Wire.Number(cfg, "startup_expires_at") - UnixNow();
             deadlineMs = Math.Max(0, Math.Min(7200000, remaining));
             deadlineTimer = new System.Threading.Timer(delegate(object state) { if (clock.ElapsedMilliseconds >= Interlocked.Read(ref deadlineMs)) Stop(); }, null, 100, 100);
         }
@@ -334,6 +338,13 @@ namespace SupportMcp {
                             if (Wire.Text(ack, "type") == "end") break;
                             if (Wire.Text(ack, "type") != "ack") throw new InvalidDataException("Result not acknowledged.");
                             lastId = activeId; activeId = ""; result = null; Work(-1);
+                        }
+                        if (operation != null) {
+                            // The relay answers a busy poll at once, so do not spin on it. Wait for
+                            // the operation and poll busy every 2 s. That keeps the client marked alive
+                            // and notices an operator end or expiry within about 2 s.
+                            if (WaitHandle.WaitAny(new WaitHandle[] { done, stop }, 2000) == 0) continue;
+                            if (stop.WaitOne(0)) break;
                         }
                         var frame = Send(Wire.Map("type", "poll", "generation", generation, "busy", operation != null), false);
                         if (networkError != "") { networkError = ""; ShowStatus("Support session active. Close this window to end access."); Print("Connection restored."); Link(true); }
@@ -925,7 +936,7 @@ namespace SupportMcp {
                     WF.MessageBox.Show("This restart support session has expired or is invalid.", "Remote support"); return;
                 }
                 bool preparing = resume && args[0] == "--prepare-restart";
-                if (resume) config["startup_expires_at"] = Wire.Number(config, "resume_expires_at");
+                if (resume) { config["startup_expires_at"] = Wire.Number(config, "resume_expires_at"); config.Remove("startup_ms"); }
                 bool first; using (var mutex = new Mutex(true, "Local\\SupportMcp" + (resume ? "Resume-" : "-") + Wire.Text(config, "sid"), out first)) {
                     if (!first) { WF.MessageBox.Show("This support session is already open.", "Remote support"); return; }
                     // Resume is pre-consented through the existing support

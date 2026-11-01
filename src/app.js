@@ -266,9 +266,17 @@ async function handleJ(request, env, url, origin, agentText, appBundle) {
       const status = await (await stub.fetch('https://do/status?log_tail=0')).json();
       return appPage(url, status.windows_mode === 'app' ? status.state : 'ended', id.toString());
     };
-    // A real button click always sends Origin. A cross-site or scripted POST
-    // gets 403 and the code stays unused.
-    if (request.method === 'POST' && request.headers.get('origin') !== origin) {
+    // A button click on our own page is same-origin. Browsers send Origin on it,
+    // and it must match exactly. A few older ones (IE11 on Windows 7) omit Origin
+    // on a same-origin form POST. Without Origin, accept only a Referer from our
+    // own /j/ page, which the page's Referrer-Policy: same-origin keeps on the
+    // click. Anything else gets 403 and the code stays unused.
+    const fromOurPage = () => {
+      const originHeader = request.headers.get('origin');
+      if (originHeader !== null) return originHeader === origin;
+      return (request.headers.get('referer') || '').startsWith(`${origin}/j/`);
+    };
+    if (request.method === 'POST' && !fromOurPage()) {
       return new Response('Open the support page and click the download button.', { status: 403, headers: noStore });
     }
     if (request.method === 'GET') return page();
@@ -277,7 +285,13 @@ async function handleJ(request, env, url, origin, agentText, appBundle) {
     if (!out.ok) return page();
     let body;
     try {
-      body = buildAppDownload(appBundle, { sid: id.toString(), key: out.key, origin, startup_expires_at: out.startup_expires_at });
+      // startup_ms is what is left of the first-connect window now. The app counts
+      // it on its own clock, so a PC clock that is wrong cannot end it early.
+      body = buildAppDownload(appBundle, {
+        sid: id.toString(), key: out.key, origin,
+        startup_expires_at: out.startup_expires_at,
+        startup_ms: Math.max(1, out.startup_expires_at - Date.now()),
+      });
     } catch (_) {
       return appPage(url, 'ended', '', 404);
     }
@@ -305,6 +319,8 @@ async function handleJ(request, env, url, origin, agentText, appBundle) {
   return psText(script, 200);
 }
 
+const AGENT_BODY_MAX = 750000;
+
 // The downloaded app's transport: authenticated HTTPS long polling.
 async function handleAgent(request, env, url) {
   if (url.protocol !== 'https:' && !isLoopback(url.hostname)) return json({ error: 'https required' }, 403);
@@ -317,8 +333,12 @@ async function handleAgent(request, env, url) {
   if (!/^[0-9a-f]{64}$/.test(sid)) return json({ error: 'unauthorized' }, 401);
   // Limit input before forwarding to the DO. The largest allowed result is one
   // base64 file chunk plus its envelope.
+  // Refuse on the declared length before reading anything. A body with no
+  // Content-Length is checked again after it is read.
+  const declared = request.headers.get('content-length');
+  if (declared !== null && Number(declared) > AGENT_BODY_MAX) return json({ error: 'request too large' }, 413);
   const body = await request.text();
-  if (body.length > 750000) return json({ error: 'request too large' }, 413);
+  if (body.length > AGENT_BODY_MAX) return json({ error: 'request too large' }, 413);
   let id;
   try { id = env.SESSION.idFromString(sid); } catch (_) { return json({ error: 'unauthorized' }, 401); }
   const r = await env.SESSION.get(id).fetch(new Request('https://do/agent', {
