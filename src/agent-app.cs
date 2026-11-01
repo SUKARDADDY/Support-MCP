@@ -290,13 +290,17 @@ namespace SupportMcp {
                     string encoded = Wire.Text(frame, "data_b64");
                     if (encoded.Length > 700000) throw new ArgumentException("File chunk too large.");
                     byte[] data = Convert.FromBase64String(encoded);
-                    using (var s = new FileStream(path, Wire.Flag(frame, "append") ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.None)) s.Write(data, 0, data.Length);
+                    // Same as the PowerShell agent: create missing parent directories (path is already validated).
+                    string parent = Path.GetDirectoryName(path);
+                    if (!String.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent);
+                    using (var s = new FileStream(path, Wire.Flag(frame, "append") ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.Read)) s.Write(data, 0, data.Length);
                     return Wire.Map("ok", true, "bytes", data.Length);
                 }
                 if (type != "get_file") throw new ArgumentException("Unknown operation.");
                 long offset = Math.Max(0, Wire.Number(frame, "offset"));
                 int length = (int)Math.Max(1, Math.Min(524288, Wire.Number(frame, "length")));
-                using (var s = File.OpenRead(path)) {
+                // FileShare.ReadWrite, like the PowerShell agent, so a log another process is writing can be read.
+                using (var s = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) {
                     s.Position = offset; byte[] data = new byte[length]; int total = 0, n;
                     while (total < length && (n = s.Read(data, total, length - total)) > 0) total += n;
                     return Wire.Map("ok", true, "data_b64", Convert.ToBase64String(data, 0, total), "size", s.Length, "eof", s.Position >= s.Length);
