@@ -215,11 +215,16 @@ the sid, so two sessions on one PC never collide: folder
    a non-elevated console, throws, nothing is running, so the bootstrap runs the
    cleanup to remove the folder it wrote and prints a failure line.
 2. **Run**: WinForms window, TopMost on first show, title `Remote
-   support`, a fixed-size notice with the information icon, a headline (`A remote
-   support agent is connected to your machine.` after welcome) and a detail line
-   `Session active until ddd d MMM, HH:mm. You can end it at any time.` (local time, after
-   welcome), a `Show activity` / `Hide activity` link that toggles a read-only log
-   box (hidden at start; each command / file op one line, timestamped), and an
+   support`, a compact notice with the information icon whose height changes
+   when the log is shown. Its headline and detail line follow the connection:
+   `Connecting to remote support...` / `This window stays open while support
+   is connected.` before the first welcome; `A remote support agent is
+   connected to your machine.` / `Session active until ddd d MMM, HH:mm.` and
+   `You can end it at any time.` (local time) after welcome; and `Remote
+   support is reconnecting...` with the same end time after a disconnect, or on
+   a reattach that loaded `expires_at` from config. A `Show activity` /
+   `Hide activity` link toggles a read-only log box (hidden at start; each
+   command / file op one line, timestamped), next to an
    **End session** button. **Refuses to run if its own token is elevated**
    as a backstop: with UAC off, or on the built-in Administrator account, the
    limited launch task still gets a full token. The refusal runs the cleanup

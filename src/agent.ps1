@@ -144,7 +144,7 @@ if (-not $Run) {
             '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-WindowStyle', 'Hidden',
             '-File', ('"{0}"' -f $agentPath), '-Run'
         ) | Out-Null
-        Write-Host 'Support session starting. A window will open.'
+        Write-Host 'Remote support starting. A window will open.'
     } catch {
         # Nothing started, so remove the folder the bootstrap just wrote.
         Invoke-Cleanup
@@ -254,6 +254,12 @@ function Set-Status([string]$state) {
             $script:detailLbl.Text = $until
         }
         default {
+            # A reattach after a reboot already knows its end time from config.
+            if ($null -ne $script:expiresAt) {
+                $script:headLbl.Text = 'Remote support is reconnecting...'
+                $script:detailLbl.Text = $until
+                return
+            }
             $script:headLbl.Text = 'Connecting to remote support...'
             $script:detailLbl.Text = 'This window stays open while support is connected.'
         }
@@ -826,7 +832,7 @@ $endBtn.Padding = New-Object System.Windows.Forms.Padding(8, 2, 8, 2)
 $endBtn.Anchor = 'Right'
 $endBtn.Margin = New-Object System.Windows.Forms.Padding(12, 0, 0, 0)
 $endBtn.Add_Click({
-    $ans = [System.Windows.Forms.MessageBox]::Show('End the support session now?', 'Support session', 'YesNo', 'Question')
+    $ans = [System.Windows.Forms.MessageBox]::Show('End the support session now?', 'Remote support', 'YesNo', 'Question')
     if ($ans -eq 'Yes') {
         Send-Frame (New-Object psobject -Property @{ type = 'end'; reason = 'customer' })
         Finish-Cleanup
@@ -854,7 +860,7 @@ $script:form.Add_FormClosing({
         return
     }
     if ($script:ending) { return }
-    $ans = [System.Windows.Forms.MessageBox]::Show('End the support session now?', 'Support session', 'YesNo', 'Question')
+    $ans = [System.Windows.Forms.MessageBox]::Show('End the support session now?', 'Remote support', 'YesNo', 'Question')
     if ($ans -ne 'Yes') { $_.Cancel = $true; return }
     Send-Frame (New-Object psobject -Property @{ type = 'end'; reason = 'customer' })
     Finish-Cleanup

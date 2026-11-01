@@ -32,7 +32,7 @@ it, and let an agent do the diagnosis while I watch.
 - **One line, nothing to install.** The agent is a single PowerShell 5.1 script
   with no dependencies beyond what ships with Windows. No account, no codes to
   read out.
-- **The customer sees everything.** A small window says a remote support agent
+- **The customer can see everything.** A small window says a remote support agent
   is connected and has an **End session** button. Its **Show activity** link
   lists every command and file operation as it happens.
 - **Never elevated.** The agent refuses to run elevated. When a command asks
@@ -50,8 +50,9 @@ it, and let an agent do the diagnosis while I watch.
    irm https://support.example.com/j/zp5z7xuckhrm6s7t | iex
    ```
 2. The customer pastes it. The script copies itself to
-   `%LOCALAPPDATA%\SupportMCP\<id>\`, opens a small window titled "Remote support"
-   that says a support agent is connected, and connects back over a WebSocket.
+   `%LOCALAPPDATA%\SupportMCP\<id>\`, opens a small window titled "Remote support",
+   and connects back over a WebSocket. Once the relay authorizes the session,
+   the window says a remote support agent is connected.
 3. The operator calls `run`, `put_file` and `get_file`. Each one appears as a
    timestamped line in the window's activity list, which the customer opens
    with **Show activity**.
