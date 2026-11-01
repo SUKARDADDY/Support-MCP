@@ -16,7 +16,6 @@ console.log(`fresh build, normalized:     ${fresh}`);
 console.log(`committed exe, normalized:   ${committed}`);
 if (fresh !== committed) {
   console.error('\nThe committed exe does not match the source: rebuild src/app-bundle.json with scripts/build-app.ps1 on Windows.');
-  console.error('If the source did not change, the compiler on this runner may differ. Take the bundle from the "support-app" workflow artifact instead.');
   process.exit(1);
 }
 console.log('OK: the committed exe matches a fresh build of the committed source.');

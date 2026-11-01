@@ -256,9 +256,12 @@ alarm for expiry. A second Durable Object keeps the list for `session_list`.
 | `src/agent-app.manifest` | the app's `asInvoker` manifest (never asks for elevation) |
 | `src/app-bundle.json` | the compiled x86 app with the SHA-256 of its source and manifest. Tests fail when the source changed without a rebuild |
 | `src/agent.ps1` | the PowerShell agent: bootstrap, run and cleanup roles in one file |
-| `scripts/build-app.ps1` | builds `src/app-bundle.json` on Windows with the built-in compiler |
+| `scripts/build-app.ps1` | builds `src/app-bundle.json` on Windows with the built-in compiler. `-OutDir <folder>` writes only the exe and leaves the bundle alone |
+| `scripts/test-app-native.ps1` | compiles and runs `test/app-native.cs` against the app source on Windows |
+| `scripts/normalize-pe.mjs` | zeroes the build-specific fields of a .NET exe so two builds of one source compare equal |
+| `scripts/verify-app-binary.mjs` | compares a fresh build with the exe in `src/app-bundle.json` after normalizing both |
 | `scripts/prepare-app-restart.ps1` | optional: one automatic reconnect after a restart the customer authorized |
-| `test/app-native.cs` | native tests for the app, compiled and run on Windows |
+| `test/app-native.cs` | native tests for the app, compiled and run on Windows by `scripts/test-app-native.ps1` and by CI |
 
 ## Security model
 
@@ -435,20 +438,74 @@ powershell.exe -NoProfile -File scripts\build-app.ps1
 
 The script targets x86, references the WPF assemblies, embeds the `asInvoker`
 manifest, compiles with warnings as errors, and writes the executable (base64)
-and the SHA-256 of the source and manifest into the bundle. `node --test` fails
-when either hash no longer matches, so it catches a source change that was
-committed without a rebuild. It cannot prove that the committed executable was
-compiled from that source: the test only compares the hashes the builder wrote,
-and compiler output is not reproducible. If you need that assurance, rebuild the
-executable yourself with `scripts/build-app.ps1` before you deploy, and commit
-or deploy your own bundle. Commit the rebuilt bundle with any source change.
+and the SHA-256 of the source and manifest into the bundle. It always compiles
+to the file name `support-mcp-app.exe`, because the compiler embeds that name in
+the exe. Run it with `-OutDir <folder>` to write only the exe into that folder
+and leave `src/app-bundle.json` untouched.
+
+### What CI proves about the committed exe
+
+`node --test` fails when the source or manifest hash in the bundle no longer
+matches the files, so it catches a source change that was committed without a
+rebuild. It cannot tell whether `exe_b64` was compiled from that source. The
+`windows-app` job in `.github/workflows/test.yml` checks that, on every push and
+pull request, on a GitHub-hosted `windows-latest` runner:
+
+1. It builds the app from the committed source with `scripts/build-app.ps1`.
+2. It compiles and runs `test/app-native.cs`, and fails on any failed check.
+3. It runs `scripts/verify-app-binary.mjs`, which normalizes the fresh exe and
+   the committed exe and fails unless they are byte for byte identical.
+4. It uploads the fresh exe as the `support-app` workflow artifact.
+
+The .NET Framework v4 compiler is not reproducible: two builds of the same source
+differ only in the COFF header timestamp (4 bytes) and the 16-byte module
+version id (MVID) in the metadata.
+The compiler leaves the optional-header checksum at 0 and writes no debug
+directory. `scripts/normalize-pe.mjs` parses the PE headers, the CLR header and
+the metadata tables, then zeroes the timestamp, the checksum and the MVID that
+the Module table points at. It does not use fixed offsets. After that, two
+builds of one source are identical, and a one-character source change alters
+thousands of bytes. `test/normalize-pe.test.js` checks this against the
+committed exe, including that a change to any other byte changes the result.
+
+Line endings count as build input, because the compiler embeds the manifest
+bytes. `.gitattributes` keeps every file on LF so a Windows checkout builds the
+same bytes as a Linux one.
+
+What this proves: the committed exe is the output of the committed source and
+manifest, built with the .NET Framework 4.8 compiler (`csc.exe` 4.8.9221.0) on
+the runner. What it does not prove:
+
+- It trusts the runner's compiler and the framework assemblies. A different
+  compiler version can change the output and fail the check. If that happens,
+  rebuild the bundle with the same compiler version as CI and commit it.
+- It does not prove the source is safe. Review `src/agent-app.cs`.
+- It ignores 24 bytes: the timestamp, the checksum and the MVID. They hold no
+  code, but a check that skips bytes is only as good as its rule, so read
+  `scripts/normalize-pe.mjs`.
+- The exe in a download carries the session configuration appended to the end
+  (`SUPPORTMCPCFG1`). That tail is added at download time and is not part of the
+  check.
+
+When you change `src/agent-app.cs` or `src/agent-app.manifest`, rebuild the
+bundle on a Windows PC with the v4 compiler and commit it with the source:
+
+```powershell
+powershell.exe -NoProfile -File scripts\build-app.ps1
+```
+
+If the `windows-app` job fails on the exe check, it prints both normalized
+hashes. Rebuild the bundle, push, and the job passes when the hashes agree.
+To check a bundle yourself, build with `-OutDir` and run
+`node scripts/verify-app-binary.mjs <folder>\support-mcp-app.exe`.
 
 The native tests compile `test/app-native.cs` together with `src/agent-app.cs`
 on Windows, using the same references plus `/main:AppTests /target:exe`, and run
 the result. They start the real client against a fake relay and exercise HTTP
 operations, Unicode, chunking, retry deduplication, process-tree cancellation,
 timeout, local expiry and the reconnect rules. They need a Windows desktop
-session, so they are not part of `node --test`. The first connection from a
+session, so they are not part of `node --test`; CI runs them in the `windows-app`
+job. The first connection from a
 real Windows 7 PC still needs a live check for that image's TLS 1.2 and
 certificate setup.
 
@@ -463,7 +520,7 @@ operator ending the session cancels it.
 ## Develop and test
 
 ```sh
-node --test                          # 84 unit and route tests, no network
+node --test                          # 90 unit and route tests, no network
 npx wrangler deploy --dry-run --outdir /tmp/support-mcp-dry
 cp .dev.vars.example .dev.vars && npx wrangler dev --port 8787
 ```
