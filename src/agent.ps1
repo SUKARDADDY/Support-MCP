@@ -242,7 +242,7 @@ function Set-Status([string]$state) {
     if ($null -ne $script:expiresAt) {
         # A session lasts 24 hours, so a bare time would read as "ends now". Show the day too.
         $at = $script:expiresAt.ToString('ddd d MMM, HH:mm', [Globalization.CultureInfo]::InvariantCulture)
-        $until = ('Session active until {0}. You can end it at any time.' -f $at)
+        $until = ('Session active until {0}.{1}You can end it at any time.' -f $at, [Environment]::NewLine)
     }
     switch ($state) {
         'connected' {
