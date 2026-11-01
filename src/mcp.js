@@ -8,10 +8,19 @@ export const SERVER_INFO = { name: 'support-mcp', version: 'relay-v1' };
 export const TOOLS = [
   {
     name: 'session_create',
-    description: 'Create a support session and return the one-liner the customer pastes.',
+    description:
+      'Create a Windows support session. By default (windows_mode app) the customer opens a link and downloads the support app, which works on Windows 7 to 11; the result has download_url and a Start-Process one_liner. The app needs .NET Framework 4.5.2 or later and TLS 1.2, which Windows 10 and 11 include. Windows 8.1 needs the 4.5.2 update, and a Windows 7 PC needs .NET 4.5.2 installed and TLS 1.2 enabled first. With windows_mode powershell the one_liner is a PowerShell paste for Windows 8 and later.',
     inputSchema: {
       type: 'object',
-      properties: { label: { type: 'string', description: 'optional human label' } },
+      properties: {
+        label: { type: 'string', description: 'optional human label' },
+        windows_mode: {
+          type: 'string',
+          enum: ['app', 'powershell', 'legacy', 'standard'],
+          description:
+            'app (default): the customer downloads the support app (Windows 7 to 11). powershell: one-line paste into PowerShell (Windows 8 and later). legacy is an alias for app and standard is an alias for powershell.',
+        },
+      },
     },
   },
   {
@@ -21,7 +30,7 @@ export const TOOLS = [
   },
   {
     name: 'session_status',
-    description: 'State, machine, user, expiry, whether an agent is attached, and the last log rows.',
+    description: 'State, windows_mode (app or powershell), machine, user, expiry, whether an agent is attached, and the last log rows. App sessions also report elevated (true for administrator rights, null if unknown).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -34,7 +43,7 @@ export const TOOLS = [
   {
     name: 'run',
     description:
-      'Run a PowerShell command on the customer machine (as the signed-in user, never elevated). Returns exit_code (null if it timed out and was killed), stdout, stderr (plain text, each may end with [truncated]), timed_out.',
+      'Run a PowerShell command on the customer machine as the signed-in user. The tool never requests elevation. A downloaded app that the customer started as Administrator and approved runs commands with administrator rights, so check elevated in session_status first. Returns exit_code (null if it timed out and was killed), stdout, stderr (plain text, each may end with [truncated]), timed_out.',
     inputSchema: {
       type: 'object',
       properties: {

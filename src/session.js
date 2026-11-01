@@ -7,6 +7,11 @@
 // Sockets are tagged with an attach generation (`g<n>`); storage `ws_tag` names
 // the current one. Commands go only to the current socket; end/expire reach
 // every socket so a half-dead predecessor can never swallow them.
+//
+// A session has a Windows mode, fixed at creation. `powershell` sessions use the
+// WebSocket above. `app` sessions (the downloaded Windows app) use authenticated
+// HTTPS polling on /agent instead: one long poll per client, one command in
+// flight, and an `http<n>` generation tag in place of the socket tag.
 
 const CODE_TTL_MS = 10 * 60 * 1000; // pending -> consume window
 // consumed -> first attach window. src/agent.ps1 writes the same two hours into
@@ -15,6 +20,7 @@ const CODE_TTL_MS = 10 * 60 * 1000; // pending -> consume window
 const CONSUMED_TTL_MS = 2 * 60 * 60 * 1000;
 const ATTACHED_LIFE_MS = 24 * 60 * 60 * 1000; // attach -> expiry, fixed
 const RESULT_SLACK_MS = 15 * 1000; // relay waits timeout_s + this
+const HTTP_SEEN_MS = 60 * 1000; // app mode: a client counts as attached this long after its last request
 export const GET_FILE_MAX = 524288; // bytes per get_file chunk
 export const PUT_B64_MAX = 700000; // data_b64 chars per put_file chunk (~512 KiB)
 
@@ -43,6 +49,8 @@ export class Session {
     this.env = env;
     this.sql = ctx.storage.sql;
     this.pending = new Map(); // uuid -> {resolve, tag}
+    this.httpCommand = null; // app mode: the one command waiting for its result
+    this.httpPoll = null; // app mode: the parked long poll, if any
     this.sql.exec(`CREATE TABLE IF NOT EXISTS log(ts INTEGER, kind TEXT, detail TEXT)`);
   }
 
@@ -99,6 +107,7 @@ export class Session {
 
   // Send `frame` to EVERY socket (current and stale) and close them all.
   closeAll(frame, reason) {
+    this.replyToPoll(frame || { type: 'end', reason });
     const txt = frame ? JSON.stringify(frame) : null;
     for (const ws of this.ctx.getWebSockets()) {
       if (txt) {
@@ -118,6 +127,7 @@ export class Session {
       if (pred(p)) {
         this.pending.delete(id);
         p.resolve({ ok: false, error });
+        if (this.httpCommand?.frame.id === id) this.httpCommand = null;
       }
     }
   }
@@ -158,7 +168,8 @@ export class Session {
     await this.loadTtlOverride();
     try {
       if (p === '/create') return await this.doCreate(request);
-      if (p === '/consume') return await this.doConsume();
+      if (p === '/consume') return await this.doConsume(request);
+      if (p === '/agent') return await this.doAgent(request);
       if (p === '/ws') return await this.doWs(request);
       if (p === '/status') return await this.doStatus(url);
       if (p === '/command') return await this.doCommand(request);
@@ -171,6 +182,10 @@ export class Session {
 
   async doCreate(request) {
     const b = await request.json();
+    const windowsMode = b.windows_mode ?? 'powershell';
+    if (!['powershell', 'app'].includes(windowsMode)) {
+      return Response.json({ ok: false, error: 'bad windows mode' }, { status: 400 });
+    }
     // A DO name is a fresh 80-bit code, so existing state means a collision or
     // a replay; never overwrite a live or ended session.
     if ((await this.get('state')) !== undefined) {
@@ -191,6 +206,11 @@ export class Session {
       machine: null,
       user: null,
       ps: null,
+      windows_mode: windowsMode,
+      transport: null,
+      http_generation: 0,
+      http_seen_at: 0,
+      elevated: null,
       expires_at: null,
       ws_gen: 0,
     });
@@ -200,7 +220,9 @@ export class Session {
     return Response.json({ ok: true, sid: b.sid, code_expires_at: codeExpiry });
   }
 
-  async doConsume() {
+  async doConsume(request) {
+    let windowsMode = 'powershell';
+    try { windowsMode = (await request.json()).windows_mode ?? 'powershell'; } catch (_) {}
     // Hash first. Hashing yields to other requests, so doing it between the state
     // check and the write would let two concurrent consumes both see `pending`
     // and both mint a key. From the state read to the write there is only
@@ -210,6 +232,11 @@ export class Session {
     if (await this.expireIfDue()) return Response.json({ ok: false, reason: 'expired' });
     const state = await this.get('state');
     if (state !== 'pending') return Response.json({ ok: false, reason: 'not-pending' });
+    // The PowerShell script and the downloaded app are separate clients. A code
+    // minted for one can't be used up by the other.
+    if (windowsMode !== (await this.get('windows_mode', 'powershell'))) {
+      return Response.json({ ok: false, reason: 'wrong-client' });
+    }
     const now = Date.now();
     const deadline = now + this.ttlMs(CONSUMED_TTL_MS);
     await this.setMany({
@@ -221,7 +248,7 @@ export class Session {
     this.logRow('consumed');
     await this.ctx.storage.setAlarm(deadline);
     await this.pushRegistry();
-    return Response.json({ ok: true, key });
+    return Response.json({ ok: true, key, startup_expires_at: deadline });
   }
 
   async doWs(request) {
@@ -232,6 +259,7 @@ export class Session {
     let state = await this.get('state');
     if (state === 'ended' || state === undefined) return new Response('gone', { status: 410 });
     if (state === 'pending') return new Response('unauthorized', { status: 401 });
+    if ((await this.get('windows_mode', 'powershell')) === 'app') return new Response('wrong transport', { status: 401 });
     const key = request.headers.get('X-Attach-Key') || '';
     const wantHash = await this.get('key_hash');
     if (!wantHash || (await sha256Hex(key)) !== wantHash) {
@@ -284,7 +312,9 @@ export class Session {
     const tail = Math.max(0, Math.min(500, Number(url.searchParams.get('log_tail') || 20) || 0));
     const s = await this.ctx.storage.get([
       'state', 'machine', 'user', 'expires_at', 'ps', 'code', 'ended_reason', 'consumed_expires_at',
+      'windows_mode', 'transport', 'http_seen_at', 'elevated',
     ]);
+    const app = s.get('windows_mode') === 'app';
     const rows = tail
       ? this.sql.exec(`SELECT ts,kind,detail FROM log ORDER BY ts DESC LIMIT ?`, tail).toArray().reverse()
       : [];
@@ -293,10 +323,14 @@ export class Session {
       machine: s.get('machine') ?? null,
       user: s.get('user') ?? null,
       ps: s.get('ps') ?? null,
+      windows_mode: s.get('windows_mode') ?? 'powershell',
+      ...(app ? { elevated: s.get('elevated') ?? null } : {}),
       expires_at: s.get('expires_at') ?? null,
       startup_expires_at: s.get('state') === 'consumed' ? s.get('consumed_expires_at') ?? null : null,
       ended_reason: s.get('ended_reason') ?? null,
-      attached: !!(await this.currentSocket()),
+      attached: s.get('transport') === 'https-poll'
+        ? s.get('state') === 'attached' && Date.now() - (s.get('http_seen_at') || 0) < HTTP_SEEN_MS
+        : !!(await this.currentSocket()),
       log: rows,
     });
   }
@@ -307,7 +341,10 @@ export class Session {
     const state = await this.get('state');
     if (state === 'ended' || state === undefined) return Response.json({ ok: false, error: 'session ended' });
     const ws = state === 'attached' ? await this.currentSocket() : null;
-    if (!ws) return Response.json({ ok: false, error: 'agent not attached' });
+    const isHttp = state === 'attached' && (await this.get('transport')) === 'https-poll'
+      && Date.now() - (await this.get('http_seen_at', 0)) < HTTP_SEEN_MS;
+    if (!ws && !isHttp) return Response.json({ ok: false, error: 'agent not attached' });
+    if (isHttp && this.httpCommand) return Response.json({ ok: false, error: 'agent busy; wait for the current operation' });
 
     const id = crypto.randomUUID();
     let frame;
@@ -344,8 +381,12 @@ export class Session {
       return Response.json({ ok: false, error: 'bad op' });
     }
 
-    const tag = this.socketTag(ws);
-    const result = await this.awaitResult(id, ws, tag, frame, waitMs);
+    const tag = isHttp ? `http${await this.get('http_generation')}` : this.socketTag(ws);
+    const target = isHttp ? { send: () => {
+      this.httpCommand = { frame, tag };
+      this.replyToPoll(frame);
+    } } : ws;
+    const result = await this.awaitResult(id, target, tag, frame, waitMs);
     return Response.json(result);
   }
 
@@ -354,6 +395,7 @@ export class Session {
       const timer = setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
+          if (this.httpCommand?.frame.id === id) this.httpCommand = null;
           resolve({ ok: false, error: 'timeout waiting for agent', timed_out: true });
         }
       }, waitMs);
@@ -374,6 +416,96 @@ export class Session {
         }
       }
     });
+  }
+
+  // ---- app mode: HTTPS polling ----------------------------------------------
+  replyToPoll(frame) {
+    if (!this.httpPoll) return;
+    const poll = this.httpPoll;
+    this.httpPoll = null;
+    clearTimeout(poll.timer);
+    poll.resolve(Response.json(frame));
+  }
+
+  async doAgent(request) {
+    if (request.method !== 'POST') return Response.json({ error: 'method not allowed' }, { status: 405 });
+    await this.expireIfDue();
+    let state = await this.get('state');
+    if (!state || state === 'ended') return Response.json({ type: 'end' }, { status: 410 });
+    const key = request.headers.get('X-Attach-Key') || '';
+    if (state === 'pending' || (await this.get('windows_mode', 'powershell')) !== 'app'
+      || (await sha256Hex(key)) !== (await this.get('key_hash'))) {
+      return Response.json({ error: 'unauthorized' }, { status: 401 });
+    }
+    let b;
+    try { b = await request.json(); } catch (_) { return Response.json({ error: 'invalid JSON' }, { status: 400 }); }
+    if (!b || typeof b !== 'object' || Array.isArray(b)) return Response.json({ error: 'invalid message' }, { status: 400 });
+    // Recheck after hashing and body parsing, both of which can let an end or
+    // expiry request run. A delayed hello must never resurrect ended access.
+    await this.expireIfDue();
+    state = await this.get('state');
+    if (!state || state === 'ended') return Response.json({ type: 'end' }, { status: 410 });
+    if (b.type === 'hello') {
+      this.closeAll({ type: 'end', reason: 'replaced' }, 'replaced');
+      this.failPending(() => true, 'agent replaced');
+      const now = Date.now();
+      const generation = (await this.get('http_generation', 0)) + 1;
+      const firstAttach = state === 'consumed';
+      const expiresAt = firstAttach ? now + this.ttlMs(ATTACHED_LIFE_MS) : await this.get('expires_at');
+      const machine = truncate(String(b.machine ?? ''), 100) || null;
+      const user = truncate(String(b.user ?? ''), 100) || null;
+      const ps = truncate(String(b.ps ?? ''), 40) || null;
+      const agent = truncate(String(b.agent ?? ''), 40) || null;
+      const elevated = typeof b.elevated === 'boolean' ? b.elevated : null;
+      await this.setMany({
+        state: 'attached', transport: 'https-poll', http_generation: generation, http_seen_at: now,
+        expires_at: expiresAt, machine, user, ps, elevated,
+        ...(firstAttach ? { attached_first_at: now } : {}),
+      });
+      this.logRow('attached', `${firstAttach ? '' : 'reattach '}http${generation} elevated=${elevated ?? 'unknown'}`);
+      this.logRow('hello', `${machine ?? '?'}\\${user ?? '?'} ps=${ps ?? '?'} agent=${agent ?? '?'}`);
+      await this.ctx.storage.setAlarm(expiresAt);
+      await this.pushRegistry();
+      return Response.json({ type: 'welcome', generation, expires_at: expiresAt, server_time: now });
+    }
+    const generation = await this.get('http_generation');
+    if (state !== 'attached' || b.generation !== generation) return Response.json({ type: 'end', reason: 'replaced' }, { status: 409 });
+    await this.setMany({ http_seen_at: Date.now() });
+    if (b.type === 'end') {
+      this.logRow('detached', 'customer end');
+      this.closeAll({ type: 'end', reason: 'customer' }, 'customer end');
+      this.failPending(() => true, 'session ended by customer');
+      await this.markEnded('customer');
+      return Response.json({ type: 'end' });
+    }
+    if (b.type === 'poll') {
+      // A busy client already has its command, so a busy poll is only a sign of
+      // life. Answer it at once without sending the frame again. The client waits
+      // for its operation between busy polls, so this is not a tight loop.
+      if (b.busy) return Response.json({ type: 'idle' });
+      if (this.httpCommand) return Response.json(this.httpCommand.frame);
+      // One long poll per client. A retry releases its predecessor. The MCP
+      // request and this fetch keep the in-memory result and poll state alive.
+      this.replyToPoll({ type: 'idle' });
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => this.replyToPoll({ type: 'idle' }), 25000);
+        this.httpPoll = { resolve, timer };
+      });
+    }
+    if (b.type === 'result') {
+      const pending = this.pending.get(b.id);
+      if (pending && pending.tag === `http${generation}` && this.httpCommand?.frame.id === b.id) {
+        let result;
+        try { result = decodeHttpResult(b, this.httpCommand.frame.type); }
+        catch (_) { return Response.json({ error: 'invalid result' }, { status: 400 }); }
+        this.pending.delete(b.id);
+        this.httpCommand = null;
+        pending.resolve(result);
+      }
+      // Retried results are acknowledged without running anything again.
+      return Response.json({ type: 'ack' });
+    }
+    return Response.json({ error: 'unknown message' }, { status: 400 });
   }
 
   async doEnd(request) {
@@ -486,4 +618,30 @@ export class Session {
 
 function truncate(s, n) {
   return s.length > n ? s.slice(0, n) + '…' : s;
+}
+
+function decodeHttpResult(b, op) {
+  if (b.ok === false) return { ok: false, error: truncate(String(b.error || 'agent operation failed'), 1000) };
+  if (op === 'run') {
+    const decode = (data, clipped) => {
+      if (typeof data !== 'string' || data.length > 90000) throw new Error('bad output');
+      const bytes = Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
+      return new TextDecoder().decode(bytes) + (clipped ? '\n[truncated]' : '');
+    };
+    return {
+      ok: true,
+      exit_code: Number.isInteger(b.exit_code) ? b.exit_code : null,
+      stdout: decode(b.stdout_b64, b.stdout_truncated),
+      stderr: decode(b.stderr_b64, b.stderr_truncated),
+      timed_out: b.timed_out === true,
+    };
+  }
+  if (op === 'put_file') {
+    if (!Number.isSafeInteger(b.bytes) || b.bytes < 0 || b.bytes > PUT_B64_MAX) throw new Error('bad bytes');
+    return { ok: true, bytes: b.bytes };
+  }
+  if (typeof b.data_b64 !== 'string' || b.data_b64.length > 699052 || !Number.isSafeInteger(b.size) || b.size < 0 || typeof b.eof !== 'boolean') {
+    throw new Error('bad file result');
+  }
+  return { ok: true, data_b64: b.data_b64, size: b.size, eof: b.eof };
 }
