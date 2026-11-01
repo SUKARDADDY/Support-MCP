@@ -1,0 +1,3 @@
+# Line endings are part of the build input: the compiler embeds the manifest bytes and
+# the bundle records the SHA-256 of the source. A Windows checkout must not convert them.
+* text=auto eol=lf
