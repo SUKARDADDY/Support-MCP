@@ -217,7 +217,7 @@ the sid, so two sessions on one PC never collide: folder
 2. **Run**: WinForms window, TopMost on first show, title `Remote
    support`, a fixed-size notice with the information icon, a headline (`A remote
    support agent is connected to your machine.` after welcome) and a detail line
-   `Session active until HH:mm. You can end it at any time.` (local time, after
+   `Session active until ddd d MMM, HH:mm. You can end it at any time.` (local time, after
    welcome), a `Show activity` / `Hide activity` link that toggles a read-only log
    box (hidden at start; each command / file op one line, timestamped), and an
    **End session** button. **Refuses to run if its own token is elevated**

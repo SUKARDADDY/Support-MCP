@@ -240,7 +240,9 @@ function Append-Log([string]$line) {
 function Set-Status([string]$state) {
     $until = ''
     if ($null -ne $script:expiresAt) {
-        $until = ('Session active until {0}. You can end it at any time.' -f $script:expiresAt.ToString('HH:mm'))
+        # A session lasts 24 hours, so a bare time would read as "ends now". Show the day too.
+        $at = $script:expiresAt.ToString('ddd d MMM, HH:mm', [Globalization.CultureInfo]::InvariantCulture)
+        $until = ('Session active until {0}. You can end it at any time.' -f $at)
     }
     switch ($state) {
         'connected' {
