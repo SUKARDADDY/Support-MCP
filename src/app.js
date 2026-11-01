@@ -290,7 +290,7 @@ async function handleJ(request, env, url, origin, agentText, appBundle) {
       body = buildAppDownload(appBundle, {
         sid: id.toString(), key: out.key, origin,
         startup_expires_at: out.startup_expires_at,
-        startup_ms: Math.max(1, out.startup_expires_at - Date.now()),
+        startup_ms: Math.min(7200000, Math.max(1, out.startup_expires_at - Date.now())),
       });
     } catch (_) {
       return appPage(url, 'ended', '', 404);
