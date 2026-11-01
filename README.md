@@ -1,21 +1,47 @@
+<div align="center">
+
 # Support-MCP
 
-Remote support for Windows PCs, run by an AI agent over the Model Context
-Protocol. The customer pastes one line into PowerShell. A small window opens on
-their screen and shows every command as it runs. The operator, which in my case
-is Claude Code, gets seven MCP tools to run commands and move files on that PC.
-The session ends itself after 24 hours and removes the agent's own files,
-logon entry and scheduled task.
+**Let an AI agent fix a Windows PC.**<br>
+The customer pastes one line. A window on their screen shows every command as it runs.<br>
+They can stop it at any time, and after 24 hours it removes itself.
+
+[![test](https://github.com/SUKARDADDY/Support-MCP/actions/workflows/test.yml/badge.svg)](https://github.com/SUKARDADDY/Support-MCP/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-3fb950)](LICENSE)
+[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers%20%2B%20Durable%20Objects-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/durable-objects/)
+[![PowerShell 5.1](https://img.shields.io/badge/PowerShell-5.1-5391FE)](src/agent.ps1)
+[![MCP](https://img.shields.io/badge/MCP-7%20tools-d97757)](#mcp-tools)
+
+<img src="docs/hero.svg" alt="Claude Code calls session_create, run and put_file. A Cloudflare Worker relays them to the customer's PC, where a Support session window lists each command as it runs." width="100%">
+
+<sub>An illustration based on the <a href="#a-real-session">first real session</a>.</sub>
+
+[How it works](#how-it-works) · [A real session](#a-real-session) · [Security model](#security-model) · [Deploy your own](#deploy-your-own)
+
+</div>
+
+## Why
 
 I built it because I support Windows point-of-sale machines, and every
 screen-sharing tool I tried wanted an installer, an account, or a person on the
 other end reading out codes. I wanted to send a link, have the customer paste
 it, and let an agent do the diagnosis while I watch.
 
-The relay is a Cloudflare Worker with Durable Objects. The agent is a single
-PowerShell 5.1 script with no dependencies beyond what ships with Windows.
+## At a glance
 
-## What a session looks like
+- **One line, nothing to install.** The agent is a single PowerShell 5.1 script
+  with no dependencies beyond what ships with Windows. No account, no codes to
+  read out.
+- **The customer sees everything.** Every command and file operation appears in
+  their window as it happens, above an **End session** button.
+- **Never elevated.** The agent refuses to run elevated. When a command asks
+  for admin rights, Windows shows a UAC prompt and the customer decides.
+- **Gone in 24 hours.** The session ends itself and removes the agent's folder,
+  logon entry and scheduled task, even if the relay is gone.
+- **No local bridge.** A Cloudflare Worker is the MCP server. Point Claude Code
+  at it and you get seven tools.
+
+## How it works
 
 1. The operator calls `session_create`. The relay mints a single-use pairing
    code and returns a one-liner:
@@ -31,6 +57,30 @@ PowerShell 5.1 script with no dependencies beyond what ships with Windows.
    clicks **End session**, or when 24 hours pass. The agent then deletes its
    folder, its logon entry and its scheduled task.
 
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Op as Operator (Claude Code)
+  participant W as Relay (Cloudflare Worker)
+  participant PC as Customer PC
+  Op->>W: session_create
+  W-->>Op: one-liner, valid for 10 minutes
+  Note over Op,PC: The operator sends the line to the customer
+  PC->>W: GET /j/CODE from PowerShell
+  W-->>PC: agent script, and the code is used up
+  PC->>W: WebSocket /ws with the attach key in a header
+  Note over PC: The Support session window opens, with an End session button
+  Op->>W: run, put_file or get_file
+  W->>PC: command
+  Note over PC: Shown in the window as it runs
+  PC-->>W: exit code, stdout, stderr
+  W-->>Op: result
+  Op->>W: session_end
+  Note over W: or the 24 hour alarm fires
+  W->>PC: end
+  Note over PC: Deletes its folder, logon entry and scheduled task
+```
+
 The pairing link is valid for 10 minutes and can be fetched once. Only a
 request from PowerShell uses the code up. A chat app that previews the link
 gets a short harmless message instead. After the script is fetched, the PC has
@@ -40,6 +90,47 @@ state. The agent keeps the same two-hour limit on its own clock (`connect_by`
 in its config), so a PC that never connects cleans up even if the relay is
 gone. Once connected, the session lasts up to 24 hours, and a reconnect doesn't
 extend that.
+
+## A real session
+
+The first customer session was a restaurant POS terminal whose receipt printer
+had been swapped from one brand to another. Nothing printed. The whole fix ran
+through this relay with Claude Code as the operator, from pasting the link to a
+receipt coming out of the printer.
+
+What it found, in order:
+
+1. Windows could see the new printer on USB, but its USB printing interface
+   never finished coming up, so Windows had no `USB001` port to print to. A
+   spooler restart didn't help. Restarting that one USB device did, with the
+   customer approving the UAC prompt.
+2. The old print queue still used the previous vendor's driver, and that
+   driver's language monitor sent data the new printer couldn't handle. The
+   printer got stuck. It answered real-time status queries and dropped
+   everything else, and neither a power cycle nor a PC reboot cleared it. The
+   agent opened the USB device directly, bypassing the spooler, and sent the
+   ESC/POS buffer-clear command. The printer acknowledged it and printed.
+3. A fresh queue with the right vendor driver still printed nothing, because
+   that driver's own language monitor expects the vendor's port type. Turning
+   bidirectional support off on the queue fixed it, and the POS software's
+   receipts printed.
+
+Steps 2 and 3 can't be done from a screen share. They needed raw writes to the
+device and reading status bytes back, which is what `run` makes possible.
+
+## MCP tools
+
+| Tool | Does |
+|---|---|
+| `session_create` | returns `{session_id, one_liner, code_expires_at}` |
+| `session_list` | every session with its state, expiry and machine |
+| `session_status` | state, machine, user, expiry, `startup_expires_at` while waiting, whether the agent is attached, last audit rows |
+| `run` | runs PowerShell as the signed-in user; returns exit code, stdout, stderr, timed_out |
+| `put_file` | writes base64 data to a path, with append for chunking |
+| `get_file` | reads a byte range as base64, with `eof` for chunking |
+| `session_end` | tells the agent to clean up and marks the session ended |
+
+There is no screen capture and no tool that elevates. That is on purpose.
 
 ## Architecture
 
@@ -72,20 +163,6 @@ alarm for expiry. A second Durable Object keeps the list for `session_list`.
 | `src/jwt.js` | RS256 verification of the Access JWT with WebCrypto |
 | `src/template.js` | builds the served script and validates every value placed in it |
 | `src/agent.ps1` | the Windows agent: bootstrap, run and cleanup roles in one file |
-
-## MCP tools
-
-| Tool | Does |
-|---|---|
-| `session_create` | returns `{session_id, one_liner, code_expires_at}` |
-| `session_list` | every session with its state, expiry and machine |
-| `session_status` | state, machine, user, expiry, `startup_expires_at` while waiting, whether the agent is attached, last audit rows |
-| `run` | runs PowerShell as the signed-in user; returns exit code, stdout, stderr, timed_out |
-| `put_file` | writes base64 data to a path, with append for chunking |
-| `get_file` | reads a byte range as base64, with `eof` for chunking |
-| `session_end` | tells the agent to clean up and marks the session ended |
-
-There is no screen capture and no tool that elevates. That is on purpose.
 
 ## Security model
 
@@ -160,33 +237,6 @@ starts from what that script may and may not do.
   tasks. It does not undo files an operator wrote, software it installed or
   settings it changed.
 
-## A real session
-
-The first customer session was a restaurant POS terminal whose receipt printer
-had been swapped from one brand to another. Nothing printed. The whole fix ran
-through this relay with Claude Code as the operator, from pasting the link to a
-receipt coming out of the printer.
-
-What it found, in order:
-
-1. Windows could see the new printer on USB, but its USB printing interface
-   never finished coming up, so Windows had no `USB001` port to print to. A
-   spooler restart didn't help. Restarting that one USB device did, with the
-   customer approving the UAC prompt.
-2. The old print queue still used the previous vendor's driver, and that
-   driver's language monitor sent data the new printer couldn't handle. The
-   printer got stuck. It answered real-time status queries and dropped
-   everything else, and neither a power cycle nor a PC reboot cleared it. The
-   agent opened the USB device directly, bypassing the spooler, and sent the
-   ESC/POS buffer-clear command. The printer acknowledged it and printed.
-3. A fresh queue with the right vendor driver still printed nothing, because
-   that driver's own language monitor expects the vendor's port type. Turning
-   bidirectional support off on the queue fixed it, and the POS software's
-   receipts printed.
-
-Steps 2 and 3 can't be done from a screen share. They needed raw writes to the
-device and reading status bytes back, which is what `run` makes possible.
-
 ## Deploy your own
 
 You need a Cloudflare account with a zone for the hostname, Node 22 and
@@ -245,15 +295,6 @@ binding that records every call.
 The wire protocol, the state machine and the acceptance checks are in
 [`docs/relay-v1-spec.md`](docs/relay-v1-spec.md).
 
-## Responsible use
-
-- Use it only on a computer whose owner has asked for support and agreed to
-  the session.
-- The visible window and the **End session** button are the consent mechanism.
-  They show the customer every command and let them stop the session at any
-  time. Please keep them visible in any fork.
-- You are responsible for following the law where you and the customer are.
-
 ## Limits
 
 - Windows only. The agent targets Windows PowerShell 5.1, which ships with
@@ -280,6 +321,15 @@ The wire protocol, the state machine and the acceptance checks are in
 - Where an administrator has turned on PowerShell script block logging, Windows
   may record the served script, including the attach key, in the PowerShell
   Operational event log. The key stays valid for the life of the session.
+
+## Responsible use
+
+- Use it only on a computer whose owner has asked for support and agreed to
+  the session.
+- The visible window and the **End session** button are the consent mechanism.
+  They show the customer every command and let them stop the session at any
+  time. Please keep them visible in any fork.
+- You are responsible for following the law where you and the customer are.
 
 ## Contributing
 
