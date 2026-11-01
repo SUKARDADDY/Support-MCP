@@ -204,7 +204,20 @@ test('download page is a self-contained bilingual card with the security headers
   assert.match(html, /<form method="post" action="\/j\/[a-z2-7]{16}\?client=app">/);
   for (const text of ['Download the support app.', 'Open the downloaded file.', 'More info', 'Run anyway', 'Windows protected your PC']) assert.ok(html.includes(text), text);
   assert.ok(html.includes('<strong>Allow</strong>'));
-  assert.ok((html.match(/lang="he" dir="rtl"/g) || []).length >= 6);
+  // Edge holds an uncommon exe until the customer keeps it: its own step, between Download and Open.
+  const edge = html.indexOf('isn&rsquo;t commonly downloaded');
+  assert.ok(html.indexOf('Download the support app.') < edge && edge < html.indexOf('Open the downloaded file.'), 'Edge step sits between Download and Open');
+  for (const text of ['If Microsoft Edge says the file', 'three dots', '<strong>Keep</strong>', '<strong>Show more</strong>', '<strong>Keep anyway</strong>']) assert.ok(html.includes(text), text);
+  for (const text of ['אם Microsoft Edge מציג', 'שלוש הנקודות', '<bdi dir="ltr"><strong>Keep</strong></bdi>', '<bdi dir="ltr"><strong>Show more</strong></bdi>', '<bdi dir="ltr"><strong>Keep anyway</strong></bdi>']) assert.ok(html.includes(text), text);
+  // The quote marks sit inside the bdi, so they stay beside the English words in right-to-left text.
+  assert.ok(html.includes('<bdi dir="ltr">&ldquo;Windows protected your PC&rdquo;</bdi>'));
+  assert.ok(html.includes('<bdi dir="ltr"><strong>&ldquo;isn&rsquo;t commonly downloaded&rdquo;</strong></bdi>'));
+  assert.match(html, /bdi\{white-space:nowrap\}/, 'a quoted English phrase never wraps away from its quote marks');
+  assert.ok((html.match(/lang="he" dir="rtl"/g) || []).length >= 7);
+  // IE11 has no :focus-visible and drops a rule it cannot parse, so plain :focus is its own rule.
+  assert.match(html, /button:focus\{outline:3px solid #9DB9F5;outline-offset:3px\}/);
+  assert.match(html, /button:focus:not\(:focus-visible\)\{outline:none\}/);
+  assert.ok(html.indexOf('button:focus{') < html.indexOf('button:focus:not(:focus-visible)'), 'plain :focus comes first');
   assert.equal((html.match(/<form/g) || []).length, 1);
   assert.ok(!/<script|https?:\/\/|src=|<link|@import|url\(/.test(html), 'no scripts or external requests');
 });
