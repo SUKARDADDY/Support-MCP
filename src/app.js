@@ -82,11 +82,14 @@ h2{margin:0 0 6px;font:600 17px/1.3 "Segoe UI Variable Display","Segoe UI",syste
 p{margin:0 0 8px}.he{direction:rtl;text-align:right}.sub{color:#5B6472;font-size:13.5px}
 button{display:block;width:100%;min-height:52px;margin:4px 0 22px;padding:0 16px;border:0;border-radius:8px;background:#2563EB;color:#fff;font:600 17px "Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,Roboto,Arial,sans-serif;cursor:pointer}
 button .he{display:block;margin:0;font-size:14px;font-weight:400;text-align:center;color:#fff}
-button:hover{background:#1D4FC4}button:focus-visible{outline:3px solid #9DB9F5;outline-offset:3px}
+button:hover{background:#1D4FC4}
+button:focus{outline:3px solid #9DB9F5;outline-offset:3px}
+button:focus:not(:focus-visible){outline:none}
 ol{list-style:none;counter-reset:step;margin:0 0 4px;padding:0;border-top:1px solid #E4E7EC}
 li{counter-increment:step;position:relative;padding:14px 0 14px 38px;border-bottom:1px solid #E4E7EC}
 li:before{content:counter(step);position:absolute;left:0;top:14px;width:26px;height:26px;border-radius:50%;background:#F5F6F8;color:#141A24;font-size:13px;font-weight:600;display:grid;place-items:center}
 li span{display:block}li .he{margin-top:2px;color:#5B6472;font-size:13.5px}
+bdi{white-space:nowrap}
 .note{margin:16px 0 0;color:#5B6472;font-size:13px}
 @media(max-width:480px){body{padding:12px 10px;align-items:flex-start}.body{padding:4px 18px 20px}}`;
 
@@ -102,7 +105,7 @@ function appPage(url, state = 'pending', sid = '', expiredStatus = 410) {
     ? `<p class="sub">Download the support app on the computer that needs help.</p>
        <p class="sub he" lang="he" dir="rtl">הורידו את אפליקציית התמיכה במחשב שזקוק לעזרה.</p>
        <form method="post" action="${url.pathname}?client=app"><button type="submit">Download the support app<span class="he" lang="he" dir="rtl">הורדת אפליקציית התמיכה</span></button></form>
-       <ol>${step('Download the support app.', 'הורידו את אפליקציית התמיכה.')}${step('Open the downloaded file. If Windows says &ldquo;Windows protected your PC&rdquo;, click <strong>More info</strong>, then <strong>Run anyway</strong>.', 'פתחו את הקובץ שהורד. אם Windows מציג <bdi dir="ltr">&ldquo;Windows protected your PC&rdquo;</bdi>, לחצו על <bdi dir="ltr"><strong>More info</strong></bdi> ואז על <bdi dir="ltr"><strong>Run anyway</strong></bdi>.')}${step('Click <strong>Allow</strong>.', 'לחצו על <strong>Allow</strong>.')}</ol>
+       <ol>${step('Download the support app.', 'הורידו את אפליקציית התמיכה.')}${step('If Microsoft Edge says the file <strong>&ldquo;isn&rsquo;t commonly downloaded&rdquo;</strong>, point at the download, click the three dots (<strong>...</strong>), then click <strong>Keep</strong>. In the box that opens, click <strong>Show more</strong>, then <strong>Keep anyway</strong>.', 'אם Microsoft Edge מציג שהקובץ <bdi dir="ltr"><strong>&ldquo;isn&rsquo;t commonly downloaded&rdquo;</strong></bdi>, העבירו את העכבר מעל ההורדה, לחצו על שלוש הנקודות (<bdi dir="ltr"><strong>...</strong></bdi>) ואז על <bdi dir="ltr"><strong>Keep</strong></bdi>. בחלון שנפתח לחצו על <bdi dir="ltr"><strong>Show more</strong></bdi> ואז על <bdi dir="ltr"><strong>Keep anyway</strong></bdi>.')}${step('Open the downloaded file. If Windows says &ldquo;Windows protected your PC&rdquo;, click <strong>More info</strong>, then <strong>Run anyway</strong>.', 'פתחו את הקובץ שהורד. אם Windows מציג <bdi dir="ltr">&ldquo;Windows protected your PC&rdquo;</bdi>, לחצו על <bdi dir="ltr"><strong>More info</strong></bdi> ואז על <bdi dir="ltr"><strong>Run anyway</strong></bdi>.')}${step('Click <strong>Allow</strong>.', 'לחצו על <strong>Allow</strong>.')}</ol>
        <p class="note">A small window stays in the corner of your screen while support is connected. Close it or click End session to stop access.</p>
        <p class="note he" lang="he" dir="rtl">חלון קטן נשאר בפינת המסך בזמן שהתמיכה מחוברת. סגירתו או לחיצה על End session מפסיקה את הגישה.</p>`
     : downloaded

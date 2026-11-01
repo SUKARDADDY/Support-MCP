@@ -60,19 +60,22 @@ and let an agent do the diagnosis while I watch.
    ```
    The result also has `one_liner`, a `Start-Process '<link>'` command for a
    PowerShell console on the customer's PC, which works in PowerShell 2.0.
-2. The customer opens the link. The page explains the three steps in English
+2. The customer opens the link. The page explains the steps in English
    and Hebrew and has a **Download the support app** button. Opening or
    refreshing the page does not use the code.
 3. The button submits a same-origin form. The relay then returns
    `remote-support-<id>.exe`: the app with this session's configuration
    appended. The code is used up.
-4. The customer opens the file. If Windows says "Windows protected your PC",
+4. If Edge says the file "isn't commonly downloaded", the customer points at
+   the download, clicks the three dots (**...**), then **Keep**, then
+   **Show more** and **Keep anyway**.
+5. The customer opens the file. If Windows says "Windows protected your PC",
    they click **More info**, then **Run anyway**. They click **Allow** in the
    consent dialog. The app connects back over HTTPS and a small window docks in
    the bottom-right corner.
-5. The operator calls `run`, `put_file` and `get_file`. The window turns blue
+6. The operator calls `run`, `put_file` and `get_file`. The window turns blue
    while one runs. It never shows the commands, paths or output.
-6. The session ends when the operator calls `session_end`, when the customer
+7. The session ends when the operator calls `session_end`, when the customer
    clicks **End session** (after an inline "End the session?" check), or when 24
    hours pass. The window says "Support is disconnected." and closes after four
    seconds. The app leaves nothing installed. The downloaded file stays in
@@ -378,9 +381,9 @@ apply to only one client say which.
 ## Unsigned app
 
 The downloaded app has no code signature, and the repository does not ship a
-signing key. A browser may warn about the download, and Windows SmartScreen
+signing key. Edge may hold the download until the customer keeps it, and Windows SmartScreen
 shows "Windows protected your PC" when the customer opens it. The download page
-tells them to click **More info**, then **Run anyway**. The warning goes away
+tells them both steps: **Keep anyway** in Edge, then **More info** and **Run anyway**. The warning goes away
 only when you sign the app with a certificate your customers' Windows trusts.
 Signing, for example with `signtool`, is out of scope for this repository.
 

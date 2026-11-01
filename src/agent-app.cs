@@ -601,7 +601,7 @@ namespace SupportMcp {
         readonly Glyph tileGlyph, tuckGlyph;
         readonly System.Windows.Shapes.Rectangle sweep;
         readonly TranslateTransform sweepMove = new TranslateTransform();
-        readonly TextBlock head, status, until, tuckTitle, tuckTimer, askTitle, askText;
+        readonly TextBlock head, status, until, adminLine, noteLine, tuckTitle, tuckTimer, askTitle, askText;
         readonly StackPanel fullView, tuckView, askFoot;
         readonly Border askBox, normalFoot;
         readonly FlatButton collapse, endButton, tuckEnd, expand, keep, sure;
@@ -655,12 +655,12 @@ namespace SupportMcp {
             status = Ui.Label("", 12.5, FontWeights.Normal, p.Muted, Ui.TextFont);
             text.Children.Add(head); text.Children.Add(status);
             if (administrator) {
-                var admin = Ui.Label("Running with administrator rights.", 12.5, FontWeights.Normal, p.Stop, Ui.TextFont); admin.Margin = new Thickness(0, 6, 0, 0);
-                text.Children.Add(admin);
+                adminLine = Ui.Label("Running with administrator rights.", 12.5, FontWeights.Normal, p.Stop, Ui.TextFont); adminLine.Margin = new Thickness(0, 6, 0, 0);
+                text.Children.Add(adminLine);
             }
             if (!String.IsNullOrEmpty(note)) {
-                var line = Ui.Label(note, 12, FontWeights.Normal, p.Muted, Ui.TextFont); line.Margin = new Thickness(0, 6, 0, 0);
-                text.Children.Add(line);
+                noteLine = Ui.Label(note, 12, FontWeights.Normal, p.Muted, Ui.TextFont); noteLine.Margin = new Thickness(0, 6, 0, 0);
+                text.Children.Add(noteLine);
             }
             body.Children.Add(text);
             fullView.Children.Add(body);
@@ -854,6 +854,10 @@ namespace SupportMcp {
             until.Text = connectedOnce && expires != DateTime.MinValue ? "Ends by itself " + expires.ToString("ddd d MMM, HH:mm", System.Globalization.CultureInfo.InvariantCulture) : "";
             tuckTitle.Text = working ? "Support is working" : "Remote support";
             tuckTimer.Text = connectedOnce ? Ui.Clock(session.Elapsed) : "";
+
+            // Once the session has ended these lines would be stale.
+            if (adminLine != null) adminLine.Visibility = ended ? Visibility.Collapsed : Visibility.Visible;
+            if (noteLine != null) noteLine.Visibility = ended ? Visibility.Collapsed : Visibility.Visible;
 
             bool small = tucked && !ended;
             card.Width = small ? Double.NaN : CardWidth;
