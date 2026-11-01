@@ -26,3 +26,36 @@ jobs:
         with:
           node-version: 22
       - run: node --test
+
+  # Runs on a GitHub-hosted Windows runner with the .NET Framework v4 compiler.
+  # It builds the app from source, runs the native tests, and checks that the exe
+  # committed in src/app-bundle.json is the build of the committed source.
+  windows-app:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Show the compiler version
+        shell: pwsh
+        run: (Get-Item "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\csc.exe").VersionInfo.ProductVersion
+      - name: Build the app from source
+        shell: pwsh
+        run: ./scripts/build-app.ps1 -OutDir "$env:RUNNER_TEMP\app-build"
+      - name: Run the native tests
+        shell: pwsh
+        run: ./scripts/test-app-native.ps1 -WorkDir "$env:RUNNER_TEMP\app-native"
+      - name: Check the committed exe against the fresh build
+        run: node scripts/verify-app-binary.mjs "$env:RUNNER_TEMP\app-build\support-mcp-app.exe"
+      - name: Upload the fresh build
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: support-app
+          path: ${{ runner.temp }}/app-build/support-mcp-app.exe
+          if-no-files-found: error
