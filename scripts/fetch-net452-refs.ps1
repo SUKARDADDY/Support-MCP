@@ -1,6 +1,8 @@
 # Download the .NET Framework 4.5.2 reference assemblies from nuget.org, check the
 # package against the SHA-512 pinned below, and extract them. Prints the folder to
-# pass as -ReferenceDir to build-app.ps1 and test-app-native.ps1. CI and
+# pass as -ReferenceDir to build-app.ps1 and test-app-native.ps1, and nothing
+# else on stdout: the status line goes to stderr, so `$refs = powershell.exe -File
+# fetch-net452-refs.ps1` captures only the folder. CI and
 # maintainers use this same script. It stops, and extracts nothing, when the
 # download does not match the pin.
 #
@@ -32,5 +34,5 @@ if (-not (Test-Path -LiteralPath (Join-Path $extracted 'mscorlib.dll'))) { throw
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $references) | Out-Null
 Move-Item -LiteralPath $extracted -Destination $references
 Remove-Item -LiteralPath (Join-Path $Destination 'package') -Recurse -Force
-Write-Host "Verified $id $version (SHA-512 $sha512)"
+[Console]::Error.WriteLine("Verified $id $version (SHA-512 $sha512)")
 Write-Output $references
