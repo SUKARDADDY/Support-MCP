@@ -149,7 +149,7 @@ with the system timer at 1 ms as well, for example while a browser or an
 animated WPF window is open. The reason is in the comment above `TypeText`:
 Windows 11 Notepad reads the character of a Unicode key event late, so events
 sent less than about 10 ms apart replace one another. The code waits 20 ms
-between characters and the relay budgets 25 ms for each.
+between characters and the relay budgets 35 ms for each (the app measures about 21 ms; Windows 11 can ignore its 1 ms timer request for a minimized window, which costs about 31 ms).
 
 An operator can prepare one automatic reconnect after a restart the customer
 authorized. `scripts/prepare-app-restart.ps1` runs inside the live session on

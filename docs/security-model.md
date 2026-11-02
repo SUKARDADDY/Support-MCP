@@ -36,7 +36,13 @@ apply to only one client say which.
   hooks that see only physical events. Windows removes a hook that times out,
   without telling the app, so the app also compares `GetLastInputInfo` with the
   time of its own last injected input, and a later input counts as the
-  customer's. Screenshots, UI reads and commands are not paused. The app refuses
+  customer's. That time is only as fine as the system clock (about 15.6 ms), so
+  the app also treats a key or mouse button that is down while it holds none as
+  the customer's. Typing checks all of this during every 20 ms gap and right
+  before each character, and stops within a few milliseconds. If the hooks did
+  not install, the app first sends one harmless key (F24) to prove that the
+  last-input time follows its own input, and refuses all input if it cannot
+  prove it. Screenshots, UI reads and commands are not paused. The app refuses
   to click its own window or type while its own window has the focus, and it
   checks the focused window again before each key and each typed character.
   Typing, key sequences and drags also stop at once when the session ends or the

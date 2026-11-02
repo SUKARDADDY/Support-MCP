@@ -38,9 +38,10 @@ const LANE_OF = { run: 'cmd', put_file: 'cmd', get_file: 'cmd', screen: 'screen'
 const NO_SCREEN_PS = 'the PowerShell fallback has no screen access';
 const NO_SCREEN_OLD = 'this support app is too old for screen control';
 const NO_SCREEN_CONSENT = 'the customer has not approved screen control for this session';
-// Per-character pacing of the app's typing is about 15 ms (see Screen.TypeText in
-// src/agent-app.cs). The relay waits this long for each typed character.
-const TYPE_MS_PER_CHAR = 25;
+// The app types one character every 20 ms (Screen.TypeGapMs in src/agent-app.cs) and measures about 21 ms per
+// character. Windows 11 can ignore the app's 1 ms timer request, for example for a minimized window, and then a
+// character takes about 31 ms. The relay waits 35 ms for each.
+const TYPE_MS_PER_CHAR = 35;
 const FULL_ONLY = ['block_input', 'send_sas'];
 export const GET_FILE_MAX = 524288; // bytes per get_file chunk
 export const PUT_B64_MAX = 700000; // data_b64 chars per put_file chunk (~512 KiB)

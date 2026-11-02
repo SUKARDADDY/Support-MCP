@@ -223,10 +223,14 @@ of them and keeps working: see [Lanes](#lanes-screen-and-control-frames).
   and `screen` and `control` results are described below. A malformed result
   gets 400 `{"error":"invalid result"}` and does not resolve the command, which
   keeps waiting for a valid one until its timeout. The app does not resend a
-  result the relay refuses with a 4xx other than 401, 403, 409 and 410 (400 and
-  413 in practice): it replaces that result once with `{"ok":false,"error":"result
-  rejected by relay"}`, sends that, and carries on polling. A result it cannot
-  serialize under 750,000 bytes gets the same replacement.
+  result the relay refuses with 400 or 413: it replaces that result once with
+  `{"ok":false,"error":"result rejected by relay"}`, sends that, and carries on
+  polling. A result it cannot serialize under 750,000 bytes gets the same
+  replacement. Any other failure, including 408, 429 and other 4xx answers, takes
+  the normal retry path with the same result. That replacement carries only
+  `type`, `id`, `generation`, `ok` and `error`, so the relay always accepts it. If
+  it is refused anyway, the app drops it and carries on, and the operator's call
+  ends with the relay's `timeout waiting for agent`.
 - `end` is the customer ending the session: the relay marks it `ended` with
   reason `customer`. An operator `session_end`, the alarm and the 24-hour limit
   answer any waiting poll with `{"type":"end"}`, fail the waiting command, and
@@ -380,7 +384,7 @@ bad value is never an error. `session_status` returns a deadline only while it
 is in the future.
 
 **Timeouts.** The relay waits `30 s + 15 s` for a `screen` result, plus the
-seconds of a `wait` and 25 ms per character of `type` or `type_secret` text (the app types one character every 20 ms),
+seconds of a `wait` and 35 ms per character of `type` or `type_secret` text (the app types one character every 20 ms, about 21 ms measured, and about 31 ms when Windows ignores its 1 ms timer request),
 then answers the operator `timeout waiting for agent`.
 
 Audit log: DO SQLite table `log(ts INTEGER ms, kind TEXT, detail TEXT)`;

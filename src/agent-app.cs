@@ -40,15 +40,20 @@ namespace SupportMcp {
             using (var identity = WindowsIdentity.GetCurrent())
                 return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
         }
-        public static string ConsentMessage(bool administrator) {
+        public static string ConsentMessage(bool administrator) { return ConsentMessage(administrator, true); }
+        // screen = false is a reconnect whose earlier approval did not cover screen control: the prompt must say what will happen.
+        public static string ConsentMessage(bool administrator, bool screen) {
+            string what = screen ? "see your screen, control your mouse and keyboard, run commands and read or change files" : "run commands and read or change files";
             string rights = administrator
-                ? "This client is running as Administrator. Allow remote support to see your screen, control your mouse and keyboard, run commands and read or change files with administrator rights?\n\nSupport can change system settings and files for all users."
-                : "Allow remote support to see your screen, control your mouse and keyboard, run commands and read or change files as your signed-in user?";
+                ? "This client is running as Administrator. Allow remote support to " + what + " with administrator rights?\n\nSupport can change system settings and files for all users."
+                : "Allow remote support to " + what + " as your signed-in user?";
+            if (!screen) rights += "\n\nScreen, mouse and keyboard control stay off for this reconnect.";
             return rights + "\n\nA small window stays in the corner of your screen while support is connected. Access ends when you close it, click End session, or after 24 hours. Nothing reconnects after reboot unless separately prepared.";
         }
-        public static bool Confirm(bool administrator, bool resume, Func<string, WF.DialogResult> prompt) {
+        public static bool Confirm(bool administrator, bool resume, Func<string, WF.DialogResult> prompt) { return Confirm(administrator, resume, true, prompt); }
+        public static bool Confirm(bool administrator, bool resume, bool screen, Func<string, WF.DialogResult> prompt) {
             // A prepared reconnect never grants administrator access silently.
-            return (resume && !administrator) || prompt(ConsentMessage(administrator)) == WF.DialogResult.Yes;
+            return (resume && !administrator) || prompt(ConsentMessage(administrator, screen)) == WF.DialogResult.Yes;
         }
     }
 
@@ -215,14 +220,21 @@ namespace SupportMcp {
         }
     }
 
-    // GetLastInputInfo covers the customer's input and the app's own. This tells the two apart by the
-    // tick of the app's last injected input, so the pause still works when Windows has dropped a hook.
+    // GetLastInputInfo covers the customer's input and the app's own. This tells the two apart by the tick of the
+    // app's last injected input, so the pause still works when Windows has dropped a hook. The tick has the
+    // resolution of the system clock (about 15.6 ms), so on its own it can miss a key pressed in the same tick as the
+    // app's last event; Screen also watches the keys and buttons that are held down.
     public static class InputIdle {
-        public const int SlackMs = 50;
+        // SendInput updates the last-input time before it returns (300 of 300 on Windows 11), so no slack is needed on
+        // that system. A little stays in case an older Windows updates it a moment later; it is far below the 20 ms gap.
+        public const int SlackMs = 10;
         // Milliseconds since the customer last used the mouse or keyboard, or -1 when the last input was the app's own.
         public static long CustomerAgoMs(uint lastInputTick, uint nowTick, uint lastInjectedTick, bool injected) {
             if (injected && unchecked((int)(lastInputTick - lastInjectedTick)) <= SlackMs) return -1;
-            return Math.Max(0, unchecked((int)(nowTick - lastInputTick)));
+            // Unsigned: a PC idle for more than 24.8 days still reads as idle. A time a moment ahead of now (the clock
+            // was read just before the input) reads as "just now".
+            uint ago = unchecked(nowTick - lastInputTick);
+            return ago > uint.MaxValue - 1000 ? 0 : ago;
         }
         // Milliseconds left of the pause window for that age, 0 when there is none.
         public static long RemainingMs(long agoMs) { return agoMs < 0 ? 0 : Math.Max(0, PauseClock.WindowMs - agoMs); }
@@ -334,6 +346,7 @@ namespace SupportMcp {
         [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint code, uint type);
         [StructLayout(LayoutKind.Sequential)] public struct LastInput { public uint Size, Time; }
         [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LastInput info);
+        [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vk);
         [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr window, out Rc rect);
         [DllImport("winmm.dll")] public static extern uint timeBeginPeriod(uint ms);
         [DllImport("winmm.dll")] public static extern uint timeEndPeriod(uint ms);
@@ -405,19 +418,48 @@ namespace SupportMcp {
         volatile List<AutomationElement> refs = new List<AutomationElement>();
         volatile int treeDisplay; // the display the last ui_tree read; ui_act's screenshot comes from it
         static int injectedTick; static volatile bool injectedAny; // the app's own last injected input, for GetLastInputInfo
-        public void Start() { Watch.Start(); }
+        public void Start() { Watch.Start(); if (!Watch.Ok) ProveFallback(); }
         public void Dispose() { Watch.Dispose(); }
         public bool Paused { get { return PausedForMs > 0; } }
-        // The pause comes from two sources. The low-level hooks see only physical input, but Windows removes a hook
-        // that times out, without telling the app. GetLastInputInfo cannot be dropped; it also counts the app's own
-        // input, so it is compared with the tick of the app's last injection and only a later input counts.
+        // The pause comes from three sources. The low-level hooks see only physical input, but Windows removes a hook
+        // that times out, without telling the app. So there are two that cannot be dropped. GetLastInputInfo also
+        // counts the app's own input, so it is compared with the tick of the app's last injection (Send records it
+        // from the same call), and a later input counts. That tick is only as fine as the system clock, so a key
+        // pressed in the same tick as the app's last event shows only in the third source: a key or mouse button that
+        // is down right now. The app's own key events go down and up inside one SendInput call, so between its calls
+        // nothing of its own is down.
         public long PausedForMs {
             get {
                 var info = new Win.LastInput { Size = (uint)Marshal.SizeOf(typeof(Win.LastInput)) };
                 long external = Win.GetLastInputInfo(ref info)
                     ? InputIdle.RemainingMs(InputIdle.CustomerAgoMs(info.Time, unchecked((uint)Environment.TickCount), unchecked((uint)Thread.VolatileRead(ref injectedTick)), injectedAny)) : 0;
+                if (AnyInputDown()) Watch.Clock.Touch(PauseClock.Now());
                 return Math.Max(external, Watch.Clock.RemainingMs(PauseClock.Now()));
             }
+        }
+        static int holding; // above 0 while the app itself keeps a key or mouse button down (Press, Drag)
+        static bool AnyInputDown() {
+            if (Thread.VolatileRead(ref holding) > 0) return false;
+            for (int vk = 1; vk < 255; vk++) if ((Win.GetAsyncKeyState(vk) & 0x8000) != 0) return true;
+            return false;
+        }
+        // After the app's own input: the time Windows gave it. Any input later than this is the customer's.
+        static void RecordInjection() {
+            int now = Environment.TickCount, stamp = now;
+            var info = new Win.LastInput { Size = (uint)Marshal.SizeOf(typeof(Win.LastInput)) };
+            if (Win.GetLastInputInfo(ref info) && unchecked((int)(info.Time - (uint)now)) > 0) stamp = unchecked((int)info.Time);
+            Interlocked.Exchange(ref injectedTick, stamp); injectedAny = true;
+        }
+        // When the hooks did not install, the two other sources are the only guard. Prove first that this session's
+        // last-input time follows the app's own input: send one harmless key (F24) and read the time back.
+        volatile bool fallbackProven;
+        internal bool ProveFallback() {
+            try {
+                Send(KeyEvent(0x87, 0, 0), KeyEvent(0x87, 0, 2));
+                var info = new Win.LastInput { Size = (uint)Marshal.SizeOf(typeof(Win.LastInput)) };
+                bool ok = Win.GetLastInputInfo(ref info) && Math.Abs(unchecked((int)(info.Time - (uint)Environment.TickCount))) <= 100;
+                fallbackProven = ok; return ok;
+            } catch (ScreenError) { return false; }
         }
 
         // Physical pixels on every display: per-monitor aware for this thread on Windows 10 1607+,
@@ -463,6 +505,8 @@ namespace SupportMcp {
             var v = new View { Phys = list[i], Index = i, Count = list.Count }; ScreenMath.Fit(v.Phys.Width, v.Phys.Height, out v.W, out v.H); return v;
         }
         static View GetView(Dictionary<string, object> a) { return GetView((int)Wire.Number(a, "display")); }
+        // The display of the last ui_tree, or the primary one when displays changed since: the ref may still be good.
+        static View GetViewOrPrimary(int i) { return GetView(i >= 0 && i < Monitors().Count ? i : 0); }
         // ui_tree reads the foreground window, so it uses the display that holds the center of that window.
         static View ForegroundView() {
             IntPtr fg = Win.GetForegroundWindow();
@@ -512,7 +556,10 @@ namespace SupportMcp {
                     throw new ScreenError("that window runs as administrator; this app cannot control it");
             } finally { if (token != IntPtr.Zero) Win.CloseHandle(token); Win.CloseHandle(process); }
         }
-        void Free() { if (Paused) throw new ScreenError(PauseText); }
+        void Free() {
+            if (!Watch.Ok && !fallbackProven) throw new ScreenError("cannot watch for customer input");
+            if (Paused) throw new ScreenError(PauseText);
+        }
         // Between the steps of a longer input: stop when support access has ended, and give way to the customer.
         void Between(WaitHandle stop) {
             if (stop.WaitOne(0)) throw new ScreenError("support access ended");
@@ -531,7 +578,7 @@ namespace SupportMcp {
         }
         static void Send(params Win.In[] inputs) {
             uint sent = Win.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Win.In)));
-            Interlocked.Exchange(ref injectedTick, Environment.TickCount); injectedAny = true;
+            RecordInjection();
             if (sent != inputs.Length) throw new ScreenError("Windows refused the input");
         }
         static Win.In MouseEvent(int dx, int dy, int data, uint flags) {
@@ -551,7 +598,8 @@ namespace SupportMcp {
                 ushort scan = (ushort)Win.MapVirtualKey((uint)vk, 0); uint ext = KeySpec.IsExtended(vk) ? 1u : 0u;
                 down.Add(KeyEvent(vk, scan, ext)); up.Insert(0, KeyEvent(vk, scan, ext | 2u));
             }
-            Send(down.ToArray()); Thread.Sleep(30); Send(up.ToArray());
+            Interlocked.Increment(ref holding);
+            try { Send(down.ToArray()); Thread.Sleep(30); Send(up.ToArray()); } finally { Interlocked.Decrement(ref holding); }
         }
         // One real key press, down and up in a single call.
         static void Tap(int vk) {
@@ -569,23 +617,28 @@ namespace SupportMcp {
         // So this raises the timer itself and waits TypeGapMs between characters. Typing 5000 characters takes
         // about 100 s.
         internal void TypeText(string text, WaitHandle stop, bool secret) {
-            int sent = 0; IntPtr seen = IntPtr.Zero; var gap = new Stopwatch();
+            int sent = 0, total = 0; IntPtr seen = IntPtr.Zero; var gap = new Stopwatch(); bool afterHigh = false;
+            foreach (char c in text) if (c != '\r') total++;
             Win.timeBeginPeriod(1);
             try {
                 foreach (char c in text) {
                     if (c == '\r') continue;
+                    // The two halves of a surrogate pair go out as one character: nothing is checked between them.
+                    bool secondHalf = afterHigh && char.IsLowSurrogate(c);
                     try {
-                        Between(stop); KeyTarget(ref seen);
+                        // Wait out the gap, watching the customer and the stop flag all the time, then check once more
+                        // right before the event. A check before the gap would be 20 ms old by the time it is sent.
                         // Thread.Sleep(1), not WaitOne(1): with the timer at 1 ms the sleep takes about 2 ms, but a 1 ms wait on a handle still takes about 15 ms.
-                        while (gap.IsRunning && gap.ElapsedMilliseconds < TypeGapMs) { Wait(stop, 0); Thread.Sleep(1); }
+                        while (gap.IsRunning && gap.ElapsedMilliseconds < TypeGapMs) { if (!secondHalf) Between(stop); Thread.Sleep(1); }
+                        if (!secondHalf) { Between(stop); KeyTarget(ref seen); }
                         if (c == '\n') Tap(0x0D); else if (c == '\t') Tap(0x09);
                         else Send(KeyEvent(0, c, 4), KeyEvent(0, c, 6));
                     } catch (ScreenError e) {
                         // A secret's error carries no count, and the relay drops its text anyway.
                         if (secret || sent == 0) throw;
-                        throw new ScreenError(e.Message + " (typed " + sent + " of " + text.Length + " characters)");
+                        throw new ScreenError(e.Message + " (typed " + sent + " of " + total + " characters)");
                     }
-                    gap.Reset(); gap.Start(); sent++;
+                    gap.Reset(); gap.Start(); sent++; afterHigh = char.IsHighSurrogate(c);
                 }
             } finally { Win.timeEndPeriod(1); }
         }
@@ -605,11 +658,13 @@ namespace SupportMcp {
         void Drag(View v, int x1, int y1, int x2, int y2, WaitHandle stop) {
             v.Check(x1, y1); v.Check(x2, y2); int ax = v.PhysX(x1), ay = v.PhysY(y1), bx = v.PhysX(x2), by = v.PhysY(y2);
             Target(ax, ay); Target(bx, by);
-            MoveTo(ax, ay); Wait(stop, 50); Send(MouseEvent(0, 0, 0, 2));
+            MoveTo(ax, ay); Wait(stop, 50);
+            Interlocked.Increment(ref holding);
             try {
+                Send(MouseEvent(0, 0, 0, 2));
                 for (int i = 1; i <= 10; i++) { Wait(stop, 20); Between(stop); MoveTo(ax + (bx - ax) * i / 10, ay + (by - ay) * i / 10); }
                 Wait(stop, 50);
-            } finally { Send(MouseEvent(0, 0, 0, 4)); }
+            } finally { try { Send(MouseEvent(0, 0, 0, 4)); } finally { Interlocked.Decrement(ref holding); } }
         }
 
         // Input actions: refuse during a customer pause, in the support window and in elevated windows.
@@ -722,7 +777,7 @@ namespace SupportMcp {
                 if (name == "wait") stop.WaitOne((int)(Seconds(a) * 1000));
                 else if (desktop != "default") throw new ScreenError("cannot reach the screen; Windows may be locked or showing a security prompt");
                 // ui_tree reads the display of the foreground window and ui_act answers with the display of its ui_tree, so refs and pixels agree.
-                View v = name == "wait" && !Wire.Flag(a, "screenshot") ? null : name == "ui_tree" ? ForegroundView() : name == "ui_act" ? GetView(treeDisplay) : GetView(a);
+                View v = name == "wait" && !Wire.Flag(a, "screenshot") ? null : name == "ui_tree" ? ForegroundView() : name == "ui_act" ? GetViewOrPrimary(treeDisplay) : GetView(a);
                 bool input = name == "click" || name == "move" || name == "drag" || name == "scroll" || name == "type" || name == "type_secret" || name == "key" || name == "ui_act";
                 if (name == "screenshot" || (name == "wait" && v != null)) Merge(r, Shot(v.Phys));
                 else if (name == "zoom") {
@@ -939,8 +994,12 @@ namespace SupportMcp {
                 }
                 try { return Wire.Text(Send(lane.Result, false, false), "type"); }
                 catch (WebException) {
-                    if (rejected < 400 || rejected > 499) throw;
-                    if (lane.Rejected) return "ack"; // the relay refused the plain error too: drop it and carry on
+                    // Only 400 (invalid result) and 413 (too large) say the result itself is bad. Anything else, 408 or 429
+                    // for example, is a failure of the moment and takes the normal retry path.
+                    if (rejected != 400 && rejected != 413) throw;
+                    // The relay refused the plain error too. It always validates, so this is not expected. Drop it and
+                    // carry on: the operator's call then ends with the relay's own timeout instead of hanging for ever.
+                    if (lane.Rejected) return "ack";
                     RejectResult(lane);
                 }
             }
@@ -1625,7 +1684,7 @@ namespace SupportMcp {
                     bool approvedAdministratorResume = resume && !preparing && administrator && RestartResume.HasAdministratorConsent(config);
                     // Read before Disarm clears it. A normal start and the prepare prompt show the screen control text themselves.
                     bool screenAllowed = !resume || preparing || RestartResume.HasScreenConsent(config);
-                    if (!approvedAdministratorResume && !SupportAccess.Confirm(administrator, resume && !preparing, delegate(string message) {
+                    if (!approvedAdministratorResume && !SupportAccess.Confirm(administrator, resume && !preparing, screenAllowed, delegate(string message) {
                         if (preparing) message += "\n\nAlso allow ONE automatic reconnect at the next Windows sign-in with these same rights, without another prompt? It keeps this session's original expiry. End session cancels it.";
                         return ConsentDialog.Ask(message, administrator) ? WF.DialogResult.Yes : WF.DialogResult.No;
                     })) return;

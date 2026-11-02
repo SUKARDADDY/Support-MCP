@@ -224,6 +224,21 @@ test('a frame sent into a poll the app aborted goes out when the guard ends, not
   await f.end();
 });
 
+test('the relay waits 35 ms per typed character on top of the base wait', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_800_000_000_000 });
+  const f = await attach();
+  let out = null;
+  const p = f.op(screen('type', { text: 'a'.repeat(1000) })).then((r) => { out = r; });
+  await until(() => f.session.httpCommands.screen);
+  const base = 30000 + 15000 + 1000 * 35;
+  t.mock.timers.tick(base - 1);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(out, null, 'still waiting just before the budget');
+  t.mock.timers.tick(1);
+  await p;
+  assert.deepEqual([out.ok, out.error], [false, 'timeout waiting for agent']);
+});
+
 test('an old client keeps one lane and the busy flag, gets lane cmd on its frames, and cannot do screen work', async () => {
   const f = await attach({ caps: undefined, control: undefined, agent: 'windows-app-1' });
   const tooOld = 'this support app is too old for screen control';

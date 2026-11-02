@@ -198,10 +198,14 @@ public static class AppTests {
         // The pause survives a dropped hook: GetLastInputInfo counts, minus the app's own injected input.
         Assert(InputIdle.CustomerAgoMs(10000, 10500, 0, false) == 500 && InputIdle.RemainingMs(500) == 2500, "Input with no injection by the app is the customer's");
         Assert(InputIdle.CustomerAgoMs(10000, 10500, 10000, true) == -1 && InputIdle.CustomerAgoMs(10000, 10500, 10020, true) == -1 && InputIdle.RemainingMs(-1) == 0, "Input at the app's own injection tick is not the customer's");
-        Assert(InputIdle.CustomerAgoMs(10100, 10500, 10000, true) == 400 && InputIdle.CustomerAgoMs(10051, 10500, 10000, true) == 449, "A later input after the app's injection is the customer's");
-        Assert(InputIdle.CustomerAgoMs(10040, 10500, 10000, true) == -1 && InputIdle.CustomerAgoMs(10050, 10500, 10000, true) == -1, "The slack covers the tick resolution");
+        Assert(InputIdle.CustomerAgoMs(10100, 10500, 10000, true) == 400 && InputIdle.CustomerAgoMs(10011, 10500, 10000, true) == 489, "A later input after the app's injection is the customer's");
+        Assert(InputIdle.CustomerAgoMs(10010, 10500, 10000, true) == -1 && InputIdle.SlackMs < 20, "The slack stays below the 20 ms typing gap");
+        Assert(InputIdle.CustomerAgoMs(16, 32, 0, true) == 16, "One clock tick after the app's last event is the customer's, as it is for a key pressed during the typing gap");
         Assert(InputIdle.RemainingMs(3000) == 0 && InputIdle.RemainingMs(2999) == 1 && InputIdle.RemainingMs(0) == 3000, "Three seconds from the customer's input");
         Assert(InputIdle.CustomerAgoMs(4294967000u, 200u, 0, false) == 496 && InputIdle.CustomerAgoMs(4294967000u, 200u, 4294966900u, true) == 496 && InputIdle.CustomerAgoMs(4294967200u, 200u, 4294967290u, true) == -1, "The tick counter wraps");
+        long month = 30L * 86400000; uint monthAgo = unchecked((uint)(5000 + month));
+        Assert(InputIdle.CustomerAgoMs(5000, monthAgo, 0, false) == month && InputIdle.RemainingMs(month) == 0, "A PC idle for 30 days is idle, not paused");
+        Assert(InputIdle.CustomerAgoMs(10005, 10000, 0, false) == 0 && InputIdle.RemainingMs(0) == 3000, "An input a moment ahead of the clock reads as just now");
         Console.WriteLine("PASS pause cross-check against GetLastInputInfo");
     }
     static string Hex(string b64) { return Convert.ToBase64String(Convert.FromBase64String(b64), 0, 2); }
@@ -227,6 +231,20 @@ public static class AppTests {
             }
         }
         Console.WriteLine("PASS a result the relay refuses is replaced by an error once, and the client carries on");
+        // Any other 4xx is a failure of the moment: the same result is sent again, not replaced.
+        foreach (int code in new int[] { 408, 429 }) {
+            using (var relay = new FakeRelay()) {
+                relay.Lifetime = 300000; relay.Start();
+                relay.RejectOk = code;
+                string id = relay.Queue(Run("[Console]::Write('kept')", 20));
+                for (int i = 0; i < 100 && !relay.ResultCounts.ContainsKey(id); i++) Thread.Sleep(50);
+                Assert(relay.ResultCounts.ContainsKey(id), "The result was sent");
+                relay.RejectOk = 0;
+                var r = relay.WaitResult(id, 20);
+                Assert(Wire.Flag(r, "ok") && Decode(r, "stdout_b64") == "kept" && relay.ResultCounts[id] >= 2, "A " + code + " takes the retry path and the real result gets through: " + Wire.Text(r, "error"));
+            }
+        }
+        Console.WriteLine("PASS only 400 and 413 replace a result");
         // Run as: only the signed-in user in normal mode.
         using (var relay = new FakeRelay()) {
             relay.Lifetime = 300000; relay.Start();
@@ -387,6 +405,13 @@ public static class AppTests {
                         Assert(prompts == (preconsented ? 0 : 1), "Administrator startup and reconnect must always prompt");
                     }
                 }
+            }
+            foreach (bool administrator in new bool[] { false, true }) {
+                string without = SupportAccess.ConsentMessage(administrator, false);
+                Assert(!without.Contains("see your screen") && without.Contains("run commands") && without.Contains("stay off") && without.Contains("with administrator rights?") == administrator, "A reconnect without screen consent must not promise it: " + without);
+                Assert(SupportAccess.ConsentMessage(administrator) == SupportAccess.ConsentMessage(administrator, true), "The default consent names screen control");
+                string shown = null; SupportAccess.Confirm(administrator, true, false, delegate(string message) { shown = message; return DialogResult.No; });
+                Assert(administrator ? shown == without : shown == null, "The prompt for a reconnect without screen consent says so");
             }
             Console.WriteLine("PASS consent accepts only Yes, describes actual rights, and never silently grants administrator reconnect");
             using (var relay = new FakeRelay()) {
