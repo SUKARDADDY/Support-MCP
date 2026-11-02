@@ -7,6 +7,8 @@ using System.Net;
 using System.Diagnostics;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -302,6 +304,175 @@ public static class AppTests {
         } finally { RestartResume.Disarm(resume); }
         Console.WriteLine("PASS a prepared reconnect carries screen consent only when the prompt recorded it");
     }
+    // The service side of a Client in full control, without a service: screen frames are answered here, and
+    // as: "user" runs with a copy of this process's own token, the way the service runs with the console user's.
+    sealed class FakeFull : IFullControl {
+        [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+        [DllImport("advapi32.dll", SetLastError = true)] static extern bool DuplicateTokenEx(IntPtr token, uint access, IntPtr attributes, int level, int type, out IntPtr result);
+        [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+        public bool SignedIn = true; public long WelcomedAt; public int Screens;
+        public string UserName { get { return "tester"; } }
+        public Dictionary<string, object> ScreenOp(Dictionary<string, object> frame, WaitHandle stop) { Screens++; return Wire.Map("ok", true, "desktop", "secure"); }
+        public IntPtr UserToken(out string profile) {
+            if (!SignedIn) throw new ArgumentException(TokenChoice.NobodySignedIn);
+            IntPtr own, dup;
+            if (!OpenProcessToken(GetCurrentProcess(), 0x02000000, out own)) throw new Exception("OpenProcessToken");
+            try { if (!DuplicateTokenEx(own, 0x02000000, IntPtr.Zero, 2, 1, out dup)) throw new Exception("DuplicateTokenEx"); } finally { CloseHandle(own); }
+            profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile); return dup;
+        }
+        public void Report(Dictionary<string, object> poll, long serverOffsetMs) { poll["desktop"] = "secure"; poll["input_blocked_until"] = Client.UnixNow() + 60000; }
+        public void Welcomed(long expiresAtMs) { WelcomedAt = expiresAtMs; }
+    }
+
+    static void FullControlTests(string dir) {
+        Assert(ConsentPath.Decide(true, 2, 1, 5) == Consent.Confirm && ConsentPath.Decide(true, 1, 0, -1) == Consent.Confirm, "An elevated app (or UAC off for an administrator) gets no UAC prompt, so it asks itself");
+        Assert(ConsentPath.Decide(false, 3, 1, 0) == Consent.Confirm && ConsentPath.Decide(false, 3, -1, 0) == Consent.Confirm, "An administrator who elevates without a prompt is asked by the app");
+        Assert(ConsentPath.Decide(false, 1, 0, -1) == Consent.Unavailable && ConsentPath.Decide(false, 1, 0, 0) == Consent.Unavailable, "UAC off and a standard user: full control is impossible");
+        Assert(ConsentPath.Decide(false, 3, 1, 5) == Consent.Prompt && ConsentPath.Decide(false, 3, -1, -1) == Consent.Prompt && ConsentPath.Decide(false, 3, 1, 2) == Consent.Prompt, "An administrator with UAC gets the UAC prompt");
+        Assert(ConsentPath.Decide(false, 1, 1, 0) == Consent.Prompt && ConsentPath.Decide(false, 1, -1, 5) == Consent.Prompt, "A standard user gets the UAC credential prompt (ConsentPromptBehaviorAdmin does not apply)");
+        Assert(SupportAccess.LimitedHeading + " " + SupportAccess.LimitedText == "Continue with limited support? Support can see your screen and control your mouse and keyboard, but not Windows security prompts.", "Fallback text");
+        Assert(SupportAccess.FullHeading + " " + SupportAccess.FullText == "Give support full control of this PC? Support can see your screen, control your mouse and keyboard, work through Windows security prompts and the sign-in screen, and keep working after a restart. Access ends when you click End session, or after 24 hours, and everything is removed.", "Full control text");
+        Assert(SupportAccess.Asking == "Windows will ask for permission to give support full control.", "Notice before UAC");
+        Console.WriteLine("PASS full-control consent: the UAC prompt, the app's own confirm, or unavailable, and the texts");
+
+        // ACLs: the service folder is SYSTEM and Administrators only, with nothing inherited.
+        var folder = FullAcl.Folder(); var rules = folder.GetAccessRules(true, true, typeof(SecurityIdentifier));
+        Assert(folder.AreAccessRulesProtected && rules.Count == 2, "Folder ACL: protected, two rules, got " + rules.Count);
+        foreach (FileSystemAccessRule r in rules)
+            Assert((r.IdentityReference.Equals(FullAcl.SystemSid) || r.IdentityReference.Equals(FullAcl.AdminsSid)) && r.FileSystemRights == FileSystemRights.FullControl && r.AccessControlType == AccessControlType.Allow
+                && r.InheritanceFlags == (InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit) && !r.IsInherited, "Folder rule " + r.IdentityReference);
+        var window = FullAcl.Window(); var wrules = window.GetAccessRules(true, true, typeof(SecurityIdentifier)); int users = 0;
+        Assert(window.AreAccessRulesProtected && wrules.Count == 3, "Window ACL: protected, three rules");
+        foreach (FileSystemAccessRule r in wrules) {
+            if (!r.IdentityReference.Equals(FullAcl.UsersSid)) { Assert(r.FileSystemRights == FileSystemRights.FullControl, "SYSTEM and Administrators own window.exe"); continue; }
+            users++; Assert((r.FileSystemRights & FileSystemRights.ReadAndExecute) == FileSystemRights.ReadAndExecute && (r.FileSystemRights & (FileSystemRights.Write | FileSystemRights.Delete | FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership)) == 0, "Users may only read and run window.exe");
+        }
+        Assert(users == 1, "Users read window.exe");
+        var me = WindowsIdentity.GetCurrent().User; var script = FullAcl.Script(me);
+        foreach (FileSystemAccessRule r in script.GetAccessRules(true, true, typeof(SecurityIdentifier))) if (r.IdentityReference.Equals(me)) Assert((r.FileSystemRights & (FileSystemRights.Write | FileSystemRights.Delete)) == 0, "The user may read a command script, not change it");
+        // On disk, as icacls shows it.
+        string aclDir = Path.Combine(dir, "acl-folder"); Directory.CreateDirectory(aclDir, FullAcl.Folder());
+        try {
+            var icacls = Process.Start(new ProcessStartInfo("icacls.exe", "\"" + aclDir + "\"") { UseShellExecute = false, RedirectStandardOutput = true, CreateNoWindow = true });
+            string shown = icacls.StandardOutput.ReadToEnd(); icacls.WaitForExit();
+            string sys = FullAcl.SystemSid.Translate(typeof(NTAccount)).Value, admins = FullAcl.AdminsSid.Translate(typeof(NTAccount)).Value;
+            int entries = 0; foreach (string line in shown.Split('\n')) if (line.Contains(":(")) entries++;
+            Assert(shown.Contains(sys + ":(OI)(CI)(F)") && shown.Contains(admins + ":(OI)(CI)(F)") && entries == 2, "icacls shows SYSTEM and Administrators with full control, inherited by files and folders, and nobody else:\n" + shown);
+        } finally {
+            var mine = new DirectorySecurity(); mine.AddAccessRule(new FileSystemAccessRule(me, FileSystemRights.FullControl, AccessControlType.Allow));
+            Directory.SetAccessControl(aclDir, mine); Directory.Delete(aclDir);
+        }
+        Console.WriteLine("PASS full-control ACLs: the folder (checked with icacls), window.exe and command scripts");
+
+        // The deadline: saved and loaded, expiry, the 24-hour cap, and the first welcome.
+        long now = Client.UnixNow();
+        var st = new FullState { Deadline = now + 7200000, SasChanged = true, SasOriginal = -1 }; st.Save(dir);
+        var back = FullState.Load(dir);
+        Assert(back != null && back.Deadline == st.Deadline && !back.Welcomed && back.SasChanged && back.SasOriginal == -1, "State round trip");
+        back.Welcomed = true; back.SasOriginal = 2; back.Save(dir); back = FullState.Load(dir);
+        Assert(back.Welcomed && back.SasOriginal == 2 && !File.Exists(FullState.PathIn(dir) + ".new"), "State is replaced in place");
+        File.WriteAllText(FullState.PathIn(dir), "{not json"); Assert(FullState.Load(dir) == null, "A damaged state is treated as over");
+        File.WriteAllText(FullState.PathIn(dir), "{\"deadline\":\"soon\"}"); Assert(FullState.Load(dir) == null, "A state of the wrong type is treated as over");
+        File.Delete(FullState.PathIn(dir)); Assert(FullState.Load(dir) == null, "A missing state is treated as over");
+        Assert(!FullState.Expired(now + 1, now) && FullState.Expired(now, now) && FullState.Expired(now - 1, now), "Expired at the deadline");
+        Assert(FullState.Clamp(now + 3 * FullState.DayMs, now) == now + FullState.DayMs && FullState.Clamp(now + 5000, now) == now + 5000, "Never more than 24 hours");
+        Assert(FullState.OnWelcome(now + 7200000, false, now + 86000000, now) == now + 86000000, "The first welcome moves connect_by to the session's expiry");
+        Assert(FullState.OnWelcome(now + 50000000, true, now + 86000000, now) == now + 50000000 && FullState.OnWelcome(now + 50000000, true, now + 1000, now) == now + 1000, "A later welcome never extends the deadline, only brings it closer");
+        Assert(FullState.OnWelcome(now + 7200000, false, now + 5 * FullState.DayMs, now) == now + FullState.DayMs, "A relay expiry beyond 24 hours is capped");
+        Assert(FullInstall.SasNeeded(-1) && FullInstall.SasNeeded(0) && FullInstall.SasNeeded(2) && !FullInstall.SasNeeded(1) && !FullInstall.SasNeeded(3), "SoftwareSASGeneration changes only when services may not send SAS");
+        Assert(FullInstall.SasWanted(-1) == 1 && FullInstall.SasWanted(0) == 1 && FullInstall.SasWanted(2) == 3, "Ease of access apps keep their right");
+        Console.WriteLine("PASS full-control state: persistence, expiry, the 24-hour cap and the first welcome");
+
+        // The backstop never runs agent.exe, restores the registry exactly, and deletes itself last.
+        string f = @"C:\ProgramData\SupportMCP\abcd1234", parent = @"C:\ProgramData\SupportMCP";
+        string absent = Backstop.Script("abcd1234", f, parent, new FullState { SasChanged = true, SasOriginal = -1 });
+        string two = Backstop.Script("abcd1234", f, parent, new FullState { SasChanged = true, SasOriginal = 2 });
+        string kept = Backstop.Script("abcd1234", f, parent, new FullState { SasChanged = false, SasOriginal = 1 });
+        string key = "\"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\"";
+        Assert(absent.Contains("reg delete " + key + " /v SoftwareSASGeneration /f") && two.Contains("reg add " + key + " /v SoftwareSASGeneration /t REG_DWORD /d 2 /f") && !kept.Contains("reg "), "The registry value is deleted, put back, or left alone");
+        foreach (string s in new string[] { absent, two, kept }) {
+            int stop = s.IndexOf("sc stop \"SupportMcp-abcd1234\""), del = s.IndexOf("sc delete \"SupportMcp-abcd1234\""), rd = s.IndexOf("rd /s /q \"" + f + "\""), task = s.IndexOf("schtasks /delete /tn \"SupportMcp-abcd1234\" /f");
+            Assert(stop == 0 && del > stop && rd > del && task > rd && s.EndsWith("schtasks /delete /tn \"SupportMcp-abcd1234\" /f") && !s.Contains("agent.exe") && !s.Contains("window.exe") && s.Contains("taskkill /f /fi \"SERVICES eq SupportMcp-abcd1234\""), "Backstop order: stop, delete the service, remove the folder, then the task itself: " + s);
+            Assert(s.IndexOf('%') == s.IndexOf("%i") && s.IndexOf("%i") == s.LastIndexOf("%i"), "One %i and no other %, so Task Scheduler expands nothing");
+        }
+        string xml = Backstop.Xml(@"C:\Windows\System32\cmd.exe", "/c " + absent, (long)(new DateTime(2026, 11, 3, 12, 0, 0, DateTimeKind.Utc) - new DateTime(1970, 1, 1)).TotalMilliseconds + 500);
+        Assert(xml.Contains("<StartBoundary>2026-11-03T12:00:01Z</StartBoundary>") && xml.Contains("<UserId>S-1-5-18</UserId>") && xml.Contains("<StartWhenAvailable>true</StartWhenAvailable>") && xml.Contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"), "Task at the deadline in UTC, rounded up, as SYSTEM, and run late if the PC was off");
+        Assert(xml.Contains("<Command>C:\\Windows\\System32\\cmd.exe</Command>") && xml.Contains("<Arguments>" + System.Security.SecurityElement.Escape("/c " + absent) + "</Arguments>") && !xml.Contains(" & ") && xml.Contains("&amp;") && xml.Contains("&quot;"), "The command line is escaped for XML");
+        Assert(Backstop.RemoveFolder(f, parent).StartsWith("(for /l %i in (1,1,20) do @(if exist \"" + f + "\"") && Backstop.RemoveFolder(f, parent).EndsWith("rd \"" + parent + "\" 2>nul"), "The folder is removed with retries, then the parent only when empty");
+        Console.WriteLine("PASS backstop task: the command line, its order and the task XML");
+
+        // run in full control: the token choice and the as: field.
+        Assert(TokenChoice.Pick(true, false, 0) == RunAs.System && TokenChoice.Pick(true, true, 3) == RunAs.System, "as: system runs as SYSTEM, signed in or not");
+        Assert(TokenChoice.Pick(false, false, 0) == RunAs.Nobody && TokenChoice.NobodySignedIn == "nobody is signed in; use as: \"system\"", "as: user with nobody signed in is an error");
+        Assert(TokenChoice.Pick(false, true, 3) == RunAs.ElevatedUser && TokenChoice.Pick(false, true, 1) == RunAs.User && TokenChoice.Pick(false, true, 2) == RunAs.User, "An administrator's filtered token is swapped for its elevated linked token; other tokens run as they are");
+        var full = new FakeFull();
+        using (var relay = new FakeRelay()) {
+            relay.Agent.Full = full; relay.Lifetime = 300000; relay.Start();
+            var caps = (System.Collections.ArrayList)relay.Hello["caps"];
+            Assert(Wire.Text(relay.Hello, "control") == "full" && caps.Contains("full") && caps.Contains("screen") && Wire.Text(relay.Hello, "user") == "tester" && Wire.Flag(relay.Hello, "elevated"), "The service's hello says control full");
+            for (int i = 0; i < 100 && full.WelcomedAt == 0; i++) Thread.Sleep(20);
+            Assert(Math.Abs(full.WelcomedAt - (Client.UnixNow() + 300000)) < 5000, "The welcome's expiry reaches the service");
+            for (int i = 0; i < 100 && (relay.LastPoll == null || Wire.Text(relay.LastPoll, "desktop") != "secure"); i++) Thread.Sleep(50);
+            Assert(Wire.Text(relay.LastPoll, "desktop") == "secure" && Wire.Number(relay.LastPoll, "input_blocked_until") > 0, "Polls carry the service's report");
+            var shot = relay.Call(Act("screenshot")); Assert(Wire.Flag(shot, "ok") && Wire.Text(shot, "desktop") == "secure" && full.Screens == 1, "Screen frames go to the service");
+            var sys = Run("[Console]::Write([Security.Principal.WindowsIdentity]::GetCurrent().Name)", 30); sys["as"] = "system";
+            var r = relay.Call(sys); Assert(Wire.Flag(r, "ok") && Decode(r, "stdout_b64") == WindowsIdentity.GetCurrent().Name, "as: system runs with the service's own token: " + Wire.Text(r, "error"));
+            var user = Run("[Console]::Write([Security.Principal.WindowsIdentity]::GetCurrent().Name + '|' + (Get-Location).Path)", 30); user["as"] = "user";
+            r = relay.Call(user); Assert(Wire.Flag(r, "ok") && Decode(r, "stdout_b64") == WindowsIdentity.GetCurrent().Name + "|" + Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "as: user runs with the given token in its profile folder: " + Wire.Text(r, "error") + Decode(r, "stderr_b64"));
+            full.SignedIn = false;
+            r = relay.Call(user); Assert(!Wire.Flag(r, "ok") && Wire.Text(r, "error") == TokenChoice.NobodySignedIn, "as: user with nobody signed in: " + Wire.Text(r, "error"));
+            var bad = Run("1", 10); bad["as"] = "root"; r = relay.Call(bad); Assert(Wire.Text(r, "error") == "as must be user or system", "Only user and system");
+        }
+        Console.WriteLine("PASS full-control client: hello, welcome, poll report, screen frames, and run as system, as user and with nobody signed in");
+
+        // Block timer: the time limit, the operator's off, and Ctrl+Alt+Del.
+        var block = new BlockTimer(); block.Arm(1000, 99);
+        Assert(block.RemainingMs(1000) == 600000 && block.On(600999) && !block.On(601000), "At most 10 minutes");
+        block.Arm(1000, 0); Assert(block.RemainingMs(1000) == 60000, "At least 1 minute");
+        block.Arm(1000, 2); Assert(block.Check(5000, true, true) && block.Check(120999, true, true) && !block.Check(121000, true, true) && !block.Escaped && !block.On(121000), "It lifts by itself when the time is up");
+        block.Arm(1000, 2); Assert(!block.Check(5000, false, true) && block.Escaped && !block.Check(6000, true, true) && !block.On(6000), "A switch to the secure desktop is Ctrl+Alt+Del: off, and it stays off");
+        block.Arm(1000, 2); Assert(!block.Escaped && !block.Check(5000, true, false) && block.Escaped, "A block Windows already lifted counts as Ctrl+Alt+Del; only on again re-arms it");
+        block.Arm(1000, 2); block.Off(); Assert(!block.Check(5000, true, true) && !block.Escaped, "The operator's off");
+        Console.WriteLine("PASS block_input timer: the 10-minute cap, renewal, Ctrl+Alt+Del and off");
+
+        // Pipe messages are length-prefixed JSON objects within a size limit; a window may only ask for status or end.
+        Func<byte[], Dictionary<string, object>> read = delegate(byte[] raw) { return Pipes.Read(new MemoryStream(raw), 1024); };
+        Func<string, byte[]> frame = delegate(string json) { byte[] b = Encoding.UTF8.GetBytes(json), all = new byte[b.Length + 4]; BitConverter.GetBytes(b.Length).CopyTo(all, 0); b.CopyTo(all, 4); return all; };
+        var ms = new MemoryStream(); Pipes.Write(ms, Wire.Map("type", "status")); ms.Position = 0;
+        Assert(Wire.Text(Pipes.Read(ms, 1024), "type") == "status", "A message round trip");
+        foreach (byte[] raw in new byte[][] { frame("[1,2]"), frame("null"), frame("{\"type\":"), frame("\"text\""), new byte[] { 2, 0, 0, 0, 0x7B }, new byte[] { 0xFF, 0xFF, 0xFF, 0x7F }, new byte[] { 1, 0, 0, 0, 0x7B }, new byte[] { 0, 4, 0, 0 }, new byte[] { 1, 0 } }) {
+            try { read(raw); throw new Exception("accepted a bad message of " + raw.Length + " bytes"); } catch (InvalidDataException) { } catch (EndOfStreamException) { }
+        }
+        Assert(Pipes.UiRequest(read(frame("{\"type\":\"status\"}"))) == "status" && Pipes.UiRequest(read(frame("{\"type\":\"end\"}"))) == "end", "status and end");
+        foreach (string json in new string[] { "{\"type\":\"run\"}", "{\"type\":\"status\",\"x\":1}", "{\"type\":5}", "{}", "{\"Type\":\"end\"}", "{\"type\":[\"end\"]}" })
+            Assert(Pipes.UiRequest(read(frame(json))) == null, "A window may not ask " + json);
+        // The real pipe: a window reads status and ends the session; garbage closes the connection; nobody can take the name first.
+        string sid8 = Guid.NewGuid().ToString("N").Substring(0, 8); int ended = 0;
+        var ui = new UiServer(Backstop.Name(sid8) + "-ui", delegate { return Wire.Map("connected", true, "link", true, "busy", 1, "paused", false, "blocked", true, "expires_at", Client.UnixNow() + 3600000, "ended", ended > 0); }, delegate { Interlocked.Increment(ref ended); });
+        try { Native.PipeServer(Backstop.Name(sid8) + "-ui", "D:P(A;;GA;;;SY)", 4, true); throw new Exception("a second first instance was allowed"); } catch (System.ComponentModel.Win32Exception) { }
+        Assert(ServiceLink.Running(sid8) && !ServiceLink.Running(Guid.NewGuid().ToString("N").Substring(0, 8)), "Running finds the service of this session only");
+        using (var raw = new System.IO.Pipes.NamedPipeClientStream(".", Backstop.Name(sid8) + "-ui", System.IO.Pipes.PipeDirection.InOut)) {
+            raw.Connect(2000); Pipes.Write(raw, Wire.Map("type", "run", "command", "calc"));
+            try { Pipes.Read(raw, 4096); throw new Exception("the service answered a request a window may not make"); } catch (IOException) { }
+            Assert(ended == 0, "A bad request does nothing");
+        }
+        var link = new ServiceLink(sid8); int connected = 0, finished = 0, busyNow = -1;
+        link.Connected += delegate { connected++; }; link.Finished += delegate { finished++; }; link.BusyChanged += delegate(int n) { busyNow = n; };
+        link.Start();
+        for (int i = 0; i < 100 && (connected == 0 || busyNow != 1); i++) Thread.Sleep(50);
+        Assert(connected == 1 && busyNow == 1 && link.Blocked && !link.Paused && link.SurvivesSignOut && Math.Abs((link.ExpiresLocal.ToUniversalTime() - DateTime.UtcNow).TotalMinutes - 60) < 1, "The window reads status");
+        link.Stop(); link.Flush(5000);
+        for (int i = 0; i < 100 && finished == 0; i++) Thread.Sleep(50);
+        Assert(ended >= 1 && finished == 1 && !ServiceLink.Running(sid8), "End session reaches the service, and the window sees the session end");
+        Console.WriteLine("PASS pipes: framing, the window's two requests, the first-instance guard and the window link");
+
+        // The corner window's copy is the exe without the configuration (and its attach key).
+        byte[] cfgBytes = Encoding.UTF8.GetBytes("{\"sid\":\"x\"}"), body = new byte[] { 77, 90, 1, 2, 3 };
+        var withCfg = new MemoryStream(); withCfg.Write(body, 0, body.Length); withCfg.Write(cfgBytes, 0, cfgBytes.Length); withCfg.Write(BitConverter.GetBytes(cfgBytes.Length), 0, 4); byte[] footer = Encoding.ASCII.GetBytes(Wire.Footer); withCfg.Write(footer, 0, footer.Length);
+        Assert(Wire.Payload(withCfg.ToArray()) == body.Length, "window.exe is cut before the configuration");
+        Console.WriteLine("PASS window.exe carries no session configuration");
+    }
     static void LaneTests() {
         using (var relay = new FakeRelay()) {
             relay.Lifetime = 300000; relay.Start();
@@ -316,10 +487,10 @@ public static class AppTests {
             var screen = relay.Call(Act("wait", "seconds", 0.2, "screenshot", false));
             Assert(Wire.Flag(screen, "ok") && timer.ElapsedMilliseconds < 4000 && !relay.HasResult(cmdId), "A screen operation must finish while the command still runs, took " + timer.ElapsedMilliseconds + " ms");
             foreach (string name in new string[] { "block_input", "send_sas" }) {
-                var denied = relay.Call(Act(name)); Assert(!Wire.Flag(denied, "ok") && Wire.Text(denied, "error") == "full control is not available in this build", name + " needs full control");
+                var denied = relay.Call(Act(name)); Assert(!Wire.Flag(denied, "ok") && Wire.Text(denied, "error") == Screen.NoFull, name + " needs full control");
             }
             var control = relay.Call(Wire.Map("type", "control", "lane", "screen", "action", "request_full_control"));
-            Assert(!Wire.Flag(control, "ok") && Wire.Text(control, "error") == "full control is not available in this build", "request_full_control is not available in normal mode");
+            Assert(!Wire.Flag(control, "ok") && Wire.Text(control, "error") == Screen.NoFull, "request_full_control without a handler is refused in normal mode");
             var bad = relay.Call(Act("fly")); Assert(!Wire.Flag(bad, "ok") && Wire.Text(bad, "error") == "unknown screen action", "Unknown action");
             var secretKey = relay.Call(Act("key", "keys", "ctrl+alt+Delete", "screenshot", false)); Assert(!Wire.Flag(secretKey, "ok"), "ctrl+alt+Delete is refused");
             Assert(!relay.HasResult(cmdId), "The command is still running");
@@ -328,6 +499,28 @@ public static class AppTests {
             Assert(relay.WaitBusy(delegate(string[] b) { return b.Length == 0; }, 2000), "A finished lane ends the parked poll at once, so the client is free again within 2 s");
             Console.WriteLine("PASS hello, lanes: a screen operation runs while a command runs, and full-control operations are refused");
         }
+        // A normal-mode app that can elevate says so with the "full" cap, and request_full_control goes to its handler.
+        using (var relay = new FakeRelay()) {
+            relay.Agent.CanElevate = true; int asked = 0;
+            relay.Agent.RequestFull = delegate { asked++; return Wire.Map("ok", false, "error", "the customer declined full control"); };
+            relay.Lifetime = 300000; relay.Start();
+            var caps = (System.Collections.ArrayList)relay.Hello["caps"];
+            Assert(caps.Contains("full") && Wire.Text(relay.Hello, "control") == "normal", "A normal-mode app that can elevate reports the full cap and control normal");
+            var r = relay.Call(Wire.Map("type", "control", "lane", "screen", "action", "request_full_control"));
+            Assert(asked == 1 && !Wire.Flag(r, "ok") && Wire.Text(r, "error") == "the customer declined full control", "request_full_control runs the elevation handler: " + Wire.Text(r, "error"));
+            var more = relay.Call(Run("[Console]::Write('still')", 20));
+            Assert(Wire.Flag(more, "ok") && Decode(more, "stdout_b64") == "still", "A declined request leaves normal mode working");
+        }
+        // A handler that hands the session to the service stops this client without a result or an end.
+        using (var relay = new FakeRelay()) {
+            relay.Agent.CanElevate = true; var agent = relay.Agent;
+            agent.RequestFull = delegate { agent.EndRemote = false; agent.Stop(); return null; };
+            relay.Lifetime = 300000; relay.Start();
+            string id = relay.Queue(Wire.Map("type", "control", "lane", "screen", "action", "request_full_control"));
+            relay.WaitExit(); Thread.Sleep(300);
+            Assert(!relay.HasResult(id) && !relay.End, "A handed-over client sends no result and no end");
+        }
+        Console.WriteLine("PASS request_full_control: the full cap, a declined request, and the silent handover");
     }
     // Needs a Windows desktop session: real capture, input and windows.
     static void LiveScreenTests() {
@@ -538,6 +731,7 @@ public static class AppTests {
             } finally { RestartResume.Disarm(resume); }
             Console.WriteLine("PASS reconnect path/deadline constraints and one-time startup registration/removal");
             ScreenPureTests(dir);
+            FullControlTests(dir);
             ClientRuleTests(dir);
             LaneTests();
             LiveScreenTests();
