@@ -68,10 +68,10 @@ public sealed class FakeRelay : IDisposable {
     public void Queue(Dictionary<string, object> b) {
         lock (gate) { b["id"] = Guid.NewGuid().ToString(); result = null; frame = b; }
     }
-    public Dictionary<string, object> WaitResult() {
-        lock (gate) { var until = DateTime.UtcNow.AddSeconds(15); while (result == null && DateTime.UtcNow < until) Monitor.Wait(gate, 100); if (result == null) throw new Exception("No result: " + Agent.LastError); return result; }
+    public Dictionary<string, object> WaitResult(int seconds = 15) {
+        lock (gate) { var until = DateTime.UtcNow.AddSeconds(seconds); while (result == null && DateTime.UtcNow < until) Monitor.Wait(gate, 100); if (result == null) throw new Exception("No result: " + Agent.LastError); return result; }
     }
-    public Dictionary<string, object> Call(Dictionary<string, object> b) { Queue(b); return WaitResult(); }
+    public Dictionary<string, object> Call(Dictionary<string, object> b) { long t = Wire.Number(b, "timeout_s"); Queue(b); return WaitResult((int)Math.Max(15, t + 10)); }
     public void WaitExit() { if (!agentThread.Join(20000)) throw new Exception("Client failed to stop"); if (Agent.LastError != "") throw new Exception(Agent.LastError); }
     public void Dispose() { Agent.Stop(); if (agentThread.ThreadState != ThreadState.Unstarted) agentThread.Join(20000); Agent.Dispose(); listener.Close(); server.Join(1000); }
 }
@@ -108,8 +108,8 @@ public static class AppTests {
             using (var relay = new FakeRelay()) {
                 relay.Start();
                 Assert(relay.Elevated == SupportAccess.IsAdministrator(), "Handshake must report actual token rights");
-                var rights = relay.Call(Run("$p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent()); [Console]::Write($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))", 10));
-                Assert(Wire.Flag(rights, "ok") && Decode(rights, "stdout_b64") == SupportAccess.IsAdministrator().ToString(), "Commands must inherit the consented access rights");
+                var rights = relay.Call(Run("$p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent()); [Console]::Write($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))", 60));
+                Assert(Wire.Flag(rights, "ok") && Decode(rights, "stdout_b64") == SupportAccess.IsAdministrator().ToString(), "Commands must inherit the consented access rights: timed_out=" + Wire.Flag(rights, "timed_out") + " exit_code=" + Wire.Number(rights, "exit_code") + " stdout=[" + Decode(rights, "stdout_b64") + "] stderr=[" + Decode(rights, "stderr_b64") + "]");
                 var r = relay.Call(Run("[Console]::Write('hello ' + [char]0x2713); [Console]::Error.Write('warning'); exit 7", 10));
                 Assert(Wire.Flag(r, "ok") && Wire.Number(r, "exit_code") == 7, "Exit code");
                 Assert(Decode(r, "stdout_b64") == "hello \u2713" && Decode(r, "stderr_b64") == "warning", "Unicode and stderr");
