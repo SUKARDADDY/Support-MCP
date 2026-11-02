@@ -73,6 +73,15 @@ test('descriptions carry the safety guidance and mark the aliases deprecated', (
   const mode = listTools().find((t) => t.name === 'session_create').inputSchema.properties.windows_mode.description;
   assert.match(mode, /deprecated aliases; use app and powershell/);
   assert.match(by.run, /as:"system"/);
+  assert.match(by.run, /needs full control/);
+  // Normal mode: type_secret works, the other two are refused by the relay, and ui_act follows ui_tree's display.
+  assert.match(by.type_secret, /normal mode and in full control/);
+  assert.match(by.type_secret, /type_secret failed/);
+  assert.match(by.block_input, /relay refuses it/);
+  assert.match(by.send_sas, /relay refuses it/);
+  assert.match(by.request_full_control, /no full control yet/);
+  assert.match(by.ui_tree, /reports it as display/);
+  assert.equal('display' in listTools({ shape: 'split', ui: true }).find((t) => t.name === 'ui_act').inputSchema.properties, false);
   const status = by.session_status;
   for (const word of ['control', 'caps', 'desktop', 'input_blocked_until', 'paused_until', 'client_version']) assert.match(status, new RegExp(word));
 });

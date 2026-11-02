@@ -30,7 +30,15 @@ AI agent does the diagnosis and the fix while a person watches.
 ## At a glance
 
 - The customer opens a link, runs the app it downloads, and clicks **Allow**.
+  The dialog says that support can see the screen, control the mouse and
+  keyboard, run commands and change files.
 - A small window in the corner shows that the session is live.
+- Everything runs as the signed-in user, in their own session ("normal mode").
+  This version has no full control: it cannot reach UAC prompts, the lock
+  screen, the sign-in screen or windows that run as administrator, and it
+  cannot run as SYSTEM.
+- When the customer uses the mouse or keyboard, support's input pauses for 3
+  seconds.
 - Access ends 24 hours after the PC connects, or sooner if either side ends it.
 - The Worker is the MCP server, so there is nothing to run on your machine.
 
@@ -149,16 +157,16 @@ an error.
 | `session_create` | `windows_mode` `app` (default) returns `{session_id, windows_mode, download_url, one_liner, code_expires_at}`; `powershell` returns `{session_id, windows_mode, one_liner, code_expires_at}` |
 | `session_list` | every session with its state, expiry and machine |
 | `session_status` | state, `windows_mode`, machine, user, expiry, `startup_expires_at` while waiting, whether the client is attached, `client_version`, last audit rows. App sessions add `elevated`, `control` (`full`, `normal` or `null`), `caps`, and when the app reports them `desktop`, `paused_until` and `input_blocked_until` |
-| `run` | runs PowerShell on the customer's PC. `as` is `user` (default) or, under full control, `system`. Returns exit code, stdout, stderr, timed_out |
+| `run` | runs PowerShell on the customer's PC as the signed-in user. `as` is `user` (default); `system` needs full control, which no app offers yet, so the relay refuses it. Returns exit code, stdout, stderr, timed_out |
 | `put_file` | writes base64 data to a path, with append for chunking |
 | `get_file` | reads a byte range as base64, with `eof` for chunking |
 | `session_end` | tells the client to stop and marks the session ended |
 | `computer` | the screen, mouse and keyboard in one tool: `screenshot`, clicks, `mouse_move`, `left_click_drag`, `scroll`, `type`, `key`, `wait`, `zoom`. A screenshot comes back as an image, then the size, display and desktop as JSON |
 | `ui_tree`, `ui_act` | read a window's controls and act on one by its ref, through UI Automation |
-| `block_input` | lock the customer's mouse and keyboard for up to 10 minutes, under full control |
-| `send_sas` | send Ctrl+Alt+Del, under full control |
-| `type_secret` | type a secret the operator supplied. It is never logged or returned |
-| `request_full_control` | ask the customer for full control when the app runs in normal mode |
+| `block_input` | lock the customer's mouse and keyboard for up to 10 minutes. Full control only: the relay refuses it until an app reports `control: full` |
+| `send_sas` | send Ctrl+Alt+Del. Full control only, refused the same way |
+| `type_secret` | type a secret the operator supplied into the focused field, in normal mode too. It is never logged or returned, and a failure says only `type_secret failed` |
+| `request_full_control` | ask the customer for full control. This app version has none, so the call fails with an error |
 
 `computer` copies the action layout of Anthropic's computer-use tool. Add
 `?shape=split` to the MCP URL to get one tool per action (`screenshot`, `click`,
@@ -202,7 +210,7 @@ alarm for expiry. A second Durable Object keeps the list for `session_list`.
 | `src/screen.js` | the screen actions, their audit text, and the strict check of every field an app result may carry |
 | `src/jwt.js` | RS256 verification of the Access JWT with WebCrypto |
 | `src/template.js` | builds the served script and the downloaded executable, validates every value placed in them, and maps the mode aliases |
-| `src/agent-app.cs` | the Windows app: C# source for .NET Framework 4.5.2 or later, WPF window, consent dialog, HTTPS polling client |
+| `src/agent-app.cs` | the Windows app: C# source for .NET Framework 4.5.2 or later, WPF window, consent dialog, HTTPS polling client with two lanes, and screen control (capture, input, UI Automation) in the customer's own session |
 | `src/agent-app.manifest` | the app's `asInvoker` manifest (never asks for elevation) |
 | `src/app-bundle.json` | the compiled x86 app with the SHA-256 of its source and manifest. Tests fail when the source changed without a rebuild |
 | `src/agent.ps1` | the PowerShell agent: bootstrap, run and cleanup roles in one file |
@@ -232,8 +240,8 @@ you use it:
   customer's PC, and they can try to steer your AI agent. Your agent may have a shell on your own
   machine, so don't auto-approve its tool calls.
 - The window shows that access exists. It doesn't limit what you can do.
-  Commands run with the customer's rights, and what they change stays changed
-  after the session ends.
+  Commands, the mouse and the keyboard run with the customer's rights, and what
+  they change stays changed after the session ends.
 - The consent dialog, the window and the **End session** button are how the
   customer agrees to the session and stops it. Keep them in any fork.
 
@@ -316,6 +324,14 @@ check are in [docs/development.md](docs/development.md).
   `run`, `put_file` or `get_file` while one is waiting returns `agent busy`, and
   so does a second screen call. Its output is capped at 64 KiB per stream, and
   its file chunks match the PowerShell agent's.
+- Normal mode works in the customer's own desktop session only. It cannot see
+  or control UAC prompts, the lock screen or the sign-in screen (the result
+  reports `desktop: unknown` and input fails), and it refuses to click or type
+  into a window that runs as administrator. It also refuses input aimed at its
+  own window. Input fails for 3 seconds after the customer last used the mouse
+  or keyboard.
+- Typing is paced at one character every 20 ms, because Windows 11 Notepad
+  garbles faster input. A 5000-character `type` takes about 100 seconds.
 - The app polls over HTTPS, so a command's result reaches the operator after
   the next poll round trip. A screenshot is at most 700,000 base64 characters
   (about 500 KB), so the app lowers the JPEG quality until it fits.
