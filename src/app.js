@@ -3,7 +3,7 @@
 // import and the DO classes so node --test can drive it route-level; index.js
 // wires it to the real agent template.
 import { verifyAccessJwt, importRsaJwk, localBypassAllowed, callerIdentity } from './jwt.js';
-import { handleRpc } from './mcp.js';
+import { handleRpc, parseToolOptions } from './mcp.js';
 import {
   buildAppDownload,
   buildBootstrap,
@@ -174,7 +174,7 @@ function makeBackend(env, origin, devTtlMs, actor) {
       return r.json();
     },
     async run(args) {
-      const r = await cmd(args.session_id, { op: 'run', command: args.command, timeout_s: args.timeout_s });
+      const r = await cmd(args.session_id, { op: 'run', command: args.command, timeout_s: args.timeout_s, as: args.as });
       if (r.ok === false) throw new Error(r.error || 'run failed');
       return {
         exit_code: typeof r.exit_code === 'number' ? r.exit_code : null,
@@ -192,6 +192,19 @@ function makeBackend(env, origin, devTtlMs, actor) {
       const r = await cmd(args.session_id, { op: 'get_file', path: args.path, offset: args.offset, length: args.length });
       if (r.ok === false) throw new Error(r.error || 'get_file failed');
       return { data_b64: r.data_b64, size: r.size, eof: r.eof };
+    },
+    // args.action is already normalized by mcp.js; the Session checks it again.
+    async screen(args) {
+      const r = await cmd(args.session_id, { op: 'screen', action: args.action });
+      if (r.ok === false) throw new Error(r.error || 'screen action failed');
+      const { ok, ...out } = r;
+      return out;
+    },
+    async request_full_control(args) {
+      const r = await cmd(args.session_id, { op: 'control', action: 'request_full_control' });
+      if (r.ok === false) throw new Error(r.error || 'request_full_control failed');
+      const { ok, ...out } = r;
+      return out;
     },
     async session_end(args) {
       const r = await sessionStub(args.session_id).fetch('https://do/end', {
@@ -378,6 +391,13 @@ async function handleMcp(request, env, url, origin, devTtlMs) {
   if (!isJsonContentType(request)) return json({ error: 'unsupported media type' }, 415);
   const actor = await accessCaller(request, env, url);
   if (!actor) return json({ error: 'forbidden' }, 403);
+  // ?shape=computer|split and ?ui=0|1 pick this connection's tools.
+  let options;
+  try {
+    options = parseToolOptions(url.searchParams);
+  } catch (e) {
+    return json({ error: e.message }, 400);
+  }
   let msg;
   try {
     msg = await request.json();
@@ -385,7 +405,7 @@ async function handleMcp(request, env, url, origin, devTtlMs) {
     return json({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } }, 200);
   }
   const backend = makeBackend(env, origin, devTtlMs, actor);
-  const { status, body } = await handleRpc(msg, backend);
+  const { status, body } = await handleRpc(msg, backend, options);
   if (body === null) return new Response(null, { status });
   return json(body, status);
 }
