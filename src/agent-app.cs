@@ -1,6 +1,10 @@
 // .NET Framework 4 client for Windows 7 and PowerShell 2.0. No installation,
 // elevation request, autostart, WebSocket, or third-party runtime. Build with csc v4.
 // Screen control (capture, input, UI Automation) runs in the user's own process.
+// The compiler names a helper class with a random GUID for a constant primitive
+// array initializer of three or more elements and for a string switch with more than
+// six cases, and that breaks the reproducible build. Use loops, if-else and
+// non-constant arrays instead (docs/development.md).
 // The customer window is WPF (part of .NET Framework 4); WinForms is used only
 // for MessageBox and the DialogResult type of SupportAccess.Confirm.
 using System;
@@ -38,8 +42,8 @@ namespace SupportMcp {
         }
         public static string ConsentMessage(bool administrator) {
             string rights = administrator
-                ? "This client is running as Administrator. Allow remote support to run commands and read or change files with administrator rights?\n\nSupport can change system settings and files for all users."
-                : "Allow remote support to run commands and read or change files as your signed-in user?";
+                ? "This client is running as Administrator. Allow remote support to see your screen, control your mouse and keyboard, run commands and read or change files with administrator rights?\n\nSupport can change system settings and files for all users."
+                : "Allow remote support to see your screen, control your mouse and keyboard, run commands and read or change files as your signed-in user?";
             return rights + "\n\nA small window stays in the corner of your screen while support is connected. Access ends when you close it, click End session, or after 24 hours. Nothing reconnects after reboot unless separately prepared.";
         }
         public static bool Confirm(bool administrator, bool resume, Func<string, WF.DialogResult> prompt) {
@@ -195,6 +199,33 @@ namespace SupportMcp {
         public static int ToPhysical(int v, int imageLen, int physLen) { return Math.Max(0, Math.Min(physLen - 1, (int)((v + 0.5) * physLen / imageLen))); }
         public static int EdgeToPhysical(int v, int imageLen, int physLen) { return Math.Max(0, Math.Min(physLen, (int)Math.Round((double)v * physLen / imageLen))); }
         public static int ToImage(int phys, int imageLen, int physLen) { return Math.Max(0, Math.Min(imageLen - 1, (int)((phys + 0.5) * imageLen / physLen))); }
+        // The relay accepts display numbers 0 to 15, so a result may report at most 16 displays.
+        public const int MaxDisplays = 16;
+        public static void CapDisplays(List<Gdi.Rectangle> list) { if (list.Count > MaxDisplays) list.RemoveRange(MaxDisplays, list.Count - MaxDisplays); }
+        // The display that holds a point, or the nearest one when the point is on none of them. -1 for an empty list.
+        public static int MonitorAt(IList<Gdi.Rectangle> list, int x, int y) {
+            int best = -1; long bestDistance = long.MaxValue;
+            for (int i = 0; i < list.Count; i++) {
+                var r = list[i];
+                long dx = x < r.Left ? r.Left - x : x >= r.Right ? x - r.Right + 1 : 0, dy = y < r.Top ? r.Top - y : y >= r.Bottom ? y - r.Bottom + 1 : 0;
+                long d = dx * dx + dy * dy;
+                if (d < bestDistance) { bestDistance = d; best = i; }
+            }
+            return best;
+        }
+    }
+
+    // GetLastInputInfo covers the customer's input and the app's own. This tells the two apart by the
+    // tick of the app's last injected input, so the pause still works when Windows has dropped a hook.
+    public static class InputIdle {
+        public const int SlackMs = 50;
+        // Milliseconds since the customer last used the mouse or keyboard, or -1 when the last input was the app's own.
+        public static long CustomerAgoMs(uint lastInputTick, uint nowTick, uint lastInjectedTick, bool injected) {
+            if (injected && unchecked((int)(lastInputTick - lastInjectedTick)) <= SlackMs) return -1;
+            return Math.Max(0, unchecked((int)(nowTick - lastInputTick)));
+        }
+        // Milliseconds left of the pause window for that age, 0 when there is none.
+        public static long RemainingMs(long agoMs) { return agoMs < 0 ? 0 : Math.Max(0, PauseClock.WindowMs - agoMs); }
     }
 
     // Customer input wins: agent input is refused for 3 s after the last physical event.
@@ -251,6 +282,19 @@ namespace SupportMcp {
             string text = clean.ToString().Trim(); if (text.Length > 80) text = text.Substring(0, 77) + "...";
             return "[" + n + "] " + type + (text.Length > 0 ? " \"" + text + "\"" : "") + " (" + x + "," + y + ")";
         }
+        // The relay takes at most 200,000 characters of result text. Stop at MaxChars and say that more exists.
+        public const int MaxChars = 190000;
+        public const string MoreByCount = "[more elements not shown; raise max_lines]", MoreByChars = "[more elements not shown; the text limit was reached]";
+        public static string Join(IList<string> lines, bool moreByCount, int maxChars, out int kept) {
+            var text = new StringBuilder(); kept = 0; bool cut = false;
+            foreach (string line in lines) {
+                if (text.Length + line.Length + 1 > maxChars - MoreByChars.Length - 1) { cut = true; break; }
+                if (kept > 0) text.Append('\n');
+                text.Append(line); kept++;
+            }
+            if (cut || moreByCount) { if (kept > 0) text.Append('\n'); text.Append(cut ? MoreByChars : MoreByCount); }
+            return text.ToString();
+        }
     }
 
     public static class JpegFit {
@@ -288,6 +332,11 @@ namespace SupportMcp {
         [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
         [DllImport("user32.dll", SetLastError = true)] public static extern uint SendInput(uint count, In[] inputs, int size);
         [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint code, uint type);
+        [StructLayout(LayoutKind.Sequential)] public struct LastInput { public uint Size, Time; }
+        [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LastInput info);
+        [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr window, out Rc rect);
+        [DllImport("winmm.dll")] public static extern uint timeBeginPeriod(uint ms);
+        [DllImport("winmm.dll")] public static extern uint timeEndPeriod(uint ms);
         [DllImport("user32.dll")] public static extern bool GetCursorPos(out Gdi.Point p);
         [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(Gdi.Point p);
         [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr window, uint flags);
@@ -346,12 +395,30 @@ namespace SupportMcp {
     public sealed class Screen : IDisposable {
         public const string PauseText = "customer is using the PC; try again in a few seconds";
         public const string NoFull = "full control is not available in this build";
+        // The only error text type_secret ever returns. Nothing about the secret or the target can leak through it.
+        public const string SecretFailed = "type_secret failed";
+        // Least time between two typed characters. Windows 11 Notepad reads the character of a Unicode key event late,
+        // so a character injected before it has read the previous one replaces it (see TypeText). 20 ms is twice the
+        // slowest gap that still went wrong in the measurements, and it holds the relay's 25 ms per character budget.
+        public const int TypeGapMs = 20;
         internal readonly InputWatch Watch = new InputWatch();
         volatile List<AutomationElement> refs = new List<AutomationElement>();
+        volatile int treeDisplay; // the display the last ui_tree read; ui_act's screenshot comes from it
+        static int injectedTick; static volatile bool injectedAny; // the app's own last injected input, for GetLastInputInfo
         public void Start() { Watch.Start(); }
         public void Dispose() { Watch.Dispose(); }
-        public bool Paused { get { return Watch.Clock.Paused(PauseClock.Now()); } }
-        public long PausedForMs { get { return Watch.Clock.RemainingMs(PauseClock.Now()); } }
+        public bool Paused { get { return PausedForMs > 0; } }
+        // The pause comes from two sources. The low-level hooks see only physical input, but Windows removes a hook
+        // that times out, without telling the app. GetLastInputInfo cannot be dropped; it also counts the app's own
+        // input, so it is compared with the tick of the app's last injection and only a later input counts.
+        public long PausedForMs {
+            get {
+                var info = new Win.LastInput { Size = (uint)Marshal.SizeOf(typeof(Win.LastInput)) };
+                long external = Win.GetLastInputInfo(ref info)
+                    ? InputIdle.RemainingMs(InputIdle.CustomerAgoMs(info.Time, unchecked((uint)Environment.TickCount), unchecked((uint)Thread.VolatileRead(ref injectedTick)), injectedAny)) : 0;
+                return Math.Max(external, Watch.Clock.RemainingMs(PauseClock.Now()));
+            }
+        }
 
         // Physical pixels on every display: per-monitor aware for this thread on Windows 10 1607+,
         // system aware for the process before that. The manifest stays as it is, so the WPF
@@ -371,6 +438,7 @@ namespace SupportMcp {
             }, IntPtr.Zero);
             others.Sort(delegate(Gdi.Rectangle a, Gdi.Rectangle b) { return a.X != b.X ? a.X.CompareTo(b.X) : a.Y.CompareTo(b.Y); });
             if (primary.HasValue) others.Insert(0, primary.Value);
+            ScreenMath.CapDisplays(others); // the relay rejects a result that reports more displays than it can number
             return others;
         }
         // "default" when the input desktop is reachable; the secure desktop (UAC, lock, sign-in) is not.
@@ -382,9 +450,6 @@ namespace SupportMcp {
                 return Win.GetUserObjectInformation(d, 2, name, 128, out needed) && name.ToString() == "Default" ? "default" : "unknown";
             } finally { Win.CloseDesktop(d); }
         }
-        internal static bool Capturable() {
-            try { Dpi(); using (var b = Grab(new Gdi.Rectangle(0, 0, 1, 1))) return Desktop() == "default"; } catch (Exception) { return false; }
-        }
 
         sealed class View {
             public Gdi.Rectangle Phys; public int Index, Count, W, H;
@@ -392,10 +457,19 @@ namespace SupportMcp {
             public int PhysY(int y) { return Phys.Y + ScreenMath.ToPhysical(y, H, Phys.Height); }
             public void Check(int x, int y) { if (x < 0 || y < 0 || x >= W || y >= H) throw new ScreenError("coordinate " + x + "," + y + " is outside the " + W + "x" + H + " screenshot"); }
         }
-        static View GetView(Dictionary<string, object> a) {
-            var list = Monitors(); int i = (int)Wire.Number(a, "display");
+        static View GetView(int i) {
+            var list = Monitors();
             if (i < 0 || i >= list.Count) throw new ScreenError("no display " + i + "; this PC has " + list.Count);
             var v = new View { Phys = list[i], Index = i, Count = list.Count }; ScreenMath.Fit(v.Phys.Width, v.Phys.Height, out v.W, out v.H); return v;
+        }
+        static View GetView(Dictionary<string, object> a) { return GetView((int)Wire.Number(a, "display")); }
+        // ui_tree reads the foreground window, so it uses the display that holds the center of that window.
+        static View ForegroundView() {
+            IntPtr fg = Win.GetForegroundWindow();
+            if (fg == IntPtr.Zero) throw new ScreenError("no window is in the foreground");
+            Win.Rc rc; int index = 0;
+            if (Win.GetWindowRect(fg, out rc)) index = Math.Max(0, ScreenMath.MonitorAt(Monitors(), (rc.L + rc.R) / 2, (rc.T + rc.B) / 2));
+            return GetView(index);
         }
         static Gdi.Bitmap Grab(Gdi.Rectangle r) {
             var bmp = new Gdi.Bitmap(r.Width, r.Height, Img.PixelFormat.Format24bppRgb);
@@ -438,12 +512,27 @@ namespace SupportMcp {
                     throw new ScreenError("that window runs as administrator; this app cannot control it");
             } finally { if (token != IntPtr.Zero) Win.CloseHandle(token); Win.CloseHandle(process); }
         }
-        void Free() {
-            if (!Watch.Ok) throw new ScreenError("cannot watch for customer input");
-            if (Paused) throw new ScreenError(PauseText);
+        void Free() { if (Paused) throw new ScreenError(PauseText); }
+        // Between the steps of a longer input: stop when support access has ended, and give way to the customer.
+        void Between(WaitHandle stop) {
+            if (stop.WaitOne(0)) throw new ScreenError("support access ended");
+            Free();
+        }
+        // Waits ms, or throws when support access ends first.
+        static void Wait(WaitHandle stop, int ms) { if (stop.WaitOne(ms)) throw new ScreenError("support access ended"); }
+        // Keystrokes go to the foreground window: refuse the support window and an elevated window. The check
+        // is repeated for every step of a multi-step input, because the focus can change between steps.
+        static void KeyTarget(ref IntPtr seen) {
+            IntPtr fg = Win.GetForegroundWindow();
+            if (fg == seen) return;
+            if (fg != IntPtr.Zero && Owns(fg)) throw new ScreenError("the support window has the keyboard focus; click another window first");
+            NotElevated(fg);
+            seen = fg;
         }
         static void Send(params Win.In[] inputs) {
-            if (Win.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Win.In))) != inputs.Length) throw new ScreenError("Windows refused the input");
+            uint sent = Win.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Win.In)));
+            Interlocked.Exchange(ref injectedTick, Environment.TickCount); injectedAny = true;
+            if (sent != inputs.Length) throw new ScreenError("Windows refused the input");
         }
         static Win.In MouseEvent(int dx, int dy, int data, uint flags) {
             var i = new Win.In { Type = 0 }; i.Mouse = new Win.MouseIn { Dx = dx, Dy = dy, Data = unchecked((uint)data), Flags = flags }; return i;
@@ -464,16 +553,41 @@ namespace SupportMcp {
             }
             Send(down.ToArray()); Thread.Sleep(30); Send(up.ToArray());
         }
-        // Unicode events type any character the target accepts, whatever the keyboard layout.
-        void TypeText(string text) {
-            int n = 0;
-            foreach (char c in text) {
-                if (++n % 16 == 0) { if (Paused) throw new ScreenError(PauseText + " (typed " + (n - 1) + " of " + text.Length + " characters)"); }
-                if (c == '\r') continue;
-                if (c == '\n' || c == '\t') Press(new int[] { c == '\n' ? 0x0D : 0x09 });
-                else Send(KeyEvent(0, c, 4), KeyEvent(0, c, 6));
-                Thread.Sleep(2);
-            }
+        // One real key press, down and up in a single call.
+        static void Tap(int vk) {
+            ushort scan = (ushort)Win.MapVirtualKey((uint)vk, 0); uint ext = KeySpec.IsExtended(vk) ? 1u : 0u;
+            Send(KeyEvent(vk, scan, ext), KeyEvent(vk, scan, ext | 2u));
+        }
+        // Unicode key events type any character the target accepts, whatever the keyboard layout. Newline and tab are
+        // real Return and Tab keys. A character above U+FFFF goes as its two surrogate halves, one event pair each.
+        //
+        // Pacing matters. Windows 11 Notepad does not take the character from each Unicode key event. It reads it
+        // when it gets to the event, and by then a faster sender has already replaced it: "abc def 123" became
+        // "abc 3333333". One call with every event gave the same result, so the fix is time between characters.
+        // The old code slept 2 ms, which is 2 ms only while something (a browser, a WPF animation like this app's
+        // own window) has raised the system timer to 1 ms; otherwise Windows rounds it up to 15.6 ms and the bug hid.
+        // So this raises the timer itself and waits TypeGapMs between characters. Typing 5000 characters takes
+        // about 100 s.
+        internal void TypeText(string text, WaitHandle stop, bool secret) {
+            int sent = 0; IntPtr seen = IntPtr.Zero; var gap = new Stopwatch();
+            Win.timeBeginPeriod(1);
+            try {
+                foreach (char c in text) {
+                    if (c == '\r') continue;
+                    try {
+                        Between(stop); KeyTarget(ref seen);
+                        // Thread.Sleep(1), not WaitOne(1): with the timer at 1 ms the sleep takes about 2 ms, but a 1 ms wait on a handle still takes about 15 ms.
+                        while (gap.IsRunning && gap.ElapsedMilliseconds < TypeGapMs) { Wait(stop, 0); Thread.Sleep(1); }
+                        if (c == '\n') Tap(0x0D); else if (c == '\t') Tap(0x09);
+                        else Send(KeyEvent(0, c, 4), KeyEvent(0, c, 6));
+                    } catch (ScreenError e) {
+                        // A secret's error carries no count, and the relay drops its text anyway.
+                        if (secret || sent == 0) throw;
+                        throw new ScreenError(e.Message + " (typed " + sent + " of " + text.Length + " characters)");
+                    }
+                    gap.Reset(); gap.Start(); sent++;
+                }
+            } finally { Win.timeEndPeriod(1); }
         }
         // Refuse a target in this process's own windows (the corner window, dialogs) or in an elevated window.
         static void Target(int px, int py) {
@@ -481,49 +595,52 @@ namespace SupportMcp {
             if (root != IntPtr.Zero && Owns(root)) throw new ScreenError("that spot is the support window; use another spot");
             NotElevated(root);
         }
-        void Click(View v, int x, int y, string button, int count) {
+        void Click(View v, int x, int y, string button, int count, WaitHandle stop) {
             v.Check(x, y); int px = v.PhysX(x), py = v.PhysY(y);
             Target(px, py); MoveTo(px, py);
             uint down = button == "right" ? 8u : button == "middle" ? 0x20u : 2u;
-            for (int i = 0; i < count; i++) { Send(MouseEvent(0, 0, 0, down), MouseEvent(0, 0, 0, down * 2)); Thread.Sleep(40); }
+            for (int i = 0; i < count; i++) { if (i > 0) Between(stop); Send(MouseEvent(0, 0, 0, down), MouseEvent(0, 0, 0, down * 2)); Wait(stop, 40); }
         }
-        void Drag(View v, int x1, int y1, int x2, int y2) {
+        // The button is released even when the drag stops early, so a pause never leaves it held down.
+        void Drag(View v, int x1, int y1, int x2, int y2, WaitHandle stop) {
             v.Check(x1, y1); v.Check(x2, y2); int ax = v.PhysX(x1), ay = v.PhysY(y1), bx = v.PhysX(x2), by = v.PhysY(y2);
             Target(ax, ay); Target(bx, by);
-            MoveTo(ax, ay); Thread.Sleep(50); Send(MouseEvent(0, 0, 0, 2));
-            for (int i = 1; i <= 10; i++) { Thread.Sleep(20); MoveTo(ax + (bx - ax) * i / 10, ay + (by - ay) * i / 10); }
-            Thread.Sleep(50); Send(MouseEvent(0, 0, 0, 4));
+            MoveTo(ax, ay); Wait(stop, 50); Send(MouseEvent(0, 0, 0, 2));
+            try {
+                for (int i = 1; i <= 10; i++) { Wait(stop, 20); Between(stop); MoveTo(ax + (bx - ax) * i / 10, ay + (by - ay) * i / 10); }
+                Wait(stop, 50);
+            } finally { Send(MouseEvent(0, 0, 0, 4)); }
         }
 
         // Input actions: refuse during a customer pause, in the support window and in elevated windows.
-        void Input(string name, Dictionary<string, object> a, View v) {
+        void Input(string name, Dictionary<string, object> a, View v, WaitHandle stop) {
             Free();
-            if (name == "type" || name == "key") {
-                IntPtr fg = Win.GetForegroundWindow();
-                if (fg != IntPtr.Zero && Owns(fg)) throw new ScreenError("the support window has the keyboard focus; click another window first");
-                NotElevated(fg);
-            }
-            switch (name) {
+            IntPtr seen = IntPtr.Zero;
+            if (name == "type" || name == "type_secret" || name == "key") KeyTarget(ref seen);
+            // type_secret shares the typing code; the name is mapped so the switch stays small (see the note at the top).
+            switch (name == "type_secret" ? "type" : name) {
                 case "move": v.Check((int)Wire.Number(a, "x"), (int)Wire.Number(a, "y")); MoveTo(v.PhysX((int)Wire.Number(a, "x")), v.PhysY((int)Wire.Number(a, "y"))); break;
                 case "click": {
                     string button = Wire.Text(a, "button") == "" ? "left" : Wire.Text(a, "button");
                     if (button != "left" && button != "right" && button != "middle") throw new ScreenError("button must be left, right or middle");
-                    Click(v, (int)Wire.Number(a, "x"), (int)Wire.Number(a, "y"), button, (int)Math.Max(1, Math.Min(3, a.ContainsKey("count") ? Wire.Number(a, "count") : 1))); break;
+                    Click(v, (int)Wire.Number(a, "x"), (int)Wire.Number(a, "y"), button, (int)Math.Max(1, Math.Min(3, a.ContainsKey("count") ? Wire.Number(a, "count") : 1)), stop); break;
                 }
-                case "drag": Drag(v, (int)Wire.Number(a, "x1"), (int)Wire.Number(a, "y1"), (int)Wire.Number(a, "x2"), (int)Wire.Number(a, "y2")); break;
+                case "drag": Drag(v, (int)Wire.Number(a, "x1"), (int)Wire.Number(a, "y1"), (int)Wire.Number(a, "x2"), (int)Wire.Number(a, "y2"), stop); break;
                 case "scroll": {
                     string dir = Wire.Text(a, "direction") == "" ? "down" : Wire.Text(a, "direction");
                     int amount = (int)Math.Max(1, Math.Min(50, a.ContainsKey("amount") ? Wire.Number(a, "amount") : 3));
                     if (dir != "up" && dir != "down" && dir != "left" && dir != "right") throw new ScreenError("direction must be up, down, left or right");
-                    if (a.ContainsKey("x")) Click(v, (int)Wire.Number(a, "x"), (int)Wire.Number(a, "y"), "none", 0);
+                    if (a.ContainsKey("x")) Click(v, (int)Wire.Number(a, "x"), (int)Wire.Number(a, "y"), "none", 0, stop);
                     Send(MouseEvent(0, 0, 120 * amount * (dir == "up" || dir == "right" ? 1 : -1), dir == "up" || dir == "down" ? 0x800u : 0x1000u)); break;
                 }
                 case "type": {
                     string text = Wire.Text(a, "text");
                     if (text.Length > 5000) throw new ScreenError("text is longer than 5000 characters");
-                    TypeText(text); break;
+                    TypeText(text, stop, name == "type_secret"); break;
                 }
-                default: foreach (int[] combo in KeySpec.Parse(Wire.Text(a, "keys"))) { Free(); Press(combo); Thread.Sleep(20); } break;
+                default:
+                    foreach (int[] combo in KeySpec.Parse(Wire.Text(a, "keys"))) { Between(stop); KeyTarget(ref seen); Press(combo); Wait(stop, 20); }
+                    break;
             }
         }
 
@@ -553,8 +670,10 @@ namespace SupportMcp {
                 };
                 walk(AutomationElement.FromHandle(fg), 0);
             }
-            refs = list; if (more) lines.Add("[more elements not shown; raise max_lines]");
-            return String.Join("\n", lines.ToArray());
+            int kept; string text = UiLines.Join(lines, more, UiLines.MaxChars, out kept);
+            if (kept < list.Count) list.RemoveRange(kept, list.Count - kept); // a ref the text does not show is not offered
+            refs = list; treeDisplay = v.Index;
+            return text;
         }
         static bool Limited(Action action, int ms) {
             Exception error = null; var t = new Thread(delegate() { try { action(); } catch (Exception e) { error = e; } }); t.IsBackground = true; t.Start();
@@ -590,19 +709,21 @@ namespace SupportMcp {
         static double Seconds(Dictionary<string, object> a) { object v; return a.TryGetValue("seconds", out v) && v != null ? Math.Max(0, Math.Min(10, Convert.ToDouble(v))) : 1; }
         // Runs one "screen" or "control" frame and returns its result. Never throws.
         public Dictionary<string, object> Run(Dictionary<string, object> frame, WaitHandle stop) {
-            string desktop = "unknown";
+            string desktop = "unknown"; bool secret = false;
             try {
                 Dpi(); desktop = Desktop();
                 var a = frame.ContainsKey("action") ? frame["action"] as Dictionary<string, object> : null;
                 if (Wire.Text(frame, "type") == "control" || a == null) throw new ScreenError(Wire.Text(frame, "type") == "control" ? NoFull : "missing screen action");
                 string name = Wire.Text(a, "name");
-                if (name == "block_input" || name == "send_sas" || name == "type_secret" || name == "request_full_control") throw new ScreenError(NoFull);
-                if (Array.IndexOf(new string[] { "screenshot", "zoom", "wait", "ui_tree", "ui_act", "click", "move", "drag", "scroll", "type", "key" }, name) < 0) throw new ScreenError("unknown screen action");
+                secret = name == "type_secret";
+                if (name == "block_input" || name == "send_sas" || name == "request_full_control") throw new ScreenError(NoFull);
+                if (Array.IndexOf(new string[] { "screenshot", "zoom", "wait", "ui_tree", "ui_act", "click", "move", "drag", "scroll", "type", "type_secret", "key" }, name) < 0) throw new ScreenError("unknown screen action");
                 var r = Wire.Map("ok", true);
                 if (name == "wait") stop.WaitOne((int)(Seconds(a) * 1000));
                 else if (desktop != "default") throw new ScreenError("cannot reach the screen; Windows may be locked or showing a security prompt");
-                View v = name == "wait" && !Wire.Flag(a, "screenshot") ? null : GetView(a);
-                bool input = name == "click" || name == "move" || name == "drag" || name == "scroll" || name == "type" || name == "key" || name == "ui_act";
+                // ui_tree reads the display of the foreground window and ui_act answers with the display of its ui_tree, so refs and pixels agree.
+                View v = name == "wait" && !Wire.Flag(a, "screenshot") ? null : name == "ui_tree" ? ForegroundView() : name == "ui_act" ? GetView(treeDisplay) : GetView(a);
+                bool input = name == "click" || name == "move" || name == "drag" || name == "scroll" || name == "type" || name == "type_secret" || name == "key" || name == "ui_act";
                 if (name == "screenshot" || (name == "wait" && v != null)) Merge(r, Shot(v.Phys));
                 else if (name == "zoom") {
                     v.Check((int)Wire.Number(a, "x1"), (int)Wire.Number(a, "y1")); int x2 = (int)Wire.Number(a, "x2"), y2 = (int)Wire.Number(a, "y2");
@@ -613,12 +734,16 @@ namespace SupportMcp {
                 }
                 else if (name == "ui_tree") r["text"] = Tree(v, (int)Math.Max(1, Math.Min(2000, a.ContainsKey("max_lines") ? Wire.Number(a, "max_lines") : 300)));
                 else if (name == "ui_act") { string note = UiAct(a); if (note != null) r["text"] = note; }
-                else if (name != "wait") Input(name, a, v);
-                if (input && (!a.ContainsKey("screenshot") || Wire.Flag(a, "screenshot"))) { Thread.Sleep(300); Merge(r, Shot(v.Phys)); }
+                else if (name != "wait") Input(name, a, v, stop);
+                if (input && (!a.ContainsKey("screenshot") || Wire.Flag(a, "screenshot"))) { Wait(stop, 300); Merge(r, Shot(v.Phys)); }
                 if (v != null) { r["display"] = v.Index; r["displays"] = v.Count; }
                 r["desktop"] = desktop;
                 return r;
-            } catch (Exception e) { return Wire.Map("ok", false, "error", e is ScreenError || e is ArgumentException ? e.Message : e.GetType().Name + ": " + e.Message); }
+            } catch (Exception e) {
+                // Nothing of a secret, and no detail about where it went, can come back in an error.
+                if (secret) return Wire.Map("ok", false, "error", SecretFailed);
+                return Wire.Map("ok", false, "error", e is ScreenError || e is ArgumentException ? e.Message : e.GetType().Name + ": " + e.Message);
+            }
         }
     }
 
@@ -632,10 +757,15 @@ namespace SupportMcp {
         readonly AutoResetEvent signal = new AutoResetEvent(false);
         HttpWebRequest request;
         bool polling, woke;
+        // The status code of the last 4xx answer the relay gave to a request, 0 if the last request had none.
+        int rejected;
         long deadlineMs, generation, expiresAtMs, serverOffsetMs;
         int busy;
         string work;
         volatile Screen screen;
+        // False when this run was resumed after a restart whose consent did not cover screen control. The app then
+        // reports no screen cap and refuses any screen frame, so only commands and files work (see RestartResume).
+        public volatile bool ScreenAllowed = true;
         public event Action<string> Log;
         public event Action<string> Status;
         public event Action Finished;
@@ -672,6 +802,7 @@ namespace SupportMcp {
         sealed class Lane {
             public readonly string Name; public readonly ManualResetEvent Done = new ManualResetEvent(false);
             public Thread Op; public Dictionary<string, object> OpResult, Result; public string ActiveId = "", LastId = "";
+            public bool Rejected; // the relay refused this lane's result, which was replaced by a plain error
             public Lane(string name) { Name = name; }
             public bool Busy { get { return ActiveId != ""; } }
         }
@@ -706,6 +837,7 @@ namespace SupportMcp {
             if (!ending && stop.WaitOne(0)) throw new OperationCanceledException();
             var req = (HttpWebRequest)WebRequest.Create(Wire.Text(config, "origin") + "/agent?sid=" + Wire.Text(config, "sid"));
             req.Method = "POST"; req.ContentType = "application/json"; req.AllowAutoRedirect = false;
+            rejected = 0;
             req.Timeout = ending ? 3000 : 30000; req.ReadWriteTimeout = req.Timeout;
             req.Headers["X-Attach-Key"] = Wire.Text(config, "key");
             req.Proxy = WebRequest.DefaultWebProxy;
@@ -733,6 +865,7 @@ namespace SupportMcp {
                 var r = e.Response as HttpWebResponse;
                 if (r != null) {
                     int code = (int)r.StatusCode; r.Close();
+                    if (code >= 400 && code < 500) rejected = code;
                     if (code == 401 || code == 403 || code == 409 || code == 410) throw new OperationCanceledException("Support access has ended.");
                 }
                 throw;
@@ -750,8 +883,16 @@ namespace SupportMcp {
             try {
                 if (stop.WaitOne(0)) throw new OperationCanceledException();
                 string type = Wire.Text(frame, "type");
-                if (type == "screen" || type == "control") return screen.Run(frame, stop);
+                if (type == "screen" || type == "control") {
+                    var s = screen;
+                    if (!ScreenAllowed || s == null) return Wire.Map("ok", false, "error", "the customer has not approved screen control for this session");
+                    return s.Run(frame, stop);
+                }
                 if (type == "run") {
+                    // Every command runs as the signed-in user. SYSTEM needs full control, which this app does not have.
+                    string runAs = Wire.Text(frame, "as");
+                    if (runAs == "system") return Wire.Map("ok", false, "error", "as: \"system\" needs full control");
+                    if (runAs != "" && runAs != "user") return Wire.Map("ok", false, "error", "as must be user");
                     string file = Path.Combine(work, "command.ps1");
                     string prefix = "$ProgressPreference = 'SilentlyContinue'\r\n[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)\r\n";
                     File.WriteAllText(file, prefix + Wire.Text(frame, "command"), new UTF8Encoding(true));
@@ -779,6 +920,31 @@ namespace SupportMcp {
                 }
             } catch (Exception e) { return Wire.Map("ok", false, "error", e.Message); }
         }
+        // The largest request body the relay takes. A result over it, or one the relay answers with a 4xx
+        // (400 invalid result, 413 too large), would be refused every time it is resent, and the client would
+        // never poll again. So it is replaced once by a plain error result and the lane carries on.
+        const int ResultMax = 750000;
+        void RejectResult(Lane lane) {
+            lane.Rejected = true;
+            lane.Result = Wire.Map("type", "result", "id", lane.ActiveId, "generation", generation, "ok", false, "error", "result rejected by relay");
+        }
+        // Returns the relay's answer type: "ack" or "end".
+        string SendResult(Lane lane) {
+            while (true) {
+                string json = null;
+                try { json = Wire.Json().Serialize(lane.Result); } catch (InvalidOperationException) { }
+                if (json == null || Encoding.UTF8.GetByteCount(json) > ResultMax) {
+                    if (lane.Rejected) return "ack"; // even the plain error does not fit: drop it
+                    RejectResult(lane); continue;
+                }
+                try { return Wire.Text(Send(lane.Result, false, false), "type"); }
+                catch (WebException) {
+                    if (rejected < 400 || rejected > 499) throw;
+                    if (lane.Rejected) return "ack"; // the relay refused the plain error too: drop it and carry on
+                    RejectResult(lane);
+                }
+            }
+        }
         public void Run() {
             var lanes = new Lane[] { new Lane("cmd"), new Lane("screen") }; string networkError = "";
             try {
@@ -794,7 +960,7 @@ namespace SupportMcp {
                         if (generation == 0) {
                             var welcome = Send(Wire.Map("type", "hello", "machine", Environment.MachineName, "user", Environment.UserName,
                                 "ps", PowerShellVersion(), "agent", "windows-app-2", "elevated", SupportAccess.IsAdministrator(),
-                                "caps", new string[] { "screen", "uia", "lanes" }, "control", "normal"), false, false);
+                                "caps", ScreenAllowed ? new string[] { "screen", "uia", "lanes" } : new string[] { "lanes" }, "control", "normal"), false, false);
                             if (Wire.Text(welcome, "type") != "welcome") throw new InvalidDataException("Invalid support handshake.");
                             generation = Wire.Number(welcome, "generation");
                             long expires = Wire.Number(welcome, "expires_at"), now = Wire.Number(welcome, "server_time");
@@ -815,10 +981,10 @@ namespace SupportMcp {
                                 lane.Result["type"] = "result"; lane.Result["id"] = lane.ActiveId; lane.Result["generation"] = generation;
                             }
                             if (lane.Result != null) {
-                                var ack = Send(lane.Result, false, false);
-                                if (Wire.Text(ack, "type") == "end") { over = true; break; }
-                                if (Wire.Text(ack, "type") != "ack") throw new InvalidDataException("Result not acknowledged.");
-                                lane.LastId = lane.ActiveId; lane.ActiveId = ""; lane.Result = null; Work(-1);
+                                string ack = SendResult(lane);
+                                if (ack == "end") { over = true; break; }
+                                if (ack != "ack") throw new InvalidDataException("Result not acknowledged.");
+                                lane.LastId = lane.ActiveId; lane.ActiveId = ""; lane.Result = null; lane.Rejected = false; Work(-1);
                             }
                         }
                         if (over) break;
@@ -870,7 +1036,7 @@ namespace SupportMcp {
                 ShowStatus("Support session ended. You can close this window.");
                 if (Interlocked.Exchange(ref busy, 0) > 0) { var changed = BusyChanged; if (changed != null) changed(0); }
                 var finished = Finished; if (finished != null) finished();
-                foreach (var lane in lanes) lane.Done.Close();
+                // The lanes' wait handles stay open: an op thread that outlived the join above may still Set one.
                 if (screen != null) { var s = screen; screen = null; s.Dispose(); }
             }
         }
@@ -896,6 +1062,14 @@ namespace SupportMcp {
             using (var identity = WindowsIdentity.GetCurrent())
                 return identity.User.Value + "|" + Wire.Number(cfg, "resume_expires_at").ToString(System.Globalization.CultureInfo.InvariantCulture);
         }
+        // Screen control, mouse and keyboard are part of what the customer approves. A reconnect runs without a
+        // prompt, so it may use them only when the prepare prompt said so. Arm records that approval under its own
+        // value name; a reconnect prepared by an older app, or without it, gets commands and files only.
+        static string ScreenValueName(Dictionary<string, object> cfg) { return Wire.Text(cfg, "sid") + "|screen"; }
+        public static bool HasScreenConsent(Dictionary<string, object> cfg) {
+            using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(ConsentKey))
+                return key != null && String.Equals(key.GetValue(ScreenValueName(cfg)) as string, ConsentValue(cfg), StringComparison.Ordinal);
+        }
         public static bool HasAdministratorConsent(Dictionary<string, object> cfg) {
             using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(ConsentKey))
                 return key != null && String.Equals(key.GetValue(Wire.Text(cfg, "sid")) as string, ConsentValue(cfg), StringComparison.Ordinal);
@@ -907,6 +1081,7 @@ namespace SupportMcp {
             using (var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(ConsentKey)) {
                 if (administrator) key.SetValue(Wire.Text(cfg, "sid"), ConsentValue(cfg), Microsoft.Win32.RegistryValueKind.String);
                 else key.DeleteValue(Wire.Text(cfg, "sid"), false);
+                key.SetValue(ScreenValueName(cfg), ConsentValue(cfg), Microsoft.Win32.RegistryValueKind.String);
             }
             using (var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunOnce))
                 key.SetValue(ValueName(cfg), "\"" + PathFor(cfg) + "\" --resume", Microsoft.Win32.RegistryValueKind.String);
@@ -915,7 +1090,7 @@ namespace SupportMcp {
             using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunOnce, true))
                 if (key != null) key.DeleteValue(ValueName(cfg), false);
             using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(ConsentKey, true))
-                if (key != null) key.DeleteValue(Wire.Text(cfg, "sid"), false);
+                if (key != null) { key.DeleteValue(Wire.Text(cfg, "sid"), false); key.DeleteValue(ScreenValueName(cfg), false); }
         }
         public static void Cleanup(Dictionary<string, object> cfg) {
             Disarm(cfg);
@@ -1448,6 +1623,8 @@ namespace SupportMcp {
                     // Resume is pre-consented through the existing support
                     // session and restricted to its private path and deadline.
                     bool approvedAdministratorResume = resume && !preparing && administrator && RestartResume.HasAdministratorConsent(config);
+                    // Read before Disarm clears it. A normal start and the prepare prompt show the screen control text themselves.
+                    bool screenAllowed = !resume || preparing || RestartResume.HasScreenConsent(config);
                     if (!approvedAdministratorResume && !SupportAccess.Confirm(administrator, resume && !preparing, delegate(string message) {
                         if (preparing) message += "\n\nAlso allow ONE automatic reconnect at the next Windows sign-in with these same rights, without another prompt? It keeps this session's original expiry. End session cancels it.";
                         return ConsentDialog.Ask(message, administrator) ? WF.DialogResult.Yes : WF.DialogResult.No;
@@ -1457,8 +1634,9 @@ namespace SupportMcp {
                     SupportWindow window = null;
                     try {
                         using (var client = new Client(config)) {
+                            client.ScreenAllowed = screenAllowed;
                             string note = preparing ? "One automatic reconnect is enabled at the next sign-in. End session cancels it."
-                                : resume ? "Reconnected after restart. No further automatic reconnect is installed." : null;
+                                : resume ? "Reconnected after restart. No further automatic reconnect is installed." + (screenAllowed ? "" : " Screen control stays off, because this reconnect was approved before it existed.") : null;
                             window = new SupportWindow(client, Palette.Detect(), administrator, preparing, note);
                             var win = window;
                             client.Finished += delegate { if (resume && !win.Preserve) RestartResume.Disarm(config); };

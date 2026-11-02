@@ -36,6 +36,8 @@ public sealed class FakeRelay : IDisposable {
     // Simulates a PC clock that runs ahead of the relay by this many milliseconds.
     public long ClockSkew;
     public volatile bool Refuse; // drop every request, so the client can never complete a handshake
+    public volatile int RejectOk; // answer every result with ok:true with this status (400, 413), like a relay that refuses it
+    public readonly Dictionary<string, int> ResultCounts = new Dictionary<string, int>();
     public FakeRelay() : this(null) { }
     public FakeRelay(Dictionary<string, object> config) {
         var tcp = new TcpListener(IPAddress.Loopback, 0); tcp.Start(); int port = ((IPEndPoint)tcp.LocalEndpoint).Port; tcp.Stop();
@@ -65,6 +67,8 @@ public sealed class FakeRelay : IDisposable {
                 else if (Wire.Text(b, "type") == "end") { End = true; reply = Wire.Map("type", "end"); }
                 else if (Wire.Text(b, "type") == "result") {
                     Results++;
+                    { string seen = Wire.Text(b, "id"); int n; ResultCounts[seen] = ResultCounts.TryGetValue(seen, out n) ? n + 1 : 1; }
+                    if (RejectOk != 0 && Wire.Flag(b, "ok")) { ctx.Response.StatusCode = RejectOk; ctx.Response.Close(); return; }
                     if (FailFirstResult) { FailFirstResult = false; ctx.Response.StatusCode = 500; ctx.Response.Close(); return; }
                     string rid = Wire.Text(b, "id"); results[rid] = b;
                     foreach (string lane in new List<string>(frames.Keys)) if (Wire.Text(frames[lane], "id") == rid) frames.Remove(lane);
@@ -172,10 +176,113 @@ public static class AppTests {
         Assert(UiLines.Line(4, "Edit", "say \"hi\"\r\nnow", 1, 2) == "[4] Edit \"say 'hi'  now\" (1,2)", "Quotes and line breaks");
         Assert(UiLines.Line(5, "Text", new string('x', 200), 1, 2).Length == "[5] Text \"".Length + 80 + "\" (1,2)".Length, "Long names are cut at 80 characters");
         Console.WriteLine("PASS ui_tree line formatting");
+        // ui_tree text stays under the relay's 200,000 character limit and says when it was cut.
+        var many = new List<string>(); for (int i = 1; i <= 3000; i++) many.Add(UiLines.Line(i, "ControlType.Text", new string('n', 80), 1000, 700));
+        int kept; string joined = UiLines.Join(many, false, UiLines.MaxChars, out kept);
+        Assert(joined.Length <= UiLines.MaxChars && joined.Length > UiLines.MaxChars - 400 && kept < many.Count && kept > 1000 && joined.EndsWith(UiLines.MoreByChars) && joined.Split('\n').Length == kept + 1, "A long tree is cut under the limit with a closing line, kept " + kept + " length " + joined.Length);
+        Assert(UiLines.MaxChars + 10000 <= 200000, "The cap leaves room under the relay's text limit");
+        var few = new List<string>(); few.Add("[1] A"); few.Add("[2] B");
+        Assert(UiLines.Join(few, false, UiLines.MaxChars, out kept) == "[1] A\n[2] B" && kept == 2, "A short tree is unchanged");
+        Assert(UiLines.Join(few, true, UiLines.MaxChars, out kept) == "[1] A\n[2] B\n" + UiLines.MoreByCount && kept == 2, "More elements than max_lines");
+        Assert(UiLines.Join(new List<string>(), false, UiLines.MaxChars, out kept) == "" && kept == 0, "An empty tree");
+        Console.WriteLine("PASS ui_tree text is capped below the relay limit");
+        // The relay refuses a result that reports more than 16 displays.
+        var rects = new List<System.Drawing.Rectangle>(); for (int i = 0; i < 20; i++) rects.Add(new System.Drawing.Rectangle(i * 100, 0, 100, 100));
+        ScreenMath.CapDisplays(rects); Assert(rects.Count == 16 && rects[15].X == 1500, "Displays are clamped to 16");
+        var few3 = new List<System.Drawing.Rectangle>(); few3.Add(new System.Drawing.Rectangle(0, 0, 10, 10)); ScreenMath.CapDisplays(few3); Assert(few3.Count == 1, "A normal PC keeps its displays");
+        // ui_tree uses the display that holds the foreground window: left of, above, right of the primary, and off all of them.
+        var layout = new List<System.Drawing.Rectangle>(); layout.Add(new System.Drawing.Rectangle(0, 0, 1920, 1080)); layout.Add(new System.Drawing.Rectangle(-1280, 100, 1280, 1024)); layout.Add(new System.Drawing.Rectangle(1920, 0, 1600, 900));
+        Assert(ScreenMath.MonitorAt(layout, 960, 540) == 0 && ScreenMath.MonitorAt(layout, -1, 500) == 1 && ScreenMath.MonitorAt(layout, -1280, 100) == 1 && ScreenMath.MonitorAt(layout, 1920, 0) == 2 && ScreenMath.MonitorAt(layout, 1919, 1079) == 0, "A point maps to the display that holds it");
+        Assert(ScreenMath.MonitorAt(layout, 3600, 450) == 2 && ScreenMath.MonitorAt(layout, -2000, 600) == 1 && ScreenMath.MonitorAt(layout, 500, 1500) == 0 && ScreenMath.MonitorAt(new List<System.Drawing.Rectangle>(), 1, 1) == -1, "A point on no display maps to the nearest one");
+        Console.WriteLine("PASS display clamp and foreground display choice");
+        // The pause survives a dropped hook: GetLastInputInfo counts, minus the app's own injected input.
+        Assert(InputIdle.CustomerAgoMs(10000, 10500, 0, false) == 500 && InputIdle.RemainingMs(500) == 2500, "Input with no injection by the app is the customer's");
+        Assert(InputIdle.CustomerAgoMs(10000, 10500, 10000, true) == -1 && InputIdle.CustomerAgoMs(10000, 10500, 10020, true) == -1 && InputIdle.RemainingMs(-1) == 0, "Input at the app's own injection tick is not the customer's");
+        Assert(InputIdle.CustomerAgoMs(10100, 10500, 10000, true) == 400 && InputIdle.CustomerAgoMs(10051, 10500, 10000, true) == 449, "A later input after the app's injection is the customer's");
+        Assert(InputIdle.CustomerAgoMs(10040, 10500, 10000, true) == -1 && InputIdle.CustomerAgoMs(10050, 10500, 10000, true) == -1, "The slack covers the tick resolution");
+        Assert(InputIdle.RemainingMs(3000) == 0 && InputIdle.RemainingMs(2999) == 1 && InputIdle.RemainingMs(0) == 3000, "Three seconds from the customer's input");
+        Assert(InputIdle.CustomerAgoMs(4294967000u, 200u, 0, false) == 496 && InputIdle.CustomerAgoMs(4294967000u, 200u, 4294966900u, true) == 496 && InputIdle.CustomerAgoMs(4294967200u, 200u, 4294967290u, true) == -1, "The tick counter wraps");
+        Console.WriteLine("PASS pause cross-check against GetLastInputInfo");
     }
     static string Hex(string b64) { return Convert.ToBase64String(Convert.FromBase64String(b64), 0, 2); }
     static Dictionary<string, object> Act(string name, params object[] pairs) {
         var a = Wire.Map(pairs); a["name"] = name; return Wire.Map("type", "screen", "lane", "screen", "action", a);
+    }
+    // Typing, results and run: the parts that need a client but no screen.
+    static void ClientRuleTests(string dir) {
+        // A result the relay refuses is replaced once by a plain error, and the client carries on.
+        foreach (int code in new int[] { 400, 413 }) {
+            using (var relay = new FakeRelay()) {
+                relay.Lifetime = 300000; relay.Start();
+                relay.RejectOk = code;
+                string id = relay.Queue(Run("[Console]::Write('refused')", 20));
+                var r = relay.WaitResult(id, 20);
+                Assert(!Wire.Flag(r, "ok") && Wire.Text(r, "error") == "result rejected by relay", "A refused result is replaced by an error (" + code + "): " + Wire.Text(r, "error"));
+                Assert(relay.ResultCounts[id] == 2, "The refused result is sent once and its replacement once, not forever: " + relay.ResultCounts[id]);
+                relay.RejectOk = 0;
+                var next = relay.Call(Run("[Console]::Write('next')", 20));
+                Assert(Wire.Flag(next, "ok") && Decode(next, "stdout_b64") == "next", "The client polls and runs the next command after a refused result");
+                for (int i = 0; i < 100 && relay.Agent.BusyCount != 0; i++) Thread.Sleep(20);
+                Assert(relay.Agent.BusyCount == 0, "The lane is free again");
+            }
+        }
+        Console.WriteLine("PASS a result the relay refuses is replaced by an error once, and the client carries on");
+        // Run as: only the signed-in user in normal mode.
+        using (var relay = new FakeRelay()) {
+            relay.Lifetime = 300000; relay.Start();
+            string marker = Path.Combine(dir, "as-system");
+            foreach (string who in new string[] { "system", "root", "SYSTEM" }) {
+                var cmd = Run("Set-Content -LiteralPath '" + marker + "' -Value ran", 20); cmd["as"] = who;
+                var r = relay.Call(cmd);
+                Assert(!Wire.Flag(r, "ok") && Wire.Text(r, "error") == (who == "system" ? "as: \"system\" needs full control" : "as must be user"), "as " + who + " is refused: " + Wire.Text(r, "error"));
+                Assert(!File.Exists(marker), "A refused command does not run");
+            }
+            var user = Run("[Console]::Write('u')", 20); user["as"] = "user";
+            var ok = relay.Call(user); Assert(Wire.Flag(ok, "ok") && Decode(ok, "stdout_b64") == "u", "as user runs");
+            Console.WriteLine("PASS run as: system and anything but user is refused in normal mode");
+        }
+        // A reconnect without screen consent reports no screen cap and refuses screen frames.
+        var withoutScreen = new FakeRelay();
+        try {
+            withoutScreen.Agent.ScreenAllowed = false; withoutScreen.Lifetime = 300000; withoutScreen.Start();
+            var caps = (System.Collections.ArrayList)withoutScreen.Hello["caps"];
+            Assert(caps.Count == 1 && caps.Contains("lanes") && !caps.Contains("screen"), "Hello without screen consent reports only lanes");
+            var shot = withoutScreen.Call(Act("screenshot")); Assert(!Wire.Flag(shot, "ok") && Wire.Text(shot, "error").Contains("not approved"), "A screen frame is refused without consent: " + Wire.Text(shot, "error"));
+            var run = withoutScreen.Call(Run("[Console]::Write('cmd')", 20)); Assert(Wire.Flag(run, "ok") && Decode(run, "stdout_b64") == "cmd", "Commands still run");
+        } finally { withoutScreen.Dispose(); }
+        Console.WriteLine("PASS a reconnect without screen consent has commands and files only");
+        // Stop flag and pause between the steps of an input; type_secret keeps its errors generic.
+        using (var screen = new Screen()) {
+            screen.Start();
+            var stop = new ManualResetEvent(true);
+            try { screen.TypeText("abc", stop, false); throw new Exception("typing did not stop"); } catch (ScreenError e) { Assert(e.Message == "support access ended", "Stopped typing: " + e.Message); }
+            stop = new ManualResetEvent(false);
+            screen.TypeText("\r", stop, false); screen.TypeText("", stop, false);
+            screen.Watch.Clock.Touch(PauseClock.Now());
+            try { screen.TypeText("abc", stop, false); throw new Exception("typing did not pause"); } catch (ScreenError e) { Assert(e.Message == Screen.PauseText, "A pause before the first character has no count: " + e.Message); }
+            try { screen.TypeText("abc", stop, true); throw new Exception("secret typing did not pause"); } catch (ScreenError e) { Assert(e.Message == Screen.PauseText, "A secret's error has no count: " + e.Message); }
+            screen.Watch.Clock.Touch(-100000);
+            var secret = screen.Run(Act("type_secret", "text", "S3CR3T-NEVER-ECHOED"), new ManualResetEvent(true));
+            Assert(!Wire.Flag(secret, "ok") && Wire.Text(secret, "error") == Screen.SecretFailed && !Wire.Text(secret, "error").Contains("S3CR3T") && !secret.ContainsKey("text"), "type_secret returns only its generic error: " + Wire.Text(secret, "error"));
+            var tooLong = screen.Run(Act("type_secret", "text", new string('x', 6000)), new ManualResetEvent(false));
+            Assert(Wire.Text(tooLong, "error") == Screen.SecretFailed, "Even a refused secret returns the generic error");
+        }
+        Console.WriteLine("PASS input loops stop with the stop flag and the pause; type_secret errors are generic");
+        // A reconnect needs the screen consent the prepare prompt records.
+        var resume = Wire.Map("sid", Guid.NewGuid().ToString("N") + Guid.NewGuid().ToString("N"), "restart_resume", true, "resume_expires_at", Client.UnixNow() + 60000);
+        try {
+            Assert(!RestartResume.HasScreenConsent(resume), "A reconnect nobody prepared has no screen consent");
+            RestartResume.Arm(resume, false);
+            Assert(RestartResume.HasScreenConsent(resume) && !RestartResume.HasAdministratorConsent(resume), "Preparing records screen consent, and administrator consent only when asked");
+            long expiry = Wire.Number(resume, "resume_expires_at"); resume["resume_expires_at"] = expiry + 1;
+            Assert(!RestartResume.HasScreenConsent(resume), "The consent is bound to the deadline");
+            resume["resume_expires_at"] = expiry;
+            RestartResume.Disarm(resume);
+            Assert(!RestartResume.HasScreenConsent(resume), "A used or cancelled reconnect clears the screen consent");
+            using (var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(@"Software\SupportMcp\ReconnectConsent")) key.SetValue(Wire.Text(resume, "sid"), "someone|" + expiry);
+            Assert(!RestartResume.HasScreenConsent(resume), "An administrator consent from an older app is not screen consent");
+        } finally { RestartResume.Disarm(resume); }
+        Console.WriteLine("PASS a prepared reconnect carries screen consent only when the prompt recorded it");
     }
     static void LaneTests() {
         using (var relay = new FakeRelay()) {
@@ -190,7 +297,7 @@ public static class AppTests {
             var timer = Stopwatch.StartNew();
             var screen = relay.Call(Act("wait", "seconds", 0.2, "screenshot", false));
             Assert(Wire.Flag(screen, "ok") && timer.ElapsedMilliseconds < 4000 && !relay.HasResult(cmdId), "A screen operation must finish while the command still runs, took " + timer.ElapsedMilliseconds + " ms");
-            foreach (string name in new string[] { "block_input", "send_sas", "type_secret" }) {
+            foreach (string name in new string[] { "block_input", "send_sas" }) {
                 var denied = relay.Call(Act(name)); Assert(!Wire.Flag(denied, "ok") && Wire.Text(denied, "error") == "full control is not available in this build", name + " needs full control");
             }
             var control = relay.Call(Wire.Map("type", "control", "lane", "screen", "action", "request_full_control"));
@@ -206,7 +313,8 @@ public static class AppTests {
     }
     // Needs a Windows desktop session: real capture, input and windows.
     static void LiveScreenTests() {
-        if (!Screen.Capturable()) { Console.WriteLine("SKIP live screen tests: no reachable desktop"); return; }
+        Screen.Dpi();
+        if (Screen.Desktop() != "default" || Screen.Monitors().Count == 0) { Console.WriteLine("SKIP live screen tests: no reachable desktop"); return; }
         using (var relay = new FakeRelay()) {
             relay.Lifetime = 300000; relay.Start();
             var shot = relay.Call(Act("screenshot"));
@@ -235,6 +343,7 @@ public static class AppTests {
             foreach (var act in new Dictionary<string, object>[] { Act("click", "x", 5, "y", 5), Act("move", "x", 5, "y", 5), Act("type", "text", "x"), Act("key", "keys", "a"), Act("scroll", "x", 5, "y", 5), Act("drag", "x1", 5, "y1", 5, "x2", 9, "y2", 9) }) {
                 var refused = screen.Run(act, stop); Assert(!Wire.Flag(refused, "ok") && Wire.Text(refused, "error") == Screen.PauseText, "Input must be refused during a customer pause: " + ((Dictionary<string, object>)act["action"])["name"]);
             }
+            var secretPaused = screen.Run(Act("type_secret", "text", "x"), stop); Assert(!Wire.Flag(secretPaused, "ok") && Wire.Text(secretPaused, "error") == Screen.SecretFailed, "type_secret is refused during a pause with the generic error");
             Assert(Wire.Flag(screen.Run(Act("screenshot"), stop), "ok"), "A screenshot still works during a pause");
             Assert(Wire.Text(screen.Run(Act("ui_tree", "max_lines", 3), stop), "error") != Screen.PauseText, "ui_tree is not paused");
             screen.Watch.Clock.Touch(-100000);
@@ -270,6 +379,7 @@ public static class AppTests {
                         bool allowed = SupportAccess.Confirm(administrator, reconnect, delegate(string message) {
                             prompts++;
                             Assert(message.Contains("with administrator rights?") == administrator, "Consent must describe the actual access rights");
+                            Assert(message.Contains("see your screen") && message.Contains("control your mouse and keyboard") && message.Contains("run commands") && message.Contains("change files"), "Consent must name screen, mouse and keyboard control as well as commands and files: " + message);
                             return answer;
                         });
                         bool preconsented = reconnect && !administrator;
@@ -403,6 +513,7 @@ public static class AppTests {
             } finally { RestartResume.Disarm(resume); }
             Console.WriteLine("PASS reconnect path/deadline constraints and one-time startup registration/removal");
             ScreenPureTests(dir);
+            ClientRuleTests(dir);
             LaneTests();
             LiveScreenTests();
             // The downloaded PE overlay must be readable by the actual .NET client.
