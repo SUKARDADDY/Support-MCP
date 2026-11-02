@@ -28,8 +28,9 @@ jobs:
       - run: node --test
 
   # Runs on a GitHub-hosted Windows runner with the .NET Framework v4 compiler.
-  # It builds the app from source, runs the native tests, and checks that the exe
-  # committed in src/app-bundle.json is the build of the committed source.
+  # It builds the app from source against the pinned .NET Framework 4.5.2 reference
+  # assemblies, runs the native tests, and checks that the exe committed in
+  # src/app-bundle.json is the build of the committed source.
   windows-app:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: windows-latest
@@ -44,12 +45,18 @@ jobs:
       - name: Show the compiler version
         shell: pwsh
         run: (Get-Item "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\csc.exe").VersionInfo.ProductVersion
+      - name: Fetch the pinned .NET Framework 4.5.2 reference assemblies
+        id: refs
+        shell: pwsh
+        run: |
+          $refs = ./scripts/fetch-net452-refs.ps1 -Destination "$env:RUNNER_TEMP\net452-refs"
+          "dir=$refs" >> $env:GITHUB_OUTPUT
       - name: Build the app from source
         shell: pwsh
-        run: ./scripts/build-app.ps1 -OutDir "$env:RUNNER_TEMP\app-build"
+        run: ./scripts/build-app.ps1 -ReferenceDir "${{ steps.refs.outputs.dir }}" -OutDir "$env:RUNNER_TEMP\app-build"
       - name: Run the native tests
         shell: pwsh
-        run: ./scripts/test-app-native.ps1 -WorkDir "$env:RUNNER_TEMP\app-native"
+        run: ./scripts/test-app-native.ps1 -ReferenceDir "${{ steps.refs.outputs.dir }}" -WorkDir "$env:RUNNER_TEMP\app-native"
       - name: Check the committed exe against the fresh build
         run: node scripts/verify-app-binary.mjs "$env:RUNNER_TEMP\app-build\support-mcp-app.exe"
       - name: Upload the fresh build

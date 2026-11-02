@@ -488,7 +488,9 @@ namespace SupportMcp {
         }
         public static string Clock(TimeSpan span) {
             long s = (long)span.TotalSeconds;
-            return String.Format(System.Globalization.CultureInfo.InvariantCulture, "{0:00}:{1:00}:{2:00}", s / 3600, (s / 60) % 60, s % 60);
+            // Not String.Format(provider, format, a, b, c): that overload is new in .NET 4.6 and throws MissingMethodException on 4.5.2.
+            var invariant = System.Globalization.CultureInfo.InvariantCulture;
+            return (s / 3600).ToString("00", invariant) + ":" + ((s / 60) % 60).ToString("00", invariant) + ":" + (s % 60).ToString("00", invariant);
         }
         // The card: rounded, bordered, with a soft shadow. Content goes into
         // `inner`, which is clipped to the rounded corners.

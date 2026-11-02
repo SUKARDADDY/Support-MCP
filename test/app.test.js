@@ -44,6 +44,8 @@ test('app bundle matches its source and manifest, targets the v4 CLR and x86', a
     const source = await readFile(new URL(`../src/${file}`, import.meta.url));
     assert.equal(createHash('sha256').update(source).digest('hex'), bundle[key], `Rebuild the app bundle after changing ${file}`);
   }
+  // Built against the .NET 4.5.2 reference assemblies, so it cannot bind to a method a 4.5.2 PC lacks (String.Format with a provider and three arguments is new in 4.6).
+  assert.equal(bundle.reference_framework, 'net452', 'Rebuild the app bundle with scripts/build-app.ps1 -ReferenceDir <4.5.2 reference assemblies>');
   const exe = Buffer.from(bundle.exe_b64, 'base64');
   assert.equal(exe.subarray(0, 2).toString(), 'MZ');
   assert.equal(exe.readUInt16LE(exe.readUInt32LE(0x3c) + 4), 0x14c);

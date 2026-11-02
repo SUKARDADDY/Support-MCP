@@ -15,7 +15,7 @@ reports the canonical name as `windows_mode`.
 
 | `windows_mode` | Customer does | Clients | Transport |
 |---|---|---|---|
-| `app` (default) | opens a link, clicks a button, runs the downloaded `remote-support-<sid8>.exe`, clicks Allow | Windows 7 to 11 with .NET Framework 4.5.2 or later and TLS 1.2 (Windows 10 and 11 include them; 8.1 needs the 4.5.2 update; 7 needs both installed) | HTTPS polling on `POST /agent` |
+| `app` (default) | opens a link, clicks a button, runs the downloaded `remote-support-<sid8>.exe`, clicks Allow | Windows 7 to 11 with .NET Framework 4.5.2 or later (Windows 10 and 11 include it; 8.1 needs the 4.5.2 update; 7 needs it installed). The app requests TLS 1.2 itself; Windows 7 needs no registry change | HTTPS polling on `POST /agent` |
 | `powershell` | pastes `irm <link> \| iex` | Windows 8 and later, Windows PowerShell 5.1 | WebSocket on `/ws` |
 
 `legacy` is accepted as an alias for `app` and `standard` for `powershell`, in
