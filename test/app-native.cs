@@ -106,6 +106,7 @@ public static class AppTests {
             }
             Console.WriteLine("PASS consent accepts only Yes, describes actual rights, and never silently grants administrator reconnect");
             using (var relay = new FakeRelay()) {
+                relay.Lifetime = 300000; // covers the 60 s cold-start allowance below plus the rest of this block
                 relay.Start();
                 Assert(relay.Elevated == SupportAccess.IsAdministrator(), "Handshake must report actual token rights");
                 var rights = relay.Call(Run("$p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent()); [Console]::Write($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))", 60));
