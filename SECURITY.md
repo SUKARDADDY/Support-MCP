@@ -23,4 +23,5 @@ timestamp and module id. To check it yourself, run `scripts/fetch-net452-refs.ps
 (it pins and verifies the .NET Framework 4.5.2 reference assemblies), then
 `scripts/build-app.ps1 -ReferenceDir <that folder> -OutDir <folder>` on Windows, then `node scripts/verify-app-binary.mjs
 <folder>\support-mcp-app.exe`. The check trusts the compiler on the build
-machine. The README section "Build the app" lists what it does not prove.
+machine. [docs/development.md](docs/development.md#what-ci-proves-about-the-committed-exe)
+lists what it does not prove.
