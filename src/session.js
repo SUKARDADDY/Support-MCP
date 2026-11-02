@@ -30,12 +30,18 @@ const CONSUMED_TTL_MS = 2 * 60 * 60 * 1000;
 const ATTACHED_LIFE_MS = 24 * 60 * 60 * 1000; // attach -> expiry, fixed
 const RESULT_SLACK_MS = 15 * 1000; // relay waits timeout_s + this
 const HTTP_SEEN_MS = 60 * 1000; // app mode: a client counts as attached this long after its last request
+const POLL_PARK_MS = 25 * 1000; // app mode: a long poll with nothing to send ends after this long
 const REDELIVER_MS = 5 * 1000; // app mode: a frame already sent is not sent again sooner than this
 const SCREEN_WAIT_MS = 30 * 1000; // screen frame: base wait for the app's result
 const CONTROL_WAIT_MS = 120 * 1000; // request_full_control: UAC and the customer's dialogs
 const LANE_OF = { run: 'cmd', put_file: 'cmd', get_file: 'cmd', screen: 'screen', control: 'screen' };
 const NO_SCREEN_PS = 'the PowerShell fallback has no screen access';
 const NO_SCREEN_OLD = 'this support app is too old for screen control';
+const NO_SCREEN_CONSENT = 'the customer has not approved screen control for this session';
+// Per-character pacing of the app's typing is about 15 ms (see Screen.TypeText in
+// src/agent-app.cs). The relay waits this long for each typed character.
+const TYPE_MS_PER_CHAR = 25;
+const FULL_ONLY = ['block_input', 'send_sas'];
 export const GET_FILE_MAX = 524288; // bytes per get_file chunk
 export const PUT_B64_MAX = 700000; // data_b64 chars per put_file chunk (~512 KiB)
 
@@ -379,10 +385,10 @@ export class Session {
     if (!ws && !isHttp) return Response.json({ ok: false, error: 'agent not attached' });
     if (!lane) return Response.json({ ok: false, error: 'bad op' });
     const caps = isHttp ? await this.get('caps', []) : [];
+    const control = isHttp ? await this.get('control', null) : null;
     const lanesClient = caps.includes('lanes');
-    if (lane === 'screen' && !(lanesClient && caps.includes('screen'))) {
-      return Response.json({ ok: false, error: NO_SCREEN_OLD });
-    }
+    if (lane === 'screen' && !lanesClient) return Response.json({ ok: false, error: NO_SCREEN_OLD });
+    if (lane === 'screen' && !caps.includes('screen')) return Response.json({ ok: false, error: NO_SCREEN_CONSENT });
     const tag = isHttp ? `http${await this.get('http_generation')}` : null;
     // From this check to the reservation below there is no await, so two
     // concurrent calls can't both take the same lane.
@@ -401,6 +407,8 @@ export class Session {
       if (as !== 'user' && as !== 'system') return Response.json({ ok: false, error: 'as must be user or system' });
       if (as === 'system' && !isHttp) return Response.json({ ok: false, error: 'the PowerShell fallback cannot run as system' });
       if (as === 'system' && !lanesClient) return Response.json({ ok: false, error: 'this support app is too old to run as system' });
+      // Only full control (the SYSTEM service) can run as SYSTEM. A normal-mode app would run it as the user.
+      if (as === 'system' && control !== 'full') return Response.json({ ok: false, error: 'as: "system" needs full control' });
       frame = { type: 'run', id, lane, command: String(b.command ?? ''), timeout_s: t };
       // Only a client that reports lanes knows the field; the app enforces it.
       if (lanesClient) frame.as = as;
@@ -428,10 +436,12 @@ export class Session {
       this.logRow('get_file', `${frame.path} (@${off}+${len})`, b.actor);
     } else if (b.op === 'screen') {
       try { action = normalizeAction(b.action); } catch (e) { return Response.json({ ok: false, error: e.message }); }
+      // These two work only through the SYSTEM service, so a normal-mode app never sees them.
+      if (FULL_ONLY.includes(action.name) && control !== 'full') return Response.json({ ok: false, error: `${action.name} needs full control` });
       frame = { type: 'screen', id, lane, action };
       waitMs = SCREEN_WAIT_MS + RESULT_SLACK_MS
         + (action.name === 'wait' ? action.seconds * 1000 : 0)
-        + (action.text ? action.text.length * 10 : 0);
+        + (action.text ? action.text.length * TYPE_MS_PER_CHAR : 0);
       // A screenshot is logged below, once its size is known. type_secret logs a bare name.
       if (action.name !== 'screenshot') this.logRow('screen', auditText(action), b.actor);
     } else {
@@ -515,6 +525,34 @@ export class Session {
     if (!c || !this.httpPoll || this.httpPoll.busy.has(lane)) return;
     c.sent_at = Date.now();
     this.replyToPoll(c.frame);
+  }
+
+  // How long to park a poll. A frame that went to a poll the app had already
+  // aborted (Wake) is held back by the redelivery guard until it is REDELIVER_MS
+  // old. Waiting the full 25 s for the poll to end would add that to the delay, so
+  // the poll ends when the guard window does and the frame goes out then.
+  parkMs(busy) {
+    let ms = POLL_PARK_MS;
+    for (const lane of LANES) {
+      const c = this.httpCommands[lane];
+      if (c && !busy.has(lane) && c.sent_at !== null) ms = Math.min(ms, Math.max(0, c.sent_at + REDELIVER_MS - Date.now()));
+    }
+    return ms;
+  }
+
+  // The parked poll ran out its time: send a frame the guard no longer holds back, else idle.
+  releasePoll() {
+    const poll = this.httpPoll;
+    if (!poll) return;
+    for (const lane of LANES) {
+      const c = this.httpCommands[lane];
+      if (c && !poll.busy.has(lane) && (c.sent_at === null || Date.now() - c.sent_at >= REDELIVER_MS)) {
+        c.sent_at = Date.now();
+        this.replyToPoll(c.frame);
+        return;
+      }
+    }
+    this.replyToPoll({ type: 'idle' });
   }
 
   async doAgent(request) {
@@ -607,7 +645,7 @@ export class Session {
       // request and this fetch keep the in-memory result and poll state alive.
       this.replyToPoll({ type: 'idle' });
       return new Promise((resolve) => {
-        const timer = setTimeout(() => this.replyToPoll({ type: 'idle' }), 25000);
+        const timer = setTimeout(() => this.releasePoll(), this.parkMs(busy));
         this.httpPoll = { resolve, timer, busy };
       });
     }
@@ -750,6 +788,8 @@ function future(ms) {
 }
 
 function decodeHttpResult(b, frame) {
+  // The app's error text is dropped for type_secret, so a secret can never come back in an error.
+  if (b.ok === false && frame.action?.name === 'type_secret') return { ok: false, error: 'type_secret failed' };
   if (b.ok === false) return { ok: false, error: truncate(String(b.error || 'agent operation failed'), 1000) };
   const op = frame.type;
   if (op === 'screen') return decodeScreenResult(b, frame.action.name);

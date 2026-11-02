@@ -178,6 +178,52 @@ test('a frame that was sent is not sent again within five seconds, then is', asy
   await raced; await run;
 });
 
+test('a frame sent into a poll the app aborted goes out when the guard ends, not after the full 25 s park', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_800_000_000_000 });
+  const f = await attach();
+  // The app is running a command and parks a poll for the screen lane.
+  const run = f.op({ op: 'run', command: 'one' });
+  await until(() => f.session.httpCommands.cmd);
+  const first = await f.poll({ busy_lanes: [] });
+  assert.equal(first.type, 'run');
+  const parked = f.poll({ busy_lanes: ['cmd'] });
+  await until(() => f.session.httpPoll);
+  // The command finishes and the app aborts that poll (Wake) before posting the result. The relay
+  // does not know the poll is dead, so a screen frame queued now is written to it and counts as sent.
+  await f.result(first, { stdout_b64: '', stderr_b64: '', exit_code: 0 });
+  await run;
+  const shot = f.op(screen('screenshot'));
+  const lost = await parked;
+  assert.equal(lost.type, 'screen');
+  // The app's next poll arrives at once. The frame is inside the guard window, so it parks.
+  t.mock.timers.tick(200);
+  let got = null;
+  const next = f.poll({ busy_lanes: [] }).then((r) => { got = r; return r; });
+  await until(() => f.session.httpPoll);
+  t.mock.timers.tick(4000);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(got, null, 'still held back inside the guard window');
+  // At 5 s after the frame was sent it is delivered, 20 s before the old 25 s park would have ended.
+  t.mock.timers.tick(900);
+  await next;
+  assert.equal(got.type, 'screen');
+  assert.equal(got.id, lost.id);
+  assert.equal(f.session.httpPoll, null);
+  await f.result(got, shotResult());
+  assert.equal((await shot).ok, true);
+  // Without a held-back frame a poll still parks the full 25 s and then answers idle.
+  let idle = null;
+  const quiet = f.poll({ busy_lanes: ['cmd'] }).then((r) => { idle = r; });
+  await until(() => f.session.httpPoll);
+  t.mock.timers.tick(24999);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(idle, null);
+  t.mock.timers.tick(1);
+  await quiet;
+  assert.deepEqual(idle, { type: 'idle' });
+  await f.end();
+});
+
 test('an old client keeps one lane and the busy flag, gets lane cmd on its frames, and cannot do screen work', async () => {
   const f = await attach({ caps: undefined, control: undefined, agent: 'windows-app-1' });
   const tooOld = 'this support app is too old for screen control';
@@ -197,9 +243,18 @@ test('an old client keeps one lane and the busy flag, gets lane cmd on its frame
   assert.equal((await f.op({ op: 'run', command: 'x', as: 'system' })).error, 'this support app is too old to run as system');
 });
 
-test('a client with lanes but no screen cap is also refused screen work', async () => {
+test('a client with lanes but no screen cap is refused screen work with its own message', async () => {
+  // The app reports no screen cap when it was resumed from a consent that predates screen control.
   const f = await attach({ caps: ['lanes'] });
-  assert.equal((await f.op(screen('screenshot'))).error, 'this support app is too old for screen control');
+  const want = 'the customer has not approved screen control for this session';
+  assert.equal((await f.op(screen('screenshot'))).error, want);
+  assert.equal((await f.op(screen('type_secret', { text: 'x' }))).error, want);
+  assert.equal(f.session.httpCommands.screen, null);
+  // Commands still work.
+  const run = f.op({ op: 'run', command: 'whoami' });
+  await until(() => f.session.httpCommands.cmd);
+  await f.end();
+  await run;
 });
 
 test('the PowerShell fallback has no screen access, attached or not, and cannot run as system', async () => {
@@ -238,6 +293,59 @@ test('run takes as: user by default, system is passed through, anything else is 
   assert.equal((await frameFor({ as: 'system' })).as, 'system');
   assert.equal((await f.op({ op: 'run', command: 'x', as: 'root' })).error, 'as must be user or system');
   assert.equal(f.logs.filter((l) => l.kind === 'run').map((l) => l.detail).includes('[op@example.com] (system) whoami'), true);
+});
+
+test('run as system is refused unless the stored control is full, and nothing is sent to the app', async () => {
+  const msg = 'as: "system" needs full control';
+  for (const control of ['normal', undefined, 'root']) {
+    const f = await attach({ control });
+    assert.equal((await f.op({ op: 'run', command: 'whoami', as: 'system' })).error, msg);
+    assert.equal(f.session.httpCommands.cmd, null, 'no frame was queued');
+    assert.equal(f.logs.filter((l) => l.kind === 'run').length, 0, 'nothing was logged as run');
+    // The default and as: user still work in normal mode.
+    const run = f.op({ op: 'run', command: 'whoami' });
+    await until(() => f.session.httpCommands.cmd);
+    const frame = await f.poll({ busy_lanes: [] });
+    assert.equal(frame.as, 'user');
+    await f.result(frame, { stdout_b64: '', stderr_b64: '', exit_code: 0 });
+    assert.equal((await run).ok, true);
+  }
+  // The stored control decides, not the caps: a client that says "full" in caps but control normal is refused.
+  const f = await attach({ caps: NEW_CAPS, control: 'normal' });
+  assert.equal((await f.op({ op: 'run', command: 'x', as: 'system' })).error, msg);
+  // After a full-control hello it is allowed.
+  await f.req('/agent', { type: 'hello', caps: NEW_CAPS, control: 'full' }, f.key);
+  const full = f.op({ op: 'run', command: 'x', as: 'system' });
+  await until(() => f.session.httpCommands.cmd);
+  assert.equal(f.session.httpCommands.cmd.frame.as, 'system');
+  await f.end();
+  await full;
+});
+
+test('block_input and send_sas are refused in normal mode and never reach the app; type_secret is forwarded', async () => {
+  const f = await attach({ control: 'normal' });
+  for (const [name, extra] of [['block_input', { on: true }], ['block_input', { on: false }], ['send_sas', {}]]) {
+    assert.equal((await f.op(screen(name, extra))).error, `${name} needs full control`);
+    assert.equal(f.session.httpCommands.screen, null);
+  }
+  assert.equal(f.logs.filter((l) => l.kind === 'screen').length, 0, 'a refused action is not logged as done');
+  const p = f.op(screen('type_secret', { text: 'pw-123' }));
+  await until(() => f.session.httpCommands.screen);
+  const frame = await f.poll({ busy_lanes: [] });
+  assert.deepEqual([frame.type, frame.lane, frame.action.name, frame.action.text], ['screen', 'screen', 'type_secret', 'pw-123']);
+  await f.result(frame, shotResult());
+  assert.equal((await p).ok, true);
+  // In full control the other two go through. The new hello starts a new generation.
+  const { generation } = await (await f.req('/agent', { type: 'hello', caps: NEW_CAPS, control: 'full' }, f.key)).json();
+  const again = (body) => f.req('/agent', { generation, ...body }, f.key);
+  for (const [name, extra] of [['block_input', { on: true, minutes: 5 }], ['send_sas', {}]]) {
+    const q = f.op(screen(name, extra));
+    await until(() => f.session.httpCommands.screen);
+    const fr = await (await again({ type: 'poll', busy_lanes: [] })).json();
+    assert.equal(fr.action.name, name);
+    await again({ type: 'result', id: fr.id, ok: true });
+    assert.equal((await q).ok, true);
+  }
 });
 
 test('screen frames carry the lane and the normalized action; a bad action is refused before anything is sent', async () => {
@@ -289,7 +397,7 @@ test('an app error result passes through without image fields', async () => {
 });
 
 test('audit rows: typed text is a length, type_secret is bare, screenshots log their size', async () => {
-  const f = await attach();
+  const f = await attach({ control: 'full' });
   const drive = async (body, result) => {
     const p = f.op(body);
     await until(() => f.session.httpCommands.screen);
@@ -344,7 +452,21 @@ test('type_secret is never returned, even if the app echoes it in text or in an 
   frame = await f.poll({ busy_lanes: [] });
   await f.agent({ type: 'result', id: frame.id, ok: false, error: `field rejected ${secret}` });
   out = await p;
-  assert.equal(out.error, 'field rejected [redacted]');
+  // The app's error text is dropped whole, not scrubbed.
+  assert.deepEqual(out, { ok: false, error: 'type_secret failed' });
+  for (const error of ['customer is using the PC; try again in a few seconds', '', undefined]) {
+    p = f.op(screen('type_secret', { text: secret }));
+    await until(() => f.session.httpCommands.screen);
+    frame = await f.poll({ busy_lanes: [] });
+    await f.agent({ type: 'result', id: frame.id, ok: false, error, text: secret });
+    assert.deepEqual(await p, { ok: false, error: 'type_secret failed' });
+  }
+  // Other actions keep the app's error text.
+  p = f.op(screen('type', { text: 'x' }));
+  await until(() => f.session.httpCommands.screen);
+  frame = await f.poll({ busy_lanes: [] });
+  await f.agent({ type: 'result', id: frame.id, ok: false, error: 'customer is using the PC; try again in a few seconds' });
+  assert.equal((await p).error, 'customer is using the PC; try again in a few seconds');
   // A too-long secret is refused without echoing it.
   const tooLong = await f.op(screen('type_secret', { text: `${secret}`.repeat(200) }));
   assert.equal(tooLong.ok, false);

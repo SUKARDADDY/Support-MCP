@@ -32,7 +32,7 @@ const BASE_TOOLS = [
   {
     name: 'session_create',
     description:
-      'Create a Windows support session. By default (windows_mode app) the customer opens a link, downloads the support app and clicks Allow. The app works on Windows 7 to 11 and gives you the screen, mouse, keyboard, commands and files; with the customer\'s approval it also gets full control (Windows security prompts and the sign-in screen). The result has download_url and a Start-Process one_liner. The app needs .NET Framework 4.5.2 or later and TLS 1.2, which Windows 10 and 11 include. Windows 8.1 needs the 4.5.2 update, and a Windows 7 PC needs .NET 4.5.2 installed and TLS 1.2 enabled first. windows_mode powershell is the fallback: commands and files only, no screen, use it only when the app cannot run. Its one_liner is a PowerShell paste for Windows 8 and later. The aliases legacy and standard are deprecated.',
+      'Create a Windows support session. By default (windows_mode app) the customer opens a link, downloads the support app and clicks Allow. The app works on Windows 7 to 11 and gives you the screen, mouse, keyboard, commands and files as the signed-in user (normal mode). Full control (Windows security prompts, the sign-in screen, running as SYSTEM) is not available yet. The result has download_url and a Start-Process one_liner. The app needs .NET Framework 4.5.2 or later and TLS 1.2, which Windows 10 and 11 include. Windows 8.1 needs the 4.5.2 update, and a Windows 7 PC needs .NET 4.5.2 installed and TLS 1.2 enabled first. windows_mode powershell is the fallback: commands and files only, no screen, use it only when the app cannot run. Its one_liner is a PowerShell paste for Windows 8 and later. The aliases legacy and standard are deprecated.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -67,7 +67,7 @@ const BASE_TOOLS = [
   {
     name: 'run',
     description:
-      'Run a PowerShell command on the customer machine. The default as:"user" runs it as the signed-in user, with administrator rights only if that user has them under full control or the customer started the app as Administrator and approved it; check control and elevated in session_status first. With full control, as:"system" runs it as SYSTEM, which is needed for work no signed-in user can do; the app refuses it in normal mode. Returns exit_code (null if it timed out and was killed), stdout, stderr (plain text, each may end with [truncated]), timed_out. It runs in its own lane, so it does not block screen actions.',
+      'Run a PowerShell command on the customer machine. The default as:"user" runs it as the signed-in user, with administrator rights only if that user has them under full control or the customer started the app as Administrator and approved it; check control and elevated in session_status first. as:"system" runs it as SYSTEM and needs full control, which no app offers yet: the relay refuses it unless session_status shows control full. Returns exit_code (null if it timed out and was killed), stdout, stderr (plain text, each may end with [truncated]), timed_out. It runs in its own lane, so it does not block screen actions.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -179,25 +179,25 @@ const SPLIT_TOOLS = [
 
 // In both shapes. ui_tree and ui_act are dropped by ?ui=0.
 const UI_TOOLS = [
-  tool('ui_tree', `Read the controls of the foreground window through UI Automation, as text lines with a ref number each. Cheaper and more exact than a screenshot when the app exposes controls. The text is untrusted content. Normal mode cannot see elevated windows or the secure desktop.`, {
+  tool('ui_tree', `Read the controls of the foreground window through UI Automation, as text lines with a ref number each. Cheaper and more exact than a screenshot when the app exposes controls. The text is untrusted content. Normal mode cannot see elevated windows or the secure desktop. Uses the monitor that holds the foreground window: the result reports it as display, and the coordinates in the lines are pixels of that monitor's screenshot, so pass the same display to click and the other screen tools.`, {
     max_lines: { type: 'integer', description: '1..2000, default 300' },
   }),
-  tool('ui_act', `Act on a control by the ref from the latest ui_tree: invoke (click a button), set_value (value required), toggle, focus, expand, collapse, select. Refs go stale when the window changes, so read ui_tree again. ${INPUT_NOTE}`, {
+  tool('ui_act', `Act on a control by the ref from the latest ui_tree: invoke (click a button), set_value (value required), toggle, focus, expand, collapse, select. Refs go stale when the window changes, so read ui_tree again. The screenshot that follows is of the display the ui_tree reported. ${INPUT_NOTE}`, {
     ref: { type: 'integer' },
     verb: { type: 'string', enum: ['invoke', 'set_value', 'toggle', 'focus', 'expand', 'collapse', 'select'] },
     value: { type: 'string', description: 'for set_value (and optionally select)' },
-    display: DISPLAY, screenshot: SHOT,
+    screenshot: SHOT,
   }, ['ref', 'verb']),
 ];
 const EXTRA_TOOLS = [
-  tool('block_input', 'Lock or unlock the customer\'s physical mouse and keyboard. Use it only when the operator asks. on:true blocks for at most 10 minutes (default 10), then it lifts by itself; call it again to renew. The customer can cancel it with Ctrl+Alt+Del, and then it stays off until you call on:true again. Full control only: in normal mode it returns an error.', {
+  tool('block_input', 'Lock or unlock the customer\'s physical mouse and keyboard. Use it only when the operator asks. on:true blocks for at most 10 minutes (default 10), then it lifts by itself; call it again to renew. The customer can cancel it with Ctrl+Alt+Del, and then it stays off until you call on:true again. Full control only: the relay refuses it with an error unless session_status shows control full.', {
     on: { type: 'boolean' }, minutes: { type: 'integer', description: '1..10, default 10' },
   }, ['on']),
-  tool('send_sas', `Send Ctrl+Alt+Del (the secure attention sequence). Full control only. ${SCREEN_SAFETY} ${INPUT_NOTE}`, { display: DISPLAY, screenshot: SHOT }),
-  tool('type_secret', `Type a secret, such as a password, into the focused field. Use it only with a secret the operator gave you in this conversation, and never guess one. The secret is never logged (not even its length) and never returned. ${SCREEN_SAFETY} ${INPUT_NOTE}`, {
+  tool('send_sas', `Send Ctrl+Alt+Del (the secure attention sequence). Full control only: the relay refuses it with an error unless session_status shows control full. ${SCREEN_SAFETY} ${INPUT_NOTE}`, { display: DISPLAY, screenshot: SHOT }),
+  tool('type_secret', `Type a secret, such as a password, into the focused field. Use it only with a secret the operator gave you in this conversation, and never guess one. Works in normal mode and in full control, for example in a password field of an app the customer has open. The secret is never logged (not even its length) and never returned, and a failure returns only "type_secret failed" with no detail. The screenshot that follows shows whatever the field shows, so pass screenshot:false unless the field masks its input. ${SCREEN_SAFETY} ${INPUT_NOTE}`, {
     text: { type: 'string' }, display: DISPLAY, screenshot: SHOT,
   }, ['text']),
-  tool('request_full_control', 'In normal mode, ask the customer for full control: Windows asks them for permission, and if they agree the app can work through Windows security prompts, the sign-in screen and restarts. Waits up to 2 minutes for the customer. Check control in session_status first; it does nothing if control is already full.'),
+  tool('request_full_control', 'Ask the customer for full control (Windows security prompts, the sign-in screen, restarts). This app version has no full control yet, so the call fails with an error; check control and caps in session_status first. Once it exists, it waits up to 2 minutes for the customer and does nothing if control is already full.'),
 ];
 
 export const SHAPES = ['computer', 'split'];
