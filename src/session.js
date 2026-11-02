@@ -11,7 +11,16 @@
 // A session has a Windows mode, fixed at creation. `powershell` sessions use the
 // WebSocket above. `app` sessions (the downloaded Windows app) use authenticated
 // HTTPS polling on /agent instead: one long poll per client, one command in
-// flight, and an `http<n>` generation tag in place of the socket tag.
+// flight per lane, and an `http<n>` generation tag in place of the socket tag.
+//
+// An app client that reports the `lanes` cap runs two lanes at once: `cmd`
+// (run, put_file, get_file) and `screen` (screen and control frames). An older
+// client without it keeps one lane and cannot do screen work.
+
+import {
+  LANES, auditText, decodeCaps, decodeControl, decodeControlResult, decodePollReport,
+  decodeScreenResult, normalizeAction,
+} from './screen.js';
 
 const CODE_TTL_MS = 10 * 60 * 1000; // pending -> consume window
 // consumed -> first attach window. src/agent.ps1 writes the same two hours into
@@ -21,6 +30,12 @@ const CONSUMED_TTL_MS = 2 * 60 * 60 * 1000;
 const ATTACHED_LIFE_MS = 24 * 60 * 60 * 1000; // attach -> expiry, fixed
 const RESULT_SLACK_MS = 15 * 1000; // relay waits timeout_s + this
 const HTTP_SEEN_MS = 60 * 1000; // app mode: a client counts as attached this long after its last request
+const REDELIVER_MS = 5 * 1000; // app mode: a frame already sent is not sent again sooner than this
+const SCREEN_WAIT_MS = 30 * 1000; // screen frame: base wait for the app's result
+const CONTROL_WAIT_MS = 120 * 1000; // request_full_control: UAC and the customer's dialogs
+const LANE_OF = { run: 'cmd', put_file: 'cmd', get_file: 'cmd', screen: 'screen', control: 'screen' };
+const NO_SCREEN_PS = 'the PowerShell fallback has no screen access';
+const NO_SCREEN_OLD = 'this support app is too old for screen control';
 export const GET_FILE_MAX = 524288; // bytes per get_file chunk
 export const PUT_B64_MAX = 700000; // data_b64 chars per put_file chunk (~512 KiB)
 
@@ -49,8 +64,8 @@ export class Session {
     this.env = env;
     this.sql = ctx.storage.sql;
     this.pending = new Map(); // uuid -> {resolve, tag}
-    this.httpCommand = null; // app mode: the one command waiting for its result
-    this.httpPoll = null; // app mode: the parked long poll, if any
+    this.httpCommands = { cmd: null, screen: null }; // app mode: per lane, {frame, tag, sent_at} waiting for its result
+    this.httpPoll = null; // app mode: the parked long poll, if any, {resolve, timer, busy}
     this.sql.exec(`CREATE TABLE IF NOT EXISTS log(ts INTEGER, kind TEXT, detail TEXT)`);
   }
 
@@ -127,9 +142,13 @@ export class Session {
       if (pred(p)) {
         this.pending.delete(id);
         p.resolve({ ok: false, error });
-        if (this.httpCommand?.frame.id === id) this.httpCommand = null;
+        this.clearCommand(id);
       }
     }
+  }
+
+  clearCommand(id) {
+    for (const lane of LANES) if (this.httpCommands[lane]?.frame.id === id) this.httpCommands[lane] = null;
   }
 
   ttlMs(def) {
@@ -312,7 +331,8 @@ export class Session {
     const tail = Math.max(0, Math.min(500, Number(url.searchParams.get('log_tail') || 20) || 0));
     const s = await this.ctx.storage.get([
       'state', 'machine', 'user', 'expires_at', 'ps', 'code', 'ended_reason', 'consumed_expires_at',
-      'windows_mode', 'transport', 'http_seen_at', 'elevated',
+      'windows_mode', 'transport', 'http_seen_at', 'elevated', 'caps', 'control', 'agent', 'desktop',
+      'paused_until', 'input_blocked_until',
     ]);
     const app = s.get('windows_mode') === 'app';
     const rows = tail
@@ -324,7 +344,16 @@ export class Session {
       user: s.get('user') ?? null,
       ps: s.get('ps') ?? null,
       windows_mode: s.get('windows_mode') ?? 'powershell',
-      ...(app ? { elevated: s.get('elevated') ?? null } : {}),
+      ...(app ? {
+        elevated: s.get('elevated') ?? null,
+        control: s.get('control') ?? null,
+        caps: s.get('caps') ?? [],
+        desktop: s.get('desktop') ?? null,
+        // A deadline that has passed no longer says anything.
+        paused_until: future(s.get('paused_until')),
+        input_blocked_until: future(s.get('input_blocked_until')),
+      } : {}),
+      client_version: s.get('agent') ?? null,
       expires_at: s.get('expires_at') ?? null,
       startup_expires_at: s.get('state') === 'consumed' ? s.get('consumed_expires_at') ?? null : null,
       ended_reason: s.get('ended_reason') ?? null,
@@ -340,23 +369,43 @@ export class Session {
     await this.expireIfDue();
     const state = await this.get('state');
     if (state === 'ended' || state === undefined) return Response.json({ ok: false, error: 'session ended' });
+    const lane = Object.hasOwn(LANE_OF, b.op) ? LANE_OF[b.op] : null;
+    if (lane === 'screen' && (await this.get('windows_mode', 'powershell')) !== 'app') {
+      return Response.json({ ok: false, error: NO_SCREEN_PS });
+    }
     const ws = state === 'attached' ? await this.currentSocket() : null;
     const isHttp = state === 'attached' && (await this.get('transport')) === 'https-poll'
       && Date.now() - (await this.get('http_seen_at', 0)) < HTTP_SEEN_MS;
     if (!ws && !isHttp) return Response.json({ ok: false, error: 'agent not attached' });
-    if (isHttp && this.httpCommand) return Response.json({ ok: false, error: 'agent busy; wait for the current operation' });
+    if (!lane) return Response.json({ ok: false, error: 'bad op' });
+    const caps = isHttp ? await this.get('caps', []) : [];
+    const lanesClient = caps.includes('lanes');
+    if (lane === 'screen' && !(lanesClient && caps.includes('screen'))) {
+      return Response.json({ ok: false, error: NO_SCREEN_OLD });
+    }
+    const tag = isHttp ? `http${await this.get('http_generation')}` : null;
+    // From this check to the reservation below there is no await, so two
+    // concurrent calls can't both take the same lane.
+    if (isHttp && this.httpCommands[lane]) return Response.json({ ok: false, error: 'agent busy; wait for the current operation' });
 
     const id = crypto.randomUUID();
     let frame;
     let waitMs;
+    let action = null; // the normalized screen action, if any
     if (b.op === 'run') {
       let t = Number(b.timeout_s);
       if (!Number.isFinite(t) || t < 1) t = 60;
       if (t > 600) t = 600;
       t = Math.floor(t);
-      frame = { type: 'run', id, command: String(b.command ?? ''), timeout_s: t };
+      const as = b.as ?? 'user';
+      if (as !== 'user' && as !== 'system') return Response.json({ ok: false, error: 'as must be user or system' });
+      if (as === 'system' && !isHttp) return Response.json({ ok: false, error: 'the PowerShell fallback cannot run as system' });
+      if (as === 'system' && !lanesClient) return Response.json({ ok: false, error: 'this support app is too old to run as system' });
+      frame = { type: 'run', id, lane, command: String(b.command ?? ''), timeout_s: t };
+      // Only a client that reports lanes knows the field; the app enforces it.
+      if (lanesClient) frame.as = as;
       waitMs = t * 1000 + RESULT_SLACK_MS;
-      this.logRow('run', truncate(String(b.command ?? ''), 512), b.actor);
+      this.logRow('run', (as === 'system' ? '(system) ' : '') + truncate(String(b.command ?? ''), 512), b.actor);
     } else if (b.op === 'put_file') {
       const data = String(b.data_b64 ?? '');
       if (data.length > PUT_B64_MAX) {
@@ -365,7 +414,7 @@ export class Session {
           error: `data_b64 is ${data.length} chars; max ${PUT_B64_MAX} per call. Send the first chunk with append:false and the rest with append:true.`,
         });
       }
-      frame = { type: 'put_file', id, path: String(b.path ?? ''), data_b64: data, append: !!b.append };
+      frame = { type: 'put_file', id, lane, path: String(b.path ?? ''), data_b64: data, append: !!b.append };
       waitMs = 60 * 1000 + RESULT_SLACK_MS;
       const bytes = Math.floor((data.length * 3) / 4);
       this.logRow('put_file', `${frame.path} (${bytes} bytes${frame.append ? ', append' : ''})`, b.actor);
@@ -374,33 +423,64 @@ export class Session {
       if (!Number.isFinite(len) || len <= 0 || len > GET_FILE_MAX) len = GET_FILE_MAX;
       len = Math.floor(len);
       const off = Number(b.offset) > 0 ? Math.floor(Number(b.offset)) : 0;
-      frame = { type: 'get_file', id, path: String(b.path ?? ''), offset: off, length: len };
+      frame = { type: 'get_file', id, lane, path: String(b.path ?? ''), offset: off, length: len };
       waitMs = 60 * 1000 + RESULT_SLACK_MS;
       this.logRow('get_file', `${frame.path} (@${off}+${len})`, b.actor);
+    } else if (b.op === 'screen') {
+      try { action = normalizeAction(b.action); } catch (e) { return Response.json({ ok: false, error: e.message }); }
+      frame = { type: 'screen', id, lane, action };
+      waitMs = SCREEN_WAIT_MS + RESULT_SLACK_MS
+        + (action.name === 'wait' ? action.seconds * 1000 : 0)
+        + (action.text ? action.text.length * 10 : 0);
+      // A screenshot is logged below, once its size is known. type_secret logs a bare name.
+      if (action.name !== 'screenshot') this.logRow('screen', auditText(action), b.actor);
     } else {
-      return Response.json({ ok: false, error: 'bad op' });
+      if (b.action !== 'request_full_control') return Response.json({ ok: false, error: 'bad action' });
+      frame = { type: 'control', id, lane, action: 'request_full_control' };
+      waitMs = CONTROL_WAIT_MS + RESULT_SLACK_MS;
+      this.logRow('control', 'request_full_control', b.actor);
     }
 
-    const tag = isHttp ? `http${await this.get('http_generation')}` : this.socketTag(ws);
-    const target = isHttp ? { send: () => {
-      this.httpCommand = { frame, tag };
-      this.replyToPoll(frame);
-    } } : ws;
-    const result = await this.awaitResult(id, target, tag, frame, waitMs);
+    let target = ws;
+    if (isHttp) {
+      this.httpCommands[lane] = { frame, tag, sent_at: null };
+      target = { send: () => this.dispatchHttp(lane) };
+    }
+    const result = await this.awaitResult(id, target, isHttp ? tag : this.socketTag(ws), frame, waitMs,
+      b.op === 'control' ? { control_request: true } : {});
+    if (b.op === 'control' || b.op === 'screen') return Response.json(await this.finishScreen(result, action, b.actor));
     return Response.json(result);
   }
 
-  awaitResult(id, ws, tag, frame, waitMs) {
+  // Last touches on a screen or control result, before the operator sees it.
+  async finishScreen(result, action, actor) {
+    if (action?.name === 'screenshot') {
+      const display = action.display ? ` display ${action.display}` : '';
+      this.logRow('screen', result.ok ? `screenshot ${result.width}x${result.height}${display}` : `screenshot failed${display}`, actor);
+    }
+    if (result.ok) {
+      if (result.control === undefined) result.control = (await this.get('control', null));
+    }
+    // The typed secret never comes back, even if the app echoes it.
+    if (action?.name === 'type_secret') {
+      delete result.text;
+      if (typeof result.error === 'string') result.error = result.error.split(action.text).join('[redacted]');
+    }
+    return result;
+  }
+
+  awaitResult(id, ws, tag, frame, waitMs, extra = {}) {
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
-          if (this.httpCommand?.frame.id === id) this.httpCommand = null;
+          this.clearCommand(id);
           resolve({ ok: false, error: 'timeout waiting for agent', timed_out: true });
         }
       }, waitMs);
       this.pending.set(id, {
         tag,
+        ...extra,
         resolve: (r) => {
           clearTimeout(timer);
           resolve(r);
@@ -411,6 +491,7 @@ export class Session {
       } catch (e) {
         if (this.pending.has(id)) {
           this.pending.delete(id);
+          this.clearCommand(id);
           clearTimeout(timer);
           resolve({ ok: false, error: 'agent disconnected' });
         }
@@ -425,6 +506,15 @@ export class Session {
     this.httpPoll = null;
     clearTimeout(poll.timer);
     poll.resolve(Response.json(frame));
+  }
+
+  // A command was queued for `lane`. Hand it to the parked poll if that poll
+  // says the lane is free. Otherwise the next poll that does will pick it up.
+  dispatchHttp(lane) {
+    const c = this.httpCommands[lane];
+    if (!c || !this.httpPoll || this.httpPoll.busy.has(lane)) return;
+    c.sent_at = Date.now();
+    this.replyToPoll(c.frame);
   }
 
   async doAgent(request) {
@@ -447,6 +537,17 @@ export class Session {
     if (!state || state === 'ended') return Response.json({ type: 'end' }, { status: 410 });
     if (b.type === 'hello') {
       this.closeAll({ type: 'end', reason: 'replaced' }, 'replaced');
+      const control = decodeControl(b.control);
+      // A request_full_control in flight ends with a new hello, because the
+      // service takes the connection over. A full-control hello means it worked.
+      for (const [id, p] of this.pending) {
+        if (!p.control_request) continue;
+        this.pending.delete(id);
+        this.clearCommand(id);
+        p.resolve(control === 'full'
+          ? { ok: true, control, text: 'full control is on' }
+          : { ok: false, error: 'the app restarted without full control' });
+      }
       this.failPending(() => true, 'agent replaced');
       const now = Date.now();
       const generation = (await this.get('http_generation', 0)) + 1;
@@ -457,13 +558,15 @@ export class Session {
       const ps = truncate(String(b.ps ?? ''), 40) || null;
       const agent = truncate(String(b.agent ?? ''), 40) || null;
       const elevated = typeof b.elevated === 'boolean' ? b.elevated : null;
+      const caps = decodeCaps(b.caps);
       await this.setMany({
         state: 'attached', transport: 'https-poll', http_generation: generation, http_seen_at: now,
-        expires_at: expiresAt, machine, user, ps, elevated,
+        expires_at: expiresAt, machine, user, ps, elevated, agent, caps, control,
+        desktop: null, paused_until: null, input_blocked_until: null,
         ...(firstAttach ? { attached_first_at: now } : {}),
       });
       this.logRow('attached', `${firstAttach ? '' : 'reattach '}http${generation} elevated=${elevated ?? 'unknown'}`);
-      this.logRow('hello', `${machine ?? '?'}\\${user ?? '?'} ps=${ps ?? '?'} agent=${agent ?? '?'}`);
+      this.logRow('hello', `${machine ?? '?'}\\${user ?? '?'} ps=${ps ?? '?'} agent=${agent ?? '?'} control=${control ?? '?'} caps=${caps.join(',')}`);
       await this.ctx.storage.setAlarm(expiresAt);
       await this.pushRegistry();
       return Response.json({ type: 'welcome', generation, expires_at: expiresAt, server_time: now });
@@ -479,28 +582,49 @@ export class Session {
       return Response.json({ type: 'end' });
     }
     if (b.type === 'poll') {
-      // A busy client already has its command, so a busy poll is only a sign of
-      // life. Answer it at once without sending the frame again. The client waits
-      // for its operation between busy polls, so this is not a tight loop.
-      if (b.busy) return Response.json({ type: 'idle' });
-      if (this.httpCommand) return Response.json(this.httpCommand.frame);
+      // A client without the `lanes` cap has the one lane. It sends `busy`, and
+      // a lanes client sends `busy_lanes`. A busy lane already has its command,
+      // so the relay does not send that lane's frame again.
+      const lanesClient = (await this.get('caps', [])).includes('lanes');
+      const lanes = lanesClient ? LANES : ['cmd'];
+      const busy = new Set(lanesClient && Array.isArray(b.busy_lanes) ? b.busy_lanes.filter((l) => lanes.includes(l)) : b.busy ? ['cmd'] : []);
+      const report = decodePollReport(b);
+      if (Object.keys(report).length) await this.setMany(report);
+      // Every lane busy: a sign of life only. Answer at once and park nothing.
+      // The client waits for its operations between these, so this is not a
+      // tight loop. A client with one lane free keeps long-polling instead.
+      if (lanes.every((l) => busy.has(l))) return Response.json({ type: 'idle' });
+      for (const lane of lanes) {
+        const c = this.httpCommands[lane];
+        // A frame sent a moment ago is still the client's. Its next poll may
+        // have left before the lane showed busy, and a repeat would run it twice.
+        if (c && !busy.has(lane) && (c.sent_at === null || Date.now() - c.sent_at >= REDELIVER_MS)) {
+          c.sent_at = Date.now();
+          return Response.json(c.frame);
+        }
+      }
       // One long poll per client. A retry releases its predecessor. The MCP
       // request and this fetch keep the in-memory result and poll state alive.
       this.replyToPoll({ type: 'idle' });
       return new Promise((resolve) => {
         const timer = setTimeout(() => this.replyToPoll({ type: 'idle' }), 25000);
-        this.httpPoll = { resolve, timer };
+        this.httpPoll = { resolve, timer, busy };
       });
     }
     if (b.type === 'result') {
       const pending = this.pending.get(b.id);
-      if (pending && pending.tag === `http${generation}` && this.httpCommand?.frame.id === b.id) {
+      const command = LANES.map((l) => this.httpCommands[l]).find((c) => c?.frame.id === b.id);
+      if (pending && pending.tag === `http${generation}` && command) {
         let result;
-        try { result = decodeHttpResult(b, this.httpCommand.frame.type); }
+        try { result = decodeHttpResult(b, command.frame); }
         catch (_) { return Response.json({ error: 'invalid result' }, { status: 400 }); }
         this.pending.delete(b.id);
-        this.httpCommand = null;
+        this.httpCommands[command.frame.lane] = null;
+        // The lane is free now, so a parked poll that called it busy must not
+        // hold back the next command for it.
+        this.httpPoll?.busy.delete(command.frame.lane);
         pending.resolve(result);
+        if (result.desktop) await this.setMany({ desktop: result.desktop });
       }
       // Retried results are acknowledged without running anything again.
       return Response.json({ type: 'ack' });
@@ -574,7 +698,7 @@ export class Session {
       const user = truncate(String(msg.user ?? ''), 100) || null;
       const ps = truncate(String(msg.ps ?? ''), 40) || null;
       const agent = truncate(String(msg.agent ?? ''), 40) || null;
-      await this.setMany({ machine, user, ps, hello_tag: this.socketTag(ws) });
+      await this.setMany({ machine, user, ps, agent, hello_tag: this.socketTag(ws) });
       this.logRow('hello', `${machine ?? '?'}\\${user ?? '?'} ps=${ps ?? '?'} agent=${agent ?? '?'}`);
       await this.pushRegistry();
       return;
@@ -620,8 +744,16 @@ function truncate(s, n) {
   return s.length > n ? s.slice(0, n) + '…' : s;
 }
 
-function decodeHttpResult(b, op) {
+// A deadline in the future, or null. Status never reports one that has passed.
+function future(ms) {
+  return typeof ms === 'number' && ms > Date.now() ? ms : null;
+}
+
+function decodeHttpResult(b, frame) {
   if (b.ok === false) return { ok: false, error: truncate(String(b.error || 'agent operation failed'), 1000) };
+  const op = frame.type;
+  if (op === 'screen') return decodeScreenResult(b, frame.action.name);
+  if (op === 'control') return decodeControlResult(b);
   if (op === 'run') {
     const decode = (data, clipped) => {
       if (typeof data !== 'string' || data.length > 90000) throw new Error('bad output');

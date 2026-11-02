@@ -265,7 +265,7 @@ test('app sessions authenticate only the HTTP transport and report mode and righ
   assert.equal(status.attached, true); assert.equal(status.ps, '2.0-compatible'); assert.equal(status.startup_expires_at, null);
   assert.deepEqual(f.logs.map(l => l.kind), ['created', 'consumed', 'attached', 'hello']);
   const command = f.req('/command', { op: 'run', command: 'whoami', actor: 'op@example.com' });
-  while (!f.session.httpCommand) await new Promise(r => setImmediate(r));
+  while (!f.session.httpCommands.cmd) await new Promise(r => setImmediate(r));
   assert.equal((await (await f.req('/command', { op: 'run', command: 'second' })).json()).error, 'agent busy; wait for the current operation');
   const frame = await (await f.req('/agent', { type: 'poll', generation: hello.generation }, key)).json();
   assert.equal(frame.type, 'run');
@@ -288,7 +288,7 @@ test('app sessions bound what the client reports and what a result may carry', a
   const hello = await (await f.req('/agent', { type: 'hello', machine: 'm'.repeat(500), user: 'u'.repeat(500), ps: 'p'.repeat(500) }, key)).json();
   assert.equal(f.values.get('machine').length, 101); assert.equal(f.values.get('user').length, 101); assert.equal(f.values.get('ps').length, 41);
   const command = f.req('/command', { op: 'get_file', path: 'C:\\x' });
-  while (!f.session.httpCommand) await new Promise(r => setImmediate(r));
+  while (!f.session.httpCommands.cmd) await new Promise(r => setImmediate(r));
   const frame = await (await f.req('/agent', { type: 'poll', generation: hello.generation }, key)).json();
   const bad = await f.req('/agent', { type: 'result', id: frame.id, generation: hello.generation, ok: true, data_b64: 'AA==', size: -1, eof: true }, key);
   assert.equal(bad.status, 400);
@@ -506,7 +506,7 @@ test('a busy poll is a sign of life: answered at once, never re-sent the frame, 
   const f = fixture(); const key = await attached(f);
   const hello = await (await f.req('/agent', { type: 'hello' }, key)).json();
   const command = f.req('/command', { op: 'run', command: 'whoami' });
-  while (!f.session.httpCommand) await new Promise((r) => setImmediate(r));
+  while (!f.session.httpCommands.cmd) await new Promise((r) => setImmediate(r));
   const busy = await (await f.req('/agent', { type: 'poll', generation: hello.generation, busy: true }, key)).json();
   assert.deepEqual(busy, { type: 'idle' });
   assert.equal(f.session.httpPoll, null, 'a busy poll is not parked');
