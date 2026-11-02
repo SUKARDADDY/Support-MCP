@@ -67,7 +67,7 @@ const BASE_TOOLS = [
   {
     name: 'run',
     description:
-      'Run a PowerShell command on the customer machine. The default as:"user" runs it as the signed-in user, with administrator rights only if that user has them under full control or the customer started the app as Administrator and approved it; check control and elevated in session_status first. as:"system" runs it as SYSTEM and needs full control, which no app offers yet: the relay refuses it unless session_status shows control full. Returns exit_code (null if it timed out and was killed), stdout, stderr (plain text, each may end with [truncated]), timed_out. It runs in its own lane, so it does not block screen actions.',
+      'Run a PowerShell command on the customer machine. The default as:"user" runs it as the signed-in user, with administrator rights only if that user has them under full control or the customer started the app as Administrator and approved it; check control and elevated in session_status first. as:"system" runs it as SYSTEM and needs full control: the relay refuses it unless session_status shows control full. Under full control as:"user" fails with "nobody is signed in" at the sign-in screen; use as:"system" then. Returns exit_code (null if it timed out and was killed), stdout, stderr (plain text, each may end with [truncated]), timed_out. It runs in its own lane, so it does not block screen actions.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -197,7 +197,7 @@ const EXTRA_TOOLS = [
   tool('type_secret', `Type a secret, such as a password, into the focused field. Use it only with a secret the operator gave you in this conversation, and never guess one. Works in normal mode and in full control, for example in a password field of an app the customer has open. The secret is never logged (not even its length) and never returned, and a failure returns only "type_secret failed" with no detail. The screenshot that follows shows whatever the field shows, so pass screenshot:false unless the field masks its input. ${SCREEN_SAFETY} ${INPUT_NOTE}`, {
     text: { type: 'string' }, display: DISPLAY, screenshot: SHOT,
   }, ['text']),
-  tool('request_full_control', 'Ask the customer for full control (Windows security prompts, the sign-in screen, restarts). This app version has no full control yet, so the call fails with an error; check control and caps in session_status first. Once it exists, it waits up to 2 minutes for the customer and does nothing if control is already full.'),
+  tool('request_full_control', 'Ask the customer for full control (Windows security prompts, the sign-in screen, restarts) when the session runs in normal mode. Windows shows the customer a UAC prompt; on Yes the app installs a temporary service and the session continues with control full. It waits up to 2 minutes for the customer, fails if they decline or the PC cannot elevate (caps without full), and does nothing if control is already full.'),
 ];
 
 export const SHAPES = ['computer', 'split'];

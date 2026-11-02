@@ -205,7 +205,9 @@ test('download page is a self-contained bilingual card with the security headers
   assert.match(html, /<title>Remote support<\/title>/);
   assert.match(html, /<form method="post" action="\/j\/[a-z2-7]{16}\?client=app">/);
   for (const text of ['Download the support app.', 'Open the downloaded file.', 'More info', 'Run anyway', 'Windows protected your PC']) assert.ok(html.includes(text), text);
-  assert.ok(html.includes('<strong>Allow</strong>'));
+  assert.ok(html.includes('click <strong>Yes</strong>'));
+  assert.ok(html.includes('If your antivirus removes the file, tell support.'));
+  assert.ok(html.includes('אם האנטי-וירוס מוחק את הקובץ, ספרו לתמיכה.'));
   // Edge holds an uncommon exe until the customer keeps it: its own step, between Download and Open.
   const edge = html.indexOf('isn&rsquo;t commonly downloaded');
   assert.ok(html.indexOf('Download the support app.') < edge && edge < html.indexOf('Open the downloaded file.'), 'Edge step sits between Download and Open');
