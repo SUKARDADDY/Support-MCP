@@ -132,12 +132,40 @@ scaling, key parsing, the customer pause (hooks and the `GetLastInputInfo`
 cross-check), the cap on `ui_tree` text and on the display count, the choice
 of display for `ui_tree`, the stop and pause checks of typing, the replacement of
 a result the relay refuses, `as` in normal mode and the screen consent of a
-prepared reconnect. `scripts/test-app-native.ps1` also takes `-ReferenceDir`, so the tests are
+prepared reconnect. For full control they cover the parts that need no
+administrator: the consent path (UAC prompt, the app's own confirm, or
+unavailable), the folder and file ACLs (a real folder, read back with `icacls`),
+the deadline state on disk and its expiry rules, the backstop command line and
+task XML, the token choice for `run`, the `block_input` timer and its
+Ctrl+Alt+Del escape, the pipe framing and the corner window's two requests over
+a real pipe, the cut of `window.exe`, the silent handover after
+`request_full_control`, and the Client's full-control path against a fake
+service (`as: "user"` runs with a copy of the test's own token). `scripts/test-app-native.ps1` also takes `-ReferenceDir`, so the tests are
 compiled against the 4.5.2 references and the compile fails if the app or the
 tests call a method 4.5.2 lacks. They still run on the build PC's framework, so
 they cannot catch a method that is missing at run time on 4.5.2 by themselves;
 the reference assembly build does that. The first connection from a real
 Windows 7 PC was checked live (see [Limits](../README.md#limits)).
+
+The service, the helper and the install need administrator rights and a real
+console session, so the native tests do not run them. Check them by hand on a
+Windows 11 PC or VM with UAC on, against `wrangler dev` (see below; raise
+`SESSION_TTL_MS` in `.dev.vars` so a session lasts long enough). The app accepts
+`http://127.0.0.1` as its relay, so in a VM forward the port with `netsh interface
+portproxy add v4tov4 listenaddress=127.0.0.1 listenport=8787
+connectaddress=<host> connectport=8787`. Then check, with screenshots through the
+relay: UAC Yes gives `control: full`; a UAC prompt in the user's session shows
+`desktop: secure` and can be clicked; the lock screen can be unlocked with
+`type_secret`; after a restart the session comes back within its deadline and the
+sign-in screen is reachable; `block_input` blocks the physical keyboard and
+Ctrl+Alt+Del lifts it; `send_sas` shows the Ctrl+Alt+Del screen; `run` as `user`
+and as `system` report the right identity; UAC No gives the fallback dialog and
+normal mode; `request_full_control` upgrades a normal session. After
+`session_end`, an expiry, and a service killed with `taskkill /f` (the backstop
+task cleans up at the deadline), `sc query SupportMcp-<id>`, `schtasks /query /tn
+SupportMcp-<id>`, `Test-Path C:\ProgramData\SupportMCP` and `reg query
+HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v
+SoftwareSASGeneration` must all find nothing (unless that value existed before).
 
 Typing into other programs is not in the native tests, because the target has
 to be another process. When you change `Screen.TypeText`, check it by hand on
