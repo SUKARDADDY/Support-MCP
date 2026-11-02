@@ -290,9 +290,8 @@ check are in [docs/development.md](docs/development.md).
   connections, so Windows 7 needs no TLS registry change. Tested on Windows 7
   SP1 (32-bit) with stock .NET Framework 4.5.2 (Release 379893) and no TLS
   registry changes, against the live relay: the app attaches, runs commands and
-  moves files. The
-  PowerShell agent targets Windows PowerShell 5.1, which ships with Windows 10
-  and 11.
+  moves files. The PowerShell agent targets Windows PowerShell 5.1, which ships
+  with Windows 10 and 11.
 - Nothing is signed. The app shows a SmartScreen warning (see
   [Unsigned app](docs/security-model.md#unsigned-app)). `irm | iex` content has no Mark of the Web, so
   SmartScreen doesn't apply to the PowerShell agent, but Defender heuristics
