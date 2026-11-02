@@ -3,14 +3,14 @@
 # Support-MCP
 
 **Let an AI agent fix your PC.**<br>
-An MCP server on Cloudflare Workers that lets your AI agent run commands on a customer's Windows PC. It works with Claude Code, Codex, Cursor, VS Code and any other MCP client that can send custom headers over HTTP.
+An MCP server on Cloudflare Workers that lets your AI agent see, control and run commands on a customer's Windows PC. It works with Claude Code, Codex, Cursor, VS Code and any other MCP client that can send custom headers over HTTP.
 
 [![test](https://github.com/SUKARDADDY/Support-MCP/actions/workflows/test.yml/badge.svg)](https://github.com/SUKARDADDY/Support-MCP/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-3fb950)](LICENSE)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers%20%2B%20Durable%20Objects-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/durable-objects/)
 [![.NET Framework 4.5.2+](https://img.shields.io/badge/.NET%20Framework-4.5.2%2B-512BD4)](src/agent-app.cs)
 [![PowerShell 5.1](https://img.shields.io/badge/PowerShell-5.1-5391FE)](src/agent.ps1)
-[![MCP](https://img.shields.io/badge/MCP-7%20tools-d97757)](#mcp-tools)
+[![MCP](https://img.shields.io/badge/MCP-14%20tools-d97757)](#mcp-tools)
 
 <img src="docs/hero.svg" alt="Claude Code calls session_create, run and put_file. A Cloudflare Worker relays them to the customer's PC, where a small Remote support window in the corner of the screen shows that an agent is connected, with an End session button." width="100%">
 
@@ -32,7 +32,6 @@ AI agent does the diagnosis and the fix while a person watches.
 - The customer opens a link, runs the app it downloads, and clicks **Allow**.
 - A small window in the corner shows that the session is live.
 - Access ends 24 hours after the PC connects, or sooner if either side ends it.
-  The app installs nothing.
 - The Worker is the MCP server, so there is nothing to run on your machine.
 
 ## How it works
@@ -41,7 +40,8 @@ AI agent does the diagnosis and the fix while a person watches.
 2. You send the link to the customer. They download the app, run it and click
    **Allow**. Windows warns that the app is unsigned, and the download page shows
    them how to continue (see [Unsigned app](docs/security-model.md#unsigned-app)).
-3. The app connects to the relay. You call `run`, `put_file` and `get_file`.
+3. The app connects to the relay. You call `computer` (or the split screen
+   tools), `run`, `put_file` and `get_file`.
 4. The session ends when you call `session_end`, the customer clicks
    **End session**, or 24 hours pass.
 
@@ -138,9 +138,9 @@ canonical name.
 | `app` (default) | opens a link, downloads and runs the app, clicks Allow | Windows 7 to 11 (7 and 8.1 need .NET Framework 4.5.2 or later; the app asks for TLS 1.2 itself, so Windows 7 needs no registry change) |
 | `powershell` | pastes one line | Windows 8 and later |
 
-`legacy` is an alias for `app` and `standard` is an alias for `powershell`, so
-operator calls written for other deployments still work. The link's
-`?client=app` also accepts `?client=legacy`. Any other value is an error.
+The PowerShell mode is the fallback: it runs commands and moves files, and it
+has no screen access. Use it only when the app cannot run. Any other value is
+an error.
 
 ## MCP tools
 
@@ -148,11 +148,24 @@ operator calls written for other deployments still work. The link's
 |---|---|
 | `session_create` | `windows_mode` `app` (default) returns `{session_id, windows_mode, download_url, one_liner, code_expires_at}`; `powershell` returns `{session_id, windows_mode, one_liner, code_expires_at}` |
 | `session_list` | every session with its state, expiry and machine |
-| `session_status` | state, `windows_mode`, machine, user, expiry, `startup_expires_at` while waiting, whether the client is attached, `elevated` for app sessions, last audit rows |
-| `run` | runs PowerShell as the signed-in user (with administrator rights only if the customer started the app as Administrator and approved it); returns exit code, stdout, stderr, timed_out |
+| `session_status` | state, `windows_mode`, machine, user, expiry, `startup_expires_at` while waiting, whether the client is attached, `client_version`, last audit rows. App sessions add `elevated`, `control` (`full`, `normal` or `null`), `caps`, and when the app reports them `desktop`, `paused_until` and `input_blocked_until` |
+| `run` | runs PowerShell on the customer's PC. `as` is `user` (default) or, under full control, `system`. Returns exit code, stdout, stderr, timed_out |
 | `put_file` | writes base64 data to a path, with append for chunking |
 | `get_file` | reads a byte range as base64, with `eof` for chunking |
 | `session_end` | tells the client to stop and marks the session ended |
+| `computer` | the screen, mouse and keyboard in one tool: `screenshot`, clicks, `mouse_move`, `left_click_drag`, `scroll`, `type`, `key`, `wait`, `zoom`. A screenshot comes back as an image, then the size, display and desktop as JSON |
+| `ui_tree`, `ui_act` | read a window's controls and act on one by its ref, through UI Automation |
+| `block_input` | lock the customer's mouse and keyboard for up to 10 minutes, under full control |
+| `send_sas` | send Ctrl+Alt+Del, under full control |
+| `type_secret` | type a secret the operator supplied. It is never logged or returned |
+| `request_full_control` | ask the customer for full control when the app runs in normal mode |
+
+`computer` copies the action layout of Anthropic's computer-use tool. Add
+`?shape=split` to the MCP URL to get one tool per action (`screenshot`, `click`,
+`move_mouse`, `drag`, `scroll`, `type_text`, `press_key`, `wait`, `zoom`)
+instead, and `?ui=0` to hide `ui_tree` and `ui_act`. An unknown value of either
+is an error. `run`, `put_file` and `get_file` use their own lane, so a long
+command does not block the screen.
 
 ## Architecture
 
@@ -185,7 +198,8 @@ alarm for expiry. A second Durable Object keeps the list for `session_list`.
 | `src/app.js` | router, Access JWT gate, MCP handler, download page |
 | `src/session.js` | `Session` Durable Object: states, audit log, alarm, tagged sockets, the app's polling transport |
 | `src/registry.js` | `Registry` Durable Object for `session_list` |
-| `src/mcp.js` | JSON-RPC dispatch and the tool schemas |
+| `src/mcp.js` | JSON-RPC dispatch, the tool schemas for both shapes, and the mapping of each screen tool to one normalized action |
+| `src/screen.js` | the screen actions, their audit text, and the strict check of every field an app result may carry |
 | `src/jwt.js` | RS256 verification of the Access JWT with WebCrypto |
 | `src/template.js` | builds the served script and the downloaded executable, validates every value placed in them, and maps the mode aliases |
 | `src/agent-app.cs` | the Windows app: C# source for .NET Framework 4.5.2 or later, WPF window, consent dialog, HTTPS polling client |
@@ -211,9 +225,11 @@ you use it:
   customer are.
 - Tell the customer who you are before you send the link. The app is unsigned,
   and anyone can ask a customer to run an unsigned program.
+- Screenshots, and the text you type, go to your AI model provider. Don't open
+  a session on a screen you may not share with it.
 - Treat everything that comes back from a session as untrusted. Output, file
-  contents and the machine name are all written by the customer's PC, and they
-  can try to steer your AI agent. Your agent may have a shell on your own
+  contents, screenshots, window text and the machine name are all written by the
+  customer's PC, and they can try to steer your AI agent. Your agent may have a shell on your own
   machine, so don't auto-approve its tool calls.
 - The window shows that access exists. It doesn't limit what you can do.
   Commands run with the customer's rights, and what they change stays changed
@@ -296,11 +312,16 @@ check are in [docs/development.md](docs/development.md).
   [Unsigned app](docs/security-model.md#unsigned-app)). `irm | iex` content has no Mark of the Web, so
   SmartScreen doesn't apply to the PowerShell agent, but Defender heuristics
   could still flag either on some machines.
-- The app runs one operation at a time. A second `run`, `put_file` or
-  `get_file` while one is waiting returns `agent busy`. Its output is capped at
-  64 KiB per stream, and its file chunks match the PowerShell agent's.
+- The app runs one command and one screen operation at a time. A second
+  `run`, `put_file` or `get_file` while one is waiting returns `agent busy`, and
+  so does a second screen call. Its output is capped at 64 KiB per stream, and
+  its file chunks match the PowerShell agent's.
 - The app polls over HTTPS, so a command's result reaches the operator after
-  the next poll round trip. There is no screen capture.
+  the next poll round trip. A screenshot is at most 700,000 base64 characters
+  (about 500 KB), so the app lowers the JPEG quality until it fits.
+- An old app from before screen control keeps working for commands and files.
+  Its screen calls return `this support app is too old for screen control`. The
+  PowerShell fallback has no screen access either.
 - It is built for one operator, or a few people sharing one Access app. There
   are no per-operator permissions.
 - Command output is capped at 262,144 characters per stream, and the whole

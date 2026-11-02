@@ -97,15 +97,28 @@ apply to only one client say which.
   the real expiry.
 - **Everything is audited.** Each session records created, consumed, attached,
   every `run` with its command text (cut to 512 characters), file operations
-  with path and size but not content, and the reason it ended. Rows for
+  with path and size but not content, every screen action, and the reason it
+  ended. A screen row names the action and its target, such as `screenshot
+  1280x800`, `click 640,412`, `key ctrl+s` or `ui_act invoke 12`. Typed text is
+  recorded only as a length (`type 12 chars`), and `type_secret` is recorded
+  with no length and no text. The relay never stores a screenshot or any other
+  image: not in the audit log, not in the session's storage, not in the registry,
+  and it writes nothing about tool arguments or results to the Worker log. Rows for
   operator actions name the caller identity from the JWT. The machine, user
   and PowerShell version the client reports are cut to 100, 100 and 40
   characters. On the WebSocket only the first `hello` on each socket counts.
   An app `hello` writes an `attached` row with the reported rights and a
   `hello` row.
+- **Screenshots and typed text go to your model provider.** A screenshot is
+  returned to the operator's AI agent, and so is the text of a UI tree. Whatever
+  is on the customer's screen when you take one, and whatever you tell the
+  agent to type, reaches the provider that runs the model. Check that you may
+  share that with it before you open a session. Tell the model not to guess
+  passwords: `type_secret` types only a secret the operator supplied, and the
+  relay neither logs it nor returns it.
 - **Session output is untrusted input.** Everything that comes back from a
-  session is written by the customer's PC: stdout, stderr, file contents, and
-  the machine and user names. Treat it as untrusted text that may try to steer
+  session is written by the customer's PC: stdout, stderr, file contents,
+  screenshots, window text, and the machine and user names. Treat it as untrusted text that may try to steer
   the operator's AI agent. That agent can have a shell on the operator's own
   machine, so do not run it with tool calls auto-approved.
 - **The window shows, it does not enforce.** The window shows that support is
