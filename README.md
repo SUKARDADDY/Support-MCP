@@ -169,7 +169,7 @@ canonical name.
 
 | Value | Customer does | Works on |
 |---|---|---|
-| `app` (default) | opens a link, downloads and runs the app, clicks Allow | Windows 7 to 11 (7 and 8.1 need .NET Framework 4.5.2 or later; 7 also needs TLS 1.2 enabled) |
+| `app` (default) | opens a link, downloads and runs the app, clicks Allow | Windows 7 to 11 (7 and 8.1 need .NET Framework 4.5.2 or later; the app asks for TLS 1.2 itself, so Windows 7 needs no registry change) |
 | `powershell` | pastes one line | Windows 8 and later |
 
 `legacy` is an alias for `app` and `standard` is an alias for `powershell`, so
@@ -256,8 +256,10 @@ alarm for expiry. A second Durable Object keeps the list for `session_list`.
 | `src/agent-app.manifest` | the app's `asInvoker` manifest (never asks for elevation) |
 | `src/app-bundle.json` | the compiled x86 app with the SHA-256 of its source and manifest. Tests fail when the source changed without a rebuild |
 | `src/agent.ps1` | the PowerShell agent: bootstrap, run and cleanup roles in one file |
-| `scripts/build-app.ps1` | builds `src/app-bundle.json` on Windows with the built-in compiler. `-OutDir <folder>` writes only the exe and leaves the bundle alone |
-| `scripts/test-app-native.ps1` | compiles and runs `test/app-native.cs` against the app source on Windows |
+| `scripts/build-app.ps1` | builds `src/app-bundle.json` on Windows with the built-in compiler, against the 4.5.2 reference assemblies (`-ReferenceDir`, required). `-OutDir <folder>` writes only the exe and leaves the bundle alone |
+| `scripts/fetch-net452-refs.ps1` | downloads the pinned 4.5.2 reference assemblies from nuget.org, verifies their SHA-512, and prints the folder to pass as `-ReferenceDir` |
+| `scripts/app-references.ps1` | the compiler arguments shared by the build and the native tests |
+| `scripts/test-app-native.ps1` | compiles and runs `test/app-native.cs` against the app source on Windows, with the same references |
 | `scripts/normalize-pe.mjs` | zeroes the build-specific fields of a .NET exe so two builds of one source compare equal |
 | `scripts/verify-app-binary.mjs` | compares a fresh build with the exe in `src/app-bundle.json` after normalizing both |
 | `scripts/prepare-app-restart.ps1` | optional: one automatic reconnect after a restart the customer authorized |
@@ -429,16 +431,28 @@ and `src/agent-app.manifest` on a Windows machine with the .NET Framework 4
 compiler (`csc.exe` v4.0.30319). The app needs .NET Framework 4.5.2 or later and
 TLS 1.2 at run time. Windows 10 and 11 include both. Windows 8.1 ships .NET 4.5.1
 and needs the 4.5.2 update. Windows 7 ships only .NET 3.5.1, so a Windows 7 PC
-needs .NET Framework 4.5.2 or later installed, and TLS 1.2 enabled, before the
-app will run:
+needs .NET Framework 4.5.2 or later installed before the app will run.
+
+The build compiles against the .NET Framework 4.5.2 reference assemblies, not the
+newer framework on the build PC. Without them the compiler can pick a method that
+4.5.2 lacks. That happened once: `String.Format` with a provider and three
+arguments is new in .NET 4.6, and the app crashed with `MissingMethodException`
+on a PC with 4.5.2. `scripts\fetch-net452-refs.ps1` downloads the NuGet package
+`Microsoft.NETFramework.ReferenceAssemblies.net452` at a pinned version from
+nuget.org, checks it against the SHA-512 pinned in the script, extracts it, and
+prints the folder (`build\.NETFramework\v4.5.2` inside the package) to pass as
+`-ReferenceDir`. CI uses the same script.
 
 ```powershell
-powershell.exe -NoProfile -File scripts\build-app.ps1
+$refs = powershell.exe -NoProfile -File scripts\fetch-net452-refs.ps1 -Destination C:\refs\net452
+powershell.exe -NoProfile -File scripts\build-app.ps1 -ReferenceDir $refs
 ```
 
-The script targets x86, references the WPF assemblies, embeds the `asInvoker`
-manifest, compiles with warnings as errors, and writes the executable (base64)
-and the SHA-256 of the source and manifest into the bundle. It always compiles
+The script targets x86, references the 4.5.2 assemblies, embeds the `asInvoker`
+manifest, compiles with warnings as errors, and writes the executable (base64),
+`reference_framework: "net452"` and the SHA-256 of the source and manifest into
+the bundle. `-ReferenceDir` is required, so no build can skip the references.
+It always compiles
 to the file name `support-mcp-app.exe`, because the compiler embeds that name in
 the exe. Run it with `-OutDir <folder>` to write only the exe into that folder
 and leave `src/app-bundle.json` untouched.
@@ -451,11 +465,16 @@ rebuild. It cannot tell whether `exe_b64` was compiled from that source. The
 `windows-app` job in `.github/workflows/test.yml` checks that, on every push and
 pull request, on a GitHub-hosted `windows-latest` runner:
 
-1. It builds the app from the committed source with `scripts/build-app.ps1`.
-2. It compiles and runs `test/app-native.cs`, and fails on any failed check.
-3. It runs `scripts/verify-app-binary.mjs`, which normalizes the fresh exe and
+1. It fetches the .NET Framework 4.5.2 reference assemblies with
+   `scripts/fetch-net452-refs.ps1`. The script fails unless the downloaded
+   package matches the SHA-512 committed in the script.
+2. It builds the app from the committed source with `scripts/build-app.ps1`
+   against those references.
+3. It compiles and runs `test/app-native.cs` against the same references, and
+   fails on any failed check.
+4. It runs `scripts/verify-app-binary.mjs`, which normalizes the fresh exe and
    the committed exe and fails unless they are byte for byte identical.
-4. It uploads the fresh exe as the `support-app` workflow artifact.
+5. It uploads the fresh exe as the `support-app` workflow artifact.
 
 The .NET Framework v4 compiler is not reproducible: two builds of the same source
 differ only in the COFF header timestamp (4 bytes) and the 16-byte module
@@ -488,15 +507,18 @@ the runner. What it does not prove:
   check.
 
 When you change `src/agent-app.cs` or `src/agent-app.manifest`, rebuild the
-bundle on a Windows PC with the v4 compiler and commit it with the source:
+bundle on a Windows PC with the v4 compiler and commit it with the source.
+Use the references from `scripts\fetch-net452-refs.ps1`, as above: a bundle built
+without them has the same source hash but a different exe, and the job fails:
 
 ```powershell
-powershell.exe -NoProfile -File scripts\build-app.ps1
+$refs = powershell.exe -NoProfile -File scripts\fetch-net452-refs.ps1 -Destination C:\refs\net452
+powershell.exe -NoProfile -File scripts\build-app.ps1 -ReferenceDir $refs
 ```
 
 If the `windows-app` job fails on the exe check, it prints both normalized
 hashes. Rebuild the bundle, push, and the job passes when the hashes agree.
-To check a bundle yourself, build with `-OutDir` and run
+To check a bundle yourself, build with `-ReferenceDir` and `-OutDir` and run
 `node scripts/verify-app-binary.mjs <folder>\support-mcp-app.exe`.
 
 The native tests compile `test/app-native.cs` together with `src/agent-app.cs`
@@ -505,9 +527,12 @@ the result. They start the real client against a fake relay and exercise HTTP
 operations, Unicode, chunking, retry deduplication, process-tree cancellation,
 timeout, local expiry and the reconnect rules. They need a Windows desktop
 session, so they are not part of `node --test`; CI runs them in the `windows-app`
-job. The first connection from a
-real Windows 7 PC still needs a live check for that image's TLS 1.2 and
-certificate setup.
+job. `scripts/test-app-native.ps1` also takes `-ReferenceDir`, so the tests are
+compiled against the 4.5.2 references and the compile fails if the app or the
+tests call a method 4.5.2 lacks. They still run on the build PC's framework, so
+they cannot catch a method that is missing at run time on 4.5.2 by themselves;
+the reference assembly build does that. The first connection from a real
+Windows 7 PC was checked live (see the platform notes below).
 
 An operator can prepare one automatic reconnect after a restart the customer
 authorized. `scripts/prepare-app-restart.ps1` runs inside the live session on
@@ -554,7 +579,11 @@ The wire protocol, the state machine and the acceptance checks are in
   with the normal Windows certificate checks, and runs on Windows 7 to 11.
   Windows 10 and 11 include both. Windows 8.1 ships .NET 4.5.1 and needs the
   4.5.2 update. Windows 7 ships only .NET 3.5.1, so it needs .NET Framework
-  4.5.2 or later installed first, and TLS 1.2 enabled. The
+  4.5.2 or later installed first. The app turns TLS 1.2 on for its own
+  connections, so Windows 7 needs no TLS registry change. Tested on Windows 7
+  SP1 (32-bit) with stock .NET Framework 4.5.2 (Release 379893) and no TLS
+  registry changes, against the live relay: the app attaches, runs commands and
+  moves files. The
   PowerShell agent targets Windows PowerShell 5.1, which ships with Windows 10
   and 11.
 - Nothing is signed. The app shows a SmartScreen warning (see

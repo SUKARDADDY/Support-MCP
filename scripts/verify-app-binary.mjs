@@ -15,7 +15,7 @@ const committed = normalizedSha256(Buffer.from(JSON.parse(readFileSync(bundlePat
 console.log(`fresh build, normalized:     ${fresh}`);
 console.log(`committed exe, normalized:   ${committed}`);
 if (fresh !== committed) {
-  console.error('\nThe committed exe does not match the source: rebuild src/app-bundle.json with scripts/build-app.ps1 on Windows.');
+  console.error('\nThe committed exe does not match the source: rebuild src/app-bundle.json with scripts/build-app.ps1 -ReferenceDir <4.5.2 references> on Windows (scripts/fetch-net452-refs.ps1 fetches them).');
   process.exit(1);
 }
 console.log('OK: the committed exe matches a fresh build of the committed source.');
