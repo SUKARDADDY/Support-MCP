@@ -168,7 +168,8 @@ and as `system` report the right identity; UAC No gives the fallback dialog and
 normal mode; `request_full_control` upgrades a normal session. After
 `session_end`, an expiry, and a service killed with `taskkill /f` (the backstop
 task cleans up at the deadline), `sc query SupportMcp-<id>`, `schtasks /query /tn
-SupportMcp-<id>`, `Test-Path "C:\Program Files\SupportMCP-<id>"`, `reg query
+SupportMcp-<id>-<random>` (or `schtasks /query /fo csv` for any
+`SupportMcp-<id>-` task), `Test-Path "C:\Program Files\SupportMCP-<id>"`, `reg query
 HKLM\SOFTWARE\SupportMCP` and `reg query
 HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v
 SoftwareSASGeneration` must all find nothing (unless that value existed before).

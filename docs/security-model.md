@@ -34,7 +34,10 @@ apply to only one client say which.
   app that the app first puts alone in a new folder under the user's Temp, so
   nothing next to the download (an `.exe.config`, a DLL) loads into the elevated
   process. That process reads its own file once, through a handle that stops
-  anyone from changing or renaming it, and installs from those bytes. It creates
+  anyone from changing or renaming it, and installs from those bytes. Between the
+  copy and that read, another process of the same user could swap the copy. That
+  is accepted: such a process already runs as the customer, and the threat model
+  does not defend the customer from their own account. It creates
   `%ProgramFiles%\SupportMCP-<id>\` in one step with its final ACL (SYSTEM and
   Administrators only, inheritance off) and fails if anything exists there; it
   never adopts an existing folder. `%ProgramFiles%` comes from the registry, not
@@ -49,12 +52,15 @@ apply to only one client say which.
   can read holds no attach key. The service and the helper talk over a pipe only
   SYSTEM can open, and each checks the other's process id. The window's pipe is
   open to interactive users, never to the network, with the rights to read and
-  write data but not to add a pipe instance. It answers only a status read and
-  `end`; anything else, or nothing for 5 seconds, closes the connection. Any
-  interactive user can end the session through it, which is the point of the
-  window. The window sends `end` until the service confirms the session ended;
-  if it cannot reach the service it says "Cannot reach the support service."
-  rather than claiming the session ended. Every pipe client allows the server to
+  write data but not to add a pipe instance. It serves only processes in the
+  active console session, at most two connections per process, so another
+  user's session (a user switch, Remote Desktop) cannot take its connections. It
+  answers only a status read and `end`; anything else, or nothing for 5 seconds,
+  closes the connection. Whoever is at the console can end the session through
+  it, which is the point of the window. The window sends `end` on the connection
+  it already holds until the service confirms the session ended; if it cannot
+  reach the service it says "Cannot reach the support service." rather than
+  claiming the session ended. Its reads time out, so it cannot hang there. Every pipe client allows the server to
   identify it only, so a process that took a pipe's name first cannot act as
   SYSTEM or as the user. The helper runs in a kill-on-close Job of the service,
   so it dies with it.
@@ -68,14 +74,20 @@ apply to only one client say which.
   `as: "system"`, `put_file` and `get_file` run as SYSTEM. Because a user could
   aim SYSTEM at a protected file with a junction, a symbolic link or a second
   hard link in a path they control, `put_file` and `get_file` refuse a path
-  with a link in it: every existing part is checked before the open, and the
-  opened file must have exactly the requested path (and, to write, one name
-  only). A file created by such an attempt is deleted again. Short 8.3 names fail
+  with a link in it. Every folder of the path, from the drive down, is opened as
+  itself, checked to be a plain folder with exactly its own path, and held so
+  nobody can rename or replace it until the file is open. A missing folder is
+  created one level at a time and checked before the next. The opened file must
+  have exactly the requested path (and, to write, one name only). A file created
+  by such an attempt is deleted again. Short 8.3 names fail
   this check too, so use the long path. `send_sas` sends Ctrl+Alt+Del through
   `SendSAS`. The installer sets `SoftwareSASGeneration` to allow services only
   when Windows would refuse it. Sessions on one PC share it: each records itself
-  under `HKLM\SOFTWARE\SupportMCP`, and the last to end puts the old value back,
-  only if the value is still the one written. UIPI no longer limits input, so support can work
+  under `HKLM\SOFTWARE\SupportMCP` (SYSTEM and Administrators only), every change
+  of that record holds one machine-wide mutex, and the last session to end puts
+  the old value back, only if the value is still the one written. The own-window
+  guard of the helper covers the corner window the service started and the app
+  that installed it, not every process that talks to the window pipe. UIPI no longer limits input, so support can work
   in windows that run as administrator. Commands keep the Job Object and the
   output caps. `request_full_control` asks one prompt at a time, and not again
   within a minute after the customer declined.
@@ -191,13 +203,16 @@ apply to only one client say which.
   registration, and start a detached `cmd` that deletes the folder once the
   service has exited, then the backstop task, last. If `cmd` cannot start,
   Windows deletes the files at the next restart and the task stays to do the
-  rest. None of this depends on `state.json`. Second, the service keeps its deadline on disk as a UTC
+  rest. None of this depends on `state.json`. Every install has a task name of its
+  own, so the late self-delete of an earlier install's task cannot remove a newer
+  one, and an install that finds an earlier task with no record runs it and waits
+  for it first. Second, the service keeps its deadline on disk as a UTC
   time: `connect_by` until the first welcome, then the session's expiry. It checks
   it at every start, also after a restart with no network, and on a timer.
   Third, a SYSTEM scheduled task at the deadline stops and deletes the service,
   releases the registry value, removes the folder and deletes itself, in that
   order. It runs only `cmd`, `sc`, `ping`, `taskkill`, PowerShell (for the
-  registry) and `schtasks`, never the app, which antivirus may have removed. Full
+  registry) and `schtasks`, each by its full `System32` path, never the app, which antivirus may have removed. Full
   control survives a restart or a sign-out within the same deadline, and a
   restart never extends it. That guarantee is against the customer's PC, not the
   operator: with SYSTEM rights an operator can change or remove any of these
