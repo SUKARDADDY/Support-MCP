@@ -606,3 +606,36 @@ test('/mcp session_status reports control, caps and client_version', async () =>
   const s = JSON.parse(body.result.content[0].text);
   assert.deepEqual([s.control, s.caps, s.client_version, s.windows_mode], ['full', NEW_CAPS, 'windows-app-2', 'app']);
 });
+
+test('a block_input result sets input_blocked_until at once, and off clears it', async () => {
+  const f = await attach({ control: 'full' });
+  const drive = async (extra, body) => {
+    const q = f.op(screen('block_input', extra));
+    await until(() => f.session.httpCommands.screen);
+    const fr = await f.poll({ busy_lanes: [] });
+    await f.result(fr, body);
+    return q;
+  };
+  const until10 = Date.now() + 600000;
+  assert.equal((await drive({ on: true, minutes: 10 }, { input_blocked_until: until10, desktop: 'default' })).input_blocked_until, until10);
+  assert.equal((await f.status()).input_blocked_until, until10, 'stored from the result, before any poll');
+  await drive({ on: false }, { desktop: 'default' });
+  assert.equal((await f.status()).input_blocked_until, null, 'off clears it at once');
+  // A bad value makes the result invalid; the relay answers 400 and stores nothing.
+  const q = f.op(screen('block_input', { on: true }));
+  await until(() => f.session.httpCommands.screen);
+  const fr = await f.poll({ busy_lanes: [] });
+  assert.equal((await f.result(fr, { input_blocked_until: 'soon' })).status, 400);
+  await f.result(fr, { input_blocked_until: until10 });
+  await q;
+});
+
+test('an input whose screenshot failed is still a success, with the note and no image', async () => {
+  const f = await attach({ control: 'full' });
+  const q = f.op(screen('click', { x: 600, y: 450 }));
+  await until(() => f.session.httpCommands.screen);
+  const fr = await f.poll({ busy_lanes: [] });
+  await f.result(fr, { text: 'input sent; no screenshot: cannot capture the screen', desktop: 'default', display: 0, displays: 1 });
+  const r = await q;
+  assert.deepEqual([r.ok, r.text, r.image_b64, r.desktop], [true, 'input sent; no screenshot: cannot capture the screen', undefined, 'default']);
+});

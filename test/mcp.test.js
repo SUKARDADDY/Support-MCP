@@ -81,6 +81,9 @@ test('descriptions carry the safety guidance and mark the aliases deprecated', (
   assert.match(by.send_sas, /relay refuses it/);
   assert.match(by.request_full_control, /UAC prompt/);
   assert.match(by.run, /nobody is signed in/);
+  assert.match(by.press_key, /Win\+L is refused/);
+  assert.match(by.press_key, /LockWorkStation/);
+  assert.match(by.click, /input sent; no screenshot/);
   assert.match(by.ui_tree, /reports it as display/);
   assert.equal('display' in listTools({ shape: 'split', ui: true }).find((t) => t.name === 'ui_act').inputSchema.properties, false);
   const status = by.session_status;

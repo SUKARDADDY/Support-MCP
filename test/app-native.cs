@@ -152,6 +152,8 @@ public static class AppTests {
         var seq = KeySpec.Parse("ctrl+a  Delete"); Assert(seq.Count == 2 && seq[1][0] == 0x2E, "Key sequences");
         Throws(delegate { KeySpec.Parse("ctrl+alt+Delete"); }, "send_sas"); Throws(delegate { KeySpec.Parse("Delete+alt+Control"); }, "send_sas");
         Throws(delegate { KeySpec.Parse("ctrl+banana"); }, "Unknown key"); Throws(delegate { KeySpec.Parse("   "); }, "No keys");
+        Throws(delegate { KeySpec.Parse("super+l"); }, "LockWorkStation"); Throws(delegate { KeySpec.Parse("L+win"); }, "rundll32.exe user32.dll,LockWorkStation"); Throws(delegate { KeySpec.Parse("ctrl+a super+L"); }, "Win+L");
+        Assert(KeySpec.Parse("super+r")[0].Length == 2 && KeySpec.Parse("ctrl+l")[0].Length == 2, "Other Win and L combinations still work");
         Assert(KeySpec.IsExtended(0x25) && KeySpec.IsExtended(0x2E) && !KeySpec.IsExtended(0x41), "Extended keys");
         Console.WriteLine("PASS xdotool-style key parsing, and ctrl+alt+del is refused with a pointer to send_sas");
         var clock = new PauseClock();
@@ -208,7 +210,8 @@ public static class AppTests {
         long month = 30L * 86400000; uint monthAgo = unchecked((uint)(5000 + month));
         Assert(InputIdle.CustomerAgoMs(5000, monthAgo, 0, false) == month && InputIdle.RemainingMs(month) == 0, "A PC idle for 30 days is idle, not paused");
         Assert(InputIdle.CustomerAgoMs(10005, 10000, 0, false) == 0 && InputIdle.RemainingMs(0) == 3000, "An input a moment ahead of the clock reads as just now");
-        Console.WriteLine("PASS pause cross-check against GetLastInputInfo");
+        Assert(!InputIdle.Stuck(InputIdle.StuckMs - 1, false) && InputIdle.Stuck(InputIdle.StuckMs, false) && !InputIdle.Stuck(InputIdle.StuckMs * 10, true), "A key down for 10 s with no input since is stuck; one with input since (a held key repeats) is not");
+        Console.WriteLine("PASS pause cross-check against GetLastInputInfo, and the stuck-key rule");
     }
     static string Hex(string b64) { return Convert.ToBase64String(Convert.FromBase64String(b64), 0, 2); }
     static Dictionary<string, object> Act(string name, params object[] pairs) {
@@ -718,6 +721,26 @@ public static class AppTests {
             Assert(!Wire.Flag(tree, "ok") && Wire.Text(tree, "error").Contains("support window"), "ui_tree must not read this process's window: " + Wire.Text(tree, "error"));
         }
         Console.WriteLine("PASS live screen: capture, zoom, exact cursor mapping, pause and own-window guards");
+        // A key the app pressed whose up never arrived (a desktop switch) neither pauses support nor stays down:
+        // Unstick sends the up. A key no one released and no input for 10 s is stuck and stops pausing. F23 and F22 are harmless.
+        using (var screen = new Screen()) {
+            screen.Start(); var stop = new ManualResetEvent(false);
+            var t = new Thread(delegate() {
+                Screen.Send(Screen.KeyEvent(0x86, 0, 0));
+                Assert((Win.GetAsyncKeyState(0x86) & 0x8000) != 0, "Test setup: F23 is down");
+                Assert(screen.PausedForMs == 0, "The app's own key left down is not the customer's");
+                Screen.Unstick();
+                Assert((Win.GetAsyncKeyState(0x86) & 0x8000) == 0, "Unstick sent its up");
+                var raw = new Win.In[] { Screen.KeyEvent(0x85, 0, 0) }; Win.SendInput(1, raw, Marshal.SizeOf(typeof(Win.In))); // not through Send: not the app's
+                screen.Watch.Clock.Touch(-100000);
+                Assert(screen.PausedForMs > 0, "A key someone else holds pauses support");
+                Thread.Sleep((int)InputIdle.StuckMs + 1000);
+                long left = screen.PausedForMs;
+                raw[0] = Screen.KeyEvent(0x85, 0, 2); Win.SendInput(1, raw, Marshal.SizeOf(typeof(Win.In)));
+                Assert(left == 0, "After 10 s with no input it is stuck and pauses nothing: " + left);
+            }); t.Start(); t.Join();
+        }
+        Console.WriteLine("PASS a key the app left down is released, and a stuck key stops pausing after 10 s");
     }
     public static int Main() {
         string dir = Path.Combine(Path.GetTempPath(), "support-mcp-native-test-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);

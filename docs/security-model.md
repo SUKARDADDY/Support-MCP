@@ -123,7 +123,12 @@ apply to only one client say which.
   Typing, key sequences and drags also stop at once when the session ends or the
   customer starts using the PC, and a drag releases the mouse button first.
   While `block_input` holds the customer's input, the pause does not apply.
-  Under full control the hooks move to whichever desktop is shown.
+  Under full control the hooks move to whichever desktop is shown. A key or
+  mouse button that the app pressed and whose release a desktop switch swallowed
+  (Escape on the Ctrl+Alt+Del screen, a click on Yes in UAC) never counts as the
+  customer's, and the app releases it on the desktop shown now. Any key that
+  reads down for 10 seconds while no input at all reaches Windows is treated as
+  stuck: a key the customer holds repeats, so it keeps pausing support.
 - **A secret is typed, never kept.** `type_secret` types into the focused field
   in normal mode too. The relay logs only the word `type_secret`, not even a
   length. It does not return the text. If the app reports a failure, the relay

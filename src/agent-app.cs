@@ -290,6 +290,9 @@ namespace SupportMcp {
             uint ago = unchecked(nowTick - lastInputTick);
             return ago > uint.MaxValue - 1000 ? 0 : ago;
         }
+        // A key that has read down for this long while no input reached Windows is stuck, not held by the customer.
+        public const long StuckMs = 10000;
+        public static bool Stuck(long downForMs, bool inputSince) { return !inputSince && downForMs >= StuckMs; }
         // Milliseconds left of the pause window for that age, 0 when there is none.
         public static long RemainingMs(long agoMs) { return agoMs < 0 ? 0 : Math.Max(0, PauseClock.WindowMs - agoMs); }
     }
@@ -306,6 +309,8 @@ namespace SupportMcp {
 
     // xdotool-style key names (ctrl+s, alt+tab, Return, F5, "ctrl+a Delete") to virtual-key codes.
     public static class KeySpec {
+        // Windows ignores an injected Win+L, and the L would be typed into the focused window.
+        public const string LockHint = "Windows ignores an injected Win+L. To lock the PC, use run with as: \"user\" and the command rundll32.exe user32.dll,LockWorkStation";
         static readonly Dictionary<string, int> Names = Build();
         static Dictionary<string, int> Build() {
             var d = new Dictionary<string, int>();
@@ -332,6 +337,7 @@ namespace SupportMcp {
                 }
                 mods.AddRange(rest);
                 if (mods.Contains(0x11) && mods.Contains(0x12) && mods.Contains(0x2E)) throw new ArgumentException("Ctrl+Alt+Del cannot be sent as a key; use send_sas.");
+                if (mods.Contains(0x5B) && mods.Contains(0x4C)) throw new ArgumentException(LockHint);
                 combos.Add(mods.ToArray());
             }
             if (combos.Count == 0) throw new ArgumentException("No keys given.");
@@ -514,17 +520,62 @@ namespace SupportMcp {
         public long PausedForMs {
             get {
                 var info = new Win.LastInput { Size = (uint)Marshal.SizeOf(typeof(Win.LastInput)) };
-                long external = Win.GetLastInputInfo(ref info)
+                bool known = Win.GetLastInputInfo(ref info);
+                long external = known
                     ? InputIdle.RemainingMs(InputIdle.CustomerAgoMs(info.Time, unchecked((uint)Environment.TickCount), unchecked((uint)Thread.VolatileRead(ref injectedTick)), injectedAny)) : 0;
-                if (AnyInputDown()) Watch.Clock.Touch(PauseClock.Now());
+                if (AnyInputDown(known ? info.Time : 0)) Watch.Clock.Touch(PauseClock.Now());
                 return Math.Max(external, Watch.Clock.RemainingMs(PauseClock.Now()));
             }
         }
         static int holding; // above 0 while the app itself keeps a key or mouse button down (Press, Drag)
-        static bool AnyInputDown() {
+        // Keys and mouse buttons the app pressed and has not yet seen come up. A key or click that switches the desktop
+        // (Escape or Cancel on the Ctrl+Alt+Del screen, Return on the sign-in screen, Yes on UAC) does its work on the
+        // way down; its up is refused, or lands on the desktop that is gone, so Windows keeps it down on the new one.
+        // Unstick sends those ups on the desktop shown now, and AnyInputDown never takes them for the customer's.
+        static readonly List<int> ours = new List<int>();
+        static readonly object pad = new object(); // one sender of downs and ups at a time: an input, or Unstick
+        static bool Ours(int vk) { lock (ours) return ours.Contains(vk); }
+        static void NoteDowns(Win.In[] inputs) {
+            foreach (var i in inputs) {
+                int vk = i.Type == 1 ? ((i.Key.Flags & 6) == 0 ? i.Key.Vk : 0) : (i.Mouse.Flags & 2) != 0 ? 1 : (i.Mouse.Flags & 8) != 0 ? 2 : (i.Mouse.Flags & 0x20) != 0 ? 4 : 0;
+                if (vk != 0) lock (ours) if (!ours.Contains(vk)) ours.Add(vk);
+            }
+        }
+        static bool OnShownDesktop() {
+            string shown = InputName(), mine = DesktopName(Win.GetThreadDesktop(Win.GetCurrentThreadId()));
+            return shown != null && shown == mine; // GetAsyncKeyState reads nothing on any other desktop
+        }
+        // On a thread on the desktop shown now: release what the app left down, and forget what is up.
+        internal static void Unstick() {
+            if (Thread.VolatileRead(ref holding) > 0 || !OnShownDesktop()) return;
+            lock (pad) {
+                int[] list; lock (ours) list = ours.ToArray();
+                foreach (int vk in list) {
+                    if ((Win.GetAsyncKeyState(vk) & 0x8000) != 0) {
+                        var up = vk == 1 ? MouseEvent(0, 0, 0, 4) : vk == 2 ? MouseEvent(0, 0, 0, 0x10) : vk == 4 ? MouseEvent(0, 0, 0, 0x40)
+                            : KeyEvent(vk, (ushort)Win.MapVirtualKey((uint)vk, 0), (KeySpec.IsExtended(vk) ? 1u : 0u) | 2u);
+                        Win.SendInput(1, new Win.In[] { up }, Marshal.SizeOf(typeof(Win.In))); RecordInjection();
+                    }
+                    if ((Win.GetAsyncKeyState(vk) & 0x8000) == 0) lock (ours) ours.Remove(vk);
+                }
+            }
+        }
+        // Since when each key has read down, and the last-input time then. A key the customer holds repeats, so the
+        // last-input time moves; one that reads down for StuckMs while it does not is stuck, and stops the pause.
+        static readonly Dictionary<int, long> downSince = new Dictionary<int, long>(); static readonly Dictionary<int, uint> downTick = new Dictionary<int, uint>();
+        static bool AnyInputDown(uint lastInput) {
             if (Thread.VolatileRead(ref holding) > 0) return false;
-            for (int vk = 1; vk < 255; vk++) if ((Win.GetAsyncKeyState(vk) & 0x8000) != 0) return true;
-            return false;
+            long now = PauseClock.Now(); bool any = false;
+            lock (downSince) {
+                for (int vk = 1; vk < 255; vk++) {
+                    if ((Win.GetAsyncKeyState(vk) & 0x8000) == 0) { downSince.Remove(vk); continue; }
+                    if (Ours(vk)) continue;
+                    long since; uint tick;
+                    if (!downSince.TryGetValue(vk, out since) || !downTick.TryGetValue(vk, out tick) || tick != lastInput) { downSince[vk] = since = now; downTick[vk] = lastInput; }
+                    if (!InputIdle.Stuck(now - since, false)) any = true;
+                }
+            }
+            return any;
         }
         // After the app's own input: the time Windows gave it. Any input later than this is the customer's.
         static void RecordInjection() {
@@ -571,6 +622,7 @@ namespace SupportMcp {
         internal static string Desktop() { string name = InputName(); return name == "Default" ? "default" : name == "Winlogon" ? "secure" : "unknown"; }
         internal static string InputName() {
             IntPtr d = Win.OpenInputDesktop(0, false, 1);
+            if (d == IntPtr.Zero) d = Win.OpenInputDesktop(0, false, 0); // no access asked: the name is all that is read
             if (d == IntPtr.Zero) return null;
             try { return DesktopName(d); } finally { Win.CloseDesktop(d); }
         }
@@ -662,7 +714,8 @@ namespace SupportMcp {
             NotElevated(fg);
             seen = fg;
         }
-        static void Send(params Win.In[] inputs) {
+        internal static void Send(params Win.In[] inputs) {
+            NoteDowns(inputs);
             uint sent = Win.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Win.In)));
             RecordInjection();
             if (sent != inputs.Length) throw new ScreenError("Windows refused the input");
@@ -670,7 +723,7 @@ namespace SupportMcp {
         static Win.In MouseEvent(int dx, int dy, int data, uint flags) {
             var i = new Win.In { Type = 0 }; i.Mouse = new Win.MouseIn { Dx = dx, Dy = dy, Data = unchecked((uint)data), Flags = flags }; return i;
         }
-        static Win.In KeyEvent(int vk, ushort scan, uint flags) {
+        internal static Win.In KeyEvent(int vk, ushort scan, uint flags) {
             var i = new Win.In { Type = 1 }; i.Key = new Win.KeyIn { Vk = (ushort)vk, Scan = scan, Flags = flags }; return i;
         }
         // Absolute move over the whole virtual desktop, rounded up so Windows lands on this exact pixel.
@@ -686,17 +739,19 @@ namespace SupportMcp {
             }
             Interlocked.Increment(ref holding);
             try {
+                lock (pad) {
                 string before = Full ? InputName() : null;
                 Send(down.ToArray()); Thread.Sleep(30);
                 // Full control: a key that switches the desktop (Return on the sign-in screen) has done its work, and Windows
                 // refuses its key-up on the desktop that is gone. That is not a failure.
                 try { Send(up.ToArray()); } catch (ScreenError) { if (!Full || InputName() == before) throw; }
+                }
             } finally { Interlocked.Decrement(ref holding); }
         }
         // One real key press, down and up in a single call.
         static void Tap(int vk) {
             ushort scan = (ushort)Win.MapVirtualKey((uint)vk, 0); uint ext = KeySpec.IsExtended(vk) ? 1u : 0u;
-            Send(KeyEvent(vk, scan, ext), KeyEvent(vk, scan, ext | 2u));
+            lock (pad) Send(KeyEvent(vk, scan, ext), KeyEvent(vk, scan, ext | 2u));
         }
         // Unicode key events type any character the target accepts, whatever the keyboard layout. Newline and tab are
         // real Return and Tab keys. A character above U+FFFF goes as its two surrogate halves, one event pair each.
@@ -744,7 +799,7 @@ namespace SupportMcp {
             v.Check(x, y); int px = v.PhysX(x), py = v.PhysY(y);
             Target(px, py); MoveTo(px, py);
             uint down = button == "right" ? 8u : button == "middle" ? 0x20u : 2u;
-            for (int i = 0; i < count; i++) { if (i > 0) Between(stop); Send(MouseEvent(0, 0, 0, down), MouseEvent(0, 0, 0, down * 2)); Wait(stop, 40); }
+            for (int i = 0; i < count; i++) { if (i > 0) Between(stop); lock (pad) Send(MouseEvent(0, 0, 0, down), MouseEvent(0, 0, 0, down * 2)); Wait(stop, 40); }
         }
         // The button is released even when the drag stops early, so a pause never leaves it held down.
         void Drag(View v, int x1, int y1, int x2, int y2, WaitHandle stop) {
@@ -752,7 +807,7 @@ namespace SupportMcp {
             Target(ax, ay); Target(bx, by);
             MoveTo(ax, ay); Wait(stop, 50);
             Interlocked.Increment(ref holding);
-            try {
+            lock (pad) try {
                 Send(MouseEvent(0, 0, 0, 2));
                 for (int i = 1; i <= 10; i++) { Wait(stop, 20); Between(stop); MoveTo(ax + (bx - ax) * i / 10, ay + (by - ay) * i / 10); }
                 Wait(stop, 50);
@@ -857,10 +912,28 @@ namespace SupportMcp {
         static void Merge(Dictionary<string, object> into, Dictionary<string, object> from) { foreach (var kv in from) into[kv.Key] = kv.Value; }
         static double Seconds(Dictionary<string, object> a) { object v; return a.TryGetValue("seconds", out v) && v != null ? Math.Max(0, Math.Min(10, Convert.ToDouble(v))) : 1; }
         // Runs one "screen" or "control" frame and returns its result. Never throws.
+        // Full control: runs a capture on a fresh thread on the desktop shown now (the helper sets it), for the screenshot
+        // after an input that switched the desktop. null in normal mode.
+        public static Func<Func<Dictionary<string, object>>, Dictionary<string, object>> OnShown;
+        public const int SettleMs = 2000;
+        // The screenshot after an input. The input has happened whatever this finds: the capture follows a desktop switch
+        // and is retried for SettleMs, and if it still fails the result says so in text and stays ok.
+        static void Settle(Dictionary<string, object> r, View v, string before, WaitHandle stop) {
+            var clock = Stopwatch.StartNew(); string reason = "the screen could not be captured";
+            while (true) {
+                try {
+                    var onShown = OnShown;
+                    Merge(r, onShown == null || InputName() == before ? Shot(v.Phys) : onShown(delegate { Dpi(); return Shot(v.Phys); }));
+                    return;
+                } catch (Exception e) { reason = e.Message; }
+                if (clock.ElapsedMilliseconds >= SettleMs || stop.WaitOne(250)) break;
+            }
+            object note; r["text"] = (r.TryGetValue("text", out note) ? note + "\n" : "") + "input sent; no screenshot: " + reason;
+        }
         public Dictionary<string, object> Run(Dictionary<string, object> frame, WaitHandle stop) {
             string desktop = "unknown"; bool secret = false;
             try {
-                Dpi(); desktop = Desktop();
+                Dpi(); desktop = Desktop(); Unstick(); string startName = InputName();
                 var a = frame.ContainsKey("action") ? frame["action"] as Dictionary<string, object> : null;
                 if (Wire.Text(frame, "type") == "control" || a == null) throw new ScreenError(Wire.Text(frame, "type") == "control" ? NoFull : "missing screen action");
                 string name = Wire.Text(a, "name");
@@ -884,9 +957,10 @@ namespace SupportMcp {
                 else if (name == "ui_tree") r["text"] = Tree(v, (int)Math.Max(1, Math.Min(2000, a.ContainsKey("max_lines") ? Wire.Number(a, "max_lines") : 300)));
                 else if (name == "ui_act") { string note = UiAct(a); if (note != null) r["text"] = note; }
                 else if (name != "wait") Input(name, a, v, stop);
-                if (input && (!a.ContainsKey("screenshot") || Wire.Flag(a, "screenshot"))) { Wait(stop, 300); Merge(r, Shot(v.Phys)); }
+                if (input && (!a.ContainsKey("screenshot") || Wire.Flag(a, "screenshot"))) { Wait(stop, 300); Settle(r, v, startName, stop); }
                 if (v != null) { r["display"] = v.Index; r["displays"] = v.Count; }
-                r["desktop"] = desktop;
+                r["desktop"] = input ? Desktop() : desktop; // after the input: it may have switched the desktop
+                Unstick();
                 return r;
             } catch (Exception e) {
                 // Nothing of a secret, and no detail about where it went, can come back in an error.
@@ -994,6 +1068,9 @@ namespace SupportMcp {
             public bool Busy { get { return ActiveId != ""; } }
         }
         static string LaneOf(string type) { return type == "run" || type == "put_file" || type == "get_file" ? "cmd" : type == "screen" || type == "control" ? "screen" : null; }
+        public long ServerOffsetMs { get { return Interlocked.Read(ref serverOffsetMs); } }
+        // Ends a parked poll, so the next poll carries a fresh report (the full-control service uses it after a change).
+        public void Nudge() { Wake(); }
         void Wake() {
             signal.Set();
             lock (gate) { woke = true; if (polling && request != null) request.Abort(); }
@@ -1170,7 +1247,7 @@ namespace SupportMcp {
                             generation = Wire.Number(welcome, "generation");
                             long expires = Wire.Number(welcome, "expires_at"), now = Wire.Number(welcome, "server_time");
                             if (now == 0) now = UnixNow();
-                            serverOffsetMs = now - UnixNow(); // the relay reports deadlines on its own clock
+                            Interlocked.Exchange(ref serverOffsetMs, now - UnixNow()); // the relay reports deadlines on its own clock
                             long remainingMs = Math.Max(0, Math.Min(86400000, expires - now));
                             Interlocked.Exchange(ref deadlineMs, clock.ElapsedMilliseconds + remainingMs);
                             Interlocked.Exchange(ref expiresAtMs, UnixNow() + remainingMs);
@@ -1945,14 +2022,20 @@ namespace SupportMcp {
                 }
             }
         }
-        void Poll() {
-            while (true) {
-                Thread.Sleep(500);
-                NamedPipeClientStream pipe; lock (gate) pipe = status;
-                if (pipe == null) continue;
-                try { Pipes.Write(pipe, Wire.Map("type", "status")); last = Pipes.Read(pipe, 4096, 5000); Interlocked.Exchange(ref lastAt, PauseClock.Now()); }
-                catch (Exception) { }
+        void Poll() { while (true) { Thread.Sleep(500); PollNow(); } }
+        readonly object pollGate = new object();
+        // Raised when the desktop or the block changed, so the service reports it to the relay at once.
+        public event Action Changed;
+        public void PollNow() {
+            NamedPipeClientStream pipe; lock (gate) pipe = status;
+            if (pipe == null) return;
+            Dictionary<string, object> before = last, now;
+            lock (pollGate) {
+                try { Pipes.Write(pipe, Wire.Map("type", "status")); now = Pipes.Read(pipe, 4096, 5000); } catch (Exception) { return; }
+                last = now; Interlocked.Exchange(ref lastAt, PauseClock.Now());
             }
+            var changed = Changed;
+            if (changed != null && (before == null || Wire.Text(before, "desktop") != Wire.Text(now, "desktop") || (Wire.Number(before, "blocked_ms") > 0) != (Wire.Number(now, "blocked_ms") > 0))) changed();
         }
         // The helper's status if it is under 3 s old: desktop, paused_ms, blocked_ms.
         public Dictionary<string, object> Status { get { var s = last; return s != null && PauseClock.Now() - Interlocked.Read(ref lastAt) < 3000 ? s : null; } }
@@ -2029,7 +2112,7 @@ namespace SupportMcp {
         public static void Run(string exe, string[] args) {
             int service; if (args.Length != 2 || !int.TryParse(args[1], out service)) return;
             string name = Backstop.Name(FullInstall.Sid8(Wire.ReadConfig(exe))) + "-h" + Process.GetCurrentProcess().Id;
-            Screen.Full = true;
+            Screen.Full = true; Screen.OnShown = delegate(Func<Dictionary<string, object>> f) { return OnInputDesktop(f); };
             var screen = new Screen(); var blocker = new Blocker();
             screen.Blocked = delegate { return blocker.Active; }; screen.Step = blocker.Check;
             NamedPipeServerStream op = Native.PipeServer(name + "-op", Sddl, 1, true), st = Native.PipeServer(name + "-st", Sddl, 1, true);
@@ -2039,8 +2122,8 @@ namespace SupportMcp {
                 try {
                     while (Wire.Text(Pipes.Read(st, 1024), "type") == "status") {
                         Dictionary<string, object> r;
-                        try { r = OnInputDesktop(delegate { screen.Rearm(); long b = blocker.RemainingMs; return Wire.Map("desktop", Screen.Desktop(), "paused_ms", b > 0 ? 0 : screen.PausedForMs, "blocked_ms", b); }); }
-                        catch (Exception) { r = Wire.Map("desktop", "unknown", "paused_ms", 0, "blocked_ms", blocker.RemainingMs); }
+                        try { r = OnInputDesktop(delegate { screen.Rearm(); Screen.Unstick(); long b = blocker.RemainingMs; return Wire.Map("desktop", Screen.Desktop(), "paused_ms", b > 0 ? 0 : screen.PausedForMs, "blocked_ms", b); }); }
+                        catch (Exception) { r = Wire.Map("desktop", Screen.Desktop(), "paused_ms", 0, "blocked_ms", blocker.RemainingMs); } // reading the name needs no switch
                         Pipes.Write(st, r);
                     }
                 } catch (Exception) { }
@@ -2224,6 +2307,7 @@ namespace SupportMcp {
                 if (state != null && state.Sid == Wire.Text(config, "sid") && !FullState.Expired(state.Deadline, Client.UnixNow()) && !stopping) {
                     ui = new UiServer(Backstop.Name(sid8) + "-ui", UiStatus, delegate { var c = client; if (c != null) c.Stop(); });
                     helper = new HelperHost(exe, sid8);
+                    helper.Changed += delegate { var c = client; if (c != null) c.Nudge(); }; // an escape or a desktop switch reaches the relay at once
                     var cfg = new Dictionary<string, object>(config); cfg["startup_ms"] = state.Deadline - Client.UnixNow(); cfg.Remove("startup_expires_at");
                     client = new Client(cfg, FullState.DayMs) { Full = this, WorkRoot = folder };
                     client.Connected += delegate { connected = true; };
@@ -2284,10 +2368,19 @@ namespace SupportMcp {
                 string error = Native.SendSas(); if (error != null) return Wire.Map("ok", false, "error", error);
                 stop.WaitOne(1500);
                 bool shot = !a.ContainsKey("screenshot") || Wire.Flag(a, "screenshot");
-                return helper.Op(Wire.Map("type", "screen", "own_pids", pids, "action", Wire.Map("name", shot ? "screenshot" : "wait", "seconds", 0.1, "screenshot", false, "display", Wire.Number(a, "display"))));
+                var sas = helper.Op(Wire.Map("type", "screen", "own_pids", pids, "action", Wire.Map("name", shot ? "screenshot" : "wait", "seconds", 0.1, "screenshot", false, "display", Wire.Number(a, "display"))));
+                helper.PollNow();
+                // Ctrl+Alt+Del went out: a failed screenshot after it does not make the action fail.
+                return Wire.Flag(sas, "ok") ? sas : Wire.Map("ok", true, "text", "Ctrl+Alt+Del sent; no screenshot: " + Wire.Text(sas, "error"));
             }
             var forward = new Dictionary<string, object>(frame); forward["own_pids"] = pids;
-            return helper.Op(forward);
+            var result = helper.Op(forward);
+            helper.PollNow(); // the desktop and the block as they are now, for the next poll
+            if (a != null && Wire.Text(a, "name") == "block_input" && Wire.Flag(result, "ok")) {
+                var st = helper.Status; var c = client; long left = st == null ? 0 : Wire.Number(st, "blocked_ms");
+                result["input_blocked_until"] = left > 0 && c != null ? Client.UnixNow() + c.ServerOffsetMs + left : (object)null;
+            }
+            return result;
         }
         public IntPtr UserToken(out string profile) {
             uint s = Native.WTSGetActiveConsoleSessionId(); IntPtr token = IntPtr.Zero;

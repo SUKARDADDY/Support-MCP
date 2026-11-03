@@ -15,7 +15,7 @@ const SCREEN_SAFETY =
 const COORDS =
   'Coordinates are pixels of the latest screenshot. Screenshots are scaled down (never up) to fit 1280 x 800 and the app maps your coordinates to the real screen.';
 const INPUT_NOTE =
-  'Every input action appends a fresh screenshot to its result unless you pass screenshot:false. When the customer is using the mouse or keyboard, input fails with "customer is using the PC; try again in a few seconds": wait and retry. Needs the support app (not the PowerShell fallback).';
+  'Every input action appends a fresh screenshot to its result unless you pass screenshot:false. When the customer is using the mouse or keyboard, input fails with "customer is using the PC; try again in a few seconds": wait and retry. If the input went out but no screenshot could follow (it switched to or from the Windows security screen, for example Yes on UAC or Cancel on Ctrl+Alt+Del), the result is still a success with the text "input sent; no screenshot: ...": do not repeat the input, take a screenshot. Needs the support app (not the PowerShell fallback).';
 const SHOT = { type: 'boolean', description: 'append a fresh screenshot to the result (default true)' };
 const DISPLAY = { type: 'integer', description: 'monitor to use, 0 is the primary (default 0); results report displays' };
 const XY = (what) => ({ type: 'array', items: { type: 'integer' }, minItems: 2, maxItems: 2, description: `${what} as [x, y]` });
@@ -127,7 +127,7 @@ const COMPUTER_ACTIONS = [
 ];
 const COMPUTER_TOOL = tool(
   'computer',
-  `Look at and control the customer's screen, mouse and keyboard through the support app. Start with action screenshot. ${COORDS} ${INPUT_NOTE} ${SCREEN_SAFETY} Actions: screenshot; left_click, right_click, middle_click, double_click, triple_click and mouse_move at coordinate; left_click_drag from start_coordinate to coordinate; scroll at coordinate with scroll_direction and scroll_amount; type text; key (xdotool style: ctrl+s, alt+tab, Return, F5; Ctrl+Alt+Del is refused, use send_sas); wait for duration seconds (at most 10); zoom into region at full resolution.`,
+  `Look at and control the customer's screen, mouse and keyboard through the support app. Start with action screenshot. ${COORDS} ${INPUT_NOTE} ${SCREEN_SAFETY} Actions: screenshot; left_click, right_click, middle_click, double_click, triple_click and mouse_move at coordinate; left_click_drag from start_coordinate to coordinate; scroll at coordinate with scroll_direction and scroll_amount; type text; key (xdotool style: ctrl+s, alt+tab, Return, F5; Ctrl+Alt+Del is refused, use send_sas; Win+L is refused because Windows ignores it, so to lock the PC use run as:"user" with rundll32.exe user32.dll,LockWorkStation); wait for duration seconds (at most 10); zoom into region at full resolution.`,
   {
     action: { type: 'string', enum: COMPUTER_ACTIONS },
     coordinate: XY('target point'),
@@ -166,7 +166,7 @@ const SPLIT_TOOLS = [
   tool('type_text', `Type text into the focused control. Any language works. At most 5000 characters per call. Never use it for a password: use type_secret. ${INPUT_NOTE}`, {
     text: { type: 'string' }, display: DISPLAY, screenshot: SHOT,
   }, ['text']),
-  tool('press_key', `Press a key or combination, xdotool style: ctrl+s, alt+tab, Return, F5. Ctrl+Alt+Del is refused: use send_sas. ${INPUT_NOTE}`, {
+  tool('press_key', `Press a key or combination, xdotool style: ctrl+s, alt+tab, Return, F5. Ctrl+Alt+Del is refused: use send_sas. Win+L is refused because Windows ignores it: to lock the PC, use run as:"user" with rundll32.exe user32.dll,LockWorkStation. ${INPUT_NOTE}`, {
     keys: { type: 'string' }, display: DISPLAY, screenshot: SHOT,
   }, ['keys']),
   tool('wait', `Wait up to 10 seconds, for example for a window to open. ${INPUT_NOTE}`, {

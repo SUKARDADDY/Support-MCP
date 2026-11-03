@@ -196,7 +196,7 @@ an error.
 | `put_file` | writes base64 data to a path, with append for chunking. As SYSTEM under full control |
 | `get_file` | reads a byte range as base64, with `eof` for chunking. As SYSTEM under full control |
 | `session_end` | tells the client to stop and marks the session ended |
-| `computer` | the screen, mouse and keyboard in one tool: `screenshot`, clicks, `mouse_move`, `left_click_drag`, `scroll`, `type`, `key`, `wait`, `zoom`. A screenshot comes back as an image, then the size, display and desktop (`default`, or `secure` for UAC, the lock and sign-in screens and Ctrl+Alt+Del) as JSON |
+| `computer` | the screen, mouse and keyboard in one tool: `screenshot`, clicks, `mouse_move`, `left_click_drag`, `scroll`, `type`, `key`, `wait`, `zoom`. A screenshot comes back as an image, then the size, display and desktop (`default`, or `secure` for UAC, the lock and sign-in screens and Ctrl+Alt+Del) as JSON. An input that switched the desktop and left no screenshot still succeeds, with the note "input sent; no screenshot". `key` refuses Win+L, which Windows ignores: lock with `run` as `user` and `rundll32.exe user32.dll,LockWorkStation` |
 | `ui_tree`, `ui_act` | read a window's controls and act on one by its ref, through UI Automation |
 | `block_input` | lock the customer's mouse and keyboard for up to 10 minutes; it lifts by itself, and Ctrl+Alt+Del lifts it at once. Full control only |
 | `send_sas` | send Ctrl+Alt+Del. Full control only |

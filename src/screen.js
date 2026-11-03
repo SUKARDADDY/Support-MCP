@@ -223,6 +223,11 @@ function copyMeta(b, out) {
     if (typeof b.text !== 'string' || b.text.length > RESULT_TEXT_MAX) throw new Error('bad text');
     out.text = b.text;
   }
+  // block_input reports when the block lifts by itself, on the relay's clock.
+  if (present(b.input_blocked_until)) {
+    if (!isInt(b.input_blocked_until, 1, Number.MAX_SAFE_INTEGER)) throw new Error('bad input_blocked_until');
+    out.input_blocked_until = b.input_blocked_until;
+  }
 }
 
 // An ok result for a `screen` frame. `name` is the action it answers.

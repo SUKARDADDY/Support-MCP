@@ -308,7 +308,13 @@ the screenshot the model saw (at most 1280 x 800). `display` is an integer 0 to
 | `type_secret` | `text` (1 to 1000 chars), `display`, `screenshot` |
 
 `screenshot` (boolean, default `true`) asks for a fresh screenshot of `display`
-after the action, taken after a short settle (about 300 ms). The app, not the
+after the action, taken after a short settle (about 300 ms). The input's success
+never depends on it: when the input switched the desktop the app captures the
+new one, retrying for up to 2 s, and if that fails it answers `ok:true` with no
+image and `text` "input sent; no screenshot: <reason>". `desktop` in an input's
+result is read after the input. A `block_input` result carries
+`input_blocked_until` (Unix ms on the relay's clock, absent when input is not
+blocked), and the relay stores it at once. The app, not the
 relay, enforces everything that depends on the PC: the 3-second customer
 pause, the own-window guard, the refusal of elevated windows and the refusal of
 Ctrl+Alt+Del in `key`. The relay itself refuses `block_input` and
@@ -375,6 +381,7 @@ it does not list are dropped.
 | `displays` | whole number 1 to 16, and above `display` when both are sent. The app reports at most 16 |
 | `desktop` | `default`, `secure` or `unknown` (`secure` is the Winlogon desktop: UAC, lock, sign-in, Ctrl+Alt+Del) |
 | `text` | string of at most 200,000 characters (2000 for `control`). **Required** for `ui_tree`. The app stops a `ui_tree` at about 190,000 characters and ends it with a `[more elements not shown...]` line |
+| `input_blocked_until` | whole number above 0 (`block_input` results) |
 | `control` | `full` or `normal` (`control` results only) |
 
 The request body limit stays 750,000 characters, so the app steps JPEG quality

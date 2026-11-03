@@ -76,6 +76,10 @@ test('a good screenshot result passes and is copied field by field', () => {
   // nulls count as absent
   assert.equal(decodeScreenResult({ ok: true, image_b64: null, mime: null, width: null, height: null, text: null, desktop: null }, 'click').ok, true);
   assert.deepEqual(decodeScreenResult({ ok: true, text: 'tree', desktop: 'secure' }, 'ui_tree'), { ok: true, text: 'tree', desktop: 'secure' });
+  assert.deepEqual(decodeScreenResult({ ok: true, input_blocked_until: 1793665285449, desktop: 'default' }, 'block_input'), { ok: true, input_blocked_until: 1793665285449, desktop: 'default' });
+  for (const bad of ['soon', -1, 0, 1.5, Number.MAX_SAFE_INTEGER + 2]) assert.throws(() => decodeScreenResult({ ok: true, input_blocked_until: bad }, 'block_input'), /input_blocked_until/);
+  // An input that went out without its screenshot: ok, a note, no image.
+  assert.deepEqual(decodeScreenResult({ ok: true, text: 'input sent; no screenshot: x', desktop: 'default' }, 'click'), { ok: true, text: 'input sent; no screenshot: x', desktop: 'default' });
   // the largest image allowed
   const max = '/9j/' + 'A'.repeat(IMAGE_B64_MAX - 4);
   assert.equal(decodeScreenResult(shot({ image_b64: max }), 'screenshot').image_b64.length, IMAGE_B64_MAX);
