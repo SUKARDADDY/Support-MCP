@@ -86,7 +86,7 @@ namespace SupportMcp {
         public static Consent Detect() {
             int lua = -1, admin = -1;
             using (var hklm = Microsoft.Win32.RegistryKey.OpenBaseKey(Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryView.Registry64))
-            using (var key = hklm.OpenSubKey(FullInstall.PolicyKey)) {
+            using (var key = hklm.OpenSubKey(SasShare.PolicyKey)) {
                 if (key != null) { object v = key.GetValue("EnableLUA"); if (v is int) lua = (int)v; v = key.GetValue("ConsentPromptBehaviorAdmin"); if (v is int) admin = (int)v; }
             }
             using (var identity = WindowsIdentity.GetCurrent()) return Decide(SupportAccess.IsAdministrator(), Native.ElevationType(identity.Token), lua, admin);
@@ -110,24 +110,18 @@ namespace SupportMcp {
             object v; return d.TryGetValue(key, out v) && v is bool && (bool)v;
         }
         public static JavaScriptSerializer Json() { return new JavaScriptSerializer { MaxJsonLength = 800000 }; }
-        public static Dictionary<string, object> ReadConfig(string file) {
-            using (var s = File.OpenRead(file)) {
-                byte[] footer = Encoding.ASCII.GetBytes(Footer), tail = new byte[footer.Length + 4];
-                if (s.Length < tail.Length) throw new InvalidDataException("Missing session configuration.");
-                s.Position = s.Length - tail.Length; s.Read(tail, 0, tail.Length);
-                for (int i = 0; i < footer.Length; i++) if (tail[i + 4] != footer[i]) throw new InvalidDataException("Invalid session configuration.");
-                int n = BitConverter.ToInt32(tail, 0);
-                if (n < 1 || n > 4096 || n > s.Length - tail.Length) throw new InvalidDataException("Invalid session configuration size.");
-                byte[] data = new byte[n]; s.Position -= n + tail.Length; s.Read(data, 0, n);
-                var cfg = Json().Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(data));
-                if (!System.Text.RegularExpressions.Regex.IsMatch(Text(cfg, "sid"), "^[0-9a-f]{64}$") ||
-                    !System.Text.RegularExpressions.Regex.IsMatch(Text(cfg, "key"), "^[0-9a-f]{64}$")) throw new InvalidDataException("Invalid session credentials.");
-                Uri origin = new Uri(Text(cfg, "origin"));
-                if ((origin.Scheme != "https" && !(origin.Scheme == "http" && origin.IsLoopback)) ||
-                    origin.AbsolutePath != "/" || origin.UserInfo != "" || origin.Query != "" || origin.Fragment != "")
-                    throw new InvalidDataException("Invalid support server.");
-                return cfg;
-            }
+        public static Dictionary<string, object> ReadConfig(string file) { return ReadConfig(File.ReadAllBytes(file)); }
+        public static Dictionary<string, object> ReadConfig(byte[] all) {
+            int start = Payload(all), n = all.Length - Footer.Length - 4 - start;
+            for (int i = 0; i < Footer.Length; i++) if (all[all.Length - Footer.Length + i] != (byte)Footer[i]) throw new InvalidDataException("Invalid session configuration.");
+            var cfg = Json().Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(all, start, n));
+            if (!System.Text.RegularExpressions.Regex.IsMatch(Text(cfg, "sid"), "^[0-9a-f]{64}$") ||
+                !System.Text.RegularExpressions.Regex.IsMatch(Text(cfg, "key"), "^[0-9a-f]{64}$")) throw new InvalidDataException("Invalid session credentials.");
+            Uri origin = new Uri(Text(cfg, "origin"));
+            if ((origin.Scheme != "https" && !(origin.Scheme == "http" && origin.IsLoopback)) ||
+                origin.AbsolutePath != "/" || origin.UserInfo != "" || origin.Query != "" || origin.Fragment != "")
+                throw new InvalidDataException("Invalid support server.");
+            return cfg;
         }
         // The length of the exe without its appended session configuration. The corner window's copy is cut there,
         // so the file a signed-in user can read carries no attach key.
@@ -910,6 +904,8 @@ namespace SupportMcp {
         DateTime ExpiresLocal { get; }
         // True when access goes on after the customer signs out or restarts, so closing the window then must not end it.
         bool SurvivesSignOut { get; }
+        // True when the link finished because the session's service could not be reached, not because the session ended.
+        bool Lost { get; }
         void Stop();
     }
 
@@ -988,6 +984,7 @@ namespace SupportMcp {
         public bool Paused { get { var s = screen; return s != null && s.Paused; } }
         public bool Blocked { get { return false; } }
         public bool SurvivesSignOut { get { return false; } }
+        public bool Lost { get { return false; } }
         // One operation at a time per lane. Screen operations run while a command runs.
         sealed class Lane {
             public readonly string Name; public readonly ManualResetEvent Done = new ManualResetEvent(false);
@@ -1102,7 +1099,9 @@ namespace SupportMcp {
                     string encoded = Wire.Text(frame, "data_b64");
                     if (encoded.Length > 700000) throw new ArgumentException("File chunk too large.");
                     byte[] data = Convert.FromBase64String(encoded);
-                    // Same as the PowerShell agent: create missing parent directories (path is already validated).
+                    // Same as the PowerShell agent: create missing parent directories (path is already validated). Full control
+                    // writes as SYSTEM, so it refuses links and junctions on the way (Native.OpenPlain).
+                    if (Full != null) { using (var s = Native.OpenPlain(path, true, Wire.Flag(frame, "append"))) s.Write(data, 0, data.Length); return Wire.Map("ok", true, "bytes", data.Length); }
                     string parent = Path.GetDirectoryName(path);
                     if (!String.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent);
                     using (var s = new FileStream(path, Wire.Flag(frame, "append") ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.Read)) s.Write(data, 0, data.Length);
@@ -1112,7 +1111,7 @@ namespace SupportMcp {
                 long offset = Math.Max(0, Wire.Number(frame, "offset"));
                 int length = (int)Math.Max(1, Math.Min(524288, Wire.Number(frame, "length")));
                 // FileShare.ReadWrite, like the PowerShell agent, so a log another process is writing can be read.
-                using (var s = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) {
+                using (var s = Full != null ? Native.OpenPlain(path, false, false) : new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) {
                     s.Position = offset; byte[] data = new byte[length]; int total = 0, n;
                     while (total < length && (n = s.Read(data, total, length - total)) > 0) total += n;
                     return Wire.Map("ok", true, "data_b64", Convert.ToBase64String(data, 0, total), "size", s.Length, "eof", s.Position >= s.Length);
@@ -1353,8 +1352,6 @@ namespace SupportMcp {
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr security, uint create, uint flags, IntPtr template);
         [StructLayout(LayoutKind.Sequential)] struct FileInfo { public uint Attributes, C1, C2, A1, A2, W1, W2, Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow; }
         [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetFileInformationByHandle(SafeFileHandle h, out FileInfo info);
-        [DllImport("advapi32.dll", SetLastError = true)] static extern bool GetSecurityDescriptorDacl(IntPtr sd, out bool present, out IntPtr dacl, out bool defaulted);
-        [DllImport("advapi32.dll", SetLastError = true)] static extern int SetSecurityInfo(SafeFileHandle h, int type, uint what, IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
 
         public static int ElevationType(IntPtr token) { int v, n; return GetTokenInformation(token, 18, out v, 4, out n) ? v : 1; }
         // The elevated half of an administrator's split token. SYSTEM, which holds SeTcbPrivilege, gets a primary token.
@@ -1386,14 +1383,16 @@ namespace SupportMcp {
         }
         // A pipe that only the accounts in sddl can open, never from the network. first: fail when the name exists, so
         // nobody can create it before us and wait for our clients.
-        public static NamedPipeServerStream PipeServer(string name, string sddl, int instances, bool first) {
+        public static NamedPipeServerStream PipeServer(string name, string sddl, int instances, bool first) { return PipeServer(name, sddl, instances, first, false); }
+        // overlapped: reads on it can time out (Pipes.Read with ms).
+        public static NamedPipeServerStream PipeServer(string name, string sddl, int instances, bool first, bool overlapped) {
             IntPtr sd;
             if (!ConvertStringSecurityDescriptorToSecurityDescriptor(sddl, 1, out sd, IntPtr.Zero)) throw new Win32Exception();
             try {
                 var security = new CommandJob.Security { Size = Marshal.SizeOf(typeof(CommandJob.Security)), Descriptor = sd };
-                var h = CreateNamedPipe(@"\\.\pipe\" + name, 3u | (first ? 0x80000u : 0u), 8u, (uint)instances, 65536, 65536, 0, ref security);
+                var h = CreateNamedPipe(@"\\.\pipe\" + name, 3u | (first ? 0x80000u : 0u) | (overlapped ? 0x40000000u : 0u), 8u, (uint)instances, 65536, 65536, 0, ref security);
                 if (h.IsInvalid) throw new Win32Exception();
-                return new NamedPipeServerStream(PipeDirection.InOut, false, false, h);
+                return new NamedPipeServerStream(PipeDirection.InOut, overlapped, false, h);
             } finally { LocalFree(sd); }
         }
         // UAC: runs exe elevated and waits for it. Returns its exit code, or -1223 when the customer said No.
@@ -1408,26 +1407,47 @@ namespace SupportMcp {
             try { SendSAS(false); return null; } catch (DllNotFoundException) { } catch (EntryPointNotFoundException) { }
             return "this version of Windows cannot send Ctrl+Alt+Del";
         }
-        // The elevated installer runs from Downloads: load DLLs from System32 only (Windows 8, or 7 with KB2533623).
+        // The elevated installer runs from its own copy in a fresh Temp folder (Elevation.Stage). Also load DLLs from
+        // System32 only after Main starts (Windows 8, or 7 with KB2533623).
         public static void SafeDllSearch() { try { SetDefaultDllDirectories(0x800); } catch (EntryPointNotFoundException) { } }
-        // Opens path itself, never a link's target, and holds it so nobody can swap it, refuses a link, then makes
-        // Administrators the owner and sets the protected DACL of sec.
-        public static void SecureDirectory(string path, DirectorySecurity sec) {
-            using (var h = CreateFile(path, 0x00020000 | 0x00040000 | 0x00080000 | 0x80, 3, IntPtr.Zero, 3, 0x02000000 | 0x00200000, IntPtr.Zero)) {
-                if (h.IsInvalid) throw new Win32Exception();
-                FileInfo info;
-                if (!GetFileInformationByHandle(h, out info)) throw new Win32Exception();
-                if ((info.Attributes & 0x10) == 0 || (info.Attributes & 0x400) != 0) throw new IOException("not a plain folder: " + path);
-                byte[] sd = sec.GetSecurityDescriptorBinaryForm(), owner = new byte[FullAcl.AdminsSid.BinaryLength];
-                FullAcl.AdminsSid.GetBinaryForm(owner, 0);
-                GCHandle pinSd = GCHandle.Alloc(sd, GCHandleType.Pinned), pinOwner = GCHandle.Alloc(owner, GCHandleType.Pinned);
-                try {
-                    bool present, defaulted; IntPtr dacl;
-                    if (!GetSecurityDescriptorDacl(pinSd.AddrOfPinnedObject(), out present, out dacl, out defaulted) || !present) throw new Win32Exception();
-                    int e = SetSecurityInfo(h, 1, 0x1u | 0x4u | 0x80000000u, pinOwner.AddrOfPinnedObject(), IntPtr.Zero, dacl, IntPtr.Zero);
-                    if (e != 0) throw new Win32Exception(e);
-                } finally { pinSd.Free(); pinOwner.Free(); }
-            }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateDirectory(string path, ref CommandJob.Security security);
+        // Creates path with the security of sec in one step, and fails when anything exists there: an existing folder
+        // is never adopted, so nobody can hold a handle to it from before.
+        public static void CreateLocked(string path, DirectorySecurity sec) {
+            var pin = GCHandle.Alloc(sec.GetSecurityDescriptorBinaryForm(), GCHandleType.Pinned);
+            try {
+                var security = new CommandJob.Security { Size = Marshal.SizeOf(typeof(CommandJob.Security)), Descriptor = pin.AddrOfPinnedObject() };
+                if (!CreateDirectory(path, ref security)) throw new Win32Exception();
+            } finally { pin.Free(); }
+        }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern int GetFinalPathNameByHandle(SafeFileHandle h, StringBuilder path, int size, int flags);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetFileInformationByHandle(SafeFileHandle h, int kind, ref byte delete, int size);
+        // Full control runs file operations as SYSTEM, and a user may put a junction, a link or a second hard link in a
+        // path to aim SYSTEM at a protected file. So every existing part of the path must be plain before the open, and
+        // after it the handle must name exactly the requested path, be no link and (to write) have one name only. A file
+        // this call created somewhere else is deleted again. 8.3 short names fail the check too; use the long path.
+        public const string LinkRefused = "the path goes through a link or junction, or the file has another name; file operations as SYSTEM refuse those";
+        public static FileStream OpenPlain(string path, bool write, bool append) {
+            for (string part = path; part != null; part = Path.GetDirectoryName(part))
+                if ((File.Exists(part) || Directory.Exists(part)) && (File.GetAttributes(part) & FileAttributes.ReparsePoint) != 0) throw new ArgumentException(LinkRefused);
+            if (write) { string parent = Path.GetDirectoryName(path); if (!String.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent); }
+            // write: GENERIC_WRITE, DELETE, FILE_READ_ATTRIBUTES, OPEN_ALWAYS, share read. read: GENERIC_READ, OPEN_EXISTING, share read and write.
+            var h = CreateFile(path, write ? 0x40000000u | 0x10000u | 0x80u : 0x80000000u, write ? 1u : 3u, IntPtr.Zero, write ? 4u : 3u, 0x00200000, IntPtr.Zero);
+            int error = Marshal.GetLastWin32Error();
+            if (h.IsInvalid) throw new Win32Exception(error);
+            bool created = write && error != 183, ok = false;
+            try {
+                FileInfo info; var name = new StringBuilder(1024);
+                int n = GetFinalPathNameByHandle(h, name, name.Capacity, 0);
+                string final = n > 0 && n < name.Capacity ? name.ToString() : "";
+                if (final.StartsWith(@"\\?\")) final = final.Substring(4);
+                ok = GetFileInformationByHandle(h, out info) && (info.Attributes & 0x410) == 0 && (!write || info.Links <= 1)
+                    && String.Equals(final, Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase);
+                if (!ok) { if (created) { byte yes = 1; SetFileInformationByHandle(h, 4, ref yes, 1); } throw new ArgumentException(LinkRefused); }
+                var stream = new FileStream(h, write ? FileAccess.Write : FileAccess.Read);
+                if (write) { if (append) stream.Seek(0, SeekOrigin.End); else stream.SetLength(0); }
+                return stream;
+            } finally { if (!ok) h.Dispose(); }
         }
     }
 
@@ -1440,19 +1460,38 @@ namespace SupportMcp {
             BitConverter.GetBytes(body.Length).CopyTo(all, 0); body.CopyTo(all, 4);
             s.Write(all, 0, all.Length); s.Flush();
         }
-        public static Dictionary<string, object> Read(Stream s, int max) {
-            int n = BitConverter.ToInt32(Fill(s, 4), 0);
+        public static Dictionary<string, object> Read(Stream s, int max) { return Read(s, max, 0); }
+        // ms above 0: the whole message must arrive within ms (the stream must be overlapped), else TimeoutException.
+        public static Dictionary<string, object> Read(Stream s, int max, int ms) {
+            var clock = Stopwatch.StartNew();
+            int n = BitConverter.ToInt32(Fill(s, 4, ms, clock), 0);
             if (n < 2 || n > max) throw new InvalidDataException("bad message size");
             Dictionary<string, object> m;
-            try { m = Json().Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(Fill(s, n))); }
+            try { m = Json().Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(Fill(s, n, ms, clock))); }
             catch (Exception) { throw new InvalidDataException("bad message"); }
             if (m == null) throw new InvalidDataException("bad message");
             return m;
         }
-        static byte[] Fill(Stream s, int n) {
+        static byte[] Fill(Stream s, int n, int ms, Stopwatch clock) {
             var b = new byte[n]; int got = 0, r;
-            while (got < n) { if ((r = s.Read(b, got, n - got)) <= 0) throw new EndOfStreamException(); got += r; }
+            while (got < n) {
+                if (ms <= 0) r = s.Read(b, got, n - got);
+                else {
+                    var pending = s.BeginRead(b, got, n - got, null, null);
+                    long left = ms - clock.ElapsedMilliseconds;
+                    if (left <= 0 || !pending.AsyncWaitHandle.WaitOne((int)left)) throw new System.TimeoutException("the pipe client sent nothing in time");
+                    r = s.EndRead(pending);
+                }
+                if (r <= 0) throw new EndOfStreamException();
+                got += r;
+            }
             return b;
+        }
+        // A client end that asks only for reading and writing data, and lets the server identify it but never act as it:
+        // a process that took the name first must not be able to impersonate SYSTEM or the user.
+        public static NamedPipeClientStream Client(string name) {
+            return new NamedPipeClientStream(".", name, PipeAccessRights.ReadData | PipeAccessRights.WriteData | PipeAccessRights.ReadAttributes | PipeAccessRights.Synchronize,
+                PipeOptions.None, TokenImpersonationLevel.Identification, HandleInheritability.None);
         }
         // What a corner window may ask the service: exactly {"type":"status"} or {"type":"end"}. null for anything else.
         public static string UiRequest(Dictionary<string, object> m) {
@@ -1483,10 +1522,10 @@ namespace SupportMcp {
         public static FileSecurity Script(SecurityIdentifier user) { return ForFile(user, FileSystemRights.Read); }
     }
 
-    // state.json in the service folder: the deadline (Unix ms on the UTC wall clock) and the registry value to restore.
+    // state.json in the service folder: the full session id and the deadline (Unix ms on the UTC wall clock).
     public sealed class FullState {
         public const long DayMs = 86400000;
-        public long Deadline; public bool Welcomed, SasChanged; public int SasOriginal = -1; // -1: the value did not exist
+        public string Sid = ""; public long Deadline; public bool Welcomed;
         public static bool Expired(long deadline, long now) { return now >= deadline; }
         public static long Clamp(long deadline, long now) { return Math.Min(deadline, now + DayMs); }
         // The first welcome replaces connect_by with the session's expiry. A later one (after a restart) only brings it closer.
@@ -1494,16 +1533,68 @@ namespace SupportMcp {
         public static string PathIn(string folder) { return Path.Combine(folder, "state.json"); }
         public void Save(string folder) {
             string file = PathIn(folder), temp = file + ".new";
-            File.WriteAllText(temp, Wire.Json().Serialize(Wire.Map("deadline", Deadline, "welcomed", Welcomed, "sas_changed", SasChanged, "sas_original", SasOriginal)));
+            File.WriteAllText(temp, Wire.Json().Serialize(Wire.Map("sid", Sid, "deadline", Deadline, "welcomed", Welcomed)));
             if (File.Exists(file)) File.Replace(temp, file, null); else File.Move(temp, file);
         }
         // null when missing or damaged. The service then treats the session as over.
         public static FullState Load(string folder) {
             try {
                 var m = Wire.Json().Deserialize<Dictionary<string, object>>(File.ReadAllText(PathIn(folder)));
-                var st = new FullState { Deadline = Wire.Number(m, "deadline"), Welcomed = Wire.Flag(m, "welcomed"), SasChanged = Wire.Flag(m, "sas_changed"), SasOriginal = (int)Wire.Number(m, "sas_original") };
-                return st.Deadline > 0 ? st : null;
+                var st = new FullState { Sid = Wire.Text(m, "sid"), Deadline = Wire.Number(m, "deadline"), Welcomed = Wire.Flag(m, "welcomed") };
+                return st.Deadline > 0 && st.Sid.Length == 64 ? st : null;
             } catch (Exception) { return null; }
+        }
+    }
+
+    // SoftwareSASGeneration lets a service call SendSAS (1: services, 3: services and ease of access apps). Sessions
+    // on one PC share it. Each holds a value named after its service under HoldersKey; the first that had to change
+    // the value records what it found ("original": the number as text, or "absent") and what it wrote. The last holder to leave puts
+    // the original back, and only when the value is still the one written, so a later change by an administrator stays.
+    public static class SasShare {
+        public const string PolicyKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", RootKey = @"SOFTWARE\SupportMCP", HoldersKey = RootKey + @"\SoftwareSASGeneration", Value = "SoftwareSASGeneration";
+        // HKLM in the 64-bit view: this is an x86 process, and these keys must not land under Wow6432Node.
+        public static Microsoft.Win32.RegistryKey Machine() { return Microsoft.Win32.RegistryKey.OpenBaseKey(Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryView.Registry64); }
+        public static bool Needed(int value) { return value != 1 && value != 3; }
+        public static int Wanted(int value) { return value == 2 ? 3 : 1; }
+        static int Read(Microsoft.Win32.RegistryKey k, string name) { object v = k == null ? null : k.GetValue(name); return v is int ? (int)v : -1; }
+        const Microsoft.Win32.RegistryValueKind Dword = Microsoft.Win32.RegistryValueKind.DWord;
+        public static void Acquire(Microsoft.Win32.RegistryKey root, string holder) {
+            using (var policy = root.CreateSubKey(PolicyKey)) using (var holders = root.CreateSubKey(HoldersKey)) {
+                holders.SetValue(holder, 1, Dword); // first, so a crash after the change below still puts it back
+                int current = Read(policy, Value); object written = holders.GetValue("written");
+                if (written is int && current == (int)written) return; // another session changed it already
+                holders.DeleteValue("written", false); holders.DeleteValue("original", false);
+                if (!Needed(current)) return; // services may already send SAS: nothing to change or restore
+                holders.SetValue("original", current < 0 ? "absent" : current.ToString(System.Globalization.CultureInfo.InvariantCulture), Microsoft.Win32.RegistryValueKind.String);
+                holders.SetValue("written", Wanted(current), Dword);
+                policy.SetValue(Value, Wanted(current), Dword);
+            }
+        }
+        public static void Release(Microsoft.Win32.RegistryKey root, string holder) {
+            using (var holders = root.OpenSubKey(HoldersKey, true)) {
+                if (holders == null) return;
+                holders.DeleteValue(holder, false);
+                foreach (string name in holders.GetValueNames()) if (name.StartsWith("SupportMcp-", StringComparison.Ordinal)) return; // still needed
+                string original = holders.GetValue("original") as string; object written = holders.GetValue("written"); int number;
+                if (original != null && written is int)
+                    using (var policy = root.OpenSubKey(PolicyKey, true))
+                        if (policy != null && Read(policy, Value) == (int)written) {
+                            if (original == "absent") policy.DeleteValue(Value, false);
+                            else if (int.TryParse(original, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out number)) policy.SetValue(Value, number, Dword);
+                        }
+            }
+            root.DeleteSubKey(HoldersKey, false);
+            bool empty; using (var top = root.OpenSubKey(RootKey)) empty = top != null && top.SubKeyCount == 0 && top.ValueCount == 0;
+            if (empty) root.DeleteSubKey(RootKey, false);
+        }
+        // The same release in PowerShell for the backstop task, which must not run the app. psRoot is "HKLM:" there.
+        public static string ReleaseScript(string psRoot, string holder) {
+            string r = psRoot + "\\" + RootKey, k = psRoot + "\\" + HoldersKey, p = psRoot + "\\" + PolicyKey;
+            return "$r='" + r + "'; $k='" + k + "'; $p='" + p + "'; if (Test-Path $k) { Remove-ItemProperty -Path $k -Name '" + holder + "' -ErrorAction SilentlyContinue; " +
+                "$v = Get-ItemProperty -Path $k; if (@($v.PSObject.Properties | Where-Object { $_.Name -like 'SupportMcp-*' }).Count -eq 0) { " +
+                "$c = (Get-ItemProperty -Path $p -ErrorAction SilentlyContinue).SoftwareSASGeneration; " +
+                "if ($v.written -ne $null -and $v.original -ne $null -and $c -eq $v.written) { if ($v.original -eq 'absent') { Remove-ItemProperty -Path $p -Name SoftwareSASGeneration } elseif ($v.original -match '^[0-9]+$') { Set-ItemProperty -Path $p -Name SoftwareSASGeneration -Value ([int]$v.original) -Type DWord } }; " +
+                "Remove-Item -Path $k; $g = Get-Item -Path $r; if ($g.SubKeyCount -eq 0 -and $g.ValueCount -eq 0) { Remove-Item -Path $r } } }";
         }
     }
 
@@ -1543,41 +1634,49 @@ namespace SupportMcp {
         }
     }
 
-    // The backstop: a SYSTEM scheduled task at the deadline that removes the service, the registry change and the
-    // folder, then itself. It runs cmd, never agent.exe, which antivirus may have deleted. The service moves it from
-    // connect_by to the session's expiry at the first welcome.
+    // The backstop: a SYSTEM scheduled task at the deadline that removes the service, its share of the registry value
+    // and the folder, then itself, in that order. It runs cmd and PowerShell, never agent.exe, which antivirus may have
+    // deleted. The service moves it from connect_by to the session's expiry at the first welcome.
     public static class Backstop {
         public static string Name(string sid8) { return "SupportMcp-" + sid8; }
-        // cmd: delete the folder, retrying while a closing window still holds window.exe, then its parent if empty.
-        public static string RemoveFolder(string folder, string parent) {
-            return "(for /l %i in (1,1,20) do @(if exist \"" + folder + "\" (rd /s /q \"" + folder + "\" 2>nul & if exist \"" + folder + "\" ping -n 3 127.0.0.1 >nul))) & rd \"" + parent + "\" 2>nul";
+        // cmd: delete the folder, retrying while a closing window still holds window.exe.
+        public static string RemoveFolder(string folder) {
+            return "(for /l %i in (1,1,20) do @(if exist \"" + folder + "\" (rd /s /q \"" + folder + "\" 2>nul & if exist \"" + folder + "\" ping -n 3 127.0.0.1 >nul)))";
         }
-        public static string Script(string sid8, string folder, string parent, FullState state) {
-            string name = Name(sid8), key = "\"HKLM\\" + FullInstall.PolicyKey + "\"";
-            string s = "sc stop \"" + name + "\" & ping -n 6 127.0.0.1 >nul & taskkill /f /fi \"SERVICES eq " + name + "\" & sc delete \"" + name + "\"";
-            if (state.SasChanged) s += state.SasOriginal < 0 ? " & reg delete " + key + " /v SoftwareSASGeneration /f" : " & reg add " + key + " /v SoftwareSASGeneration /t REG_DWORD /d " + state.SasOriginal + " /f";
-            return s + " & " + RemoveFolder(folder, parent) + " & schtasks /delete /tn \"" + name + "\" /f";
+        public static string DeleteSelf(string sid8) { return "schtasks /delete /tn \"" + Name(sid8) + "\" /f"; }
+        static string System32(string tool) { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), @"System32\" + tool); }
+        // The actions in order, as command and arguments. 64-bit paths: Task Scheduler resolves them without this process's redirection.
+        public static string[][] Actions(string sid8, string folder) {
+            string name = Name(sid8);
+            return new string[][] {
+                new string[] { System32("cmd.exe"), "/c sc stop \"" + name + "\" & ping -n 6 127.0.0.1 >nul & taskkill /f /fi \"SERVICES eq " + name + "\" & sc delete \"" + name + "\"" },
+                new string[] { System32(@"WindowsPowerShell\v1.0\powershell.exe"), "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"" + SasShare.ReleaseScript("HKLM:", name) + "\"" },
+                new string[] { System32("cmd.exe"), "/c " + RemoveFolder(folder) + " & " + DeleteSelf(sid8) } };
         }
-        public static string Xml(string command, string arguments, long deadline) {
+        public static string Xml(string[][] actions, long deadline) {
             // Whole seconds in UTC, rounded up, so the task never fires before the deadline.
             string at = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddMilliseconds(deadline + 999).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", System.Globalization.CultureInfo.InvariantCulture);
+            var exec = new StringBuilder();
+            foreach (string[] a in actions) exec.Append("<Exec><Command>" + System.Security.SecurityElement.Escape(a[0]) + "</Command><Arguments>" + System.Security.SecurityElement.Escape(a[1]) + "</Arguments></Exec>");
             return "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">" +
                 "<RegistrationInfo><Description>Removes a remote support session at its deadline if it is still installed.</Description></RegistrationInfo>" +
                 "<Triggers><TimeTrigger><StartBoundary>" + at + "</StartBoundary><Enabled>true</Enabled></TimeTrigger></Triggers>" +
                 "<Principals><Principal id=\"System\"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>" +
                 "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" +
                 "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT10M</ExecutionTimeLimit><Enabled>true</Enabled></Settings>" +
-                "<Actions Context=\"System\"><Exec><Command>" + System.Security.SecurityElement.Escape(command) + "</Command><Arguments>" + System.Security.SecurityElement.Escape(arguments) + "</Arguments></Exec></Actions></Task>";
+                "<Actions Context=\"System\">" + exec + "</Actions></Task>";
         }
-        // The 64-bit cmd: Task Scheduler resolves the path itself, without the 32-bit redirection of this process.
-        public static string Cmd { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), @"System32\cmd.exe"); } }
-        public static void Register(string sid8, string folder, string parent, FullState state) {
+        // The XML goes into the session folder, which only SYSTEM and Administrators can write and which was created
+        // fresh by this install, so nobody else can change it before schtasks reads it.
+        public static void Register(string sid8, string folder, FullState state) {
             string xml = Path.Combine(folder, "backstop.xml");
-            File.WriteAllText(xml, Xml(Cmd, "/c " + Script(sid8, folder, parent, state), state.Deadline), Encoding.Unicode);
+            File.WriteAllText(xml, Xml(Actions(sid8, folder), state.Deadline), Encoding.Unicode);
             try { if (Shell.Run("schtasks.exe", "/create /tn \"" + Name(sid8) + "\" /xml \"" + xml + "\" /f") != 0) throw new IOException("cannot register the backstop task"); }
             finally { File.Delete(xml); }
         }
         public static void Delete(string sid8) { Shell.Run("schtasks.exe", "/delete /tn \"" + Name(sid8) + "\" /f"); }
+        public static bool Exists(string sid8) { return Shell.Run("schtasks.exe", "/query /tn \"" + Name(sid8) + "\"") == 0; }
+        public static void RunNow(string sid8) { Shell.Run("schtasks.exe", "/run /tn \"" + Name(sid8) + "\""); }
     }
 
     static class Scm {
@@ -1614,72 +1713,74 @@ namespace SupportMcp {
 
     // --elevate-install and every cleanup that runs outside the service.
     public static class FullInstall {
-        public const string PolicyKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
-        public static string Parent { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "SupportMCP"); } }
-        public static string Sid8(Dictionary<string, object> cfg) { return Wire.Text(cfg, "sid").Substring(0, 8); }
-        public static string Folder(string sid8) { return Path.Combine(Parent, sid8); }
-        // The 64-bit view: this is an x86 process, and the policy key must not land under Wow6432Node.
-        static Microsoft.Win32.RegistryKey Policy(bool write) {
-            using (var hklm = Microsoft.Win32.RegistryKey.OpenBaseKey(Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryView.Registry64))
-                return write ? hklm.CreateSubKey(PolicyKey) : hklm.OpenSubKey(PolicyKey);
+        // %ProgramFiles%, from HKLM in the 64-bit view, not from an environment variable the user could set for the
+        // elevated process. Users may not create, rename or delete anything in it.
+        public static string Root {
+            get {
+                using (var hklm = SasShare.Machine()) using (var k = hklm.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion"))
+                    return Convert.ToString(k.GetValue("ProgramFilesDir"));
+            }
         }
-        // SoftwareSASGeneration lets a service call SendSAS: 1 is services, 3 is services and ease of access apps. -1: absent.
-        public static int ReadSas() { using (var k = Policy(false)) { object v = k == null ? null : k.GetValue("SoftwareSASGeneration"); return v is int ? (int)v : -1; } }
-        public static bool SasNeeded(int value) { return value != 1 && value != 3; }
-        public static int SasWanted(int value) { return value == 2 ? 3 : 1; }
-        public static void RestoreSas(FullState st) {
-            if (!st.SasChanged) return;
-            try { using (var k = Policy(true)) { if (st.SasOriginal < 0) k.DeleteValue("SoftwareSASGeneration", false); else k.SetValue("SoftwareSASGeneration", st.SasOriginal, Microsoft.Win32.RegistryValueKind.DWord); } }
-            catch (Exception) { }
+        public static string Sid8(Dictionary<string, object> cfg) { return Wire.Text(cfg, "sid").Substring(0, 8); }
+        public static string Folder(string sid8) { return Path.Combine(Root, "SupportMCP-" + sid8); }
+        // The elevated installer reads its own exe once, through a handle that lets nobody write, rename or delete it
+        // while the install runs, and takes the bytes and the configuration from that one read.
+        public static byte[] ReadSelf(string exe, out FileStream held) {
+            held = new FileStream(exe, FileMode.Open, FileAccess.Read, FileShare.Read);
+            var all = new byte[held.Length]; int got = 0, n;
+            while (got < all.Length && (n = held.Read(all, got, all.Length - got)) > 0) got += n;
+            if (got != all.Length) throw new IOException("short read");
+            return all;
         }
         // --elevate-install <deadline, Unix ms> <1 when the session is already connected>. Exit code 0: installed and
-        // running. Anything else: nothing is left installed.
-        public static int Install(string exe, Dictionary<string, object> cfg, string[] args) {
+        // running. Anything else: nothing of this install is left.
+        public static int Install(byte[] self, Dictionary<string, object> cfg, string[] args) {
             long now = Client.UnixNow(), deadline;
             if (args.Length != 3 || !long.TryParse(args[1], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out deadline) || deadline <= now) return 2;
-            string sid8 = Sid8(cfg), name = Backstop.Name(sid8), folder = Folder(sid8), parent = Parent;
+            string sid = Wire.Text(cfg, "sid"), sid8 = Sid8(cfg), name = Backstop.Name(sid8), folder = Folder(sid8);
             if (!System.Text.RegularExpressions.Regex.IsMatch(folder, @"^[A-Za-z]:\\[^%&|<>^""]+$")) return 2; // it goes into cmd lines
             var status = Scm.Status(name);
-            if (status == ServiceControllerStatus.Running) return 0; // this session has full control already
-            if (status != null) Remove(sid8, null);
-            var state = new FullState { Deadline = FullState.Clamp(deadline, now), Welcomed = args[2] == "1" };
+            if (status != null || Directory.Exists(folder) || File.Exists(folder)) {
+                // A leftover (a crash in the middle of an install) or a running service. Only this session's is touched:
+                // another session whose id starts with the same 8 characters is never adopted or removed.
+                var old = FullState.Load(folder);
+                if (old != null ? old.Sid != sid : status != null) return 3;
+                if (status == ServiceControllerStatus.Running) return 0; // this session has full control already
+                if (old == null && Backstop.Exists(sid8)) { Backstop.RunNow(sid8); return 3; } // no record to clean up with: the backstop does it
+                Remove(sid8);
+            }
+            try { Native.CreateLocked(folder, LockedFolder()); } catch (Exception) { return 1; } // not ours: leave it alone
+            var state = new FullState { Sid = sid, Deadline = FullState.Clamp(deadline, now), Welcomed = args[2] == "1" };
             try {
-                // Every user may create folders in %ProgramData%, so SupportMCP may already exist, made by someone else, or
-                // be a link. Create it locked down, or take it over through a handle that refuses links.
-                if (!Directory.Exists(parent) && !File.Exists(parent)) { try { Directory.CreateDirectory(parent, FullAcl.Folder()); } catch (IOException) { } }
-                Native.SecureDirectory(parent, FullAcl.Folder());
-                if (Directory.Exists(folder)) Directory.Delete(folder, true); else if (File.Exists(folder)) File.Delete(folder);
-                Directory.CreateDirectory(folder, FullAcl.Folder());
-                Native.SecureDirectory(folder, FullAcl.Folder());
-                byte[] all = File.ReadAllBytes(exe);
-                File.WriteAllBytes(Path.Combine(folder, "agent.exe"), all);
+                File.WriteAllBytes(Path.Combine(folder, "agent.exe"), self);
                 string window = Path.Combine(folder, "window.exe");
-                using (var f = new FileStream(window, FileMode.CreateNew)) f.Write(all, 0, Wire.Payload(all));
+                using (var f = new FileStream(window, FileMode.CreateNew)) f.Write(self, 0, Wire.Payload(self));
                 File.SetAccessControl(window, FullAcl.Window());
-                state.SasOriginal = ReadSas(); state.SasChanged = SasNeeded(state.SasOriginal);
-                state.Save(folder); // before the registry changes, so every cleanup can put the value back
-                if (state.SasChanged) using (var k = Policy(true)) k.SetValue("SoftwareSASGeneration", SasWanted(state.SasOriginal), Microsoft.Win32.RegistryValueKind.DWord);
-                Backstop.Register(sid8, folder, parent, state);
+                state.Save(folder);
+                using (var hklm = SasShare.Machine()) SasShare.Acquire(hklm, name);
+                Backstop.Register(sid8, folder, state);
                 Scm.Create(name, "\"" + Path.Combine(folder, "agent.exe") + "\" --service");
                 Scm.Start(name);
                 return 0;
-            } catch (Exception) { Remove(sid8, state); return 1; }
+            } catch (Exception) { Remove(sid8); return 1; }
         }
-        // Layer 1 from outside the service: a failed install or a leftover of this session.
-        public static void Remove(string sid8, FullState state) {
+        // The service folder: created by an elevated administrator, owned by Administrators.
+        static DirectorySecurity LockedFolder() { var s = FullAcl.Folder(); s.SetOwner(FullAcl.AdminsSid); return s; }
+        // Layer 1 from outside the service (a failed install, a leftover of this session): the service, the registry
+        // share, the folder, and the backstop task last.
+        public static void Remove(string sid8) {
             string folder = Folder(sid8);
-            if (state == null) state = FullState.Load(folder);
             Scm.Remove(Backstop.Name(sid8));
-            if (state != null) RestoreSas(state);
+            try { using (var hklm = SasShare.Machine()) SasShare.Release(hklm, Backstop.Name(sid8)); } catch (Exception) { }
+            try { if (Directory.Exists(folder)) Directory.Delete(folder, true); else if (File.Exists(folder)) File.Delete(folder); } catch (Exception) { }
             Backstop.Delete(sid8);
-            try { if ((File.GetAttributes(Parent) & FileAttributes.ReparsePoint) == 0 && Directory.Exists(folder)) Directory.Delete(folder, true); } catch (Exception) { }
-            try { Directory.Delete(Parent); } catch (Exception) { } // only when empty
         }
-        // A running exe cannot delete itself: a detached cmd removes the folder after the service has exited. When cmd
-        // cannot start, Windows deletes the files at the next restart.
-        public static void RemoveLater(string folder) {
+        // A running exe cannot delete itself: a detached cmd removes the folder after the service has exited, then the
+        // backstop task, last. When cmd cannot start, Windows deletes the files at the next restart and the task stays
+        // as the backstop it is.
+        public static void RemoveLater(string sid8, string folder) {
             try {
-                using (Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"), "/c ping -n 3 127.0.0.1 >nul & " + Backstop.RemoveFolder(folder, Parent)) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Environment.SystemDirectory })) { }
+                using (Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"), "/c ping -n 3 127.0.0.1 >nul & " + Backstop.RemoveFolder(folder) + " & " + Backstop.DeleteSelf(sid8)) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Environment.SystemDirectory })) { }
             } catch (Exception) {
                 try { foreach (string f in Directory.GetFiles(folder)) Native.MoveFileEx(f, null, 4); Native.MoveFileEx(folder, null, 4); } catch (Exception) { }
             }
@@ -1689,14 +1790,23 @@ namespace SupportMcp {
     // The customer's side of --elevate-install.
     public static class Elevation {
         public const int Installed = 0, Declined = 1, Failed = 2;
+        // The elevated child runs from a copy in a new folder of its own under the user's Temp, so nothing that sits
+        // next to the download (an .exe.config, a DLL) is loaded by the elevated process. The caller deletes the folder.
+        public static string Stage(string exe) {
+            string dir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N")), copy = Path.Combine(dir, Path.GetFileName(exe));
+            Directory.CreateDirectory(dir); File.Copy(exe, copy); return copy;
+        }
         // UAC, then wait for the install. On a fresh STA thread, as ShellExecuteEx wants.
         public static int Install(string exe, long deadline, bool connected, IntPtr owner) {
             int outcome = Failed;
             var t = new Thread(delegate() {
+                string staged = null;
                 try {
-                    int code = Native.RunElevated(exe, "--elevate-install " + deadline.ToString(System.Globalization.CultureInfo.InvariantCulture) + (connected ? " 1" : " 0"), owner);
+                    staged = Stage(exe);
+                    int code = Native.RunElevated(staged, "--elevate-install " + deadline.ToString(System.Globalization.CultureInfo.InvariantCulture) + (connected ? " 1" : " 0"), owner);
                     outcome = code == 0 ? Installed : code == -1223 ? Declined : Failed;
                 } catch (Exception) { outcome = Failed; }
+                finally { if (staged != null) try { Directory.Delete(Path.GetDirectoryName(staged), true); } catch (Exception) { } }
             });
             t.SetApartmentState(ApartmentState.STA); t.Start(); t.Join();
             return outcome;
@@ -1732,7 +1842,7 @@ namespace SupportMcp {
             }
         }
         NamedPipeClientStream Connect(string name) {
-            var c = new NamedPipeClientStream(".", name, PipeDirection.InOut);
+            var c = Pipes.Client(name);
             try {
                 c.Connect(15000); uint server;
                 if (!Native.GetNamedPipeServerProcessId(c.SafePipeHandle, out server) || server != pid) throw new IOException("unexpected pipe server");
@@ -1894,15 +2004,20 @@ namespace SupportMcp {
         }
     }
 
-    // The corner windows' pipe. Interactive users may open it, the network may not. A request is {"type":"status"} or
-    // {"type":"end"}; anything else closes the connection.
+    // The corner windows' pipe. Interactive users may open it, the network may not, and nobody but SYSTEM may add a
+    // pipe instance (0x12008B: read and write data, read attributes and permissions, synchronize). A request is
+    // {"type":"status"} or {"type":"end"}; anything else, or nothing for 5 s, closes the connection, so idle clients
+    // cannot keep the 8 instances from a window that wants to end the session.
     sealed class UiServer {
-        const string Sddl = "D:P(A;;GA;;;SY)(A;;GRGW;;;IU)";
+        const string Sddl = "D:P(A;;GA;;;SY)(A;;0x12008B;;;IU)";
+        public const int Instances = 8, ReadMs = 5000;
         readonly Func<Dictionary<string, object>> status; readonly Action end;
         readonly Dictionary<uint, long> seen = new Dictionary<uint, long>(); readonly List<int> pids = new List<int>();
-        public UiServer(string name, Func<Dictionary<string, object>> status, Action end) {
+        public UiServer(string name, Func<Dictionary<string, object>> status, Action end) : this(name, status, end, Sddl) { }
+        // sddl: the tests' own, since only the creator of a pipe's ACL may add instances and the tests do not run as SYSTEM.
+        internal UiServer(string name, Func<Dictionary<string, object>> status, Action end, string sddl) {
             this.status = status; this.end = end;
-            for (int i = 0; i < 4; i++) { var pipe = Native.PipeServer(name, Sddl, 4, i == 0); var t = new Thread(Serve); t.IsBackground = true; t.Start(pipe); }
+            for (int i = 0; i < Instances; i++) { var pipe = Native.PipeServer(name, sddl, Instances, i == 0, true); var t = new Thread(Serve); t.IsBackground = true; t.Start(pipe); }
         }
         void Serve(object o) {
             var pipe = (NamedPipeServerStream)o;
@@ -1912,7 +2027,7 @@ namespace SupportMcp {
                     if (Native.GetNamedPipeClientProcessId(pipe.SafePipeHandle, out pid)) lock (pids) { if (!pids.Contains((int)pid)) pids.Add((int)pid); if (pids.Count > 16) pids.RemoveAt(0); }
                     if (!Native.GetNamedPipeClientSessionId(pipe.SafePipeHandle, out session)) session = 0xFFFFFFFF;
                     while (true) {
-                        string request = Pipes.UiRequest(Pipes.Read(pipe, 1024));
+                        string request = Pipes.UiRequest(Pipes.Read(pipe, 1024, ReadMs));
                         if (request == null) break;
                         if (request == "end") end();
                         lock (seen) seen[session] = PauseClock.Now();
@@ -1928,38 +2043,51 @@ namespace SupportMcp {
         public int[] Pids { get { lock (pids) return pids.ToArray(); } }
     }
 
-    // The corner window's view of the full-control service, through its pipe: status every 500 ms, "end" for End session.
+    // The corner window's view of the full-control service, through its pipe: status every 500 ms, "end" for End
+    // session. End is sent again until the service reports the session ended. When the service cannot be reached the
+    // link finishes as Lost, and the window says so instead of claiming the session ended.
     public sealed class ServiceLink : ISupportLink {
-        readonly string pipe; Thread loop, ender; volatile bool finished; bool connected, linkUp = true; int busy;
+        public static int EndMs = 30000; // tests shorten it
+        readonly string pipe; Thread loop, ender; volatile bool finished, lost; bool connected, linkUp = true; int busy;
         volatile bool paused, blocked; long expires;
         public event Action Connected; public event Action<bool> LinkChanged; public event Action<int> BusyChanged; public event Action Finished;
         public ServiceLink(string sid8) { pipe = Backstop.Name(sid8) + "-ui"; }
         public bool Paused { get { return paused; } }
         public bool Blocked { get { return blocked; } }
+        public bool Lost { get { return lost; } }
         public bool SurvivesSignOut { get { return true; } }
         public DateTime ExpiresLocal { get { long ms = Interlocked.Read(ref expires); return ms == 0 ? DateTime.MinValue : new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddMilliseconds(ms).ToLocalTime(); } }
         static Dictionary<string, object> Ask(string name, string type, int ms) {
-            using (var c = new NamedPipeClientStream(".", name, PipeDirection.InOut)) { c.Connect(ms); Pipes.Write(c, Wire.Map("type", type)); return Pipes.Read(c, 4096); }
+            using (var c = Pipes.Client(name)) { c.Connect(ms); Pipes.Write(c, Wire.Map("type", type)); return Pipes.Read(c, 4096); }
         }
         // True when the service of this session answers and the session is not over.
         public static bool Running(string sid8) { try { return !Wire.Flag(Ask(Backstop.Name(sid8) + "-ui", "status", 1000), "ended"); } catch (Exception) { return false; } }
-        public static void End(string sid8) { try { Ask(Backstop.Name(sid8) + "-ui", "end", 3000); } catch (Exception) { } }
+        // Sends "end" until the service says the session ended, for up to 30 s. False when that never came.
+        public static bool End(string sid8) { return EndPipe(Backstop.Name(sid8) + "-ui", delegate { return false; }); }
+        static bool EndPipe(string name, Func<bool> done) {
+            var clock = Stopwatch.StartNew();
+            while (clock.ElapsedMilliseconds < EndMs && !done()) {
+                try { if (Wire.Flag(Ask(name, "end", 2000), "ended")) return true; } catch (Exception) { }
+                Thread.Sleep(500);
+            }
+            return done();
+        }
         public void Start() { if (loop != null) return; loop = new Thread(Loop); loop.IsBackground = true; loop.Start(); }
         void Loop() {
             var clock = Stopwatch.StartNew(); bool reached = false;
             while (!finished) {
                 try {
-                    using (var c = new NamedPipeClientStream(".", pipe, PipeDirection.InOut)) {
+                    using (var c = Pipes.Client(pipe)) {
                         c.Connect(2000); reached = true;
-                        while (true) { Pipes.Write(c, Wire.Map("type", "status")); if (Apply(Pipes.Read(c, 4096))) { Finish(); return; } Thread.Sleep(500); }
+                        while (true) { Pipes.Write(c, Wire.Map("type", "status")); if (Apply(Pipes.Read(c, 4096))) { Finish(false); return; } Thread.Sleep(500); }
                     }
                 } catch (Exception) {
-                    // Gone once reached: the session ended. Before that, the service may still be starting.
+                    // Gone without saying ended, or never there: the service cannot be reached, which is not the same as ended.
                     if (reached || clock.ElapsedMilliseconds > 30000) break;
                     Thread.Sleep(500);
                 }
             }
-            Finish();
+            Finish(true);
         }
         // True when the session is over. Values of the wrong type count as false or zero.
         bool Apply(Dictionary<string, object> s) {
@@ -1974,13 +2102,13 @@ namespace SupportMcp {
             if (connected && up != linkUp) { linkUp = up; var e = LinkChanged; if (e != null) e(up); }
             return false;
         }
-        void Finish() { if (finished) return; finished = true; var f = Finished; if (f != null) f(); }
-        // End session: tell the service on a connection of its own.
+        void Finish(bool unreachable) { lock (this) { if (finished) return; finished = true; lost = unreachable; } var f = Finished; if (f != null) f(); }
+        // End session: send "end" on connections of its own until the service confirms; the status loop sees it too.
         public void Stop() {
             if (finished || ender != null) return;
-            ender = new Thread(delegate() { try { Ask(pipe, "end", 2000); } catch (Exception) { } }); ender.IsBackground = true; ender.Start();
+            ender = new Thread(delegate() { if (!EndPipe(pipe, delegate { return finished; })) Finish(true); else Finish(false); }); ender.IsBackground = true; ender.Start();
         }
-        // Before the app exits: wait until an end request went out.
+        // Before the app exits: wait until the end request is confirmed or given up.
         public void Flush(int ms) { var t = ender; if (t != null) t.Join(ms); }
     }
 
@@ -2016,7 +2144,7 @@ namespace SupportMcp {
             try {
                 // Layer 2: the service's own clock. A deadline that passed while the PC was off ends it before it connects.
                 state = FullState.Load(folder);
-                if (state != null && !FullState.Expired(state.Deadline, Client.UnixNow()) && !stopping) {
+                if (state != null && state.Sid == Wire.Text(config, "sid") && !FullState.Expired(state.Deadline, Client.UnixNow()) && !stopping) {
                     ui = new UiServer(Backstop.Name(sid8) + "-ui", UiStatus, delegate { var c = client; if (c != null) c.Stop(); });
                     helper = new HelperHost(exe, sid8);
                     var cfg = new Dictionary<string, object>(config); cfg["startup_ms"] = state.Deadline - Client.UnixNow(); cfg.Remove("startup_expires_at");
@@ -2037,7 +2165,7 @@ namespace SupportMcp {
             try {
                 if (ended || shutdown || helper == null) return;
                 if (FullState.Expired(state.Deadline, Client.UnixNow())) { var c = client; if (c != null) c.Stop(); return; }
-                if (backstopDue) { Backstop.Register(sid8, folder, FullInstall.Parent, state); backstopDue = false; }
+                if (backstopDue) { Backstop.Register(sid8, folder, state); backstopDue = false; }
             } catch (Exception) { } finally { Monitor.Exit(superviseGate); }
             try { helper.Ensure(); } catch (Exception) { }
             try { EnsureWindow(); } catch (Exception) { }
@@ -2112,19 +2240,18 @@ namespace SupportMcp {
             ThreadPool.QueueUserWorkItem(delegate { Supervise(); });
         }
         // Layer 1: the end of the session (operator, customer, relay alarm, expiry). Open windows read "ended" and close
-        // themselves; then the helper, the registry value, the task and the service registration go, and a detached cmd
-        // removes the folder once this process has exited.
+        // themselves; then the helper, this session's share of the registry value and the service registration go, and
+        // a detached cmd removes the folder once this process has exited and then the backstop task, last. None of it
+        // depends on state.json, so a damaged one cannot stop the registry value from being put back.
         void Cleanup() {
             if (Interlocked.Exchange(ref cleaned, 1) != 0) return;
             ended = true;
             if (timer != null) timer.Dispose();
             if (ui != null && ui.AnySeenWithin(3000)) Thread.Sleep(1500);
             if (helper != null) helper.Stop();
-            var st = state ?? FullState.Load(folder);
-            if (st != null) FullInstall.RestoreSas(st);
-            try { Backstop.Delete(sid8); } catch (Exception) { }
+            try { using (var hklm = SasShare.Machine()) SasShare.Release(hklm, ServiceName); } catch (Exception) { }
             Scm.Delete(ServiceName);
-            FullInstall.RemoveLater(folder);
+            FullInstall.RemoveLater(sid8, folder);
         }
     }
 
@@ -2132,7 +2259,8 @@ namespace SupportMcp {
     // normal-mode session to the service after request_full_control.
     sealed class StartFlow {
         readonly SupportWindow window; readonly Dictionary<string, object> config; readonly string exe, sid8; readonly long connectBy;
-        Thread thread, clientThread; Client client; ServiceLink link; Mutex windowMutex;
+        Thread thread, clientThread, ender; Client client; ServiceLink link; Mutex windowMutex;
+        long declinedAt = long.MinValue / 2; int requesting;
         public StartFlow(SupportWindow window, Dictionary<string, object> config, string exe, long connectBy) {
             this.window = window; this.config = config; this.exe = exe; this.connectBy = connectBy; sid8 = FullInstall.Sid8(config);
         }
@@ -2140,19 +2268,24 @@ namespace SupportMcp {
         // After the window closed: finish an install in progress (it ends the service if the customer ended), stop the client.
         public void Finish() {
             if (thread != null) thread.Join(120000);
+            if (ender != null) ender.Join(35000);
             if (client != null) { client.Stop(); if (clientThread != null) clientThread.Join(20000); }
             if (link != null) link.Flush(3000);
         }
         T Ui<T>(Func<T> f) { return window.Dispatcher.Invoke(f); }
         void Ui(Action a) { window.Dispatcher.Invoke(a); }
         bool Ask(string heading, string text, bool warning) { return !window.EndedByCustomer && Ui(delegate { return ConsentDialog.Ask(heading, text, warning); }); }
+        // The customer ended the session while the install ran: end the new service, and say so if that cannot be confirmed.
+        void EndOrWarn() {
+            if (!ServiceLink.End(sid8)) WF.MessageBox.Show("Cannot reach the support service. Support may still have access until the session ends by itself. Tell support.", "Remote support");
+        }
         void Run() {
             try {
                 // Opened again while this session has full control: be its window.
                 if (ServiceLink.Running(sid8)) { Ui(BecomeWindow); return; }
                 Consent path = ConsentPath.Detect();
                 int outcome = path == Consent.Unavailable ? Elevation.Declined : Elevate(path, connectBy, false);
-                if (window.EndedByCustomer) { if (outcome == Elevation.Installed) ServiceLink.End(sid8); return; }
+                if (window.EndedByCustomer) { if (outcome == Elevation.Installed) EndOrWarn(); return; }
                 if (outcome == Elevation.Installed) { Ui(BecomeWindow); return; }
                 // UAC No, a failure, or Don't allow: limited support, if the customer wants it. Don't allow is the default.
                 bool admin = SupportAccess.IsAdministrator();
@@ -2178,6 +2311,12 @@ namespace SupportMcp {
         // request_full_control, on the client's screen lane. On success the service has said hello, which answers the
         // operator; this client then stops without sending anything and the window shows the service.
         Dictionary<string, object> RequestFull() {
+            // One prompt at a time, and none within a minute of a declined one: the operator cannot nag the customer.
+            if (PauseClock.Now() - Interlocked.Read(ref declinedAt) < 60000) return Wire.Map("ok", false, "error", "the customer declined full control less than a minute ago; ask them first, then try again");
+            if (Interlocked.CompareExchange(ref requesting, 1, 0) != 0) return Wire.Map("ok", false, "error", "a request for full control is already waiting for the customer");
+            try { return AskFull(); } finally { Interlocked.Exchange(ref requesting, 0); }
+        }
+        Dictionary<string, object> AskFull() {
             Consent path = ConsentPath.Detect();
             if (path == Consent.Unavailable) return Wire.Map("ok", false, "error", "this Windows account cannot get administrator rights, so full control is not possible");
             Ui(delegate { window.Hold(true); });
@@ -2188,10 +2327,11 @@ namespace SupportMcp {
                 Ui(delegate { window.Hold(false); });
             }
             if (outcome == Elevation.Installed) return null;
+            if (outcome == Elevation.Declined) Interlocked.Exchange(ref declinedAt, PauseClock.Now());
             return Wire.Map("ok", false, "error", outcome == Elevation.Declined ? "the customer declined full control" : "full control could not be set up on this PC");
         }
         void BecomeWindow() {
-            if (window.EndedByCustomer) { ServiceLink.End(sid8); return; }
+            if (window.EndedByCustomer) { ender = new Thread(EndOrWarn); ender.Start(); return; }
             bool mine; windowMutex = new Mutex(true, "Local\\SupportMcpWindow-" + sid8, out mine);
             if (!mine) { window.CloseQuietly(); return; } // the service already started the window
             window.SetAccess(false, null);
@@ -2356,7 +2496,7 @@ namespace SupportMcp {
         public volatile bool Preserve;
         // Set when the customer ended the session, so a full-control install still running can end the service it made.
         public volatile bool EndedByCustomer;
-        bool connectedOnce, linkOk = true, busy, paused, blocked, workShown, ended, tucked, confirming, sessionEnding, sweeping, userMoved, placing, held, heldEnd;
+        bool connectedOnce, linkOk = true, busy, paused, blocked, workShown, ended, tucked, confirming, sessionEnding, sweeping, userMoved, placing, held, heldEnd, ending, lostEnd;
         string notice;
         readonly Stopwatch session = new Stopwatch(), workClock = new Stopwatch();
         TimeSpan endedAfter;
@@ -2471,7 +2611,12 @@ namespace SupportMcp {
             endButton.Click += delegate { AskToEnd(); };
             tuckEnd.Click += delegate { AskToEnd(); };
             keep.Click += delegate { confirming = false; Render(); };
-            sure.Click += delegate { EndedByCustomer = true; if (link != null) link.Stop(); ShowEnded(); };
+            // Full control: the session is over only when the service confirms it (or the window says it cannot reach it).
+            sure.Click += delegate {
+                EndedByCustomer = true;
+                if (link == null || !link.SurvivesSignOut) { if (link != null) link.Stop(); ShowEnded(); return; }
+                ending = true; confirming = false; link.Stop(); Render();
+            };
             PreviewKeyDown += delegate(object sender, KeyEventArgs e) { if (e.Key == Key.Escape && confirming) { confirming = false; Render(); e.Handled = true; } };
 
             tick.Interval = TimeSpan.FromSeconds(1); tick.Tick += delegate { UpdateTimer(); };
@@ -2579,7 +2724,8 @@ namespace SupportMcp {
             if (ended) return;
             ended = true; endedAfter = session.Elapsed; session.Stop(); tick.Stop(); pause.Stop(); hold.Stop(); paused = false; blocked = false;
             confirming = false; tucked = false; workShown = false; busy = false;
-            Render(); closer.Start();
+            lostEnd = link != null && link.Lost;
+            Render(); if (!lostEnd) closer.Start();
         }
         void OnClosing(object sender, System.ComponentModel.CancelEventArgs e) {
             // User close (End session, Alt+F4, taskbar Close) asks inline first.
@@ -2620,9 +2766,11 @@ namespace SupportMcp {
             edge.Background = !live ? p.Line : working ? (animate ? p.WorkSoft : p.Work) : p.Live;
             SetSweeping(animate);
 
-            head.Text = ended ? "Support is disconnected." : !connectedOnce ? "Connecting to support..." : !linkOk ? "Reconnecting to support..." : "A remote support agent is connected to your machine.";
+            head.Text = ended ? (lostEnd ? "Cannot reach the support service." : "Support is disconnected.") : ending ? "Ending the session..." : !connectedOnce ? "Connecting to support..." : !linkOk ? "Reconnecting to support..." : "A remote support agent is connected to your machine.";
             status.Inlines.Clear(); timerRun = null;
-            if (ended) {
+            if (ended && lostEnd) {
+                status.Inlines.Add(new Run("Support may still have access until the session ends by itself. Tell support."));
+            } else if (ended) {
                 status.Inlines.Add(new Run("Session ended after " + Ui.Clock(endedAfter) + ". Support can no longer reach this PC."));
             } else if (!connectedOnce) {
                 status.Inlines.Add(new Run(notice ?? "This window stays open while support is connected."));
@@ -2651,7 +2799,8 @@ namespace SupportMcp {
             fullView.Visibility = small ? Visibility.Collapsed : Visibility.Visible;
             tuckView.Visibility = small ? Visibility.Visible : Visibility.Collapsed;
             collapse.Visibility = ended ? Visibility.Hidden : Visibility.Visible;
-            normalFoot.Visibility = !ended && !confirming ? Visibility.Visible : Visibility.Collapsed;
+            normalFoot.Visibility = (!ended && !confirming) || lostEnd ? Visibility.Visible : Visibility.Collapsed;
+            endButton.Visibility = ended || ending ? Visibility.Collapsed : Visibility.Visible;
             askBox.Visibility = askFoot.Visibility = !ended && confirming ? Visibility.Visible : Visibility.Collapsed;
         }
     }
@@ -2725,8 +2874,9 @@ namespace SupportMcp {
             if (role == "--service") { try { ServiceBase.Run(new SupportService(executable, Wire.ReadConfig(executable))); } catch (Exception) { } return; }
             if (role == "--helper") { try { Helper.Run(executable, args); } catch (Exception) { } Environment.Exit(0); }
             if (role == "--elevate-install") {
-                Native.SafeDllSearch(); int code = 1;
-                try { code = FullInstall.Install(executable, Wire.ReadConfig(executable), args); } catch (Exception) { }
+                Native.SafeDllSearch(); int code = 1; FileStream held = null;
+                try { byte[] self = FullInstall.ReadSelf(executable, out held); code = FullInstall.Install(self, Wire.ReadConfig(self), args); } catch (Exception) { }
+                finally { if (held != null) held.Dispose(); }
                 Environment.Exit(code);
             }
             WF.Application.EnableVisualStyles();
