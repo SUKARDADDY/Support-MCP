@@ -135,7 +135,12 @@ a result the relay refuses, `as` in normal mode and the screen consent of a
 prepared reconnect. For full control they cover the parts that need no
 administrator: the consent path (UAC prompt, the app's own confirm, or
 unavailable), the folder and file ACLs (a real folder, read back with `icacls`),
-the deadline state on disk and its expiry rules, the backstop command line and
+the exclusive creation of the folder and the parent it goes in, the deadline
+state on disk and its expiry rules, the shared `SoftwareSASGeneration` record (in
+C# and in the backstop's PowerShell), the staging copy and the held exe of the
+elevated installer, the refusal of junctions and hard links by SYSTEM file
+operations, identification-only pipe clients, the 5-second pipe timeout, the
+window's unconfirmed end, the backstop command line and
 task XML, the token choice for `run`, the `block_input` timer and its
 Ctrl+Alt+Del escape, the pipe framing and the corner window's two requests over
 a real pipe, the cut of `window.exe`, the silent handover after
@@ -163,7 +168,8 @@ and as `system` report the right identity; UAC No gives the fallback dialog and
 normal mode; `request_full_control` upgrades a normal session. After
 `session_end`, an expiry, and a service killed with `taskkill /f` (the backstop
 task cleans up at the deadline), `sc query SupportMcp-<id>`, `schtasks /query /tn
-SupportMcp-<id>`, `Test-Path C:\ProgramData\SupportMCP` and `reg query
+SupportMcp-<id>`, `Test-Path "C:\Program Files\SupportMCP-<id>"`, `reg query
+HKLM\SOFTWARE\SupportMCP` and `reg query
 HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v
 SoftwareSASGeneration` must all find nothing (unless that value existed before).
 

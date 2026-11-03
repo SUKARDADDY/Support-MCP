@@ -30,12 +30,17 @@ apply to only one client say which.
   output. End session, Alt+F4 and the taskbar Close all ask "End the session?"
   first. The PowerShell agent's window is different: it lists every command and
   file operation as it runs.
-- **Full control is a temporary SYSTEM service.** After UAC, the app copies
-  itself (with the session settings and attach key) to
-  `%ProgramData%\SupportMCP\<id>\`. Only SYSTEM and Administrators can read that
-  folder: inheritance is off, and the installer takes over a `SupportMCP` folder
-  that someone else created first, through a handle that refuses links. SYSTEM
-  code never runs from Downloads or Temp. The service `SupportMcp-<id>` owns the
+- **Full control is a temporary SYSTEM service.** UAC elevates a copy of the
+  app that the app first puts alone in a new folder under the user's Temp, so
+  nothing next to the download (an `.exe.config`, a DLL) loads into the elevated
+  process. That process reads its own file once, through a handle that stops
+  anyone from changing or renaming it, and installs from those bytes. It creates
+  `%ProgramFiles%\SupportMCP-<id>\` in one step with its final ACL (SYSTEM and
+  Administrators only, inheritance off) and fails if anything exists there; it
+  never adopts an existing folder. `%ProgramFiles%` comes from the registry, not
+  from an environment variable the user could set, and Users cannot create,
+  rename or delete anything in it, so nobody else can hold a handle to the
+  folder or put a file in it. SYSTEM code never runs from Downloads or Temp. The service `SupportMcp-<id>` owns the
   relay connection and says `control: full`. It starts two processes on the
   console session: a helper with a SYSTEM token, which runs every screen
   operation and so reaches the secure desktop (UAC, the lock and sign-in
@@ -43,19 +48,37 @@ apply to only one client say which.
   token. The window's copy of the exe has no session settings, so the file a user
   can read holds no attach key. The service and the helper talk over a pipe only
   SYSTEM can open, and each checks the other's process id. The window's pipe is
-  open to interactive users, never to the network, and answers only a status
-  read and `end`; anything else closes the connection. Any interactive user can
-  end the session through it, which is the point of the window. The helper runs
-  in a kill-on-close Job of the service, so it dies with it.
+  open to interactive users, never to the network, with the rights to read and
+  write data but not to add a pipe instance. It answers only a status read and
+  `end`; anything else, or nothing for 5 seconds, closes the connection. Any
+  interactive user can end the session through it, which is the point of the
+  window. The window sends `end` until the service confirms the session ended;
+  if it cannot reach the service it says "Cannot reach the support service."
+  rather than claiming the session ended. Every pipe client allows the server to
+  identify it only, so a process that took a pipe's name first cannot act as
+  SYSTEM or as the user. The helper runs in a kill-on-close Job of the service,
+  so it dies with it.
+- **The window shows, it cannot stop code that runs as the user.** Code that runs
+  in the customer's session can hide or cover the corner window. It shows that
+  access exists; it does not enforce anything.
 - **What full control can do.** `run` with `as: "user"` runs as the console
   user, with their elevated token when they are an administrator, in their
   session; with nobody signed in it fails with `nobody is signed in; use as:
-  "system"`. `as: "system"`, `put_file` and `get_file` run as SYSTEM.
-  `send_sas` sends Ctrl+Alt+Del through `SendSAS`; the installer sets
-  `SoftwareSASGeneration` to allow services only when Windows would refuse it,
-  and puts the old value back. UIPI no longer limits input, so support can work
+  "system"`. After a user switch, `as: "user"` is whoever is at the console now.
+  `as: "system"`, `put_file` and `get_file` run as SYSTEM. Because a user could
+  aim SYSTEM at a protected file with a junction, a symbolic link or a second
+  hard link in a path they control, `put_file` and `get_file` refuse a path
+  with a link in it: every existing part is checked before the open, and the
+  opened file must have exactly the requested path (and, to write, one name
+  only). A file created by such an attempt is deleted again. Short 8.3 names fail
+  this check too, so use the long path. `send_sas` sends Ctrl+Alt+Del through
+  `SendSAS`. The installer sets `SoftwareSASGeneration` to allow services only
+  when Windows would refuse it. Sessions on one PC share it: each records itself
+  under `HKLM\SOFTWARE\SupportMCP`, and the last to end puts the old value back,
+  only if the value is still the one written. UIPI no longer limits input, so support can work
   in windows that run as administrator. Commands keep the Job Object and the
-  output caps.
+  output caps. `request_full_control` asks one prompt at a time, and not again
+  within a minute after the customer declined.
 - **Normal mode.** Without full control, screen capture, mouse, keyboard and UI
   Automation run inside the customer's own process and desktop session, with the
   customer's token. It cannot see or operate the secure desktop, it cannot run as
@@ -164,18 +187,21 @@ apply to only one client say which.
   request from an older one gets a 409.
 - **Full control removes itself in three layers.** First, any end of the
   session (`session_end`, End session, the relay's alarm, the deadline) makes the
-  service stop the helper, restore the registry value, delete the backstop task
-  and its own registration, and start a detached `cmd` that deletes the folder
-  once the service has exited (if `cmd` cannot start, Windows deletes the files
-  at the next restart). Second, the service keeps its deadline on disk as a UTC
+  service stop the helper, release its share of the registry value, delete its
+  registration, and start a detached `cmd` that deletes the folder once the
+  service has exited, then the backstop task, last. If `cmd` cannot start,
+  Windows deletes the files at the next restart and the task stays to do the
+  rest. None of this depends on `state.json`. Second, the service keeps its deadline on disk as a UTC
   time: `connect_by` until the first welcome, then the session's expiry. It checks
   it at every start, also after a restart with no network, and on a timer.
   Third, a SYSTEM scheduled task at the deadline stops and deletes the service,
-  restores the registry value, removes the folder and deletes itself. It runs
-  only `cmd`, `sc`, `reg`, `taskkill` and `schtasks`, never the app, which
-  antivirus may have removed. Full control survives a restart or a sign-out
-  within the same deadline, and a restart never extends it. There is no
-  uninstall entry: nothing stays installed to uninstall.
+  releases the registry value, removes the folder and deletes itself, in that
+  order. It runs only `cmd`, `sc`, `ping`, `taskkill`, PowerShell (for the
+  registry) and `schtasks`, never the app, which antivirus may have removed. Full
+  control survives a restart or a sign-out within the same deadline, and a
+  restart never extends it. That guarantee is against the customer's PC, not the
+  operator: with SYSTEM rights an operator can change or remove any of these
+  layers. There is no uninstall entry: nothing stays installed to uninstall.
 - **Normal mode leaves nothing behind.** It installs no service, scheduled task
   or logon entry, so restarting the PC ends access, and it deletes its temporary
   command folder on exit. A command runs inside a Windows Job Object, so a

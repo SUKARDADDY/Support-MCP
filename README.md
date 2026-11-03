@@ -101,14 +101,16 @@ Full control is the default. When the customer runs the app, the corner window
 says "Windows will ask for permission to give support full control.", and
 Windows shows its UAC prompt. On **Yes** the app installs, for this session only:
 
-- the folder `%ProgramData%\SupportMCP\<first 8 characters of the session id>\`,
+- the folder `%ProgramFiles%\SupportMCP-<first 8 characters of the session id>\`,
   readable only by SYSTEM and Administrators, with a copy of the app, its
   session settings and the deadline;
 - the service `SupportMcp-<id>` ("Remote support session"), automatic start,
   running as LocalSystem;
 - a scheduled task of the same name at the deadline, as a backstop;
 - the registry value `SoftwareSASGeneration`, only when Windows would refuse
-  Ctrl+Alt+Del from a service. The old value, or its absence, is put back.
+  Ctrl+Alt+Del from a service, and a record of it under
+  `HKLM\SOFTWARE\SupportMCP`. The last session to end puts the old value, or
+  its absence, back, unless an administrator changed it meanwhile.
 
 If no UAC prompt will appear (the app already runs as administrator, UAC is off,
 or an administrator elevates without a prompt), the app asks itself first: "Give
@@ -119,8 +121,8 @@ From normal mode, `request_full_control` asks again.
 
 Everything is removed when the session ends: by `session_end`, by **End
 session**, by the relay's 24-hour alarm, or by the service's own clock. If the
-service was killed, the backstop task removes the service, the folder, the
-registry value and itself at the deadline, without running the app. A restart or
+service was killed, the backstop task removes the service, the registry value,
+the folder and itself at the deadline, without running the app. A restart or
 a sign-out does not end the session, and does not extend it.
 
 ### The PowerShell alternative

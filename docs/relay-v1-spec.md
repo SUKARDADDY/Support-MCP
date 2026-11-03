@@ -635,19 +635,22 @@ Roles, by the first argument of the one exe:
 | Role | Runs as | Does |
 |---|---|---|
 | none | the customer | shows the corner window, decides the consent path (UAC prompt, the app's own confirm when no prompt will appear, or unavailable when a standard user has UAC off), runs `--elevate-install` with `ShellExecuteEx` `runas`, and reads its exit code. On 0 it becomes the corner window of the service; on UAC No (1223), any failure or Don't allow it shows the fallback dialog |
-| `--elevate-install <deadline> <0\|1>` | administrator, through UAC | creates `%ProgramData%\SupportMCP\<sid8>\` (SYSTEM and Administrators only, inheritance off, the parent taken over through a handle that refuses links), copies the exe as `agent.exe` and, cut before its configuration, as `window.exe` (Users may read and run it), writes `state.json`, sets `SoftwareSASGeneration` when needed, registers the backstop task, then creates and starts the service. Any failure removes all of it. The deadline is UTC milliseconds: `connect_by` before the first connection, the session's expiry after it |
+| `--elevate-install <deadline> <0\|1>` | administrator, through UAC | runs from a copy the app put alone in a new Temp folder, reads its own file once through a handle that denies writing and renaming, creates `%ProgramFiles%\SupportMCP-<sid8>\` with `CreateDirectoryW` and its final ACL (SYSTEM and Administrators only, inheritance off), failing if it exists, copies the exe as `agent.exe` and, cut before its configuration, as `window.exe` (Users may read and run it), writes `state.json` (the full session id and the deadline), takes a share of `SoftwareSASGeneration` under `HKLM\SOFTWARE\SupportMCP` and sets it when needed, registers the backstop task, then creates and starts the service. Any failure removes all of it. The deadline is UTC milliseconds: `connect_by` before the first connection, the session's expiry after it |
 | `--service` | LocalSystem, session 0 | the relay connection with both lanes (`control:"full"`, caps with `full`). It checks its deadline at start and every 2 s, moves the backstop task to `expires_at` at the first welcome (later welcomes can only bring it closer), follows session changes, sends Ctrl+Alt+Del with `SendSAS`, and runs cleanup |
 | `--helper <service pid>` | SYSTEM, on the console session (`TokenSessionId`), `winsta0\default` | every screen operation, each on a fresh thread switched to the input desktop (`OpenInputDesktop`, `SetThreadDesktop`); low-level hooks re-armed on each desktop; `block_input` on one thread that holds `BlockInput` and runs every operation while it lasts. It serves two pipes only SYSTEM can open, checks that the client is the service, and runs in a kill-on-close Job of the service |
-| `--window <sid8>` | the signed-in user (`WTSQueryUserToken`), started by the service at each sign-in | the corner window, through a pipe open to interactive users only that answers `{"type":"status"}` and `{"type":"end"}` and closes on anything else |
+| `--window <sid8>` | the signed-in user (`WTSQueryUserToken`), started by the service at each sign-in | the corner window, through a pipe open to interactive users only (read and write data, no new instances) that answers `{"type":"status"}` and `{"type":"end"}` and closes on anything else or after 5 s of silence. It repeats `end` until the status says ended, and says it cannot reach the service when the pipe is gone |
 
-Pipe messages are a 4-byte length and UTF-8 JSON. The backstop task runs at the
-deadline as SYSTEM, also late when the PC was off, and its action is
-`cmd /c`: `sc stop`, `taskkill` of the service process, `sc delete`, the
-registry restore, a retrying `rd /s /q` of the folder, `rd` of the empty parent,
-and `schtasks /delete` of itself. It never runs the app. The service's own
-cleanup does the same in process and leaves the folder to a detached `cmd` that
-runs after it exits, with `MoveFileEx` at the next restart only when `cmd` cannot
-start. A system shutdown stops the service without `end`, so the session goes on
+Pipe messages are a 4-byte length and UTF-8 JSON, and pipe clients connect at
+the identification level only. The backstop task runs at the deadline as SYSTEM,
+also late when the PC was off, with three actions in order: `cmd` (`sc stop`,
+`taskkill` of the service process, `sc delete`), PowerShell (release this
+session's share of `SoftwareSASGeneration`), and `cmd` (a retrying `rd /s /q` of
+the folder, then `schtasks /delete` of itself). It never runs the app. The
+service's own cleanup does the same in process and leaves the folder and then the
+task to a detached `cmd` that runs after it exits; when `cmd` cannot start,
+`MoveFileEx` deletes the files at the next restart and the task stays. As SYSTEM,
+`put_file` and `get_file` refuse a path that contains a junction, a symbolic link
+or (to write) a file with a second hard link. A system shutdown stops the service without `end`, so the session goes on
 after the restart within the same `expires_at`.
 
 `scripts/build-app.ps1` compiles on Windows and writes `src/app-bundle.json`.
