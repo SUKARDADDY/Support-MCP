@@ -25,7 +25,9 @@ function fixture() {
   return { session, values, logs, registryBodies, req, env };
 }
 
-const until = async (cond) => { for (let i = 0; i < 200 && !cond(); i++) await new Promise((r) => setImmediate(r)); assert.ok(cond(), 'condition never held'); };
+// Waits on real time, not a tick count: hashing the attach key runs on the thread pool, which is slow on a busy CI
+// runner. setImmediate and performance.now are used because some tests mock setTimeout and Date.
+const until = async (cond, ms = 2000) => { const end = performance.now() + ms; while (!cond() && performance.now() < end) await new Promise((r) => setImmediate(r)); assert.ok(cond(), 'condition never held'); };
 
 // An attached app session. `hello` is what the app says; no caps is an old client.
 async function attach(hello = {}, mode = 'app') {
