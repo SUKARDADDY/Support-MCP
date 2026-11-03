@@ -1422,32 +1422,55 @@ namespace SupportMcp {
         }
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern int GetFinalPathNameByHandle(SafeFileHandle h, StringBuilder path, int size, int flags);
         [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetFileInformationByHandle(SafeFileHandle h, int kind, ref byte delete, int size);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateDirectory(string path, IntPtr security);
+        static string FinalPath(SafeFileHandle h) {
+            var name = new StringBuilder(1024); int n = GetFinalPathNameByHandle(h, name, name.Capacity, 0);
+            string final = n > 0 && n < name.Capacity ? name.ToString() : "";
+            return final.StartsWith(@"\\?\") ? final.Substring(4) : final;
+        }
         // Full control runs file operations as SYSTEM, and a user may put a junction, a link or a second hard link in a
-        // path to aim SYSTEM at a protected file. So every existing part of the path must be plain before the open, and
-        // after it the handle must name exactly the requested path, be no link and (to write) have one name only. A file
-        // this call created somewhere else is deleted again. 8.3 short names fail the check too; use the long path.
+        // path to aim SYSTEM at a protected file. So every folder of the path, from the drive down, is opened as itself
+        // (never a link's target), checked to be a plain folder with exactly its own path, and held without delete
+        // sharing, so nobody can rename or replace it until the file is open. A missing folder (to write) is created one
+        // level at a time, each checked the same way before the next. The file itself must then have exactly the
+        // requested path, be no link and (to write) have one name only. A file this call created somewhere else is
+        // deleted again. 8.3 short names fail the check too; use the long path.
         public const string LinkRefused = "the path goes through a link or junction, or the file has another name; file operations as SYSTEM refuse those";
-        public static FileStream OpenPlain(string path, bool write, bool append) {
-            for (string part = path; part != null; part = Path.GetDirectoryName(part))
-                if ((File.Exists(part) || Directory.Exists(part)) && (File.GetAttributes(part) & FileAttributes.ReparsePoint) != 0) throw new ArgumentException(LinkRefused);
-            if (write) { string parent = Path.GetDirectoryName(path); if (!String.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent); }
-            // write: GENERIC_WRITE, DELETE, FILE_READ_ATTRIBUTES, OPEN_ALWAYS, share read. read: GENERIC_READ, OPEN_EXISTING, share read and write.
-            var h = CreateFile(path, write ? 0x40000000u | 0x10000u | 0x80u : 0x80000000u, write ? 1u : 3u, IntPtr.Zero, write ? 4u : 3u, 0x00200000, IntPtr.Zero);
-            int error = Marshal.GetLastWin32Error();
-            if (h.IsInvalid) throw new Win32Exception(error);
-            bool created = write && error != 183, ok = false;
+        static List<SafeFileHandle> HoldFolders(string full, bool create) {
+            var held = new List<SafeFileHandle>(); var levels = new List<string>(); bool ok = false;
+            for (string level = Path.GetDirectoryName(full); level != null; level = Path.GetDirectoryName(level)) levels.Insert(0, level);
             try {
-                FileInfo info; var name = new StringBuilder(1024);
-                int n = GetFinalPathNameByHandle(h, name, name.Capacity, 0);
-                string final = n > 0 && n < name.Capacity ? name.ToString() : "";
-                if (final.StartsWith(@"\\?\")) final = final.Substring(4);
-                ok = GetFileInformationByHandle(h, out info) && (info.Attributes & 0x410) == 0 && (!write || info.Links <= 1)
-                    && String.Equals(final, Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase);
-                if (!ok) { if (created) { byte yes = 1; SetFileInformationByHandle(h, 4, ref yes, 1); } throw new ArgumentException(LinkRefused); }
-                var stream = new FileStream(h, write ? FileAccess.Write : FileAccess.Read);
-                if (write) { if (append) stream.Seek(0, SeekOrigin.End); else stream.SetLength(0); }
-                return stream;
-            } finally { if (!ok) h.Dispose(); }
+                foreach (string level in levels) {
+                    if (create && !Directory.Exists(level) && !File.Exists(level) && !CreateDirectory(level, IntPtr.Zero) && Marshal.GetLastWin32Error() != 183) throw new Win32Exception();
+                    // FILE_READ_ATTRIBUTES; share read and write, not delete; BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+                    var h = CreateFile(level, 0x80, 3, IntPtr.Zero, 3, 0x02000000 | 0x00200000, IntPtr.Zero);
+                    if (h.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+                    held.Add(h); FileInfo info;
+                    if (!GetFileInformationByHandle(h, out info) || (info.Attributes & 0x400) != 0 || (info.Attributes & 0x10) == 0
+                        || !String.Equals(FinalPath(h).TrimEnd('\\'), level.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) throw new ArgumentException(LinkRefused);
+                }
+                ok = true; return held;
+            } finally { if (!ok) foreach (var h in held) h.Dispose(); }
+        }
+        public static FileStream OpenPlain(string path, bool write, bool append) {
+            string full = Path.GetFullPath(path);
+            var held = HoldFolders(full, write);
+            try {
+                // write: GENERIC_WRITE, DELETE, FILE_READ_ATTRIBUTES, OPEN_ALWAYS, share read. read: GENERIC_READ, OPEN_EXISTING, share read and write.
+                var h = CreateFile(full, write ? 0x40000000u | 0x10000u | 0x80u : 0x80000000u, write ? 1u : 3u, IntPtr.Zero, write ? 4u : 3u, 0x00200000, IntPtr.Zero);
+                int error = Marshal.GetLastWin32Error();
+                if (h.IsInvalid) throw new Win32Exception(error);
+                bool created = write && error != 183, ok = false;
+                try {
+                    FileInfo info;
+                    ok = GetFileInformationByHandle(h, out info) && (info.Attributes & 0x410) == 0 && (!write || info.Links <= 1)
+                        && String.Equals(FinalPath(h), full, StringComparison.OrdinalIgnoreCase);
+                    if (!ok) { if (created) { byte yes = 1; SetFileInformationByHandle(h, 4, ref yes, 1); } throw new ArgumentException(LinkRefused); }
+                    var stream = new FileStream(h, write ? FileAccess.Write : FileAccess.Read);
+                    if (write) { if (append) stream.Seek(0, SeekOrigin.End); else stream.SetLength(0); }
+                    return stream;
+                } finally { if (!ok) h.Dispose(); }
+            } finally { foreach (var f in held) f.Dispose(); }
         }
     }
 
@@ -1491,7 +1514,7 @@ namespace SupportMcp {
         // a process that took the name first must not be able to impersonate SYSTEM or the user.
         public static NamedPipeClientStream Client(string name) {
             return new NamedPipeClientStream(".", name, PipeAccessRights.ReadData | PipeAccessRights.WriteData | PipeAccessRights.ReadAttributes | PipeAccessRights.Synchronize,
-                PipeOptions.None, TokenImpersonationLevel.Identification, HandleInheritability.None);
+                PipeOptions.Asynchronous, TokenImpersonationLevel.Identification, HandleInheritability.None);
         }
         // What a corner window may ask the service: exactly {"type":"status"} or {"type":"end"}. null for anything else.
         public static string UiRequest(Dictionary<string, object> m) {
@@ -1516,6 +1539,12 @@ namespace SupportMcp {
             s.AddAccessRule(new FileSystemAccessRule(reader, rights, AccessControlType.Allow));
             return s;
         }
+        // HKLM\SOFTWARE\SupportMCP: SYSTEM and Administrators only, inherited by its subkeys.
+        public static RegistrySecurity Registry() {
+            var s = new RegistrySecurity(); s.SetAccessRuleProtection(true, false);
+            foreach (var who in new SecurityIdentifier[] { SystemSid, AdminsSid }) s.AddAccessRule(new RegistryAccessRule(who, RegistryRights.FullControl, InheritanceFlags.ContainerInherit, PropagationFlags.None, AccessControlType.Allow));
+            return s;
+        }
         // The corner window runs as the signed-in user, so its copy (which carries no session key) is readable by Users.
         public static FileSecurity Window() { return ForFile(UsersSid, FileSystemRights.ReadAndExecute); }
         // A command for as: "user" may be read, not changed, by the user it runs as.
@@ -1525,7 +1554,7 @@ namespace SupportMcp {
     // state.json in the service folder: the full session id and the deadline (Unix ms on the UTC wall clock).
     public sealed class FullState {
         public const long DayMs = 86400000;
-        public string Sid = ""; public long Deadline; public bool Welcomed;
+        public string Sid = "", Task = ""; public long Deadline; public bool Welcomed; public int AppPid;
         public static bool Expired(long deadline, long now) { return now >= deadline; }
         public static long Clamp(long deadline, long now) { return Math.Min(deadline, now + DayMs); }
         // The first welcome replaces connect_by with the session's expiry. A later one (after a restart) only brings it closer.
@@ -1533,15 +1562,15 @@ namespace SupportMcp {
         public static string PathIn(string folder) { return Path.Combine(folder, "state.json"); }
         public void Save(string folder) {
             string file = PathIn(folder), temp = file + ".new";
-            File.WriteAllText(temp, Wire.Json().Serialize(Wire.Map("sid", Sid, "deadline", Deadline, "welcomed", Welcomed)));
+            File.WriteAllText(temp, Wire.Json().Serialize(Wire.Map("sid", Sid, "task", Task, "deadline", Deadline, "welcomed", Welcomed, "app_pid", AppPid)));
             if (File.Exists(file)) File.Replace(temp, file, null); else File.Move(temp, file);
         }
         // null when missing or damaged. The service then treats the session as over.
         public static FullState Load(string folder) {
             try {
                 var m = Wire.Json().Deserialize<Dictionary<string, object>>(File.ReadAllText(PathIn(folder)));
-                var st = new FullState { Sid = Wire.Text(m, "sid"), Deadline = Wire.Number(m, "deadline"), Welcomed = Wire.Flag(m, "welcomed") };
-                return st.Deadline > 0 && st.Sid.Length == 64 ? st : null;
+                var st = new FullState { Sid = Wire.Text(m, "sid"), Task = Wire.Text(m, "task"), Deadline = Wire.Number(m, "deadline"), Welcomed = Wire.Flag(m, "welcomed"), AppPid = (int)Wire.Number(m, "app_pid") };
+                return st.Deadline > 0 && st.Sid.Length == 64 && st.Task.StartsWith("SupportMcp-", StringComparison.Ordinal) ? st : null;
             } catch (Exception) { return null; }
         }
     }
@@ -1558,7 +1587,20 @@ namespace SupportMcp {
         public static int Wanted(int value) { return value == 2 ? 3 : 1; }
         static int Read(Microsoft.Win32.RegistryKey k, string name) { object v = k == null ? null : k.GetValue(name); return v is int ? (int)v : -1; }
         const Microsoft.Win32.RegistryValueKind Dword = Microsoft.Win32.RegistryValueKind.DWord;
-        public static void Acquire(Microsoft.Win32.RegistryKey root, string holder) {
+        // Installs, services and backstop tasks of different sessions change the record at the same time: one machine-wide
+        // mutex orders them (only administrators and services may create Global objects). The tests use a Local one.
+        public static string MutexName = @"Global\SupportMcp-Sas";
+        static void Locked(Action work) {
+            using (var m = new Mutex(false, MutexName)) {
+                bool own = false;
+                try { try { own = m.WaitOne(30000); } catch (AbandonedMutexException) { own = true; } work(); }
+                finally { if (own) m.ReleaseMutex(); }
+            }
+        }
+        public static void Acquire(Microsoft.Win32.RegistryKey root, string holder) { Locked(delegate { AcquireLocked(root, holder); }); }
+        public static void Release(Microsoft.Win32.RegistryKey root, string holder) { Locked(delegate { ReleaseLocked(root, holder); }); }
+        static void AcquireLocked(Microsoft.Win32.RegistryKey root, string holder) {
+            using (var top = root.CreateSubKey(RootKey)) if (root.Name == "HKEY_LOCAL_MACHINE") top.SetAccessControl(FullAcl.Registry());
             using (var policy = root.CreateSubKey(PolicyKey)) using (var holders = root.CreateSubKey(HoldersKey)) {
                 holders.SetValue(holder, 1, Dword); // first, so a crash after the change below still puts it back
                 int current = Read(policy, Value); object written = holders.GetValue("written");
@@ -1570,7 +1612,7 @@ namespace SupportMcp {
                 policy.SetValue(Value, Wanted(current), Dword);
             }
         }
-        public static void Release(Microsoft.Win32.RegistryKey root, string holder) {
+        static void ReleaseLocked(Microsoft.Win32.RegistryKey root, string holder) {
             using (var holders = root.OpenSubKey(HoldersKey, true)) {
                 if (holders == null) return;
                 holders.DeleteValue(holder, false);
@@ -1588,13 +1630,15 @@ namespace SupportMcp {
             if (empty) root.DeleteSubKey(RootKey, false);
         }
         // The same release in PowerShell for the backstop task, which must not run the app. psRoot is "HKLM:" there.
-        public static string ReleaseScript(string psRoot, string holder) {
+        public static string ReleaseScript(string psRoot, string holder) { return ReleaseScript(psRoot, holder, MutexName); }
+        public static string ReleaseScript(string psRoot, string holder, string mutex) {
             string r = psRoot + "\\" + RootKey, k = psRoot + "\\" + HoldersKey, p = psRoot + "\\" + PolicyKey;
-            return "$r='" + r + "'; $k='" + k + "'; $p='" + p + "'; if (Test-Path $k) { Remove-ItemProperty -Path $k -Name '" + holder + "' -ErrorAction SilentlyContinue; " +
+            return "$m = New-Object System.Threading.Mutex($false, '" + mutex + "'); $own = $false; try { try { $own = $m.WaitOne(30000) } catch [System.Threading.AbandonedMutexException] { $own = $true }; " +
+                "$r='" + r + "'; $k='" + k + "'; $p='" + p + "'; if (Test-Path $k) { Remove-ItemProperty -Path $k -Name '" + holder + "' -ErrorAction SilentlyContinue; " +
                 "$v = Get-ItemProperty -Path $k; if (@($v.PSObject.Properties | Where-Object { $_.Name -like 'SupportMcp-*' }).Count -eq 0) { " +
                 "$c = (Get-ItemProperty -Path $p -ErrorAction SilentlyContinue).SoftwareSASGeneration; " +
                 "if ($v.written -ne $null -and $v.original -ne $null -and $c -eq $v.written) { if ($v.original -eq 'absent') { Remove-ItemProperty -Path $p -Name SoftwareSASGeneration } elseif ($v.original -match '^[0-9]+$') { Set-ItemProperty -Path $p -Name SoftwareSASGeneration -Value ([int]$v.original) -Type DWord } }; " +
-                "Remove-Item -Path $k; $g = Get-Item -Path $r; if ($g.SubKeyCount -eq 0 -and $g.ValueCount -eq 0) { Remove-Item -Path $r } } }";
+                "Remove-Item -Path $k; $g = Get-Item -Path $r; if ($g.SubKeyCount -eq 0 -and $g.ValueCount -eq 0) { Remove-Item -Path $r } } } } finally { if ($own) { $m.ReleaseMutex() }; $m.Close() }";
         }
     }
 
@@ -1625,6 +1669,11 @@ namespace SupportMcp {
     }
 
     static class Shell {
+        public static string Output(string tool, string args) {
+            using (var p = Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, tool), args) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, WorkingDirectory = Environment.SystemDirectory })) {
+                string text = p.StandardOutput.ReadToEnd(); p.WaitForExit(60000); return text;
+            }
+        }
         // Runs a Windows tool hidden. Returns its exit code, or -1 when it did not finish within a minute.
         public static int Run(string tool, string args) {
             using (var p = Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, tool), args) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Environment.SystemDirectory })) {
@@ -1639,19 +1688,24 @@ namespace SupportMcp {
     // deleted. The service moves it from connect_by to the session's expiry at the first welcome.
     public static class Backstop {
         public static string Name(string sid8) { return "SupportMcp-" + sid8; }
+        // Each install's task has a name of its own, so the late self-delete of an earlier install's task, or of its
+        // service's cleanup, can never remove the task of a later install of the same session.
+        public static string NewTask(string sid8) { return Name(sid8) + "-" + Guid.NewGuid().ToString("N").Substring(0, 8); }
+        // Full paths, from the 64-bit System32 (Task Scheduler resolves them without this process's redirection; the
+        // service's own cmd is 32-bit and gets SysWOW64, which has the same tools). No spaces, so no quotes in cmd lines.
+        public static string System32(string tool) { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), @"System32\" + tool); }
         // cmd: delete the folder, retrying while a closing window still holds window.exe.
         public static string RemoveFolder(string folder) {
-            return "(for /l %i in (1,1,20) do @(if exist \"" + folder + "\" (rd /s /q \"" + folder + "\" 2>nul & if exist \"" + folder + "\" ping -n 3 127.0.0.1 >nul)))";
+            return "(for /l %i in (1,1,20) do @(if exist \"" + folder + "\" (rd /s /q \"" + folder + "\" 2>nul & if exist \"" + folder + "\" " + System32("PING.EXE") + " -n 3 127.0.0.1 >nul)))";
         }
-        public static string DeleteSelf(string sid8) { return "schtasks /delete /tn \"" + Name(sid8) + "\" /f"; }
-        static string System32(string tool) { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), @"System32\" + tool); }
-        // The actions in order, as command and arguments. 64-bit paths: Task Scheduler resolves them without this process's redirection.
-        public static string[][] Actions(string sid8, string folder) {
-            string name = Name(sid8);
+        public static string DeleteTask(string task) { return System32("schtasks.exe") + " /delete /tn \"" + task + "\" /f"; }
+        // The actions in order, as command and arguments.
+        public static string[][] Actions(string sid8, string folder, string task) {
+            string name = Name(sid8), sc = System32("sc.exe");
             return new string[][] {
-                new string[] { System32("cmd.exe"), "/c sc stop \"" + name + "\" & ping -n 6 127.0.0.1 >nul & taskkill /f /fi \"SERVICES eq " + name + "\" & sc delete \"" + name + "\"" },
+                new string[] { System32("cmd.exe"), "/c " + sc + " stop \"" + name + "\" & " + System32("PING.EXE") + " -n 6 127.0.0.1 >nul & " + System32("taskkill.exe") + " /f /fi \"SERVICES eq " + name + "\" & " + sc + " delete \"" + name + "\"" },
                 new string[] { System32(@"WindowsPowerShell\v1.0\powershell.exe"), "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"" + SasShare.ReleaseScript("HKLM:", name) + "\"" },
-                new string[] { System32("cmd.exe"), "/c " + RemoveFolder(folder) + " & " + DeleteSelf(sid8) } };
+                new string[] { System32("cmd.exe"), "/c " + RemoveFolder(folder) + " & " + DeleteTask(task) } };
         }
         public static string Xml(string[][] actions, long deadline) {
             // Whole seconds in UTC, rounded up, so the task never fires before the deadline.
@@ -1670,13 +1724,24 @@ namespace SupportMcp {
         // fresh by this install, so nobody else can change it before schtasks reads it.
         public static void Register(string sid8, string folder, FullState state) {
             string xml = Path.Combine(folder, "backstop.xml");
-            File.WriteAllText(xml, Xml(Actions(sid8, folder), state.Deadline), Encoding.Unicode);
-            try { if (Shell.Run("schtasks.exe", "/create /tn \"" + Name(sid8) + "\" /xml \"" + xml + "\" /f") != 0) throw new IOException("cannot register the backstop task"); }
+            File.WriteAllText(xml, Xml(Actions(sid8, folder, state.Task), state.Deadline), Encoding.Unicode);
+            try { if (Shell.Run("schtasks.exe", "/create /tn \"" + state.Task + "\" /xml \"" + xml + "\" /f") != 0) throw new IOException("cannot register the backstop task"); }
             finally { File.Delete(xml); }
         }
-        public static void Delete(string sid8) { Shell.Run("schtasks.exe", "/delete /tn \"" + Name(sid8) + "\" /f"); }
-        public static bool Exists(string sid8) { return Shell.Run("schtasks.exe", "/query /tn \"" + Name(sid8) + "\"") == 0; }
-        public static void RunNow(string sid8) { Shell.Run("schtasks.exe", "/run /tn \"" + Name(sid8) + "\""); }
+        public static void Delete(string task) { Shell.Run("schtasks.exe", "/delete /tn \"" + task + "\" /f"); }
+        // The tasks of every install of this session that are still registered.
+        public static List<string> Tasks(string sid8) {
+            var found = new List<string>(); string prefix = "\"\\" + Name(sid8) + "-";
+            foreach (string line in Shell.Output("schtasks.exe", "/query /fo csv /nh").Split('\n'))
+                if (line.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) { string name = line.Substring(2, line.IndexOf('"', 2) - 2); if (!found.Contains(name)) found.Add(name); }
+            return found;
+        }
+        // Runs the tasks of a leftover install and waits, at most 90 s, until each has deleted itself.
+        public static void RunAndWait(string sid8) {
+            foreach (string task in Tasks(sid8)) Shell.Run("schtasks.exe", "/run /tn \"" + task + "\"");
+            var clock = Stopwatch.StartNew();
+            while (Tasks(sid8).Count > 0 && clock.ElapsedMilliseconds < 90000) Thread.Sleep(2000);
+        }
     }
 
     static class Scm {
@@ -1736,29 +1801,33 @@ namespace SupportMcp {
         // running. Anything else: nothing of this install is left.
         public static int Install(byte[] self, Dictionary<string, object> cfg, string[] args) {
             long now = Client.UnixNow(), deadline;
-            if (args.Length != 3 || !long.TryParse(args[1], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out deadline) || deadline <= now) return 2;
+            int appPid;
+            if (args.Length != 4 || !long.TryParse(args[1], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out deadline) || deadline <= now
+                || !int.TryParse(args[3], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out appPid)) return 2;
             string sid = Wire.Text(cfg, "sid"), sid8 = Sid8(cfg), name = Backstop.Name(sid8), folder = Folder(sid8);
             if (!System.Text.RegularExpressions.Regex.IsMatch(folder, @"^[A-Za-z]:\\[^%&|<>^""]+$")) return 2; // it goes into cmd lines
             var status = Scm.Status(name);
-            if (status != null || Directory.Exists(folder) || File.Exists(folder)) {
+            if (status != null || Directory.Exists(folder) || File.Exists(folder) || Backstop.Tasks(sid8).Count > 0) {
                 // A leftover (a crash in the middle of an install) or a running service. Only this session's is touched:
                 // another session whose id starts with the same 8 characters is never adopted or removed.
                 var old = FullState.Load(folder);
                 if (old != null ? old.Sid != sid : status != null) return 3;
                 if (status == ServiceControllerStatus.Running) return 0; // this session has full control already
-                if (old == null && Backstop.Exists(sid8)) { Backstop.RunNow(sid8); return 3; } // no record to clean up with: the backstop does it
+                // No record to clean up with: the backstop tasks do it, and are waited for so they cannot delete anything new.
+                if (old == null) Backstop.RunAndWait(sid8);
                 Remove(sid8);
+                if (Backstop.Tasks(sid8).Count > 0 || Directory.Exists(folder)) return 3;
             }
             try { Native.CreateLocked(folder, LockedFolder()); } catch (Exception) { return 1; } // not ours: leave it alone
-            var state = new FullState { Sid = sid, Deadline = FullState.Clamp(deadline, now), Welcomed = args[2] == "1" };
+            var state = new FullState { Sid = sid, Task = Backstop.NewTask(sid8), Deadline = FullState.Clamp(deadline, now), Welcomed = args[2] == "1", AppPid = appPid };
             try {
                 File.WriteAllBytes(Path.Combine(folder, "agent.exe"), self);
                 string window = Path.Combine(folder, "window.exe");
                 using (var f = new FileStream(window, FileMode.CreateNew)) f.Write(self, 0, Wire.Payload(self));
                 File.SetAccessControl(window, FullAcl.Window());
                 state.Save(folder);
+                Backstop.Register(sid8, folder, state); // before the registry share, so the backstop covers it from the start
                 using (var hklm = SasShare.Machine()) SasShare.Acquire(hklm, name);
-                Backstop.Register(sid8, folder, state);
                 Scm.Create(name, "\"" + Path.Combine(folder, "agent.exe") + "\" --service");
                 Scm.Start(name);
                 return 0;
@@ -1773,14 +1842,16 @@ namespace SupportMcp {
             Scm.Remove(Backstop.Name(sid8));
             try { using (var hklm = SasShare.Machine()) SasShare.Release(hklm, Backstop.Name(sid8)); } catch (Exception) { }
             try { if (Directory.Exists(folder)) Directory.Delete(folder, true); else if (File.Exists(folder)) File.Delete(folder); } catch (Exception) { }
-            Backstop.Delete(sid8);
+            foreach (string task in Backstop.Tasks(sid8)) Backstop.Delete(task);
         }
         // A running exe cannot delete itself: a detached cmd removes the folder after the service has exited, then the
         // backstop task, last. When cmd cannot start, Windows deletes the files at the next restart and the task stays
         // as the backstop it is.
-        public static void RemoveLater(string sid8, string folder) {
+        public static void RemoveLater(IList<string> tasks, string folder) {
             try {
-                using (Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"), "/c ping -n 3 127.0.0.1 >nul & " + Backstop.RemoveFolder(folder) + " & " + Backstop.DeleteSelf(sid8)) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Environment.SystemDirectory })) { }
+                string line = "/c " + Backstop.System32("PING.EXE") + " -n 3 127.0.0.1 >nul & " + Backstop.RemoveFolder(folder);
+                foreach (string task in tasks) line += " & " + Backstop.DeleteTask(task);
+                using (Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"), line) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Environment.SystemDirectory })) { }
             } catch (Exception) {
                 try { foreach (string f in Directory.GetFiles(folder)) Native.MoveFileEx(f, null, 4); Native.MoveFileEx(folder, null, 4); } catch (Exception) { }
             }
@@ -1803,7 +1874,9 @@ namespace SupportMcp {
                 string staged = null;
                 try {
                     staged = Stage(exe);
-                    int code = Native.RunElevated(staged, "--elevate-install " + deadline.ToString(System.Globalization.CultureInfo.InvariantCulture) + (connected ? " 1" : " 0"), owner);
+                    // The last argument is this process: the corner window until the service starts one, which the helper must not click.
+                    int code = Native.RunElevated(staged, "--elevate-install " + deadline.ToString(System.Globalization.CultureInfo.InvariantCulture) + (connected ? " 1 " : " 0 ")
+                        + Process.GetCurrentProcess().Id.ToString(System.Globalization.CultureInfo.InvariantCulture), owner);
                     outcome = code == 0 ? Installed : code == -1223 ? Declined : Failed;
                 } catch (Exception) { outcome = Failed; }
                 finally { if (staged != null) try { Directory.Delete(Path.GetDirectoryName(staged), true); } catch (Exception) { } }
@@ -1877,7 +1950,7 @@ namespace SupportMcp {
                 Thread.Sleep(500);
                 NamedPipeClientStream pipe; lock (gate) pipe = status;
                 if (pipe == null) continue;
-                try { Pipes.Write(pipe, Wire.Map("type", "status")); last = Pipes.Read(pipe, 4096); Interlocked.Exchange(ref lastAt, PauseClock.Now()); }
+                try { Pipes.Write(pipe, Wire.Map("type", "status")); last = Pipes.Read(pipe, 4096, 5000); Interlocked.Exchange(ref lastAt, PauseClock.Now()); }
                 catch (Exception) { }
             }
         }
@@ -2005,27 +2078,29 @@ namespace SupportMcp {
     }
 
     // The corner windows' pipe. Interactive users may open it, the network may not, and nobody but SYSTEM may add a
-    // pipe instance (0x12008B: read and write data, read attributes and permissions, synchronize). A request is
-    // {"type":"status"} or {"type":"end"}; anything else, or nothing for 5 s, closes the connection, so idle clients
-    // cannot keep the 8 instances from a window that wants to end the session.
+    // pipe instance (0x12008B: read and write data, read attributes and permissions, synchronize). It serves only
+    // clients in the active console session, at most 2 connections per process, so a process of another user (fast
+    // user switching, Remote Desktop) cannot take the 8 instances. A request is {"type":"status"} or {"type":"end"};
+    // anything else, or nothing for 5 s, closes the connection.
     sealed class UiServer {
         const string Sddl = "D:P(A;;GA;;;SY)(A;;0x12008B;;;IU)";
-        public const int Instances = 8, ReadMs = 5000;
-        readonly Func<Dictionary<string, object>> status; readonly Action end;
-        readonly Dictionary<uint, long> seen = new Dictionary<uint, long>(); readonly List<int> pids = new List<int>();
-        public UiServer(string name, Func<Dictionary<string, object>> status, Action end) : this(name, status, end, Sddl) { }
-        // sddl: the tests' own, since only the creator of a pipe's ACL may add instances and the tests do not run as SYSTEM.
-        internal UiServer(string name, Func<Dictionary<string, object>> status, Action end, string sddl) {
-            this.status = status; this.end = end;
+        public const int Instances = 8, ReadMs = 5000, PerProcess = 2;
+        readonly Func<Dictionary<string, object>> status; readonly Action end; readonly Func<uint, bool> allowSession;
+        readonly Dictionary<uint, long> seen = new Dictionary<uint, long>(); readonly Dictionary<uint, int> open = new Dictionary<uint, int>();
+        public UiServer(string name, Func<Dictionary<string, object>> status, Action end) : this(name, status, end, delegate(uint s) { return s == Native.WTSGetActiveConsoleSessionId(); }, Sddl) { }
+        // allowSession and sddl: the tests' own. Only the owner of a pipe's ACL may add instances, and the tests do not run as SYSTEM.
+        internal UiServer(string name, Func<Dictionary<string, object>> status, Action end, Func<uint, bool> allowSession, string sddl) {
+            this.status = status; this.end = end; this.allowSession = allowSession;
             for (int i = 0; i < Instances; i++) { var pipe = Native.PipeServer(name, sddl, Instances, i == 0, true); var t = new Thread(Serve); t.IsBackground = true; t.Start(pipe); }
         }
         void Serve(object o) {
             var pipe = (NamedPipeServerStream)o;
             while (true) {
+                uint pid = 0; bool counted = false;
                 try {
-                    pipe.WaitForConnection(); uint pid, session;
-                    if (Native.GetNamedPipeClientProcessId(pipe.SafePipeHandle, out pid)) lock (pids) { if (!pids.Contains((int)pid)) pids.Add((int)pid); if (pids.Count > 16) pids.RemoveAt(0); }
-                    if (!Native.GetNamedPipeClientSessionId(pipe.SafePipeHandle, out session)) session = 0xFFFFFFFF;
+                    pipe.WaitForConnection(); uint session;
+                    if (!Native.GetNamedPipeClientProcessId(pipe.SafePipeHandle, out pid) || !Native.GetNamedPipeClientSessionId(pipe.SafePipeHandle, out session) || !allowSession(session)) throw new UnauthorizedAccessException();
+                    lock (open) { int n; open.TryGetValue(pid, out n); if (n >= PerProcess) throw new UnauthorizedAccessException(); open[pid] = n + 1; counted = true; }
                     while (true) {
                         string request = Pipes.UiRequest(Pipes.Read(pipe, 1024, ReadMs));
                         if (request == null) break;
@@ -2034,13 +2109,13 @@ namespace SupportMcp {
                         Pipes.Write(pipe, status());
                     }
                 } catch (Exception) { }
+                if (counted) lock (open) { if (--open[pid] == 0) open.Remove(pid); }
                 try { pipe.Disconnect(); } catch (Exception) { return; }
             }
         }
         // A window in that session asked for status within ms.
         public bool SeenWithin(uint session, long ms) { long at; lock (seen) return seen.TryGetValue(session, out at) && PauseClock.Now() - at < ms; }
         public bool AnySeenWithin(long ms) { lock (seen) foreach (long at in seen.Values) if (PauseClock.Now() - at < ms) return true; return false; }
-        public int[] Pids { get { lock (pids) return pids.ToArray(); } }
     }
 
     // The corner window's view of the full-control service, through its pipe: status every 500 ms, "end" for End
@@ -2048,7 +2123,7 @@ namespace SupportMcp {
     // link finishes as Lost, and the window says so instead of claiming the session ended.
     public sealed class ServiceLink : ISupportLink {
         public static int EndMs = 30000; // tests shorten it
-        readonly string pipe; Thread loop, ender; volatile bool finished, lost; bool connected, linkUp = true; int busy;
+        readonly string pipe; Thread loop, ender; volatile bool finished, lost, ending; bool connected, linkUp = true; int busy;
         volatile bool paused, blocked; long expires;
         public event Action Connected; public event Action<bool> LinkChanged; public event Action<int> BusyChanged; public event Action Finished;
         public ServiceLink(string sid8) { pipe = Backstop.Name(sid8) + "-ui"; }
@@ -2058,7 +2133,7 @@ namespace SupportMcp {
         public bool SurvivesSignOut { get { return true; } }
         public DateTime ExpiresLocal { get { long ms = Interlocked.Read(ref expires); return ms == 0 ? DateTime.MinValue : new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddMilliseconds(ms).ToLocalTime(); } }
         static Dictionary<string, object> Ask(string name, string type, int ms) {
-            using (var c = Pipes.Client(name)) { c.Connect(ms); Pipes.Write(c, Wire.Map("type", type)); return Pipes.Read(c, 4096); }
+            using (var c = Pipes.Client(name)) { c.Connect(ms); Pipes.Write(c, Wire.Map("type", type)); return Pipes.Read(c, 4096, UiServer.ReadMs); }
         }
         // True when the service of this session answers and the session is not over.
         public static bool Running(string sid8) { try { return !Wire.Flag(Ask(Backstop.Name(sid8) + "-ui", "status", 1000), "ended"); } catch (Exception) { return false; } }
@@ -2079,7 +2154,7 @@ namespace SupportMcp {
                 try {
                     using (var c = Pipes.Client(pipe)) {
                         c.Connect(2000); reached = true;
-                        while (true) { Pipes.Write(c, Wire.Map("type", "status")); if (Apply(Pipes.Read(c, 4096))) { Finish(false); return; } Thread.Sleep(500); }
+                        while (true) { Pipes.Write(c, Wire.Map("type", ending ? "end" : "status")); if (Apply(Pipes.Read(c, 4096, UiServer.ReadMs))) { Finish(false); return; } Thread.Sleep(ending ? 300 : 500); }
                     }
                 } catch (Exception) {
                     // Gone without saying ended, or never there: the service cannot be reached, which is not the same as ended.
@@ -2103,10 +2178,12 @@ namespace SupportMcp {
             return false;
         }
         void Finish(bool unreachable) { lock (this) { if (finished) return; finished = true; lost = unreachable; } var f = Finished; if (f != null) f(); }
-        // End session: send "end" on connections of its own until the service confirms; the status loop sees it too.
+        // End session: the status loop sends "end" instead of "status" on the connection it holds, until the service
+        // reports the session ended. Without that within EndMs, the link finishes as Lost.
         public void Stop() {
             if (finished || ender != null) return;
-            ender = new Thread(delegate() { if (!EndPipe(pipe, delegate { return finished; })) Finish(true); else Finish(false); }); ender.IsBackground = true; ender.Start();
+            ending = true;
+            ender = new Thread(delegate() { var clock = Stopwatch.StartNew(); while (!finished && clock.ElapsedMilliseconds < EndMs) Thread.Sleep(100); Finish(true); }); ender.IsBackground = true; ender.Start();
         }
         // Before the app exits: wait until the end request is confirmed or given up.
         public void Flush(int ms) { var t = ender; if (t != null) t.Join(ms); }
@@ -2200,7 +2277,8 @@ namespace SupportMcp {
         public Dictionary<string, object> ScreenOp(Dictionary<string, object> frame, WaitHandle stop) {
             if (Wire.Text(frame, "type") == "control") return Wire.Map("ok", true, "control", "full", "text", "full control is already on");
             var a = frame.ContainsKey("action") ? frame["action"] as Dictionary<string, object> : null;
-            var pids = new List<int>(ui.Pids); if (windowPid != 0) pids.Add(windowPid);
+            // The own-window guard covers the corner window this service started and the app that installed it, nothing else.
+            var pids = new List<int>(); if (windowPid != 0) pids.Add(windowPid); if (state != null && state.AppPid != 0) pids.Add(state.AppPid);
             if (a != null && Wire.Text(a, "name") == "send_sas") {
                 // SendSAS works from a service only, with SoftwareSASGeneration allowing it (the install sets it).
                 string error = Native.SendSas(); if (error != null) return Wire.Map("ok", false, "error", error);
@@ -2251,7 +2329,7 @@ namespace SupportMcp {
             if (helper != null) helper.Stop();
             try { using (var hklm = SasShare.Machine()) SasShare.Release(hklm, ServiceName); } catch (Exception) { }
             Scm.Delete(ServiceName);
-            FullInstall.RemoveLater(sid8, folder);
+            FullInstall.RemoveLater(state != null ? new List<string> { state.Task } : Backstop.Tasks(sid8), folder);
         }
     }
 

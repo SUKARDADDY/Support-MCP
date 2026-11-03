@@ -373,9 +373,10 @@ public static class AppTests {
 
         // The deadline: saved and loaded with the full session id, expiry, the 24-hour cap, and the first welcome.
         long now = Client.UnixNow(); string fullSid = new string('c', 64);
-        var st = new FullState { Sid = fullSid, Deadline = now + 7200000 }; st.Save(dir);
+        var st = new FullState { Sid = fullSid, Task = Backstop.NewTask("cccccccc"), Deadline = now + 7200000, AppPid = 4242 }; st.Save(dir);
         var back = FullState.Load(dir);
-        Assert(back != null && back.Deadline == st.Deadline && !back.Welcomed && back.Sid == fullSid, "State round trip");
+        Assert(back != null && back.Deadline == st.Deadline && !back.Welcomed && back.Sid == fullSid && back.AppPid == 4242 && back.Task == st.Task && back.Task.StartsWith("SupportMcp-cccccccc-") && back.Task.Length == 28, "State round trip, with this install's own task name");
+        Assert(Backstop.NewTask("cccccccc") != Backstop.NewTask("cccccccc"), "Every install gets a task name of its own");
         back.Welcomed = true; back.Save(dir); back = FullState.Load(dir);
         Assert(back.Welcomed && !File.Exists(FullState.PathIn(dir) + ".new"), "State is replaced in place");
         File.WriteAllText(FullState.PathIn(dir), "{\"deadline\":" + (now + 5000) + "}"); Assert(FullState.Load(dir) == null, "A state without the full session id is treated as over");
@@ -393,6 +394,7 @@ public static class AppTests {
         // SoftwareSASGeneration shared by sessions, in a test copy of the two keys under HKCU. The C# release and the
         // backstop's PowerShell release must behave the same.
         string testKey = @"Software\SupportMcpTest-" + Guid.NewGuid().ToString("N");
+        SasShare.MutexName = @"Local\SupportMcpTest-Sas-" + Guid.NewGuid().ToString("N"); // a Global one needs administrator rights
         Func<Microsoft.Win32.RegistryKey> root = delegate { return Microsoft.Win32.Registry.CurrentUser.CreateSubKey(testKey); };
         Func<object> sas = delegate { using (var r = root()) using (var k = r.OpenSubKey(SasShare.PolicyKey)) return k == null ? null : k.GetValue(SasShare.Value); };
         Action<object> setSas = delegate(object v) { using (var r = root()) using (var k = r.CreateSubKey(SasShare.PolicyKey)) { if (v == null) k.DeleteValue(SasShare.Value, false); else k.SetValue(SasShare.Value, v, Microsoft.Win32.RegistryValueKind.DWord); } };
@@ -428,16 +430,26 @@ public static class AppTests {
                 release("SupportMcp-aaaaaaaa");
                 Assert((int)sas() == 1 && clean(), "A value that already allowed services is left alone" + how);
             }
+            // The C# and the PowerShell release both wait for the mutex another process holds.
+            setSas(null);
+            using (var r = root()) SasShare.Acquire(r, "SupportMcp-aaaaaaaa");
+            var other = new Mutex(false, SasShare.MutexName); var taken = new ManualResetEvent(false); var letGo = new ManualResetEvent(false);
+            var owner = new Thread(delegate() { other.WaitOne(); taken.Set(); letGo.WaitOne(); other.ReleaseMutex(); }); owner.Start(); taken.WaitOne();
+            var waited = Stopwatch.StartNew(); var releaser = new Thread(delegate() { psRelease("SupportMcp-aaaaaaaa"); }); releaser.Start();
+            Thread.Sleep(2500); Assert((int)sas() == 1, "The PowerShell release waits while another process holds the mutex");
+            letGo.Set(); releaser.Join(30000); owner.Join();
+            Assert(sas() == null && clean() && waited.ElapsedMilliseconds >= 2500, "Then it runs");
         } finally { Microsoft.Win32.Registry.CurrentUser.DeleteSubKeyTree(testKey, false); }
         Console.WriteLine("PASS SoftwareSASGeneration: shared by sessions, put back by the last one, an administrator's change kept, the same in PowerShell");
 
         // The backstop never runs agent.exe, releases the registry share, and deletes itself last.
         string f = @"C:\Program Files\SupportMCP-abcd1234";
-        var actions = Backstop.Actions("abcd1234", f);
+        var actions = Backstop.Actions("abcd1234", f, "SupportMcp-abcd1234-0123abcd"); string sys32 = Backstop.System32("");
         Assert(actions.Length == 3 && actions[0][0].EndsWith(@"\System32\cmd.exe") && actions[1][0].EndsWith(@"\System32\WindowsPowerShell\v1.0\powershell.exe") && actions[2][0].EndsWith(@"\System32\cmd.exe"), "cmd, PowerShell, cmd from the 64-bit System32");
-        Assert(actions[0][1] == "/c sc stop \"SupportMcp-abcd1234\" & ping -n 6 127.0.0.1 >nul & taskkill /f /fi \"SERVICES eq SupportMcp-abcd1234\" & sc delete \"SupportMcp-abcd1234\"", "First the service: " + actions[0][1]);
+        Assert(actions[0][1] == "/c " + sys32 + "sc.exe stop \"SupportMcp-abcd1234\" & " + sys32 + "PING.EXE -n 6 127.0.0.1 >nul & " + sys32 + "taskkill.exe /f /fi \"SERVICES eq SupportMcp-abcd1234\" & " + sys32 + "sc.exe delete \"SupportMcp-abcd1234\"", "First the service, every tool by its full path: " + actions[0][1]);
+        Assert(sys32.IndexOf(' ') < 0, "System32 has no space, so the cmd lines need no quotes around tools");
         Assert(actions[1][1].Contains(SasShare.ReleaseScript("HKLM:", "SupportMcp-abcd1234")) && !actions[1][1].Substring(actions[1][1].IndexOf('"') + 1).TrimEnd('"').Contains("\""), "Then the registry share, with no double quote inside the script");
-        Assert(actions[2][1].StartsWith("/c (for /l %i in (1,1,20) do @(if exist \"" + f + "\"") && actions[2][1].EndsWith(" & schtasks /delete /tn \"SupportMcp-abcd1234\" /f"), "Then the folder, and the task itself last: " + actions[2][1]);
+        Assert(actions[2][1].StartsWith("/c (for /l %i in (1,1,20) do @(if exist \"" + f + "\"") && actions[2][1].EndsWith(" & " + sys32 + "schtasks.exe /delete /tn \"SupportMcp-abcd1234-0123abcd\" /f") && actions[2][1].Contains(sys32 + "PING.EXE -n 3"), "Then the folder, and the task itself last: " + actions[2][1]);
         foreach (string[] a in actions) {
             Assert(!a[1].Contains("agent.exe") && !a[1].Contains("window.exe"), "The backstop never runs the app");
             Assert(a[1].IndexOf('%') < 0 || (a[1].IndexOf('%') == a[1].IndexOf("%i") && a[1].IndexOf("%i") == a[1].LastIndexOf("%i")), "At most one %i and no other %, so Task Scheduler expands nothing");
@@ -496,8 +508,8 @@ public static class AppTests {
         // The real pipe: a window reads status and ends the session; garbage closes the connection; nobody can take the name first.
         string sid8 = Guid.NewGuid().ToString("N").Substring(0, 8); int ended = 0;
         // Only the pipe's owner may add instances, and the tests do not run as SYSTEM: this account stands in for it.
-        string uiSddl = "D:P(A;;GA;;;" + me.Value + ")(A;;0x12008B;;;IU)";
-        var ui = new UiServer(Backstop.Name(sid8) + "-ui", delegate { return Wire.Map("connected", true, "link", true, "busy", 1, "paused", false, "blocked", true, "expires_at", Client.UnixNow() + 3600000, "ended", ended > 0); }, delegate { Interlocked.Increment(ref ended); }, uiSddl);
+        string uiSddl = "D:P(A;;GA;;;" + me.Value + ")(A;;0x12008B;;;IU)"; Func<uint, bool> anySession = delegate(uint session) { return true; };
+        var ui = new UiServer(Backstop.Name(sid8) + "-ui", delegate { return Wire.Map("connected", true, "link", true, "busy", 1, "paused", false, "blocked", true, "expires_at", Client.UnixNow() + 3600000, "ended", ended > 0); }, delegate { Interlocked.Increment(ref ended); }, anySession, uiSddl);
         try { Native.PipeServer(Backstop.Name(sid8) + "-ui", "D:P(A;;GA;;;SY)", 4, true); throw new Exception("a second first instance was allowed"); } catch (System.ComponentModel.Win32Exception) { }
         Assert(ServiceLink.Running(sid8) && !ServiceLink.Running(Guid.NewGuid().ToString("N").Substring(0, 8)), "Running finds the service of this session only");
         // A client that asks for full access (which includes making a new pipe instance) is refused.
@@ -523,20 +535,24 @@ public static class AppTests {
         link.Stop(); link.Flush(5000);
         for (int i = 0; i < 100 && finished == 0; i++) Thread.Sleep(50);
         Assert(ended >= 1 && finished == 1 && !link.Lost && !ServiceLink.Running(sid8), "End session reaches the service, and the window sees the session end");
-        // Idle clients on every instance are cut off after 5 s, so a window can still get through.
+        // One process gets at most 2 connections, and idle ones are cut off after 5 s.
         string sid8b = Guid.NewGuid().ToString("N").Substring(0, 8); int endedB = 0;
-        new UiServer(Backstop.Name(sid8b) + "-ui", delegate { return Wire.Map("connected", true, "link", true, "ended", false); }, delegate { endedB++; }, uiSddl);
+        new UiServer(Backstop.Name(sid8b) + "-ui", delegate { return Wire.Map("connected", true, "link", true, "ended", false); }, delegate { endedB++; }, anySession, uiSddl);
         var idle = new List<System.IO.Pipes.NamedPipeClientStream>();
-        for (int i = 0; i < UiServer.Instances; i++) { var c = Pipes.Client(Backstop.Name(sid8b) + "-ui"); c.Connect(2000); idle.Add(c); }
-        Assert(!ServiceLink.Running(sid8b), "All instances are taken by idle clients");
+        for (int i = 0; i < UiServer.PerProcess; i++) { var c = Pipes.Client(Backstop.Name(sid8b) + "-ui"); c.Connect(2000); idle.Add(c); }
+        Assert(!ServiceLink.Running(sid8b), "A third connection of the same process is refused");
         Thread.Sleep(UiServer.ReadMs + 1500);
-        Assert(ServiceLink.Running(sid8b), "The idle clients were cut off and a window gets through");
+        Assert(ServiceLink.Running(sid8b), "The idle clients were cut off and the process gets through again");
         foreach (var c in idle) c.Dispose();
+        // Only the active console session is served: a process of another session (a switched user, Remote Desktop) is refused.
+        string sid8c = Guid.NewGuid().ToString("N").Substring(0, 8);
+        new UiServer(Backstop.Name(sid8c) + "-ui", delegate { return Wire.Map("connected", true, "ended", false); }, delegate { }, delegate(uint session) { return false; }, uiSddl);
+        Assert(!ServiceLink.Running(sid8c), "A client from another session is refused");
         // A service that never confirms the end: the window says it cannot reach it, not that the session ended.
         ServiceLink.EndMs = 2000;
         var stubborn = new ServiceLink(sid8b); int stubbornDone = 0; stubborn.Finished += delegate { stubbornDone++; }; stubborn.Start();
         Thread.Sleep(800); stubborn.Stop(); stubborn.Flush(10000);
-        Assert(stubbornDone == 1 && stubborn.Lost && endedB >= 1, "An unconfirmed end finishes as Lost");
+        Assert(stubbornDone == 1 && stubborn.Lost && endedB >= 3, "The end goes out on the connection the window holds, again and again, and an unconfirmed end finishes as Lost: " + endedB);
         ServiceLink.EndMs = 30000;
         // Pipe clients let the server identify them, never act as them.
         string me8 = Guid.NewGuid().ToString("N").Substring(0, 8); string secret = Path.Combine(dir, "only-me.txt"); File.WriteAllText(secret, "x"); Exception asClient = null;
@@ -582,7 +598,12 @@ public static class AppTests {
             }
         try { using (Native.OpenPlain(Path.Combine(plain, "twin.txt"), true, false)) { } throw new Exception("wrote through a second hard link"); } catch (ArgumentException e) { Assert(e.Message == Native.LinkRefused, e.Message); }
         Assert(File.ReadAllText(Path.Combine(target, "file.txt")) == "keep" && !File.Exists(Path.Combine(target, "new.txt")), "Nothing behind the junction or the link changed");
-        string ok = Path.Combine(plain, @"sub\data.bin");
+        // Missing folders are made one level at a time, each checked; a junction at any level is refused.
+        foreach (bool write in new bool[] { true, false }) {
+            try { using (Native.OpenPlain(Path.Combine(plain, @"jump\new\deeper\x.txt"), write, false)) { } throw new Exception("went through a junction above new folders"); } catch (ArgumentException e) { Assert(e.Message == Native.LinkRefused, e.Message); }
+        }
+        Assert(!Directory.Exists(Path.Combine(target, "new")), "No folder was made behind the junction");
+        string ok = Path.Combine(plain, @"sub\one\two\data.bin");
         using (var w = Native.OpenPlain(ok, true, false)) w.Write(new byte[] { 1, 2, 3 }, 0, 3);
         using (var w = Native.OpenPlain(ok, true, true)) w.Write(new byte[] { 4 }, 0, 1);
         using (var w = Native.OpenPlain(ok, true, false)) w.Write(new byte[] { 9 }, 0, 1);
