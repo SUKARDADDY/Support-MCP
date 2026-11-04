@@ -555,16 +555,19 @@ const mcp = async (f, query, method, params) => {
   return { status: r.status, body: await r.json() };
 };
 
-test('/mcp picks the tool shape from the URL and refuses unknown values', async () => {
+test('/mcp offers only the split tools, honours ui, and refuses shape and unknown values', async () => {
   const f = fixture();
   const names = async (q) => (await mcp(f, q, 'tools/list')).body.result.tools.map((t) => t.name);
-  assert.ok((await names('')).includes('computer'));
-  assert.ok((await names('?shape=computer')).includes('computer'));
-  const split = await names('?shape=split');
-  assert.ok(split.includes('click') && !split.includes('computer'));
+  const all = await names('');
+  assert.ok(all.includes('click') && all.includes('type_text') && all.includes('ui_act') && !all.includes('computer'));
   assert.ok(!(await names('?ui=0')).includes('ui_tree'));
-  assert.ok((await names('?shape=split&ui=1')).includes('ui_act'));
-  for (const q of ['?shape=other', '?shape=', '?ui=2', '?shape=split&ui=yes']) {
+  assert.ok((await names('?ui=1')).includes('ui_act'));
+  for (const q of ['?shape=split', '?shape=computer', '?shape=', '?shape=split&ui=1']) {
+    const r = await mcp(f, q, 'tools/list');
+    assert.equal(r.status, 400, q);
+    assert.match(r.body.error, /shape parameter was removed/);
+  }
+  for (const q of ['?ui=2', '?ui=yes']) {
     const r = await mcp(f, q, 'tools/list');
     assert.equal(r.status, 400, q);
     assert.match(r.body.error, /unknown/);
@@ -573,7 +576,7 @@ test('/mcp picks the tool shape from the URL and refuses unknown values', async 
 
 test('/mcp returns an image block then the metadata for a screenshot, end to end', async () => {
   const f = await attach();
-  const call = mcp(f, '', 'tools/call', { name: 'computer', arguments: { session_id: SID, action: 'screenshot' } });
+  const call = mcp(f, '', 'tools/call', { name: 'screenshot', arguments: { session_id: SID } });
   await until(() => f.session.httpCommands.screen);
   await f.result(await f.poll({ busy_lanes: [] }), shotResult());
   const { body } = await call;
@@ -585,7 +588,7 @@ test('/mcp returns an image block then the metadata for a screenshot, end to end
 
 test('/mcp surfaces relay errors for screen tools as tool errors', async () => {
   const f = await attach({ caps: undefined });
-  const { body } = await mcp(f, '?shape=split', 'tools/call', { name: 'click', arguments: { session_id: SID, x: 1, y: 2 } });
+  const { body } = await mcp(f, '', 'tools/call', { name: 'click', arguments: { session_id: SID, x: 1, y: 2 } });
   assert.equal(body.result.isError, true);
   assert.equal(body.result.content[0].text, 'this support app is too old for screen control');
 });
@@ -605,4 +608,37 @@ test('/mcp session_status reports control, caps and client_version', async () =>
   const { body } = await mcp(f, '', 'tools/call', { name: 'session_status', arguments: { session_id: SID } });
   const s = JSON.parse(body.result.content[0].text);
   assert.deepEqual([s.control, s.caps, s.client_version, s.windows_mode], ['full', NEW_CAPS, 'windows-app-2', 'app']);
+});
+
+test('a block_input result sets input_blocked_until at once, and off clears it', async () => {
+  const f = await attach({ control: 'full' });
+  const drive = async (extra, body) => {
+    const q = f.op(screen('block_input', extra));
+    await until(() => f.session.httpCommands.screen);
+    const fr = await f.poll({ busy_lanes: [] });
+    await f.result(fr, body);
+    return q;
+  };
+  const until10 = Date.now() + 600000;
+  assert.equal((await drive({ on: true, minutes: 10 }, { input_blocked_until: until10, desktop: 'default' })).input_blocked_until, until10);
+  assert.equal((await f.status()).input_blocked_until, until10, 'stored from the result, before any poll');
+  await drive({ on: false }, { desktop: 'default' });
+  assert.equal((await f.status()).input_blocked_until, null, 'off clears it at once');
+  // A bad value makes the result invalid; the relay answers 400 and stores nothing.
+  const q = f.op(screen('block_input', { on: true }));
+  await until(() => f.session.httpCommands.screen);
+  const fr = await f.poll({ busy_lanes: [] });
+  assert.equal((await f.result(fr, { input_blocked_until: 'soon' })).status, 400);
+  await f.result(fr, { input_blocked_until: until10 });
+  await q;
+});
+
+test('an input whose screenshot failed is still a success, with the note and no image', async () => {
+  const f = await attach({ control: 'full' });
+  const q = f.op(screen('click', { x: 600, y: 450 }));
+  await until(() => f.session.httpCommands.screen);
+  const fr = await f.poll({ busy_lanes: [] });
+  await f.result(fr, { text: 'input sent; no screenshot: cannot capture the screen', desktop: 'default', display: 0, displays: 1 });
+  const r = await q;
+  assert.deepEqual([r.ok, r.text, r.image_b64, r.desktop], [true, 'input sent; no screenshot: cannot capture the screen', undefined, 'default']);
 });

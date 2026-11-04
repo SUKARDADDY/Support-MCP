@@ -15,7 +15,7 @@ reports the canonical name as `windows_mode`.
 
 | `windows_mode` | Customer does | Clients | Transport |
 |---|---|---|---|
-| `app` (default) | opens a link, clicks a button, runs the downloaded `remote-support-<sid8>.exe`, clicks Allow | Windows 7 to 11 with .NET Framework 4.5.2 or later (Windows 10 and 11 include it; 8.1 needs the 4.5.2 update; 7 needs it installed). The app requests TLS 1.2 itself; Windows 7 needs no registry change | HTTPS polling on `POST /agent` |
+| `app` (default) | opens a link, clicks a button, runs the downloaded `remote-support-<sid8>.exe`, clicks Yes in the UAC prompt (or Allow for limited support) | Windows 7 to 11 with .NET Framework 4.5.2 or later (Windows 10 and 11 include it; 8.1 needs the 4.5.2 update; 7 needs it installed). The app requests TLS 1.2 itself; Windows 7 needs no registry change | HTTPS polling on `POST /agent` |
 | `powershell` | pastes `irm <link> \| iex` | Windows 8 and later, Windows PowerShell 5.1 | WebSocket on `/ws` |
 
 `legacy` is accepted as an alias for `app` and `standard` for `powershell`, in
@@ -301,21 +301,30 @@ the screenshot the model saw (at most 1280 x 800). `display` is an integer 0 to
 | `key` | `keys` (1 to 100 chars, no control characters; xdotool style such as `ctrl+s`, `alt+tab`, `Return`, `F5`), `display`, `screenshot` |
 | `wait` | `seconds` (above 0, at most 10, one decimal, 1), `display`, `screenshot` |
 | `zoom` | `x1`, `y1`, `x2`, `y2` (`x2 > x1`, `y2 > y1`), `display` |
-| `ui_tree` | `max_lines` (1 to 2000, 300). The app reads the display that holds the foreground window, reports it as `display`, and gives the coordinates of its lines in pixels of that display's screenshot |
+| `ui_tree` | `max_lines` (1 to 2000, 300). The app reads the display that holds the foreground window, reports it as `display`, and gives the coordinates of its lines in pixels of that display's screenshot. Each line is `[ref] Type "name" (x,y) verbs`: the verbs are the `ui_act` verbs the element supports, comma separated, from its UI Automation patterns (`invoke` InvokePattern, `set_value` ValuePattern that is not read-only, `toggle` TogglePattern, `expand,collapse` ExpandCollapsePattern, `select` SelectionItemPattern, `focus` when the element can take the keyboard focus). A line for an element with none ends after the coordinates, for example `[3] Pane (10,20)`, and a line for a disabled element ends with `disabled` in place of verbs, because every verb on it would fail. `expand,collapse` are left out for a leaf node (a tree item with no children). The example with verbs is `[12] Button "OK" (640,412) invoke,focus`. A `ui_act` with a verb the element cannot do is refused: `element N does not support VERB` when the pattern is missing, and `element N cannot do VERB: ...` when the control refuses it (`focus`, a read-only `set_value`) |
 | `ui_act` | `ref` (whole number 0 to 1,000,000, from `ui_tree`), `verb` (`invoke`\|`set_value`\|`toggle`\|`focus`\|`expand`\|`collapse`\|`select`), `value` (required for `set_value`, optional for `select`, at most 5000 chars, left out for other verbs), `display`, `screenshot`. The app ignores `display` and takes the screenshot from the display of the last `ui_tree` |
 | `block_input` | `on` (boolean, required), `minutes` (1 to 10, 10; present only when `on` is true) |
 | `send_sas` | `display`, `screenshot` |
 | `type_secret` | `text` (1 to 1000 chars), `display`, `screenshot` |
 
 `screenshot` (boolean, default `true`) asks for a fresh screenshot of `display`
-after the action, taken after a short settle (about 300 ms). The app, not the
+after the action, taken after a short settle (about 300 ms). The input's success
+never depends on it: when the input switched the desktop the app captures the
+new one, retrying for up to 2 s, and if that fails it answers `ok:true` with no
+image and `text` "input sent; no screenshot: <reason>". `desktop` in an input's
+result is read after the input. A `block_input` result carries
+`input_blocked_until` (Unix ms on the relay's clock, absent when input is not
+blocked), and the relay stores it at once. The app, not the
 relay, enforces everything that depends on the PC: the 3-second customer
 pause, the own-window guard, the refusal of elevated windows and the refusal of
 Ctrl+Alt+Del in `key`. The relay itself refuses `block_input` and
 `send_sas` unless the stored `control` is `full`, with the error `<name> needs
 full control`, so a normal-mode app never receives them (it would also answer
-`full control is not available in this build`). `type_secret` is forwarded in
-both modes.
+`this needs full control`). `type_secret` is forwarded in both modes. Under full
+control the service sends Ctrl+Alt+Del itself and answers `send_sas` with a
+screenshot taken about 1.5 s later, or with an error when `SoftwareSASGeneration`
+does not let services send it; every other screen action runs in the SYSTEM
+helper on the console session, so `desktop` may be `secure`.
 
 **`control` frame** (relay to app, lane `screen`):
 
@@ -324,8 +333,14 @@ both modes.
 ```
 
 The relay waits up to 120 s (plus 15 s) for it, because the customer may have to
-answer UAC and dialogs. The app answers with a `result` before it hands the
-connection over, or the service says `hello` with `control:"full"`. A new
+answer UAC and dialogs. A normal-mode app runs the same elevation as at its
+start. If the customer declines or elevation fails, it answers with a `result`
+(`the customer declined full control`, `full control could not be set up on this
+PC`, or that the account cannot get administrator rights). On success it sends
+nothing: the new service says `hello` with `control:"full"`, and the app stops
+its own client without an `end` and becomes the corner window. The service
+itself answers a `control` frame with `{ok:true, control:"full", text:"full
+control is already on"}`. A new
 `hello` while this frame is the pending command resolves it: `control:"full"`
 gives `{ok:true, control:"full", text:"full control is on"}`, anything else
 gives the error `the app restarted without full control`. Every other pending
@@ -336,7 +351,11 @@ command fails with `agent replaced`, as for any new `hello`.
 (`as must be user or system`). It refuses `system` unless the session's stored
 `control` is `full`, with `as: "system" needs full control`, and sends nothing.
 The app refuses it too, and any value but `user`, in normal mode (`as: "system"
-needs full control`, `as must be user`). `put_file` and `get_file` frames gain
+needs full control`, `as must be user`). Under full control the service runs
+`user` with the console user's token (the elevated linked token for an
+administrator) in that user's session and profile folder, and `system` with its
+own token; with nobody signed in, `user` fails with `nobody is signed in; use
+as: "system"`. `put_file` and `get_file` then run as SYSTEM. `put_file` and `get_file` frames gain
 `lane:"cmd"`.
 
 **Screen and control results** (app to relay, `ok:true`):
@@ -363,6 +382,7 @@ it does not list are dropped.
 | `displays` | whole number 1 to 16, and above `display` when both are sent. The app reports at most 16 |
 | `desktop` | `default`, `secure` or `unknown` (`secure` is the Winlogon desktop: UAC, lock, sign-in, Ctrl+Alt+Del) |
 | `text` | string of at most 200,000 characters (2000 for `control`). **Required** for `ui_tree`. The app stops a `ui_tree` at about 190,000 characters and ends it with a `[more elements not shown...]` line |
+| `input_blocked_until` | whole number above 0 (`block_input` results) |
 | `control` | `full` or `normal` (`control` results only) |
 
 The request body limit stays 750,000 characters, so the app steps JPEG quality
@@ -474,40 +494,47 @@ text content item, not JSON-RPC errors.
 | `get_file` | `session_id`, `path`, `offset?`, `length?` | data_b64, size, eof |
 | `session_end` | `session_id` | `{ended:true}`; sends `end` to agent first |
 
-The tools above are in every connection. The screen tools are chosen per
-connection by the `/mcp` URL: `?shape=computer` (the default) or
-`?shape=split`, and `?ui=0` to hide `ui_tree` and `ui_act` (`?ui=1` is the
-default). Any other value of either parameter gets 400 `{"error":"unknown ..."}`
-after the Access check. A tool that the connection does not list is
-`unknown tool`.
+The tools above are in every connection, with the screen tools below. `?ui=0`
+hides `ui_tree` and `ui_act` (`?ui=1` is the default); any other value gets 400
+`{"error":"unknown ui value; use 0 or 1"}` after the Access check. The `shape`
+parameter no longer exists: a request that carries it, with any value, gets 400
+`{"error":"the shape parameter was removed; ..."}` rather than a silently
+different tool list. A tool that the connection does not list is `unknown tool`.
+Every tool except `session_create` and `session_list` requires `session_id`. When
+it is missing, empty or not a string, `tools/call` returns a tool error
+`session_id is required; call session_list to find it` and nothing reaches the
+backend. There is no default session.
 
-| Tool | Shape | Maps to |
+| Tool | When listed | Maps to |
 |---|---|---|
-| `computer` | `computer` | one `action` enum: `screenshot`, `left_click`, `right_click`, `middle_click`, `double_click`, `triple_click`, `mouse_move`, `left_click_drag`, `scroll`, `type`, `key`, `wait`, `zoom`. Fields `coordinate` `[x, y]`, `start_coordinate`, `text`, `scroll_direction`, `scroll_amount`, `duration`, `region` `[x1, y1, x2, y2]`, `display`, `screenshot` (the layout of Anthropic's computer-use tool) |
-| `screenshot`, `click`, `move_mouse`, `drag`, `scroll`, `type_text`, `press_key`, `wait`, `zoom` | `split` | `screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `wait`, `zoom`, with the field names of the `screen` frame table |
-| `ui_tree`, `ui_act` | both, hidden by `ui=0` | `ui_tree`, `ui_act` |
-| `block_input`, `send_sas`, `type_secret` | both | `block_input`, `send_sas`, `type_secret`. The first two are refused without full control; `type_secret` works in both modes |
-| `request_full_control` | both | a `control` frame; returns `{control, text?, desktop?}`. This app version answers `full control is not available in this build` |
+| `screenshot`, `click`, `move_mouse`, `drag`, `scroll`, `type_text`, `press_key`, `wait`, `zoom` | always | `screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `wait`, `zoom`, with the field names of the `screen` frame table |
+| `ui_tree`, `ui_act` | unless `ui=0` | `ui_tree`, `ui_act` |
+| `block_input`, `send_sas`, `type_secret` | always | `block_input`, `send_sas`, `type_secret`. The first two are refused without full control; `type_secret` works in both modes |
+| `request_full_control` | always | a `control` frame; returns `{control, text?, desktop?}`. A normal-mode app asks the customer through UAC; on success the result comes from the service's `hello` (`full control is on`) |
 
-Both shapes call one backend: `mcp.js` turns a tool call into the normalized
+`mcp.js` turns a tool call into the normalized
 action and `backend.screen({session_id, action})`, and the Session checks the
 action again. A screen tool returns an image content block (`{type:"image",
 data, mimeType}`) when the result has an image, then a text block with the other
 result fields as JSON (`width`, `height`, `display`, `displays`, `desktop`,
 `control`, `text`). Every screen tool takes `session_id`. The descriptions tell
-the model that screenshots and UI text are untrusted, to stop at the sign-in
-screen unless the operator supplied a secret for `type_secret`, to prefer
-`ui_tree` and `ui_act` when the target app exposes controls, and to use
-`block_input` only when the operator asks.
+the model that screenshots and UI text are untrusted, to type the password
+with `type_secret` at the sign-in screen if the operator gave one in the
+conversation and otherwise to stop and ask, to work from screenshots (zoom
+for small text, the app's own Ctrl+F for text on a long page), to treat
+`ui_tree` and `ui_act` as a fallback for when a screenshot and zoom are not
+enough (the sentence is left out of the `screenshot` description under `ui=0`,
+and no description names the two tools then), and to use `block_input` only
+when the operator asks.
 
-The downloaded app (this version has normal mode only) accepts an already elevated launch only after an explicit
-administrator consent prompt whose default answer is No. An elevated reconnect
+In normal mode the downloaded app accepts an already elevated launch only after an explicit
+consent prompt whose default answer is No. An elevated reconnect
 also gets that prompt unless the customer approved one administrator reconnect
 during preparation. That approval is bound to the current user, session and
 expiry, and the reconnect consumes it. The window and the consent text say that
 the access is administrator access, and the `hello` carries an `elevated`
-boolean. Commands inherit the app's consented token, and the app never requests
-elevation. The app runs each command in a fresh non-interactive
+boolean. In normal mode commands inherit the app's consented token. The app
+requests elevation only through UAC, for full control. It runs each command in a fresh non-interactive
 `powershell.exe -NoProfile` inside a Windows Job Object, so cancellation,
 timeout or the app exiting kills the whole process tree. Output is capped at
 64 KiB per stream. The PowerShell agent rules below still apply to that agent.
@@ -584,25 +611,23 @@ the sid, so two sessions on one PC never collide: folder
 ## Windows app (`src/agent-app.cs`)
 
 .NET Framework 4 (the v4 compiler that ships with Windows, x86, `/warnaserror+`),
-WPF window, `asInvoker` manifest. It reads its configuration from its own file
-footer, shows a consent dialog (default No) before it connects, and then keeps a
-small window docked bottom-right: a connection state, a running timer, when the
+WPF window, `asInvoker` manifest, one exe with several roles chosen by the first
+argument (see [Full control](#full-control)). It reads its configuration from its
+own file footer, asks for full control first (see the consent rules in
+[docs/security-model.md](security-model.md)), falls back to normal mode only after
+an explicit Allow (default Don't allow), and keeps a small window docked
+bottom-right: a connection state, a running timer, when the
 session ends by itself, and a **blue** state while a command or file operation
 runs. The window does not show commands, paths or output. End session, Alt+F4
 and the taskbar Close ask "End the session?" inline first. An operator end,
 expiry or the fixed 24-hour limit shows "Support is disconnected." and closes
-the window after four seconds. This version has normal mode only: the app installs no service, scheduled
-task or logon entry, so restarting the PC stops it, and it removes its private
-temporary command directory on normal exit. Its hello says `agent:
-"windows-app-2"`, `caps: ["screen","uia","lanes"]` and `control: "normal"`. It never
-reports `full`, and `request_full_control` and the full-control actions answer
-`full control is not available in this build`. Full control (a temporary
-service, the secure desktop, running as SYSTEM) is a later change; the relay
-already stores the `control` and `caps` an app reports and enforces `control:
-"full"` for `as:"system"`, `block_input` and `send_sas`. The consent dialog says
-that support can see the screen, control the mouse and keyboard, run commands
-and change files. Screen control runs in the app's own process on the user's
-desktop: capture is a BitBlt of a display scaled down to fit 1280 x 800 and sent
+the window after four seconds. In normal mode the app installs no service,
+scheduled task or logon entry, so restarting the PC stops it, and it removes its
+private temporary command directory on normal exit. Its hello says `agent:
+"windows-app-2"`, `caps: ["screen","uia","lanes"]` plus `"full"` when this
+account can elevate, and `control: "normal"`. The window adds "Running without
+administrator access." Screen control runs in the app's own process on the
+user's desktop: capture is a BitBlt of a display scaled down to fit 1280 x 800 and sent
 as JPEG under 700,000 base64 characters; input is `SendInput`; UI Automation
 reads the foreground window. It reports at most 16 displays and caps a
 `ui_tree` at about 190,000 characters. Typed text goes as Unicode key events, one
@@ -615,7 +640,41 @@ the existing downloaded configuration under
 entry. The reconnect never extends the session's `expires_at`. The prepare
 prompt records the customer's approval of screen, mouse and keyboard control next
 to the reconnect (a second registry value, bound to the user and the deadline). A
-reconnect that finds no such record starts without the `screen` cap.
+reconnect that finds no such record starts without the `screen` cap. A prepared
+reconnect is normal mode only.
+
+### Full control
+
+Roles, by the first argument of the one exe:
+
+| Role | Runs as | Does |
+|---|---|---|
+| none | the customer | shows the corner window, decides the consent path (UAC prompt, the app's own confirm when no prompt will appear, or unavailable when a standard user has UAC off), runs `--elevate-install` with `ShellExecuteEx` `runas`, and reads its exit code. On 0 it becomes the corner window of the service; on UAC No (1223), any failure or Don't allow it shows the fallback dialog |
+| `--elevate-install <deadline> <0\|1>` | administrator, through UAC | runs from a copy the app put alone in a new Temp folder, reads its own file once through a handle that denies writing and renaming, creates `%ProgramFiles%\SupportMCP-<sid8>\` with `CreateDirectoryW` and its final ACL (SYSTEM and Administrators only, inheritance off), failing if it exists, copies the exe as `agent.exe` and, cut before its configuration, as `window.exe` (Users may read and run it), writes `state.json` (the full session id and the deadline), takes a share of `SoftwareSASGeneration` under `HKLM\SOFTWARE\SupportMCP` and sets it when needed, registers the backstop task, then creates and starts the service. Any failure removes all of it. The deadline is UTC milliseconds: `connect_by` before the first connection, the session's expiry after it |
+| `--service` | LocalSystem, session 0 | the relay connection with both lanes (`control:"full"`, caps with `full`). It checks its deadline at start and every 2 s, moves the backstop task to `expires_at` at the first welcome (later welcomes can only bring it closer), follows session changes, sends Ctrl+Alt+Del with `SendSAS`, and runs cleanup |
+| `--helper <service pid>` | SYSTEM, on the console session (`TokenSessionId`), `winsta0\default` | every screen operation, each on a fresh thread switched to the input desktop (`OpenInputDesktop`, `SetThreadDesktop`); low-level hooks re-armed on each desktop; `block_input` on one thread that holds `BlockInput` and runs every operation while it lasts. It serves two pipes only SYSTEM can open, checks that the client is the service, and runs in a kill-on-close Job of the service |
+| `--window <sid8>` | the signed-in user (`WTSQueryUserToken`), started by the service at each sign-in | the corner window, through a pipe open to interactive users only (read and write data, no new instances) that answers `{"type":"status"}` and `{"type":"end"}` and closes on anything else or after 5 s of silence. It serves the active console session only, at most 2 connections per process. The window sends `end` on its open connection until the status says ended, and says it cannot reach the service when the pipe is gone |
+
+Pipe messages are a 4-byte length and UTF-8 JSON, and pipe clients connect at
+the identification level only. The backstop task runs at the deadline as SYSTEM,
+also late when the PC was off, under a name of its own per install
+(`SupportMcp-<sid8>-<random>`), with three actions in order, every tool by its
+full `System32` path: `cmd` (`sc stop`,
+`taskkill` of the service process, `sc delete`), PowerShell (release this
+session's share of `SoftwareSASGeneration` under the `Global\SupportMcp-Sas`
+mutex the app uses too), and `cmd` (a retrying `rd /s /q` of
+the folder, then `schtasks /delete` of itself once the session has no entry left
+in the record). It never runs the app. Nothing changes the record without the
+mutex: after 30 s an install goes on without the share, and a release changes
+nothing and keeps the session's entry and its task. The task repeats every hour
+until it deletes itself, so a release that was skipped happens later. The
+service's own cleanup does the same in process and leaves the folder and then the
+task to a detached `cmd` that runs after it exits; when `cmd` cannot start,
+`MoveFileEx` deletes the files at the next restart and the task stays. As SYSTEM,
+`put_file` and `get_file` refuse a path that contains a junction, a symbolic link
+or (to write) a file with a second hard link; they hold every folder of the path
+while they work and create missing folders one level at a time. A system shutdown stops the service without `end`, so the session goes on
+after the restart within the same `expires_at`.
 
 `scripts/build-app.ps1` compiles on Windows and writes `src/app-bundle.json`.
 `node --test` fails when the source or manifest hash in the bundle is stale.
@@ -623,17 +682,21 @@ reconnect that finds no such record starts without the `screen` cap.
 Windows host. It runs the real client against a fake relay and covers HTTP
 operations, Unicode, chunking, retry deduplication, process-tree cancellation,
 timeout, local expiry, the reconnect rules, the two lanes, the 4xx result
-replacement, the pause cross-check, the display and ui_tree caps, and the stop
-and pause checks of typing.
+replacement, the pause cross-check, the display and ui_tree caps, the stop
+and pause checks of typing, and the pure parts of full control: the consent
+path, the folder and file ACLs (checked with `icacls`), the deadline state, the
+backstop command line and task XML, the token choice for `run`, the
+`block_input` timer and its Ctrl+Alt+Del escape, the pipe framing and the
+window's two requests, and the Client's full-control path with a fake service.
 
 ## Acceptance (each names its check)
 
 1. `node --test` green; `npx wrangler deploy --dry-run` bundles without error.
 2. Local stack (`wrangler dev`, `.dev.vars` with `DEV_SKIP_ACCESS=1`): MCP
-   `initialize` → `tools/list` returns the 7 base tools plus `computer`,
-   `ui_tree`, `ui_act`, `block_input`, `send_sas`, `type_secret` and
-   `request_full_control` (14), and `?shape=split` swaps `computer` for the
-   nine split tools (curl).
+   `initialize` → `tools/list` returns the 7 base tools plus the nine screen
+   tools, `ui_tree`, `ui_act`, `block_input`, `send_sas`, `type_secret` and
+   `request_full_control` (22), `?ui=0` drops `ui_tree` and `ui_act`, and
+   `?shape=...` is a 400 (curl).
 3. `/mcp` without the JWT on a non-localhost host → 403 (unit test with a fake
    host + a test for bad aud / expired / wrong sig using a locally generated
    RSA key).
@@ -660,16 +723,18 @@ and pause checks of typing.
     Opening or refreshing that page leaves `session_status.state` at `pending`.
     The button downloads `remote-support-<sid8>.exe` once, the state becomes
     `consumed`, a second click shows "Check your downloads", and the app attaches
-    over `/agent` after the customer clicks Allow. `windows_mode: "legacy"` and
+    over `/agent` after the customer clicks Yes in the UAC prompt (the service's `hello` says `control: full`), or Allow in the fallback dialog (`control: normal`). `windows_mode: "legacy"` and
     `"standard"` behave as `app` and `powershell`.
 
 ## Must keep
 
 - `/healthz` stays public and 200.
 - The PowerShell agent never runs elevated and no relay code path requests UAC.
-  This version of the app never asks for elevation. When full control exists, the
-  app will ask only for it, only after the customer agrees, and the relay will
-  ask for it only through an explicit `request_full_control` call.
+  The app asks for elevation only for full control: at its start, where the UAC
+  prompt (or the app's own confirm when none will appear) is the customer's
+  consent, and on an explicit `request_full_control` call.
+- Full control always removes itself: on any end of the session, at its own
+  deadline, and through the backstop task, which never runs the app.
 - A screenshot, typed text and a secret are never stored by the relay: not in
   the audit log, the Session storage, the registry or the Worker log.
 - `ended` is terminal; no path reopens a session or extends `expires_at`.

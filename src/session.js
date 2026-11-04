@@ -664,6 +664,8 @@ export class Session {
         this.httpPoll?.busy.delete(command.frame.lane);
         pending.resolve(result);
         if (result.desktop) await this.setMany({ desktop: result.desktop });
+        // A block_input result says at once whether input is blocked now, without waiting for the next poll.
+        if (result.ok && command.frame.action?.name === 'block_input') await this.setMany({ input_blocked_until: result.input_blocked_until ?? null });
       }
       // Retried results are acknowledged without running anything again.
       return Response.json({ type: 'ack' });

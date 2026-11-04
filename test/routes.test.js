@@ -73,7 +73,7 @@ test('localhost bypass: JSON POST reaches the MCP handler (tools/list)', async (
   );
   assert.equal(r.status, 200);
   const body = await r.json();
-  assert.equal(body.result.tools.length, 14);
+  assert.equal(body.result.tools.length, 22);
 });
 
 test('GET /mcp => 405', async () => {

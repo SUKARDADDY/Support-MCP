@@ -29,14 +29,15 @@ AI agent does the diagnosis and the fix while a person watches.
 
 ## At a glance
 
-- The customer opens a link, runs the app it downloads, and clicks **Allow**.
-  The dialog says that support can see the screen, control the mouse and
-  keyboard, run commands and change files.
+- The customer opens a link, runs the app it downloads, and clicks **Yes** when
+  Windows asks for permission. That gives support full control: the app installs
+  a temporary service that reaches UAC prompts, the lock screen and the sign-in
+  screen, runs commands as the signed-in user or as SYSTEM, and keeps working
+  after a restart.
+- If the customer says No, or the PC cannot give administrator rights, the app
+  offers limited support ("normal mode"): the screen, mouse and keyboard and
+  commands as the signed-in user, but no Windows security prompts.
 - A small window in the corner shows that the session is live.
-- Everything runs as the signed-in user, in their own session ("normal mode").
-  This version has no full control: it cannot reach UAC prompts, the lock
-  screen, the sign-in screen or windows that run as administrator, and it
-  cannot run as SYSTEM.
 - When the customer uses the mouse or keyboard, support's input pauses for 3
   seconds.
 - Access ends 24 hours after the PC connects, or sooner if either side ends it.
@@ -45,11 +46,13 @@ AI agent does the diagnosis and the fix while a person watches.
 ## How it works
 
 1. You call `session_create`. It returns a link that works once, within 10 minutes.
-2. You send the link to the customer. They download the app, run it and click
-   **Allow**. Windows warns that the app is unsigned, and the download page shows
-   them how to continue (see [Unsigned app](docs/security-model.md#unsigned-app)).
-3. The app connects to the relay. You call `computer` (or the split screen
-   tools), `run`, `put_file` and `get_file`.
+2. You send the link to the customer. They download the app and run it. Windows
+   warns that the app is unsigned, and the download page shows them how to
+   continue (see [Unsigned app](docs/security-model.md#unsigned-app)). The corner
+   window says "Windows will ask for permission to give support full control.",
+   and the customer clicks **Yes** in the UAC prompt.
+3. The app connects to the relay. You call the screen tools (`screenshot`,
+   `click`, `type_text` and the rest), `run`, `put_file` and `get_file`.
 4. The session ends when you call `session_end`, the customer clicks
    **End session**, or 24 hours pass.
 
@@ -66,8 +69,9 @@ sequenceDiagram
   W-->>PC: download page, the code is not used
   PC->>W: POST from the page's button, same origin
   W-->>PC: remote-support-ID.exe, and the code is used up
-  Note over PC: The customer runs it and clicks Allow
-  PC->>W: POST /agent hello, with the attach key in a header
+  Note over PC: The customer runs it and clicks Yes in the UAC prompt
+  Note over PC: The app installs a temporary SYSTEM service
+  PC->>W: POST /agent hello from the service, control full
   Note over PC: A small window docks in the corner, with an End session button
   Op->>W: run, put_file or get_file
   PC->>W: POST /agent poll
@@ -88,7 +92,38 @@ sequenceDiagram
 | Session | the first connection | 24 hours. A reconnect doesn't extend it |
 
 The app tracks the session deadline on its own clock and stops connecting once
-it passes.
+it passes. Under full control the service stores that deadline on disk and
+removes itself when it passes, even if the PC was off at the time.
+
+### Full control and the fallback
+
+Full control is the default. When the customer runs the app, the corner window
+says "Windows will ask for permission to give support full control.", and
+Windows shows its UAC prompt. On **Yes** the app installs, for this session only:
+
+- the folder `%ProgramFiles%\SupportMCP-<first 8 characters of the session id>\`,
+  readable only by SYSTEM and Administrators, with a copy of the app, its
+  session settings and the deadline;
+- the service `SupportMcp-<id>` ("Remote support session"), automatic start,
+  running as LocalSystem;
+- a scheduled task of the same name at the deadline, as a backstop;
+- the registry value `SoftwareSASGeneration`, only when Windows would refuse
+  Ctrl+Alt+Del from a service, and a record of it under
+  `HKLM\SOFTWARE\SupportMCP`. The last session to end puts the old value, or
+  its absence, back, unless an administrator changed it meanwhile.
+
+If no UAC prompt will appear (the app already runs as administrator, UAC is off,
+or an administrator elevates without a prompt), the app asks itself first: "Give
+support full control of this PC?". If the customer says No, or anything fails,
+the app asks "Continue with limited support?" with **Don't allow** selected.
+**Allow** gives normal mode, **Don't allow** ends the app with nothing installed.
+From normal mode, `request_full_control` asks again.
+
+Everything is removed when the session ends: by `session_end`, by **End
+session**, by the relay's 24-hour alarm, or by the service's own clock. If the
+service was killed, the backstop task removes the service, the registry value,
+the folder and itself at the deadline, without running the app. A restart or
+a sign-out does not end the session, and does not extend it.
 
 ### The PowerShell alternative
 
@@ -143,7 +178,7 @@ canonical name.
 
 | Value | Customer does | Works on |
 |---|---|---|
-| `app` (default) | opens a link, downloads and runs the app, clicks Allow | Windows 7 to 11 (7 and 8.1 need .NET Framework 4.5.2 or later; the app asks for TLS 1.2 itself, so Windows 7 needs no registry change) |
+| `app` (default) | opens a link, downloads and runs the app, clicks Yes in the UAC prompt (or Allow for limited support) | Windows 7 to 11 (7 and 8.1 need .NET Framework 4.5.2 or later; the app asks for TLS 1.2 itself, so Windows 7 needs no registry change) |
 | `powershell` | pastes one line | Windows 8 and later |
 
 The PowerShell mode is the fallback: it runs commands and moves files, and it
@@ -157,23 +192,24 @@ an error.
 | `session_create` | `windows_mode` `app` (default) returns `{session_id, windows_mode, download_url, one_liner, code_expires_at}`; `powershell` returns `{session_id, windows_mode, one_liner, code_expires_at}` |
 | `session_list` | every session with its state, expiry and machine |
 | `session_status` | state, `windows_mode`, machine, user, expiry, `startup_expires_at` while waiting, whether the client is attached, `client_version`, last audit rows. App sessions add `elevated`, `control` (`full`, `normal` or `null`), `caps`, and when the app reports them `desktop`, `paused_until` and `input_blocked_until` |
-| `run` | runs PowerShell on the customer's PC as the signed-in user. `as` is `user` (default); `system` needs full control, which no app offers yet, so the relay refuses it. Returns exit code, stdout, stderr, timed_out |
-| `put_file` | writes base64 data to a path, with append for chunking |
-| `get_file` | reads a byte range as base64, with `eof` for chunking |
+| `run` | runs PowerShell on the customer's PC. `as` is `user` (default) or `system`. Under full control `user` is the signed-in console user, with administrator rights when that user has them, and fails with `nobody is signed in; use as: "system"` at the sign-in screen; `system` is SYSTEM. In normal mode the relay refuses `system`. Returns exit code, stdout, stderr, timed_out |
+| `put_file` | writes base64 data to a path, with append for chunking. As SYSTEM under full control |
+| `get_file` | reads a byte range as base64, with `eof` for chunking. As SYSTEM under full control |
 | `session_end` | tells the client to stop and marks the session ended |
-| `computer` | the screen, mouse and keyboard in one tool: `screenshot`, clicks, `mouse_move`, `left_click_drag`, `scroll`, `type`, `key`, `wait`, `zoom`. A screenshot comes back as an image, then the size, display and desktop as JSON |
-| `ui_tree`, `ui_act` | read a window's controls and act on one by its ref, through UI Automation |
-| `block_input` | lock the customer's mouse and keyboard for up to 10 minutes. Full control only: the relay refuses it until an app reports `control: full` |
-| `send_sas` | send Ctrl+Alt+Del. Full control only, refused the same way |
-| `type_secret` | type a secret the operator supplied into the focused field, in normal mode too. It is never logged or returned, and a failure says only `type_secret failed` |
-| `request_full_control` | ask the customer for full control. This app version has none, so the call fails with an error |
+| `screenshot`, `click`, `move_mouse`, `drag`, `scroll`, `type_text`, `press_key`, `wait`, `zoom` | the screen, mouse and keyboard, one tool per action. A screenshot comes back as an image, then the size, display and desktop (`default`, or `secure` for UAC, the lock and sign-in screens and Ctrl+Alt+Del) as JSON. Every input takes `screenshot:false` to skip the screenshot that follows it. An input that switched the desktop and left no screenshot still succeeds, with the note "input sent; no screenshot". `press_key` refuses Win+L, which Windows ignores: lock with `run` as `user` and `rundll32.exe user32.dll,LockWorkStation` |
+| `ui_tree`, `ui_act` | a fallback for when a screenshot and zoom are not enough: read a window's controls and act on one by its ref, through UI Automation. Each `ui_tree` line ends with the verbs `ui_act` can use on that control (`[12] Button "OK" (640,412) invoke,focus`), or with `disabled` for a greyed-out control; a verb the control does not support is refused, so click its coordinates instead. Agents do better working from screenshots, zoom for small text and Ctrl+F in the app for text on a long page |
+| `block_input` | lock the customer's mouse and keyboard for up to 10 minutes; it lifts by itself, and Ctrl+Alt+Del lifts it at once. Full control only |
+| `send_sas` | send Ctrl+Alt+Del. Full control only |
+| `type_secret` | type a secret the operator supplied in the conversation into the focused field, such as the Windows password on the sign-in screen. At that screen the model types the password with this tool if the operator gave it one, and stops and asks if not. It works in normal mode too. It is never logged or returned, and a failure says only `type_secret failed` |
+| `request_full_control` | from normal mode, ask the customer for full control through a UAC prompt. On Yes the session continues under full control |
 
-`computer` copies the action layout of Anthropic's computer-use tool. Add
-`?shape=split` to the MCP URL to get one tool per action (`screenshot`, `click`,
-`move_mouse`, `drag`, `scroll`, `type_text`, `press_key`, `wait`, `zoom`)
-instead, and `?ui=0` to hide `ui_tree` and `ui_act`. An unknown value of either
-is an error. `run`, `put_file` and `get_file` use their own lane, so a long
-command does not block the screen.
+Add `?ui=0` to the MCP URL to hide `ui_tree` and `ui_act`; any other value is a
+400 error. The old `?shape=` parameter is gone: the server offers only the tools
+above, and a request that still sends `shape` gets a 400 error. Every tool except
+`session_create` and `session_list` needs a `session_id`; a call without one
+fails with `session_id is required; call session_list to find it`, and the relay
+never picks a session for you. `run`, `put_file` and `get_file` use their own
+lane, so a long command does not block the screen.
 
 ## Architecture
 
@@ -206,12 +242,12 @@ alarm for expiry. A second Durable Object keeps the list for `session_list`.
 | `src/app.js` | router, Access JWT gate, MCP handler, download page |
 | `src/session.js` | `Session` Durable Object: states, audit log, alarm, tagged sockets, the app's polling transport |
 | `src/registry.js` | `Registry` Durable Object for `session_list` |
-| `src/mcp.js` | JSON-RPC dispatch, the tool schemas for both shapes, and the mapping of each screen tool to one normalized action |
+| `src/mcp.js` | JSON-RPC dispatch, the tool schemas, and the mapping of each screen tool to one normalized action |
 | `src/screen.js` | the screen actions, their audit text, and the strict check of every field an app result may carry |
 | `src/jwt.js` | RS256 verification of the Access JWT with WebCrypto |
 | `src/template.js` | builds the served script and the downloaded executable, validates every value placed in them, and maps the mode aliases |
-| `src/agent-app.cs` | the Windows app: C# source for .NET Framework 4.5.2 or later, WPF window, consent dialog, HTTPS polling client with two lanes, and screen control (capture, input, UI Automation) in the customer's own session |
-| `src/agent-app.manifest` | the app's `asInvoker` manifest (never asks for elevation) |
+| `src/agent-app.cs` | the Windows app: C# source for .NET Framework 4.5.2 or later. One exe with several roles: the customer's app (WPF window, dialogs, HTTPS polling client with two lanes, normal-mode screen control), `--elevate-install`, the full-control `--service`, the SYSTEM `--helper` that runs screen operations on the console session, and the `--window` corner window |
+| `src/agent-app.manifest` | the app's `asInvoker` manifest. The app asks for elevation only through `--elevate-install`, after the customer started it |
 | `src/app-bundle.json` | the compiled x86 app with the SHA-256 of its source and manifest. Tests fail when the source changed without a rebuild |
 | `src/agent.ps1` | the PowerShell agent: bootstrap, run and cleanup roles in one file |
 | `scripts/build-app.ps1` | builds `src/app-bundle.json` on Windows with the built-in compiler, against the 4.5.2 reference assemblies (`-ReferenceDir`, required). `-OutDir <folder>` writes only the exe and leaves the bundle alone |
@@ -239,11 +275,12 @@ you use it:
   contents, screenshots, window text and the machine name are all written by the
   customer's PC, and they can try to steer your AI agent. Your agent may have a shell on your own
   machine, so don't auto-approve its tool calls.
-- The window shows that access exists. It doesn't limit what you can do.
-  Commands, the mouse and the keyboard run with the customer's rights, and what
-  they change stays changed after the session ends.
-- The consent dialog, the window and the **End session** button are how the
-  customer agrees to the session and stops it. Keep them in any fork.
+- The window shows that access exists. It doesn't limit what you can do. Under
+  full control you have SYSTEM rights, and what you change stays changed after
+  the session ends.
+- The UAC prompt, the app's dialogs, the window and the **End session** button
+  are how the customer agrees to the session and stops it. Keep them in any
+  fork.
 
 ## Deploy your own
 
@@ -314,7 +351,8 @@ check are in [docs/development.md](docs/development.md).
   connections, so Windows 7 needs no TLS registry change. Tested on Windows 7
   SP1 (32-bit) with stock .NET Framework 4.5.2 (Release 379893) and no TLS
   registry changes, against the live relay: the app attaches, runs commands and
-  moves files. The PowerShell agent targets Windows PowerShell 5.1, which ships
+  moves files. That test predates screen control and full control, which were
+  tested on Windows 11 only. The PowerShell agent targets Windows PowerShell 5.1, which ships
   with Windows 10 and 11.
 - Nothing is signed. The app shows a SmartScreen warning (see
   [Unsigned app](docs/security-model.md#unsigned-app)). `irm | iex` content has no Mark of the Web, so
@@ -324,12 +362,25 @@ check are in [docs/development.md](docs/development.md).
   `run`, `put_file` or `get_file` while one is waiting returns `agent busy`, and
   so does a second screen call. Its output is capped at 64 KiB per stream, and
   its file chunks match the PowerShell agent's.
-- Normal mode works in the customer's own desktop session only. It cannot see
-  or control UAC prompts, the lock screen or the sign-in screen (the result
-  reports `desktop: unknown` and input fails), and it refuses to click or type
-  into a window that runs as administrator. It also refuses input aimed at its
-  own window. Input fails for 3 seconds after the customer last used the mouse
-  or keyboard.
+- Full control works on the console session only, not in Remote Desktop
+  sessions. It follows the console through sign-out, sign-in, lock and a user
+  switch. Before anyone signs in there is no corner window.
+- The app is unsigned, and it installs a service. Antivirus may remove or block
+  it, which is why the download page says "If your antivirus removes the file,
+  tell support." The backstop task does not depend on the app's file.
+- Normal mode works in the customer's own desktop session only. It cannot see or
+  control UAC prompts, the lock screen or the sign-in screen (the result reports
+  `desktop: unknown` and input fails), and it refuses to click or type into a
+  window that runs as administrator. Under full control that limit (UIPI) no
+  longer applies. Both modes refuse clicks on the app's own windows, and keys,
+  typed text and `ui_tree` while one of them has the keyboard focus. The corner
+  window does not take the focus when it appears; only asking to end activates
+  it, and Keep connected gives the focus back to the window that had it. Input
+  also fails for 3 seconds after the customer last used the mouse or keyboard,
+  keyboard, except while `block_input` holds it.
+- Commands run in the 32-bit Windows PowerShell, because the app is x86. On
+  64-bit Windows, use `C:\Windows\Sysnative\...` to reach 64-bit tools such
+  as `logoff.exe`, and `reg.exe /reg:64` for the 64-bit registry view.
 - Typing is paced at one character every 20 ms, because Windows 11 Notepad
   garbles faster input. A 5000-character `type` takes about 100 seconds.
 - The app polls over HTTPS, so a command's result reaches the operator after

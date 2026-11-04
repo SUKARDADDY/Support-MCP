@@ -105,9 +105,11 @@ function appPage(url, state = 'pending', sid = '', expiredStatus = 410) {
     ? `<p class="sub">Download the support app on the computer that needs help.</p>
        <p class="sub he" lang="he" dir="rtl">הורידו את אפליקציית התמיכה במחשב שזקוק לעזרה.</p>
        <form method="post" action="${url.pathname}?client=app"><button type="submit">Download the support app<span class="he" lang="he" dir="rtl">הורדת אפליקציית התמיכה</span></button></form>
-       <ol>${step('Download the support app.', 'הורידו את אפליקציית התמיכה.')}${step('If Microsoft Edge says the file <strong>&ldquo;isn&rsquo;t commonly downloaded&rdquo;</strong>, point at the download, click the three dots (<strong>...</strong>), then click <strong>Keep</strong>. In the box that opens, click <strong>Show more</strong>, then <strong>Keep anyway</strong>.', 'אם Microsoft Edge מציג שהקובץ <bdi dir="ltr"><strong>&ldquo;isn&rsquo;t commonly downloaded&rdquo;</strong></bdi>, העבירו את העכבר מעל ההורדה, לחצו על שלוש הנקודות (<bdi dir="ltr"><strong>...</strong></bdi>) ואז על <bdi dir="ltr"><strong>Keep</strong></bdi>. בחלון שנפתח לחצו על <bdi dir="ltr"><strong>Show more</strong></bdi> ואז על <bdi dir="ltr"><strong>Keep anyway</strong></bdi>.')}${step('Open the downloaded file. If Windows says &ldquo;Windows protected your PC&rdquo;, click <strong>More info</strong>, then <strong>Run anyway</strong>.', 'פתחו את הקובץ שהורד. אם Windows מציג <bdi dir="ltr">&ldquo;Windows protected your PC&rdquo;</bdi>, לחצו על <bdi dir="ltr"><strong>More info</strong></bdi> ואז על <bdi dir="ltr"><strong>Run anyway</strong></bdi>.')}${step('Click <strong>Allow</strong>.', 'לחצו על <strong>Allow</strong>.')}</ol>
+       <ol>${step('Download the support app.', 'הורידו את אפליקציית התמיכה.')}${step('If Microsoft Edge says the file <strong>&ldquo;isn&rsquo;t commonly downloaded&rdquo;</strong>, point at the download, click the three dots (<strong>...</strong>), then click <strong>Keep</strong>. In the box that opens, click <strong>Show more</strong>, then <strong>Keep anyway</strong>.', 'אם Microsoft Edge מציג שהקובץ <bdi dir="ltr"><strong>&ldquo;isn&rsquo;t commonly downloaded&rdquo;</strong></bdi>, העבירו את העכבר מעל ההורדה, לחצו על שלוש הנקודות (<bdi dir="ltr"><strong>...</strong></bdi>) ואז על <bdi dir="ltr"><strong>Keep</strong></bdi>. בחלון שנפתח לחצו על <bdi dir="ltr"><strong>Show more</strong></bdi> ואז על <bdi dir="ltr"><strong>Keep anyway</strong></bdi>.')}${step('Open the downloaded file. If Windows says &ldquo;Windows protected your PC&rdquo;, click <strong>More info</strong>, then <strong>Run anyway</strong>.', 'פתחו את הקובץ שהורד. אם Windows מציג <bdi dir="ltr">&ldquo;Windows protected your PC&rdquo;</bdi>, לחצו על <bdi dir="ltr"><strong>More info</strong></bdi> ואז על <bdi dir="ltr"><strong>Run anyway</strong></bdi>.')}${step('When Windows asks for permission, click <strong>Yes</strong>.', 'כש-Windows מבקש אישור, לחצו על <bdi dir="ltr"><strong>Yes</strong></bdi>.')}</ol>
        <p class="note">A small window stays in the corner of your screen while support is connected. Close it or click End session to stop access.</p>
-       <p class="note he" lang="he" dir="rtl">חלון קטן נשאר בפינת המסך בזמן שהתמיכה מחוברת. סגירתו או לחיצה על End session מפסיקה את הגישה.</p>`
+       <p class="note he" lang="he" dir="rtl">חלון קטן נשאר בפינת המסך בזמן שהתמיכה מחוברת. סגירתו או לחיצה על End session מפסיקה את הגישה.</p>
+       <p class="note">If your antivirus removes the file, tell support.</p>
+       <p class="note he" lang="he" dir="rtl">אם האנטי-וירוס מוחק את הקובץ, ספרו לתמיכה.</p>`
     : downloaded
       ? `<h2>Check your downloads</h2><p>A download was already requested for this session. Open <strong>${filename}</strong> from your browser's Downloads list.</p>
          <p>If the file did not download, ask support for a new link.</p><p class="he" lang="he" dir="rtl">ההורדה כבר התבקשה. פתחו את הקובץ ברשימת ההורדות בדפדפן. אם לא התקבל קובץ, בקשו קישור חדש.</p>`
@@ -125,7 +127,8 @@ function appPage(url, state = 'pending', sid = '', expiredStatus = 410) {
 // ---- MCP backend: each tool talks to the DOs -------------------------------
 function makeBackend(env, origin, devTtlMs, actor) {
   const sessionStub = (sid) => {
-    if (!/^[0-9a-f]{64}$/.test(String(sid || ''))) throw new Error('session_id required (64 hex chars)');
+    if (sid === undefined || sid === null || sid === '') throw new Error('session_id is required; call session_list to find it');
+    if (!/^[0-9a-f]{64}$/.test(String(sid))) throw new Error('session_id must be the 64 hex characters from session_create or session_list');
     return env.SESSION.get(env.SESSION.idFromString(sid));
   };
   async function cmd(sid, body) {
@@ -391,7 +394,7 @@ async function handleMcp(request, env, url, origin, devTtlMs) {
   if (!isJsonContentType(request)) return json({ error: 'unsupported media type' }, 415);
   const actor = await accessCaller(request, env, url);
   if (!actor) return json({ error: 'forbidden' }, 403);
-  // ?shape=computer|split and ?ui=0|1 pick this connection's tools.
+  // ?ui=0|1 picks this connection's tools. The old ?shape parameter is a 400.
   let options;
   try {
     options = parseToolOptions(url.searchParams);

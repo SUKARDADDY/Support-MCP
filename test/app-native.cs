@@ -7,6 +7,8 @@ using System.Net;
 using System.Diagnostics;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -121,7 +123,20 @@ public static class AppTests {
         try { action(); } catch (ArgumentException e) { Assert(e.Message.Contains(part), "Wrong message: " + e.Message); return; }
         throw new Exception("Expected an error containing: " + part);
     }
+    // The focus the confirm gives back: only to the window that had it, only while the support window still holds it.
+    static void FocusReturnTests() {
+        Func<IntPtr, bool> ours = delegate(IntPtr w) { return (int)w >= 100; }, here = delegate(IntPtr w) { return (int)w != 7; };
+        IntPtr notepad = (IntPtr)10, corner = (IntPtr)100, other = (IntPtr)11;
+        Assert(FocusReturn.Target(notepad, corner, ours, here) == notepad, "Keep connected gives the focus back to the window that had it");
+        Assert(FocusReturn.Target(IntPtr.Zero, corner, ours, here) == IntPtr.Zero, "Nothing remembered, nothing to give back");
+        Assert(FocusReturn.Target(notepad, other, ours, here) == IntPtr.Zero, "The customer clicked elsewhere meanwhile: the focus is not taken from that window");
+        Assert(FocusReturn.Target(notepad, IntPtr.Zero, ours, here) == IntPtr.Zero, "No foreground window, no hand-back");
+        Assert(FocusReturn.Target(corner, corner, ours, here) == IntPtr.Zero, "Never to one of the app's own windows");
+        Assert(FocusReturn.Target((IntPtr)7, corner, ours, here) == IntPtr.Zero, "Not to a window that is gone or on another desktop");
+        Console.WriteLine("PASS keep connected returns the focus to the remembered window and nowhere else");
+    }
     static void ScreenPureTests(string dir) {
+        FocusReturnTests();
         int w, h;
         foreach (int[] c in new int[][] { new int[] { 1920, 1080, 1280, 720 }, new int[] { 2560, 1600, 1280, 800 }, new int[] { 3840, 2160, 1280, 720 }, new int[] { 1280, 1024, 1000, 800 },
             new int[] { 1024, 768, 1024, 768 }, new int[] { 800, 600, 800, 600 }, new int[] { 1366, 768, 1280, 720 }, new int[] { 1, 1, 1, 1 } }) {
@@ -150,6 +165,8 @@ public static class AppTests {
         var seq = KeySpec.Parse("ctrl+a  Delete"); Assert(seq.Count == 2 && seq[1][0] == 0x2E, "Key sequences");
         Throws(delegate { KeySpec.Parse("ctrl+alt+Delete"); }, "send_sas"); Throws(delegate { KeySpec.Parse("Delete+alt+Control"); }, "send_sas");
         Throws(delegate { KeySpec.Parse("ctrl+banana"); }, "Unknown key"); Throws(delegate { KeySpec.Parse("   "); }, "No keys");
+        Throws(delegate { KeySpec.Parse("super+l"); }, "LockWorkStation"); Throws(delegate { KeySpec.Parse("L+win"); }, "rundll32.exe user32.dll,LockWorkStation"); Throws(delegate { KeySpec.Parse("ctrl+a super+L"); }, "Win+L");
+        Assert(KeySpec.Parse("super+r")[0].Length == 2 && KeySpec.Parse("ctrl+l")[0].Length == 2, "Other Win and L combinations still work");
         Assert(KeySpec.IsExtended(0x25) && KeySpec.IsExtended(0x2E) && !KeySpec.IsExtended(0x41), "Extended keys");
         Console.WriteLine("PASS xdotool-style key parsing, and ctrl+alt+del is refused with a pointer to send_sas");
         var clock = new PauseClock();
@@ -175,6 +192,20 @@ public static class AppTests {
         Assert(UiLines.Line(3, "ControlType.Pane", "", 10, 20) == "[3] Pane (10,20)", "No name");
         Assert(UiLines.Line(4, "Edit", "say \"hi\"\r\nnow", 1, 2) == "[4] Edit \"say 'hi'  now\" (1,2)", "Quotes and line breaks");
         Assert(UiLines.Line(5, "Text", new string('x', 200), 1, 2).Length == "[5] Text \"".Length + 80 + "\" (1,2)".Length, "Long names are cut at 80 characters");
+        // Each line ends with the verbs ui_act can use, from the patterns the element supports.
+        Assert(UiLines.Line(12, "ControlType.Button", "OK", 640, 412, "invoke,focus") == "[12] Button \"OK\" (640,412) invoke,focus", "A line with verbs");
+        Assert(UiLines.Line(12, "ControlType.Button", "OK", 640, 412, "") == "[12] Button \"OK\" (640,412)", "A line without verbs has no trailing space");
+        Assert(UiLines.Verbs(true, false, false, false, false, false, true) == "invoke,focus", "A button: invoke and focus");
+        Assert(UiLines.Verbs(false, true, false, false, false, false, true) == "set_value,focus", "A writable edit: set_value and focus");
+        Assert(UiLines.Verbs(false, true, true, false, false, false, true) == "focus", "A read-only value is not set_value");
+        Assert(UiLines.Verbs(false, false, false, true, false, false, false) == "toggle", "A check box that cannot take the focus: toggle only");
+        Assert(UiLines.Verbs(false, false, false, false, true, false, true) == "expand,collapse,focus", "A tree node or combo box: expand, collapse and focus");
+        Assert(UiLines.Verbs(true, true, false, true, true, true, true) == "invoke,set_value,toggle,expand,collapse,select,focus", "Every verb, in a fixed order");
+        Assert(UiLines.Verbs(false, false, false, false, false, false, false) == "", "No pattern and no focus: no verbs");
+        Assert(UiLines.Verbs(true, true, false, true, true, true, true, false) == "disabled", "A disabled element has no verbs and says so");
+        Assert(UiLines.Line(5, "ControlType.Button", "Find next", 1, 2, UiLines.Verbs(true, false, false, false, false, false, true, false)) == "[5] Button \"Find next\" (1,2) disabled", "A disabled line");
+        Assert(UiLines.Verbs(false, false, false, false, true, false, true, true, true) == "focus", "A leaf node has no expand or collapse");
+        Assert(UiLines.Verbs(true, false, false, false, true, true, true, true, true) == "invoke,select,focus", "A leaf keeps its other verbs");
         Console.WriteLine("PASS ui_tree line formatting");
         // ui_tree text stays under the relay's 200,000 character limit and says when it was cut.
         var many = new List<string>(); for (int i = 1; i <= 3000; i++) many.Add(UiLines.Line(i, "ControlType.Text", new string('n', 80), 1000, 700));
@@ -206,7 +237,8 @@ public static class AppTests {
         long month = 30L * 86400000; uint monthAgo = unchecked((uint)(5000 + month));
         Assert(InputIdle.CustomerAgoMs(5000, monthAgo, 0, false) == month && InputIdle.RemainingMs(month) == 0, "A PC idle for 30 days is idle, not paused");
         Assert(InputIdle.CustomerAgoMs(10005, 10000, 0, false) == 0 && InputIdle.RemainingMs(0) == 3000, "An input a moment ahead of the clock reads as just now");
-        Console.WriteLine("PASS pause cross-check against GetLastInputInfo");
+        Assert(!InputIdle.Stuck(InputIdle.StuckMs - 1, false) && InputIdle.Stuck(InputIdle.StuckMs, false) && !InputIdle.Stuck(InputIdle.StuckMs * 10, true), "A key down for 10 s with no input since is stuck; one with input since (a held key repeats) is not");
+        Console.WriteLine("PASS pause cross-check against GetLastInputInfo, and the stuck-key rule");
     }
     static string Hex(string b64) { return Convert.ToBase64String(Convert.FromBase64String(b64), 0, 2); }
     static Dictionary<string, object> Act(string name, params object[] pairs) {
@@ -308,6 +340,335 @@ public static class AppTests {
         } finally { RestartResume.Disarm(resume); }
         Console.WriteLine("PASS a prepared reconnect carries screen consent only when the prompt recorded it");
     }
+    // The service side of a Client in full control, without a service: screen frames are answered here, and
+    // as: "user" runs with a copy of this process's own token, the way the service runs with the console user's.
+    sealed class FakeFull : IFullControl {
+        [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+        [DllImport("advapi32.dll", SetLastError = true)] static extern bool DuplicateTokenEx(IntPtr token, uint access, IntPtr attributes, int level, int type, out IntPtr result);
+        [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+        public bool SignedIn = true; public long WelcomedAt; public int Screens;
+        public string UserName { get { return "tester"; } }
+        public Dictionary<string, object> ScreenOp(Dictionary<string, object> frame, WaitHandle stop) { Screens++; return Wire.Map("ok", true, "desktop", "secure"); }
+        public IntPtr UserToken(out string profile) {
+            if (!SignedIn) throw new ArgumentException(TokenChoice.NobodySignedIn);
+            IntPtr own, dup;
+            if (!OpenProcessToken(GetCurrentProcess(), 0x02000000, out own)) throw new Exception("OpenProcessToken");
+            try { if (!DuplicateTokenEx(own, 0x02000000, IntPtr.Zero, 2, 1, out dup)) throw new Exception("DuplicateTokenEx"); } finally { CloseHandle(own); }
+            profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile); return dup;
+        }
+        public void Report(Dictionary<string, object> poll, long serverOffsetMs) { poll["desktop"] = "secure"; poll["input_blocked_until"] = Client.UnixNow() + 60000; }
+        public void Welcomed(long expiresAtMs) { WelcomedAt = expiresAtMs; }
+    }
+
+    static void FullControlTests(string dir) {
+        Assert(ConsentPath.Decide(true, 2, 1, 5) == Consent.Confirm && ConsentPath.Decide(true, 1, 0, -1) == Consent.Confirm, "An elevated app (or UAC off for an administrator) gets no UAC prompt, so it asks itself");
+        Assert(ConsentPath.Decide(false, 3, 1, 0) == Consent.Confirm && ConsentPath.Decide(false, 3, -1, 0) == Consent.Confirm, "An administrator who elevates without a prompt is asked by the app");
+        Assert(ConsentPath.Decide(false, 1, 0, -1) == Consent.Unavailable && ConsentPath.Decide(false, 1, 0, 0) == Consent.Unavailable, "UAC off and a standard user: full control is impossible");
+        Assert(ConsentPath.Decide(false, 3, 1, 5) == Consent.Prompt && ConsentPath.Decide(false, 3, -1, -1) == Consent.Prompt && ConsentPath.Decide(false, 3, 1, 2) == Consent.Prompt, "An administrator with UAC gets the UAC prompt");
+        Assert(ConsentPath.Decide(false, 1, 1, 0) == Consent.Prompt && ConsentPath.Decide(false, 1, -1, 5) == Consent.Prompt, "A standard user gets the UAC credential prompt (ConsentPromptBehaviorAdmin does not apply)");
+        Assert(SupportAccess.LimitedHeading + " " + SupportAccess.LimitedText == "Continue with limited support? Support can see your screen and control your mouse and keyboard, but not Windows security prompts.", "Fallback text");
+        Assert(SupportAccess.FullHeading + " " + SupportAccess.FullText == "Give support full control of this PC? Support can see your screen, control your mouse and keyboard, work through Windows security prompts and the sign-in screen, and keep working after a restart. Access ends when you click End session, or after 24 hours, and everything is removed.", "Full control text");
+        Assert(SupportAccess.Asking == "Windows will ask for permission to give support full control.", "Notice before UAC");
+        Console.WriteLine("PASS full-control consent: the UAC prompt, the app's own confirm, or unavailable, and the texts");
+
+        // ACLs: the service folder is SYSTEM and Administrators only, with nothing inherited.
+        var folder = FullAcl.Folder(); var rules = folder.GetAccessRules(true, true, typeof(SecurityIdentifier));
+        Assert(folder.AreAccessRulesProtected && rules.Count == 2, "Folder ACL: protected, two rules, got " + rules.Count);
+        foreach (FileSystemAccessRule r in rules)
+            Assert((r.IdentityReference.Equals(FullAcl.SystemSid) || r.IdentityReference.Equals(FullAcl.AdminsSid)) && r.FileSystemRights == FileSystemRights.FullControl && r.AccessControlType == AccessControlType.Allow
+                && r.InheritanceFlags == (InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit) && !r.IsInherited, "Folder rule " + r.IdentityReference);
+        var window = FullAcl.Window(); var wrules = window.GetAccessRules(true, true, typeof(SecurityIdentifier)); int users = 0;
+        Assert(window.AreAccessRulesProtected && wrules.Count == 3, "Window ACL: protected, three rules");
+        foreach (FileSystemAccessRule r in wrules) {
+            if (!r.IdentityReference.Equals(FullAcl.UsersSid)) { Assert(r.FileSystemRights == FileSystemRights.FullControl, "SYSTEM and Administrators own window.exe"); continue; }
+            users++; Assert((r.FileSystemRights & FileSystemRights.ReadAndExecute) == FileSystemRights.ReadAndExecute && (r.FileSystemRights & (FileSystemRights.Write | FileSystemRights.Delete | FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership)) == 0, "Users may only read and run window.exe");
+        }
+        Assert(users == 1, "Users read window.exe");
+        var me = WindowsIdentity.GetCurrent().User; var script = FullAcl.Script(me);
+        foreach (FileSystemAccessRule r in script.GetAccessRules(true, true, typeof(SecurityIdentifier))) if (r.IdentityReference.Equals(me)) Assert((r.FileSystemRights & (FileSystemRights.Write | FileSystemRights.Delete)) == 0, "The user may read a command script, not change it");
+        // On disk, as icacls shows it. The folder is created in one step with its ACL, and never over an existing one.
+        string aclDir = Path.Combine(dir, "acl-folder"); Native.CreateLocked(aclDir, FullAcl.Folder());
+        try {
+            try { Native.CreateLocked(aclDir, FullAcl.Folder()); throw new Exception("an existing folder was adopted"); } catch (System.ComponentModel.Win32Exception e) { Assert(e.NativeErrorCode == 183, "Exists: " + e.NativeErrorCode); }
+            var icacls = Process.Start(new ProcessStartInfo("icacls.exe", "\"" + aclDir + "\"") { UseShellExecute = false, RedirectStandardOutput = true, CreateNoWindow = true });
+            string shown = icacls.StandardOutput.ReadToEnd(); icacls.WaitForExit();
+            string sys = FullAcl.SystemSid.Translate(typeof(NTAccount)).Value, admins = FullAcl.AdminsSid.Translate(typeof(NTAccount)).Value;
+            int entries = 0; foreach (string line in shown.Split('\n')) if (line.Contains(":(")) entries++;
+            Assert(shown.Contains(sys + ":(OI)(CI)(F)") && shown.Contains(admins + ":(OI)(CI)(F)") && entries == 2, "icacls shows SYSTEM and Administrators with full control, inherited by files and folders, and nobody else:\n" + shown);
+        } finally {
+            var mine = new DirectorySecurity(); mine.AddAccessRule(new FileSystemAccessRule(me, FileSystemRights.FullControl, AccessControlType.Allow));
+            Directory.SetAccessControl(aclDir, mine); Directory.Delete(aclDir);
+        }
+        // The folder goes under %ProgramFiles%, read from HKLM, where Users may not create or delete anything.
+        Assert(FullInstall.Folder("abcd1234").EndsWith(@"\SupportMCP-abcd1234") && Directory.Exists(FullInstall.Root) && !FullInstall.Root.ToUpperInvariant().Contains("PROGRAMDATA"), "The session folder: " + FullInstall.Folder("abcd1234"));
+        foreach (FileSystemAccessRule r in Directory.GetAccessControl(FullInstall.Root).GetAccessRules(true, true, typeof(SecurityIdentifier)))
+            if (r.IdentityReference.Equals(FullAcl.UsersSid) && r.AccessControlType == AccessControlType.Allow && r.PropagationFlags != PropagationFlags.InheritOnly)
+                Assert((r.FileSystemRights & (FileSystemRights.CreateDirectories | FileSystemRights.CreateFiles | FileSystemRights.DeleteSubdirectoriesAndFiles | FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership)) == 0, "Users cannot create or delete in " + FullInstall.Root + ": " + r.FileSystemRights);
+        Console.WriteLine("PASS full-control ACLs: the folder (checked with icacls), window.exe and command scripts");
+
+        // The deadline: saved and loaded with the full session id, expiry, the 24-hour cap, and the first welcome.
+        long now = Client.UnixNow(); string fullSid = new string('c', 64);
+        var st = new FullState { Sid = fullSid, Task = Backstop.NewTask("cccccccc"), Deadline = now + 7200000, AppPid = 4242 }; st.Save(dir);
+        var back = FullState.Load(dir);
+        Assert(back != null && back.Deadline == st.Deadline && !back.Welcomed && back.Sid == fullSid && back.AppPid == 4242 && back.Task == st.Task && back.Task.StartsWith("SupportMcp-cccccccc-") && back.Task.Length == 28, "State round trip, with this install's own task name");
+        Assert(Backstop.NewTask("cccccccc") != Backstop.NewTask("cccccccc"), "Every install gets a task name of its own");
+        back.Welcomed = true; back.Save(dir); back = FullState.Load(dir);
+        Assert(back.Welcomed && !File.Exists(FullState.PathIn(dir) + ".new"), "State is replaced in place");
+        File.WriteAllText(FullState.PathIn(dir), "{\"deadline\":" + (now + 5000) + "}"); Assert(FullState.Load(dir) == null, "A state without the full session id is treated as over");
+        File.WriteAllText(FullState.PathIn(dir), "{not json"); Assert(FullState.Load(dir) == null, "A damaged state is treated as over");
+        File.WriteAllText(FullState.PathIn(dir), "{\"deadline\":\"soon\"}"); Assert(FullState.Load(dir) == null, "A state of the wrong type is treated as over");
+        File.Delete(FullState.PathIn(dir)); Assert(FullState.Load(dir) == null, "A missing state is treated as over");
+        Assert(!FullState.Expired(now + 1, now) && FullState.Expired(now, now) && FullState.Expired(now - 1, now), "Expired at the deadline");
+        Assert(FullState.Clamp(now + 3 * FullState.DayMs, now) == now + FullState.DayMs && FullState.Clamp(now + 5000, now) == now + 5000, "Never more than 24 hours");
+        Assert(FullState.OnWelcome(now + 7200000, false, now + 86000000, now) == now + 86000000, "The first welcome moves connect_by to the session's expiry");
+        Assert(FullState.OnWelcome(now + 50000000, true, now + 86000000, now) == now + 50000000 && FullState.OnWelcome(now + 50000000, true, now + 1000, now) == now + 1000, "A later welcome never extends the deadline, only brings it closer");
+        Assert(FullState.OnWelcome(now + 7200000, false, now + 5 * FullState.DayMs, now) == now + FullState.DayMs, "A relay expiry beyond 24 hours is capped");
+        Assert(SasShare.Needed(-1) && SasShare.Needed(0) && SasShare.Needed(2) && !SasShare.Needed(1) && !SasShare.Needed(3) && SasShare.Wanted(-1) == 1 && SasShare.Wanted(0) == 1 && SasShare.Wanted(2) == 3, "SoftwareSASGeneration changes only when services may not send SAS; ease of access apps keep their right");
+        Console.WriteLine("PASS full-control state: persistence, expiry, the 24-hour cap and the first welcome");
+
+        // SoftwareSASGeneration shared by sessions, in a test copy of the two keys under HKCU. The C# release and the
+        // backstop's PowerShell release must behave the same.
+        string testKey = @"Software\SupportMcpTest-" + Guid.NewGuid().ToString("N");
+        SasShare.MutexName = @"Local\SupportMcpTest-Sas-" + Guid.NewGuid().ToString("N"); // a Global one needs administrator rights
+        Func<Microsoft.Win32.RegistryKey> root = delegate { return Microsoft.Win32.Registry.CurrentUser.CreateSubKey(testKey); };
+        Func<object> sas = delegate { using (var r = root()) using (var k = r.OpenSubKey(SasShare.PolicyKey)) return k == null ? null : k.GetValue(SasShare.Value); };
+        Action<object> setSas = delegate(object v) { using (var r = root()) using (var k = r.CreateSubKey(SasShare.PolicyKey)) { if (v == null) k.DeleteValue(SasShare.Value, false); else k.SetValue(SasShare.Value, v, Microsoft.Win32.RegistryValueKind.DWord); } };
+        Func<bool> clean = delegate { using (var r = root()) return r.OpenSubKey(SasShare.RootKey) == null; };
+        Action<string> psRelease = delegate(string holder) {
+            var ps = Process.Start(new ProcessStartInfo("powershell.exe", "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"" + SasShare.ReleaseScript(@"HKCU:\" + testKey, holder) + "\"") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true });
+            string err = ps.StandardError.ReadToEnd(); ps.WaitForExit(); Assert(ps.ExitCode == 0 && err.Trim() == "", "The backstop's PowerShell runs cleanly: " + err);
+        };
+        try {
+            foreach (bool viaPowerShell in new bool[] { false, true }) {
+                Action<string> release = delegate(string holder) { if (viaPowerShell) psRelease(holder); else using (var r = root()) SasShare.Release(r, holder); };
+                string how = viaPowerShell ? " (PowerShell)" : " (C#)";
+                setSas(null);
+                using (var r = root()) SasShare.Acquire(r, "SupportMcp-aaaaaaaa");
+                Assert((int)sas() == 1, "Absent becomes 1" + how);
+                using (var r = root()) SasShare.Acquire(r, "SupportMcp-bbbbbbbb");
+                release("SupportMcp-aaaaaaaa");
+                Assert((int)sas() == 1, "The first session to leave keeps the value while another still needs it" + how);
+                release("SupportMcp-bbbbbbbb");
+                Assert(sas() == null && clean(), "The last one deletes the value it added, and the records" + how);
+                setSas(2);
+                using (var r = root()) SasShare.Acquire(r, "SupportMcp-aaaaaaaa");
+                Assert((int)sas() == 3, "2 becomes 3" + how);
+                release("SupportMcp-aaaaaaaa");
+                Assert((int)sas() == 2 && clean(), "2 comes back" + how);
+                setSas(0);
+                using (var r = root()) SasShare.Acquire(r, "SupportMcp-aaaaaaaa");
+                setSas(3); // an administrator changes it while the session runs
+                release("SupportMcp-aaaaaaaa");
+                Assert((int)sas() == 3 && clean(), "A later change by an administrator stays" + how);
+                setSas(1);
+                using (var r = root()) SasShare.Acquire(r, "SupportMcp-aaaaaaaa");
+                release("SupportMcp-aaaaaaaa");
+                Assert((int)sas() == 1 && clean(), "A value that already allowed services is left alone" + how);
+            }
+            // The C# and the PowerShell release both wait for the mutex another process holds.
+            setSas(null);
+            using (var r = root()) SasShare.Acquire(r, "SupportMcp-aaaaaaaa");
+            var other = new Mutex(false, SasShare.MutexName); var taken = new ManualResetEvent(false); var letGo = new ManualResetEvent(false);
+            var owner = new Thread(delegate() { other.WaitOne(); taken.Set(); letGo.WaitOne(); other.ReleaseMutex(); }); owner.Start(); taken.WaitOne();
+            var waited = Stopwatch.StartNew(); var releaser = new Thread(delegate() { psRelease("SupportMcp-aaaaaaaa"); }); releaser.Start();
+            Thread.Sleep(2500); Assert((int)sas() == 1, "The PowerShell release waits while another process holds the mutex");
+            letGo.Set(); releaser.Join(30000); owner.Join();
+            Assert(sas() == null && clean() && waited.ElapsedMilliseconds >= 2500, "Then it runs");
+            // Without the mutex nothing touches the record: Acquire and Release report it, PowerShell exits with 1.
+            int wait = SasShare.WaitMs; SasShare.WaitMs = 1000;
+            try {
+                setSas(null);
+                using (var r = root()) Assert(SasShare.Acquire(r, "SupportMcp-aaaaaaaa"), "Acquire reports that it ran");
+                taken.Reset(); letGo.Reset();
+                owner = new Thread(delegate() { other.WaitOne(); taken.Set(); letGo.WaitOne(); other.ReleaseMutex(); }); owner.Start(); taken.WaitOne();
+                using (var r = root()) Assert(!SasShare.Acquire(r, "SupportMcp-bbbbbbbb"), "Acquire without the mutex reports the skip");
+                using (var r = root()) using (var k = r.OpenSubKey(SasShare.HoldersKey)) Assert(k.GetValue("SupportMcp-bbbbbbbb") == null, "and adds no holder");
+                using (var r = root()) Assert(!SasShare.Release(r, "SupportMcp-aaaaaaaa"), "Release without the mutex reports the skip");
+                Assert((int)sas() == 1, "and puts nothing back");
+                var ps = Process.Start(new ProcessStartInfo("powershell.exe", "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"" + SasShare.ReleaseScript(@"HKCU:\" + testKey, "SupportMcp-aaaaaaaa") + "\"") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true });
+                string err = ps.StandardError.ReadToEnd(); ps.WaitForExit();
+                Assert(ps.ExitCode == 1 && err.Trim() == "", "The PowerShell release without the mutex exits with 1: " + ps.ExitCode + " " + err);
+                using (var r = root()) using (var k = r.OpenSubKey(SasShare.HoldersKey)) Assert((int)sas() == 1 && k.GetValue("SupportMcp-aaaaaaaa") != null && (string)k.GetValue("original") == "absent", "and keeps the entry and the original value for a later release");
+                letGo.Set(); owner.Join();
+                using (var r = root()) Assert(SasShare.Release(r, "SupportMcp-aaaaaaaa"), "A later release runs");
+                Assert(sas() == null && clean(), "and puts the original back");
+            } finally { SasShare.WaitMs = wait; letGo.Set(); }
+            // send_sas checks the value first, since Windows drops SendSAS without an error when it refuses it.
+            foreach (object v in new object[] { null, 0, 2 }) { setSas(v); using (var r = root()) Assert(!SasShare.Allowed(r), "Services may not send SAS with " + (v ?? "no value")); }
+            foreach (object v in new object[] { 1, 3 }) { setSas(v); using (var r = root()) Assert(SasShare.Allowed(r), "Services may send SAS with " + v); }
+        } finally { Microsoft.Win32.Registry.CurrentUser.DeleteSubKeyTree(testKey, false); }
+        Console.WriteLine("PASS SoftwareSASGeneration: shared by sessions, put back by the last one, an administrator's change kept, the same in PowerShell, never changed without the mutex");
+
+        // The backstop never runs agent.exe, releases the registry share, and deletes itself last.
+        string f = @"C:\Program Files\SupportMCP-abcd1234";
+        var actions = Backstop.Actions("abcd1234", f, "SupportMcp-abcd1234-0123abcd"); string sys32 = Backstop.System32("");
+        Assert(actions.Length == 3 && actions[0][0].EndsWith(@"\System32\cmd.exe") && actions[1][0].EndsWith(@"\System32\WindowsPowerShell\v1.0\powershell.exe") && actions[2][0].EndsWith(@"\System32\cmd.exe"), "cmd, PowerShell, cmd from the 64-bit System32");
+        Assert(actions[0][1] == "/c " + sys32 + "sc.exe stop \"SupportMcp-abcd1234\" & " + sys32 + "PING.EXE -n 6 127.0.0.1 >nul & " + sys32 + "taskkill.exe /f /fi \"SERVICES eq SupportMcp-abcd1234\" & " + sys32 + "sc.exe delete \"SupportMcp-abcd1234\"", "First the service, every tool by its full path: " + actions[0][1]);
+        Assert(sys32.IndexOf(' ') < 0, "System32 has no space, so the cmd lines need no quotes around tools");
+        Assert(actions[1][1].Contains(SasShare.ReleaseScript("HKLM:", "SupportMcp-abcd1234")) && !actions[1][1].Substring(actions[1][1].IndexOf('"') + 1).TrimEnd('"').Contains("\""), "Then the registry share, with no double quote inside the script");
+        Assert(actions[2][1].StartsWith("/c (for /l %i in (1,1,20) do @(if exist \"" + f + "\"") && actions[2][1].EndsWith(" & (" + sys32 + "reg.exe query \"HKLM\\SOFTWARE\\SupportMCP\\SoftwareSASGeneration\" /v \"SupportMcp-abcd1234\" /reg:64 >nul 2>&1 || " + sys32 + "schtasks.exe /delete /tn \"SupportMcp-abcd1234-0123abcd\" /f)") && actions[2][1].Contains(sys32 + "PING.EXE -n 3"), "Then the folder, and the task itself last, once its registry share is released: " + actions[2][1]);
+        foreach (string[] a in actions) {
+            Assert(!a[1].Contains("agent.exe") && !a[1].Contains("window.exe"), "The backstop never runs the app");
+            Assert(a[1].IndexOf('%') < 0 || (a[1].IndexOf('%') == a[1].IndexOf("%i") && a[1].IndexOf("%i") == a[1].LastIndexOf("%i")), "At most one %i and no other %, so Task Scheduler expands nothing");
+        }
+        string xml = Backstop.Xml(actions, (long)(new DateTime(2026, 11, 3, 12, 0, 0, DateTimeKind.Utc) - new DateTime(1970, 1, 1)).TotalMilliseconds + 500);
+        Assert(xml.Contains("<TimeTrigger><Repetition><Interval>PT1H</Interval></Repetition><StartBoundary>2026-11-03T12:00:01Z</StartBoundary>") && xml.Contains("<UserId>S-1-5-18</UserId>") && xml.Contains("<StartWhenAvailable>true</StartWhenAvailable>") && xml.Contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"), "Task at the deadline in UTC, rounded up, as SYSTEM, run late if the PC was off, and again every hour until it deletes itself");
+        int at0 = xml.IndexOf("<Arguments>" + System.Security.SecurityElement.Escape(actions[0][1])), at1 = xml.IndexOf(System.Security.SecurityElement.Escape(actions[1][1])), at2 = xml.IndexOf(System.Security.SecurityElement.Escape(actions[2][1]));
+        Assert(at0 > 0 && at1 > at0 && at2 > at1 && !xml.Contains(" & ") && xml.Contains("&amp;") && xml.Contains("&quot;"), "Three actions in order, escaped for XML");
+        Console.WriteLine("PASS backstop task: the command line, its order and the task XML");
+
+        // run in full control: the token choice and the as: field.
+        Assert(TokenChoice.Pick(true, false, 0) == RunAs.System && TokenChoice.Pick(true, true, 3) == RunAs.System, "as: system runs as SYSTEM, signed in or not");
+        Assert(TokenChoice.Pick(false, false, 0) == RunAs.Nobody && TokenChoice.NobodySignedIn == "nobody is signed in; use as: \"system\"", "as: user with nobody signed in is an error");
+        Assert(TokenChoice.Pick(false, true, 3) == RunAs.ElevatedUser && TokenChoice.Pick(false, true, 1) == RunAs.User && TokenChoice.Pick(false, true, 2) == RunAs.User, "An administrator's filtered token is swapped for its elevated linked token; other tokens run as they are");
+        var full = new FakeFull();
+        using (var relay = new FakeRelay()) {
+            relay.Agent.Full = full; relay.Lifetime = 300000; relay.Start();
+            var caps = (System.Collections.ArrayList)relay.Hello["caps"];
+            Assert(Wire.Text(relay.Hello, "control") == "full" && caps.Contains("full") && caps.Contains("screen") && Wire.Text(relay.Hello, "user") == "tester" && Wire.Flag(relay.Hello, "elevated"), "The service's hello says control full");
+            for (int i = 0; i < 100 && full.WelcomedAt == 0; i++) Thread.Sleep(20);
+            Assert(Math.Abs(full.WelcomedAt - (Client.UnixNow() + 300000)) < 5000, "The welcome's expiry reaches the service");
+            for (int i = 0; i < 100 && (relay.LastPoll == null || Wire.Text(relay.LastPoll, "desktop") != "secure"); i++) Thread.Sleep(50);
+            Assert(Wire.Text(relay.LastPoll, "desktop") == "secure" && Wire.Number(relay.LastPoll, "input_blocked_until") > 0, "Polls carry the service's report");
+            var shot = relay.Call(Act("screenshot")); Assert(Wire.Flag(shot, "ok") && Wire.Text(shot, "desktop") == "secure" && full.Screens == 1, "Screen frames go to the service");
+            var sys = Run("[Console]::Write([Security.Principal.WindowsIdentity]::GetCurrent().Name)", 30); sys["as"] = "system";
+            var r = relay.Call(sys); Assert(Wire.Flag(r, "ok") && Decode(r, "stdout_b64") == WindowsIdentity.GetCurrent().Name, "as: system runs with the service's own token: " + Wire.Text(r, "error"));
+            var user = Run("[Console]::Write([Security.Principal.WindowsIdentity]::GetCurrent().Name + '|' + (Get-Location).Path)", 30); user["as"] = "user";
+            r = relay.Call(user); Assert(Wire.Flag(r, "ok") && Decode(r, "stdout_b64") == WindowsIdentity.GetCurrent().Name + "|" + Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "as: user runs with the given token in its profile folder: " + Wire.Text(r, "error") + Decode(r, "stderr_b64"));
+            full.SignedIn = false;
+            r = relay.Call(user); Assert(!Wire.Flag(r, "ok") && Wire.Text(r, "error") == TokenChoice.NobodySignedIn, "as: user with nobody signed in: " + Wire.Text(r, "error"));
+            var bad = Run("1", 10); bad["as"] = "root"; r = relay.Call(bad); Assert(Wire.Text(r, "error") == "as must be user or system", "Only user and system");
+        }
+        Console.WriteLine("PASS full-control client: hello, welcome, poll report, screen frames, and run as system, as user and with nobody signed in");
+
+        // Block timer: the time limit, the operator's off, and Ctrl+Alt+Del.
+        var block = new BlockTimer(); block.Arm(1000, 99);
+        Assert(block.RemainingMs(1000) == 600000 && block.On(600999) && !block.On(601000), "At most 10 minutes");
+        block.Arm(1000, 0); Assert(block.RemainingMs(1000) == 60000, "At least 1 minute");
+        block.Arm(1000, 2); Assert(block.Check(5000, true, true) && block.Check(120999, true, true) && !block.Check(121000, true, true) && !block.Escaped && !block.On(121000), "It lifts by itself when the time is up");
+        block.Arm(1000, 2); Assert(!block.Check(5000, false, true) && block.Escaped && !block.Check(6000, true, true) && !block.On(6000), "A switch to the secure desktop is Ctrl+Alt+Del: off, and it stays off");
+        block.Arm(1000, 2); Assert(!block.Escaped && !block.Check(5000, true, false) && block.Escaped, "A block Windows already lifted counts as Ctrl+Alt+Del; only on again re-arms it");
+        block.Arm(1000, 2); block.Off(); Assert(!block.Check(5000, true, true) && !block.Escaped, "The operator's off");
+        Console.WriteLine("PASS block_input timer: the 10-minute cap, renewal, Ctrl+Alt+Del and off");
+
+        // Pipe messages are length-prefixed JSON objects within a size limit; a window may only ask for status or end.
+        Func<byte[], Dictionary<string, object>> read = delegate(byte[] raw) { return Pipes.Read(new MemoryStream(raw), 1024); };
+        Func<string, byte[]> frame = delegate(string json) { byte[] b = Encoding.UTF8.GetBytes(json), all = new byte[b.Length + 4]; BitConverter.GetBytes(b.Length).CopyTo(all, 0); b.CopyTo(all, 4); return all; };
+        var ms = new MemoryStream(); Pipes.Write(ms, Wire.Map("type", "status")); ms.Position = 0;
+        Assert(Wire.Text(Pipes.Read(ms, 1024), "type") == "status", "A message round trip");
+        foreach (byte[] raw in new byte[][] { frame("[1,2]"), frame("null"), frame("{\"type\":"), frame("\"text\""), new byte[] { 2, 0, 0, 0, 0x7B }, new byte[] { 0xFF, 0xFF, 0xFF, 0x7F }, new byte[] { 1, 0, 0, 0, 0x7B }, new byte[] { 0, 4, 0, 0 }, new byte[] { 1, 0 } }) {
+            try { read(raw); throw new Exception("accepted a bad message of " + raw.Length + " bytes"); } catch (InvalidDataException) { } catch (EndOfStreamException) { }
+        }
+        Assert(Pipes.UiRequest(read(frame("{\"type\":\"status\"}"))) == "status" && Pipes.UiRequest(read(frame("{\"type\":\"end\"}"))) == "end", "status and end");
+        foreach (string json in new string[] { "{\"type\":\"run\"}", "{\"type\":\"status\",\"x\":1}", "{\"type\":5}", "{}", "{\"Type\":\"end\"}", "{\"type\":[\"end\"]}" })
+            Assert(Pipes.UiRequest(read(frame(json))) == null, "A window may not ask " + json);
+        // The real pipe: a window reads status and ends the session; garbage closes the connection; nobody can take the name first.
+        string sid8 = Guid.NewGuid().ToString("N").Substring(0, 8); int ended = 0;
+        // Only the pipe's owner may add instances, and the tests do not run as SYSTEM: this account stands in for it.
+        string uiSddl = "D:P(A;;GA;;;" + me.Value + ")(A;;0x12008B;;;IU)"; Func<uint, bool> anySession = delegate(uint session) { return true; };
+        var ui = new UiServer(Backstop.Name(sid8) + "-ui", delegate { return Wire.Map("connected", true, "link", true, "busy", 1, "paused", false, "blocked", true, "expires_at", Client.UnixNow() + 3600000, "ended", ended > 0); }, delegate { Interlocked.Increment(ref ended); }, anySession, uiSddl);
+        try { Native.PipeServer(Backstop.Name(sid8) + "-ui", "D:P(A;;GA;;;SY)", 4, true); throw new Exception("a second first instance was allowed"); } catch (System.ComponentModel.Win32Exception) { }
+        Assert(ServiceLink.Running(sid8) && !ServiceLink.Running(Guid.NewGuid().ToString("N").Substring(0, 8)), "Running finds the service of this session only");
+        // A client that asks for full access (which includes making a new pipe instance) is refused.
+        // (The service's real ACL, on one instance this test account did not need rights to create.)
+        using (var real = Native.PipeServer("SupportMcpTest-acl-" + sid8, "D:P(A;;GA;;;SY)(A;;0x12008B;;;IU)", 1, true)) {
+            using (var greedy = new System.IO.Pipes.NamedPipeClientStream(".", "SupportMcpTest-acl-" + sid8, System.IO.Pipes.PipeDirection.InOut)) {
+                try { greedy.Connect(2000); throw new Exception("the window pipe gave out write access that includes new instances"); } catch (UnauthorizedAccessException) { }
+            }
+            var accepting = new Thread(delegate() { try { real.WaitForConnection(); } catch (Exception) { } }); accepting.Start();
+            using (var modest = Pipes.Client("SupportMcpTest-acl-" + sid8)) { modest.Connect(2000); Assert(modest.IsConnected, "A window's client gets in"); }
+            accepting.Join(3000);
+        }
+        using (var raw = Pipes.Client(Backstop.Name(sid8) + "-ui")) {
+            raw.Connect(2000); Pipes.Write(raw, Wire.Map("type", "run", "command", "calc"));
+            try { Pipes.Read(raw, 4096); throw new Exception("the service answered a request a window may not make"); } catch (IOException) { }
+            Assert(ended == 0, "A bad request does nothing");
+        }
+        var link = new ServiceLink(sid8); int connected = 0, finished = 0, busyNow = -1;
+        link.Connected += delegate { connected++; }; link.Finished += delegate { finished++; }; link.BusyChanged += delegate(int n) { busyNow = n; };
+        link.Start();
+        for (int i = 0; i < 100 && (connected == 0 || busyNow != 1); i++) Thread.Sleep(50);
+        Assert(connected == 1 && busyNow == 1 && link.Blocked && !link.Paused && link.SurvivesSignOut && Math.Abs((link.ExpiresLocal.ToUniversalTime() - DateTime.UtcNow).TotalMinutes - 60) < 1, "The window reads status");
+        link.Stop(); link.Flush(5000);
+        for (int i = 0; i < 100 && finished == 0; i++) Thread.Sleep(50);
+        Assert(ended >= 1 && finished == 1 && !link.Lost && !ServiceLink.Running(sid8), "End session reaches the service, and the window sees the session end");
+        // One process gets at most 2 connections, and idle ones are cut off after 5 s.
+        string sid8b = Guid.NewGuid().ToString("N").Substring(0, 8); int endedB = 0;
+        new UiServer(Backstop.Name(sid8b) + "-ui", delegate { return Wire.Map("connected", true, "link", true, "ended", false); }, delegate { endedB++; }, anySession, uiSddl);
+        var idle = new List<System.IO.Pipes.NamedPipeClientStream>();
+        for (int i = 0; i < UiServer.PerProcess; i++) { var c = Pipes.Client(Backstop.Name(sid8b) + "-ui"); c.Connect(2000); idle.Add(c); }
+        Assert(!ServiceLink.Running(sid8b), "A third connection of the same process is refused");
+        Thread.Sleep(UiServer.ReadMs + 1500);
+        Assert(ServiceLink.Running(sid8b), "The idle clients were cut off and the process gets through again");
+        foreach (var c in idle) c.Dispose();
+        // Only the active console session is served: a process of another session (a switched user, Remote Desktop) is refused.
+        string sid8c = Guid.NewGuid().ToString("N").Substring(0, 8);
+        new UiServer(Backstop.Name(sid8c) + "-ui", delegate { return Wire.Map("connected", true, "ended", false); }, delegate { }, delegate(uint session) { return false; }, uiSddl);
+        Assert(!ServiceLink.Running(sid8c), "A client from another session is refused");
+        // A service that never confirms the end: the window says it cannot reach it, not that the session ended.
+        ServiceLink.EndMs = 2000;
+        var stubborn = new ServiceLink(sid8b); int stubbornDone = 0; stubborn.Finished += delegate { stubbornDone++; }; stubborn.Start();
+        Thread.Sleep(800); stubborn.Stop(); stubborn.Flush(10000);
+        Assert(stubbornDone == 1 && stubborn.Lost && endedB >= 3, "The end goes out on the connection the window holds, again and again, and an unconfirmed end finishes as Lost: " + endedB);
+        ServiceLink.EndMs = 30000;
+        // Pipe clients let the server identify them, never act as them.
+        string me8 = Guid.NewGuid().ToString("N").Substring(0, 8); string secret = Path.Combine(dir, "only-me.txt"); File.WriteAllText(secret, "x"); Exception asClient = null;
+        using (var server = Native.PipeServer("SupportMcpTest-" + me8, "D:P(A;;GA;;;" + me.Value + ")", 1, true)) {
+            var t = new Thread(delegate() { server.WaitForConnection(); Pipes.Read(server, 1024); server.RunAsClient(delegate { try { File.ReadAllText(secret); } catch (Exception e) { asClient = e; } }); });
+            t.Start();
+            using (var c = Pipes.Client("SupportMcpTest-" + me8)) { c.Connect(2000); Pipes.Write(c, Wire.Map("type", "status")); t.Join(5000); }
+        }
+        Assert(asClient != null, "The server cannot open files as the client (identification only)");
+        Console.WriteLine("PASS pipes: framing, the window's two requests, the first-instance guard and the window link");
+
+        // The corner window's copy is the exe without the configuration (and its attach key).
+        byte[] cfgBytes = Encoding.UTF8.GetBytes("{\"sid\":\"x\"}"), body = new byte[] { 77, 90, 1, 2, 3 };
+        var withCfg = new MemoryStream(); withCfg.Write(body, 0, body.Length); withCfg.Write(cfgBytes, 0, cfgBytes.Length); withCfg.Write(BitConverter.GetBytes(cfgBytes.Length), 0, 4); byte[] footer = Encoding.ASCII.GetBytes(Wire.Footer); withCfg.Write(footer, 0, footer.Length);
+        Assert(Wire.Payload(withCfg.ToArray()) == body.Length, "window.exe is cut before the configuration");
+        Console.WriteLine("PASS window.exe carries no session configuration");
+
+        // The elevated installer runs from a copy in a fresh folder, and reads itself through a handle that nobody can write or rename under.
+        string download = Path.Combine(dir, "downloads"); Directory.CreateDirectory(download);
+        string exe = Path.Combine(download, "remote-support-abcd1234.exe"); File.WriteAllBytes(exe, withCfg.ToArray());
+        File.WriteAllText(exe + ".config", "<configuration/>"); File.WriteAllText(Path.Combine(download, "version.dll"), "planted");
+        string staged = Elevation.Stage(exe);
+        try {
+            Assert(Path.GetFileName(staged) == "remote-support-abcd1234.exe" && Path.GetDirectoryName(Path.GetDirectoryName(staged)).TrimEnd('\\') == Path.GetTempPath().TrimEnd('\\') && Directory.GetFiles(Path.GetDirectoryName(staged)).Length == 1, "Only the exe is in the staging folder: " + staged);
+            FileStream held; byte[] selfBytes = FullInstall.ReadSelf(staged, out held);
+            using (held) {
+                Assert(selfBytes.Length == withCfg.Length, "The installer reads its whole file once");
+                try { using (new FileStream(staged, FileMode.Open, FileAccess.Write, FileShare.ReadWrite)) { } throw new Exception("the held exe could be opened for writing"); } catch (IOException) { }
+                try { File.Move(staged, staged + ".old"); throw new Exception("the held exe could be renamed"); } catch (IOException) { }
+            }
+        } finally { Directory.Delete(Path.GetDirectoryName(staged), true); }
+        Console.WriteLine("PASS the elevated installer runs from a clean copy and holds its own file");
+
+        // File operations as SYSTEM refuse junctions, links and a second hard link, and work on a plain path.
+        string plain = Path.Combine(dir, "plain"), target = Path.Combine(dir, "protected"); Directory.CreateDirectory(plain); Directory.CreateDirectory(target);
+        File.WriteAllText(Path.Combine(target, "file.txt"), "keep");
+        Func<string, int> cmd = delegate(string line) { var c = Process.Start(new ProcessStartInfo("cmd.exe", "/c " + line) { UseShellExecute = false, CreateNoWindow = true }); c.WaitForExit(); return c.ExitCode; };
+        Assert(cmd("mklink /J \"" + Path.Combine(plain, "jump") + "\" \"" + target + "\"") == 0, "Test setup: a junction");
+        Assert(cmd("mklink /H \"" + Path.Combine(plain, "twin.txt") + "\" \"" + Path.Combine(target, "file.txt") + "\"") == 0, "Test setup: a second hard link");
+        foreach (string path in new string[] { Path.Combine(plain, @"jump\file.txt"), Path.Combine(plain, @"jump\new.txt") })
+            foreach (bool write in new bool[] { true, false }) {
+                try { using (Native.OpenPlain(path, write, false)) { } throw new Exception("followed a junction: " + path + " write " + write); } catch (ArgumentException e) { Assert(e.Message == Native.LinkRefused, e.Message); } catch (System.ComponentModel.Win32Exception) { Assert(!write, "Only a read of a missing file may fail differently"); }
+            }
+        try { using (Native.OpenPlain(Path.Combine(plain, "twin.txt"), true, false)) { } throw new Exception("wrote through a second hard link"); } catch (ArgumentException e) { Assert(e.Message == Native.LinkRefused, e.Message); }
+        Assert(File.ReadAllText(Path.Combine(target, "file.txt")) == "keep" && !File.Exists(Path.Combine(target, "new.txt")), "Nothing behind the junction or the link changed");
+        // Missing folders are made one level at a time, each checked; a junction at any level is refused.
+        foreach (bool write in new bool[] { true, false }) {
+            try { using (Native.OpenPlain(Path.Combine(plain, @"jump\new\deeper\x.txt"), write, false)) { } throw new Exception("went through a junction above new folders"); } catch (ArgumentException e) { Assert(e.Message == Native.LinkRefused, e.Message); }
+        }
+        Assert(!Directory.Exists(Path.Combine(target, "new")), "No folder was made behind the junction");
+        string ok = Path.Combine(plain, @"sub\one\two\data.bin");
+        using (var w = Native.OpenPlain(ok, true, false)) w.Write(new byte[] { 1, 2, 3 }, 0, 3);
+        using (var w = Native.OpenPlain(ok, true, true)) w.Write(new byte[] { 4 }, 0, 1);
+        using (var w = Native.OpenPlain(ok, true, false)) w.Write(new byte[] { 9 }, 0, 1);
+        using (var r2 = Native.OpenPlain(ok, false, false)) Assert(r2.Length == 1 && r2.ReadByte() == 9, "A plain path: create, append, then replace");
+        Assert(cmd("rmdir \"" + Path.Combine(plain, "jump") + "\"") == 0, "Test cleanup: the junction");
+        Console.WriteLine("PASS file operations as SYSTEM refuse junctions and extra hard links, and keep working on plain paths");
+    }
     static void LaneTests() {
         using (var relay = new FakeRelay()) {
             relay.Lifetime = 300000; relay.Start();
@@ -322,10 +683,10 @@ public static class AppTests {
             var screen = relay.Call(Act("wait", "seconds", 0.2, "screenshot", false));
             Assert(Wire.Flag(screen, "ok") && timer.ElapsedMilliseconds < 4000 && !relay.HasResult(cmdId), "A screen operation must finish while the command still runs, took " + timer.ElapsedMilliseconds + " ms");
             foreach (string name in new string[] { "block_input", "send_sas" }) {
-                var denied = relay.Call(Act(name)); Assert(!Wire.Flag(denied, "ok") && Wire.Text(denied, "error") == "full control is not available in this build", name + " needs full control");
+                var denied = relay.Call(Act(name)); Assert(!Wire.Flag(denied, "ok") && Wire.Text(denied, "error") == Screen.NoFull, name + " needs full control");
             }
             var control = relay.Call(Wire.Map("type", "control", "lane", "screen", "action", "request_full_control"));
-            Assert(!Wire.Flag(control, "ok") && Wire.Text(control, "error") == "full control is not available in this build", "request_full_control is not available in normal mode");
+            Assert(!Wire.Flag(control, "ok") && Wire.Text(control, "error") == Screen.NoFull, "request_full_control without a handler is refused in normal mode");
             var bad = relay.Call(Act("fly")); Assert(!Wire.Flag(bad, "ok") && Wire.Text(bad, "error") == "unknown screen action", "Unknown action");
             var secretKey = relay.Call(Act("key", "keys", "ctrl+alt+Delete", "screenshot", false)); Assert(!Wire.Flag(secretKey, "ok"), "ctrl+alt+Delete is refused");
             Assert(!relay.HasResult(cmdId), "The command is still running");
@@ -334,7 +695,48 @@ public static class AppTests {
             Assert(relay.WaitBusy(delegate(string[] b) { return b.Length == 0; }, 2000), "A finished lane ends the parked poll at once, so the client is free again within 2 s");
             Console.WriteLine("PASS hello, lanes: a screen operation runs while a command runs, and full-control operations are refused");
         }
+        // A normal-mode app that can elevate says so with the "full" cap, and request_full_control goes to its handler.
+        using (var relay = new FakeRelay()) {
+            relay.Agent.CanElevate = true; int asked = 0;
+            relay.Agent.RequestFull = delegate { asked++; return Wire.Map("ok", false, "error", "the customer declined full control"); };
+            relay.Lifetime = 300000; relay.Start();
+            var caps = (System.Collections.ArrayList)relay.Hello["caps"];
+            Assert(caps.Contains("full") && Wire.Text(relay.Hello, "control") == "normal", "A normal-mode app that can elevate reports the full cap and control normal");
+            var r = relay.Call(Wire.Map("type", "control", "lane", "screen", "action", "request_full_control"));
+            Assert(asked == 1 && !Wire.Flag(r, "ok") && Wire.Text(r, "error") == "the customer declined full control", "request_full_control runs the elevation handler: " + Wire.Text(r, "error"));
+            var more = relay.Call(Run("[Console]::Write('still')", 20));
+            Assert(Wire.Flag(more, "ok") && Decode(more, "stdout_b64") == "still", "A declined request leaves normal mode working");
+        }
+        // A handler that hands the session to the service stops this client without a result or an end.
+        using (var relay = new FakeRelay()) {
+            relay.Agent.CanElevate = true; var agent = relay.Agent;
+            agent.RequestFull = delegate { agent.EndRemote = false; agent.Stop(); return null; };
+            relay.Lifetime = 300000; relay.Start();
+            string id = relay.Queue(Wire.Map("type", "control", "lane", "screen", "action", "request_full_control"));
+            relay.WaitExit(); Thread.Sleep(300);
+            Assert(!relay.HasResult(id) && !relay.End, "A handed-over client sends no result and no end");
+        }
+        // The cooldown: a decline at the first start blocks an immediate request as much as a later decline; a failure does not.
+        {
+            int asks = 0; Func<Dictionary<string, object>> ask = delegate { asks++; return Wire.Map("ok", false, "error", "asked"); };
+            long t = PauseClock.Now();
+            var gate = new FullRequestGate(); gate.Record(Elevation.Declined, t);
+            Assert(Wire.Text(gate.Request(ask, t + 1), "error") == FullRequestGate.Cooling && asks == 0, "A decline at the first start: an immediate request gets the cooldown error and no prompt");
+            Assert(Wire.Text(gate.Request(ask, t + FullRequestGate.CooldownMs - 1), "error") == FullRequestGate.Cooling && asks == 0, "Still within the minute");
+            Assert(Wire.Text(gate.Request(ask, t + FullRequestGate.CooldownMs), "error") == "asked" && asks == 1, "After a minute it prompts again");
+            gate = new FullRequestGate(); gate.Record(Elevation.Failed, t); gate.Record(Elevation.Installed, t);
+            Assert(Wire.Text(gate.Request(ask, t + 1), "error") == "asked" && asks == 2, "A failure is not a decline: it prompts at once");
+            gate = new FullRequestGate(); var inside = new ManualResetEvent(false); var leave = new ManualResetEvent(false); Dictionary<string, object> second = null;
+            var first = new Thread(delegate() { gate.Request(delegate { inside.Set(); leave.WaitOne(); return null; }, t); }); first.Start(); inside.WaitOne();
+            second = gate.Request(ask, t); leave.Set(); first.Join();
+            Assert(Wire.Text(second, "error") == FullRequestGate.Waiting && asks == 2, "One prompt at a time");
+            gate.Record(Elevation.Declined, t + 5);
+            Assert(Wire.Text(gate.Request(ask, t + 6), "error") == FullRequestGate.Cooling && asks == 2, "A later decline starts the cooldown too");
+        }
+        Console.WriteLine("PASS request_full_control: the full cap, a declined request, the silent handover, the cooldown after any decline");
     }
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder text, int max);
+    static string ForegroundInfo() { IntPtr fg = Win.GetForegroundWindow(); uint pid; Win.GetWindowThreadProcessId(fg, out pid); var t = new StringBuilder(200); GetWindowText(fg, t, 200); string name = ""; try { name = Process.GetProcessById((int)pid).ProcessName; } catch (Exception) { } return fg + " pid " + pid + " " + name + " \"" + t + "\" (this process " + Process.GetCurrentProcess().Id + ")"; }
     // Needs a Windows desktop session: real capture, input and windows.
     static void LiveScreenTests() {
         Screen.Dpi();
@@ -387,12 +789,105 @@ public static class AppTests {
                 }
             }); t.SetApartmentState(ApartmentState.STA); t.Start(); t.Join();
             Assert(!Wire.Flag(click, "ok") && Wire.Text(click, "error").Contains("support window"), "A click on this process's window must be refused: " + Wire.Text(click, "error"));
-            Assert(!Wire.Flag(key, "ok") && Wire.Text(key, "error").Contains("support window"), "Keystrokes while this process has the focus must be refused: " + Wire.Text(key, "error"));
+            Assert(!Wire.Flag(key, "ok") && Wire.Text(key, "error").Contains("support window has the keyboard focus"), "Keystrokes while this process has the focus must be refused: " + Wire.Text(key, "error") + " foreground " + ForegroundInfo());
             Assert(!Wire.Flag(tree, "ok") && Wire.Text(tree, "error").Contains("support window"), "ui_tree must not read this process's window: " + Wire.Text(tree, "error"));
         }
         Console.WriteLine("PASS live screen: capture, zoom, exact cursor mapping, pause and own-window guards");
+        // The corner window never takes the focus when it appears, keeps a taskbar button, and gives the focus back after
+        // the customer keeps the session: asking to end activates it, Keep connected returns the focus to the window it came
+        // from. That window belongs to another process (a peer started from this exe), because a window of this process is never given the focus back.
+        {
+            var info = new ProcessStartInfo(System.Reflection.Assembly.GetExecutingAssembly().Location, "--peer " + Process.GetCurrentProcess().Id) { UseShellExecute = false, RedirectStandardOutput = true, CreateNoWindow = true };
+            var lines = new List<string>(); Process peer = Process.Start(info);
+            peer.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e) { if (e.Data != null) lock (lines) lines.Add(e.Data); };
+            peer.BeginOutputReadLine();
+            try {
+                var end = DateTime.UtcNow.AddSeconds(15); bool ready = false;
+                while (!ready && DateTime.UtcNow < end) { lock (lines) ready = lines.Contains("ready"); Thread.Sleep(25); }
+                Assert(ready, "Test setup: the peer window opened");
+                peer.Refresh(); IntPtr peerWindow = peer.MainWindowHandle;
+                bool styled = false, stillPeer = false, active = true, confirmActive = false, restored = false, usable = false, wrongIds = true, olderKept = false, tuckBack = false;
+                var t = new Thread(delegate() {
+                    Screen.Dpi();
+                    Action pump = delegate { for (int i = 0; i < 20; i++) { Application.DoEvents(); System.Windows.Threading.Dispatcher.CurrentDispatcher.Invoke(System.Windows.Threading.DispatcherPriority.Background, new Action(delegate { })); Thread.Sleep(25); } };
+                    pump();
+                    Win.SetForegroundWindow(peerWindow); pump();
+                    var window = new SupportWindow(Palette.Detect(), false, false, null);
+                    window.Show(); pump();
+                    IntPtr handle = new System.Windows.Interop.WindowInteropHelper(window).Handle;
+                    int ex = Win.GetWindowLong(handle, -20);
+                    styled = (ex & unchecked((int)Win.NoActivate)) != 0 && (ex & unchecked((int)Win.AppWindow)) != 0;
+                    stillPeer = Win.GetForegroundWindow() == peerWindow; active = window.IsActive;
+                    uint peerPid; uint peerThread = Win.GetWindowThreadProcessId(peerWindow, out peerPid);
+                    usable = FocusReturn.Usable(peerWindow, peerPid, peerThread);
+                    wrongIds = FocusReturn.Usable(peerWindow, peerPid + 1, peerThread) || FocusReturn.Usable(peerWindow, peerPid, peerThread + 1) || FocusReturn.Usable(IntPtr.Zero, 0, 0);
+                    window.AskToEnd(); pump();
+                    confirmActive = Win.GetForegroundWindow() == handle;
+                    window.KeepConnected(); pump();
+                    restored = Win.GetForegroundWindow() == peerWindow;
+                    // The customer leaves the window while the confirm is open and comes back to it (a click on Keep activates it
+                    // again): Keep must not pull the focus to the older window.
+                    Win.SetForegroundWindow(peerWindow); pump();
+                    window.AskToEnd(); pump();
+                    using (var elsewhere = new Form { StartPosition = FormStartPosition.Manual, Location = new System.Drawing.Point(display.X + 60, display.Y + 400), Size = new System.Drawing.Size(200, 150), TopMost = true }) {
+                        elsewhere.Show(); elsewhere.Activate(); pump();
+                        window.Activate(); pump();
+                        window.KeepConnected(); pump();
+                        olderKept = Win.GetForegroundWindow() != peerWindow;
+                    }
+                    // A second confirm and Keep (tucking the window while it is open calls the same method) gives the focus back again.
+                    Win.SetForegroundWindow(peerWindow); pump();
+                    window.AskToEnd(); pump();
+                    window.KeepConnected(); pump();
+                    tuckBack = Win.GetForegroundWindow() == peerWindow;
+                    window.CloseQuietly();
+                }); t.SetApartmentState(ApartmentState.STA); t.Start(); t.Join();
+                Assert(styled, "The corner window must have WS_EX_NOACTIVATE and WS_EX_APPWINDOW");
+                Assert(stillPeer && !active, "Showing the corner window must leave the focus where it was");
+                Assert(confirmActive, "Asking to end must give the confirm the focus");
+                Assert(restored, "Keep connected must give the focus back to the window that had it");
+                Assert(usable && !wrongIds, "A remembered window is usable only with the same process and thread ids");
+                Assert(olderKept, "Keep must not pull the focus to an older window after the customer left the support window");
+                Assert(tuckBack, "Closing the confirm gives the focus back again");
+            } finally { try { peer.Kill(); } catch (Exception) { } peer.Dispose(); }
+        }
+        Console.WriteLine("PASS the corner window does not take the focus, keeps its taskbar button, and Keep connected gives the focus back");
+
+        // A key the app pressed whose up never arrived (a desktop switch) neither pauses support nor stays down:
+        // Unstick sends the up. A key no one released and no input for 10 s is stuck and stops pausing. F23 and F22 are harmless.
+        using (var screen = new Screen()) {
+            screen.Start(); var stop = new ManualResetEvent(false);
+            var t = new Thread(delegate() {
+                Screen.Send(Screen.KeyEvent(0x86, 0, 0));
+                Assert((Win.GetAsyncKeyState(0x86) & 0x8000) != 0, "Test setup: F23 is down");
+                Assert(screen.PausedForMs == 0, "The app's own key left down is not the customer's");
+                Screen.Unstick();
+                Assert((Win.GetAsyncKeyState(0x86) & 0x8000) == 0, "Unstick sent its up");
+                var raw = new Win.In[] { Screen.KeyEvent(0x85, 0, 0) }; Win.SendInput(1, raw, Marshal.SizeOf(typeof(Win.In))); // not through Send: not the app's
+                screen.Watch.Clock.Touch(-100000);
+                Assert(screen.PausedForMs > 0, "A key someone else holds pauses support");
+                Thread.Sleep((int)InputIdle.StuckMs + 1000);
+                long left = screen.PausedForMs;
+                raw[0] = Screen.KeyEvent(0x85, 0, 2); Win.SendInput(1, raw, Marshal.SizeOf(typeof(Win.In)));
+                Assert(left == 0, "After 10 s with no input it is stuck and pauses nothing: " + left);
+            }); t.Start(); t.Join();
+        }
+        Console.WriteLine("PASS a key the app left down is released, and a stuck key stops pausing after 10 s");
     }
-    public static int Main() {
+    [DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(int pid);
+    // A window of another process: the focus-return test starts this exe again with --peer <parent pid>. It lets the
+    // parent take the foreground, and prints "ready" once its window is shown.
+    static int PeerWindow(int parent) {
+        Application.EnableVisualStyles();
+        var display = Screen.Monitors()[0];
+        using (var form = new Form { Text = "focus peer", StartPosition = FormStartPosition.Manual, Location = new System.Drawing.Point(display.X + 400, display.Y + 60), Size = new System.Drawing.Size(300, 200), TopMost = true }) {
+            form.Shown += delegate { form.Activate(); AllowSetForegroundWindow(parent); Console.Out.WriteLine("ready"); Console.Out.Flush(); };
+            Application.Run(form);
+        }
+        return 0;
+    }
+    public static int Main(string[] args) {
+        if (args.Length == 2 && args[0] == "--peer") { Screen.Dpi(); return PeerWindow(int.Parse(args[1])); }
         string dir = Path.Combine(Path.GetTempPath(), "support-mcp-native-test-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
         try {
             Assert(Ui.Clock(TimeSpan.FromSeconds(0)) == "00:00:00" && Ui.Clock(TimeSpan.FromSeconds(3661)) == "01:01:01" && Ui.Clock(TimeSpan.FromHours(100)) == "100:00:00", "The session clock must format as hh:mm:ss");
@@ -544,6 +1039,7 @@ public static class AppTests {
             } finally { RestartResume.Disarm(resume); }
             Console.WriteLine("PASS reconnect path/deadline constraints and one-time startup registration/removal");
             ScreenPureTests(dir);
+            FullControlTests(dir);
             ClientRuleTests(dir);
             LaneTests();
             LiveScreenTests();
