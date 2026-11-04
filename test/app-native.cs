@@ -475,8 +475,30 @@ public static class AppTests {
             Thread.Sleep(2500); Assert((int)sas() == 1, "The PowerShell release waits while another process holds the mutex");
             letGo.Set(); releaser.Join(30000); owner.Join();
             Assert(sas() == null && clean() && waited.ElapsedMilliseconds >= 2500, "Then it runs");
+            // Without the mutex nothing touches the record: Acquire and Release report it, PowerShell exits with 1.
+            int wait = SasShare.WaitMs; SasShare.WaitMs = 1000;
+            try {
+                setSas(null);
+                using (var r = root()) Assert(SasShare.Acquire(r, "SupportMcp-aaaaaaaa"), "Acquire reports that it ran");
+                taken.Reset(); letGo.Reset();
+                owner = new Thread(delegate() { other.WaitOne(); taken.Set(); letGo.WaitOne(); other.ReleaseMutex(); }); owner.Start(); taken.WaitOne();
+                using (var r = root()) Assert(!SasShare.Acquire(r, "SupportMcp-bbbbbbbb"), "Acquire without the mutex reports the skip");
+                using (var r = root()) using (var k = r.OpenSubKey(SasShare.HoldersKey)) Assert(k.GetValue("SupportMcp-bbbbbbbb") == null, "and adds no holder");
+                using (var r = root()) Assert(!SasShare.Release(r, "SupportMcp-aaaaaaaa"), "Release without the mutex reports the skip");
+                Assert((int)sas() == 1, "and puts nothing back");
+                var ps = Process.Start(new ProcessStartInfo("powershell.exe", "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"" + SasShare.ReleaseScript(@"HKCU:\" + testKey, "SupportMcp-aaaaaaaa") + "\"") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true });
+                string err = ps.StandardError.ReadToEnd(); ps.WaitForExit();
+                Assert(ps.ExitCode == 1 && err.Trim() == "", "The PowerShell release without the mutex exits with 1: " + ps.ExitCode + " " + err);
+                using (var r = root()) using (var k = r.OpenSubKey(SasShare.HoldersKey)) Assert((int)sas() == 1 && k.GetValue("SupportMcp-aaaaaaaa") != null && (string)k.GetValue("original") == "absent", "and keeps the entry and the original value for a later release");
+                letGo.Set(); owner.Join();
+                using (var r = root()) Assert(SasShare.Release(r, "SupportMcp-aaaaaaaa"), "A later release runs");
+                Assert(sas() == null && clean(), "and puts the original back");
+            } finally { SasShare.WaitMs = wait; letGo.Set(); }
+            // send_sas checks the value first, since Windows drops SendSAS without an error when it refuses it.
+            foreach (object v in new object[] { null, 0, 2 }) { setSas(v); using (var r = root()) Assert(!SasShare.Allowed(r), "Services may not send SAS with " + (v ?? "no value")); }
+            foreach (object v in new object[] { 1, 3 }) { setSas(v); using (var r = root()) Assert(SasShare.Allowed(r), "Services may send SAS with " + v); }
         } finally { Microsoft.Win32.Registry.CurrentUser.DeleteSubKeyTree(testKey, false); }
-        Console.WriteLine("PASS SoftwareSASGeneration: shared by sessions, put back by the last one, an administrator's change kept, the same in PowerShell");
+        Console.WriteLine("PASS SoftwareSASGeneration: shared by sessions, put back by the last one, an administrator's change kept, the same in PowerShell, never changed without the mutex");
 
         // The backstop never runs agent.exe, releases the registry share, and deletes itself last.
         string f = @"C:\Program Files\SupportMCP-abcd1234";
@@ -485,13 +507,13 @@ public static class AppTests {
         Assert(actions[0][1] == "/c " + sys32 + "sc.exe stop \"SupportMcp-abcd1234\" & " + sys32 + "PING.EXE -n 6 127.0.0.1 >nul & " + sys32 + "taskkill.exe /f /fi \"SERVICES eq SupportMcp-abcd1234\" & " + sys32 + "sc.exe delete \"SupportMcp-abcd1234\"", "First the service, every tool by its full path: " + actions[0][1]);
         Assert(sys32.IndexOf(' ') < 0, "System32 has no space, so the cmd lines need no quotes around tools");
         Assert(actions[1][1].Contains(SasShare.ReleaseScript("HKLM:", "SupportMcp-abcd1234")) && !actions[1][1].Substring(actions[1][1].IndexOf('"') + 1).TrimEnd('"').Contains("\""), "Then the registry share, with no double quote inside the script");
-        Assert(actions[2][1].StartsWith("/c (for /l %i in (1,1,20) do @(if exist \"" + f + "\"") && actions[2][1].EndsWith(" & " + sys32 + "schtasks.exe /delete /tn \"SupportMcp-abcd1234-0123abcd\" /f") && actions[2][1].Contains(sys32 + "PING.EXE -n 3"), "Then the folder, and the task itself last: " + actions[2][1]);
+        Assert(actions[2][1].StartsWith("/c (for /l %i in (1,1,20) do @(if exist \"" + f + "\"") && actions[2][1].EndsWith(" & (" + sys32 + "reg.exe query \"HKLM\\SOFTWARE\\SupportMCP\\SoftwareSASGeneration\" /v \"SupportMcp-abcd1234\" /reg:64 >nul 2>&1 || " + sys32 + "schtasks.exe /delete /tn \"SupportMcp-abcd1234-0123abcd\" /f)") && actions[2][1].Contains(sys32 + "PING.EXE -n 3"), "Then the folder, and the task itself last, once its registry share is released: " + actions[2][1]);
         foreach (string[] a in actions) {
             Assert(!a[1].Contains("agent.exe") && !a[1].Contains("window.exe"), "The backstop never runs the app");
             Assert(a[1].IndexOf('%') < 0 || (a[1].IndexOf('%') == a[1].IndexOf("%i") && a[1].IndexOf("%i") == a[1].LastIndexOf("%i")), "At most one %i and no other %, so Task Scheduler expands nothing");
         }
         string xml = Backstop.Xml(actions, (long)(new DateTime(2026, 11, 3, 12, 0, 0, DateTimeKind.Utc) - new DateTime(1970, 1, 1)).TotalMilliseconds + 500);
-        Assert(xml.Contains("<StartBoundary>2026-11-03T12:00:01Z</StartBoundary>") && xml.Contains("<UserId>S-1-5-18</UserId>") && xml.Contains("<StartWhenAvailable>true</StartWhenAvailable>") && xml.Contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"), "Task at the deadline in UTC, rounded up, as SYSTEM, and run late if the PC was off");
+        Assert(xml.Contains("<TimeTrigger><Repetition><Interval>PT1H</Interval></Repetition><StartBoundary>2026-11-03T12:00:01Z</StartBoundary>") && xml.Contains("<UserId>S-1-5-18</UserId>") && xml.Contains("<StartWhenAvailable>true</StartWhenAvailable>") && xml.Contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"), "Task at the deadline in UTC, rounded up, as SYSTEM, run late if the PC was off, and again every hour until it deletes itself");
         int at0 = xml.IndexOf("<Arguments>" + System.Security.SecurityElement.Escape(actions[0][1])), at1 = xml.IndexOf(System.Security.SecurityElement.Escape(actions[1][1])), at2 = xml.IndexOf(System.Security.SecurityElement.Escape(actions[2][1]));
         Assert(at0 > 0 && at1 > at0 && at2 > at1 && !xml.Contains(" & ") && xml.Contains("&amp;") && xml.Contains("&quot;"), "Three actions in order, escaped for XML");
         Console.WriteLine("PASS backstop task: the command line, its order and the task XML");

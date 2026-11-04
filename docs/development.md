@@ -137,7 +137,8 @@ administrator: the consent path (UAC prompt, the app's own confirm, or
 unavailable), the folder and file ACLs (a real folder, read back with `icacls`),
 the exclusive creation of the folder and the parent it goes in, the deadline
 state on disk and its expiry rules, the shared `SoftwareSASGeneration` record (in
-C# and in the backstop's PowerShell), the staging copy and the held exe of the
+C# and in the backstop's PowerShell, and that neither changes it without the
+mutex), the staging copy and the held exe of the
 elevated installer, the refusal of junctions and hard links by SYSTEM file
 operations, identification-only pipe clients, the 5-second pipe timeout, the
 window's unconfirmed end, the backstop command line and

@@ -322,7 +322,8 @@ Ctrl+Alt+Del in `key`. The relay itself refuses `block_input` and
 full control`, so a normal-mode app never receives them (it would also answer
 `this needs full control`). `type_secret` is forwarded in both modes. Under full
 control the service sends Ctrl+Alt+Del itself and answers `send_sas` with a
-screenshot taken about 1.5 s later; every other screen action runs in the SYSTEM
+screenshot taken about 1.5 s later, or with an error when `SoftwareSASGeneration`
+does not let services send it; every other screen action runs in the SYSTEM
 helper on the console session, so `desktop` may be `secure`.
 
 **`control` frame** (relay to app, lane `screen`):
@@ -662,7 +663,11 @@ full `System32` path: `cmd` (`sc stop`,
 `taskkill` of the service process, `sc delete`), PowerShell (release this
 session's share of `SoftwareSASGeneration` under the `Global\SupportMcp-Sas`
 mutex the app uses too), and `cmd` (a retrying `rd /s /q` of
-the folder, then `schtasks /delete` of itself). It never runs the app. The
+the folder, then `schtasks /delete` of itself once the session has no entry left
+in the record). It never runs the app. Nothing changes the record without the
+mutex: after 30 s an install goes on without the share, and a release changes
+nothing and keeps the session's entry and its task. The task repeats every hour
+until it deletes itself, so a release that was skipped happens later. The
 service's own cleanup does the same in process and leaves the folder and then the
 task to a detached `cmd` that runs after it exits; when `cmd` cannot start,
 `MoveFileEx` deletes the files at the next restart and the task stays. As SYSTEM,

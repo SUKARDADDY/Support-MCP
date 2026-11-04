@@ -85,7 +85,11 @@ apply to only one client say which.
   when Windows would refuse it. Sessions on one PC share it: each records itself
   under `HKLM\SOFTWARE\SupportMCP` (SYSTEM and Administrators only), every change
   of that record holds one machine-wide mutex, and the last session to end puts
-  the old value back, only if the value is still the one written. The own-window
+  the old value back, only if the value is still the one written. Nothing
+  changes the record without the mutex. An install that cannot get it in 30 s
+  goes on without the share, and `send_sas` then answers that Windows refuses
+  it. A release that cannot get it keeps the session's entry and its backstop
+  task, which tries again at the deadline and then every hour. The own-window
   guard of the helper covers the corner window the service started and the app
   that installed it, not every process that talks to the window pipe. UIPI no longer limits input, so support can work
   in windows that run as administrator. Commands keep the Job Object and the
@@ -225,7 +229,7 @@ apply to only one client say which.
   registration, and start a detached `cmd` that deletes the folder once the
   service has exited, then the backstop task, last. If `cmd` cannot start,
   Windows deletes the files at the next restart and the task stays to do the
-  rest. None of this depends on `state.json`. Every install has a task name of its
+  rest. If the release could not get the mutex, the task stays too. None of this depends on `state.json`. Every install has a task name of its
   own, so the late self-delete of an earlier install's task cannot remove a newer
   one, and an install that finds an earlier task with no record runs it and waits
   for it first. Second, the service keeps its deadline on disk as a UTC

@@ -1729,16 +1729,26 @@ namespace SupportMcp {
         const Microsoft.Win32.RegistryValueKind Dword = Microsoft.Win32.RegistryValueKind.DWord;
         // Installs, services and backstop tasks of different sessions change the record at the same time: one machine-wide
         // mutex orders them (only administrators and services may create Global objects). The tests use a Local one.
+        // Nothing touches the record without the mutex. When another process still holds it after WaitMs, the work is
+        // skipped and the caller gets false: a skipped install shares nothing (send_sas then says Windows refuses it), and
+        // a skipped release keeps this session's entry and its backstop task, which releases it at the deadline.
         public static string MutexName = @"Global\SupportMcp-Sas";
-        static void Locked(Action work) {
+        public const string Refused = "Windows does not let this session send Ctrl+Alt+Del (SoftwareSASGeneration); ask the customer to press it";
+        public static int WaitMs = 30000;
+        static bool Locked(Action work) {
             using (var m = new Mutex(false, MutexName)) {
-                bool own = false;
-                try { try { own = m.WaitOne(30000); } catch (AbandonedMutexException) { own = true; } work(); }
-                finally { if (own) m.ReleaseMutex(); }
+                bool own;
+                try { own = m.WaitOne(WaitMs); } catch (AbandonedMutexException) { own = true; }
+                if (!own) return false;
+                try { work(); } finally { m.ReleaseMutex(); }
+                return true;
             }
         }
-        public static void Acquire(Microsoft.Win32.RegistryKey root, string holder) { Locked(delegate { AcquireLocked(root, holder); }); }
-        public static void Release(Microsoft.Win32.RegistryKey root, string holder) { Locked(delegate { ReleaseLocked(root, holder); }); }
+        // False: the mutex was busy and nothing was changed.
+        public static bool Acquire(Microsoft.Win32.RegistryKey root, string holder) { return Locked(delegate { AcquireLocked(root, holder); }); }
+        public static bool Release(Microsoft.Win32.RegistryKey root, string holder) { return Locked(delegate { ReleaseLocked(root, holder); }); }
+        // Whether Windows lets a service send Ctrl+Alt+Del now.
+        public static bool Allowed(Microsoft.Win32.RegistryKey root) { using (var policy = root.OpenSubKey(PolicyKey)) return !Needed(Read(policy, Value)); }
         static void AcquireLocked(Microsoft.Win32.RegistryKey root, string holder) {
             using (var top = root.CreateSubKey(RootKey)) if (root.Name == "HKEY_LOCAL_MACHINE") top.SetAccessControl(FullAcl.Registry());
             using (var policy = root.CreateSubKey(PolicyKey)) using (var holders = root.CreateSubKey(HoldersKey)) {
@@ -1770,15 +1780,17 @@ namespace SupportMcp {
             if (empty) root.DeleteSubKey(RootKey, false);
         }
         // The same release in PowerShell for the backstop task, which must not run the app. psRoot is "HKLM:" there.
+        // Without the mutex it changes nothing and exits with 1; the holder's entry stays, so the task does not delete
+        // itself and runs again an hour later (see Backstop.Xml).
         public static string ReleaseScript(string psRoot, string holder) { return ReleaseScript(psRoot, holder, MutexName); }
         public static string ReleaseScript(string psRoot, string holder, string mutex) {
             string r = psRoot + "\\" + RootKey, k = psRoot + "\\" + HoldersKey, p = psRoot + "\\" + PolicyKey;
-            return "$m = New-Object System.Threading.Mutex($false, '" + mutex + "'); $own = $false; try { try { $own = $m.WaitOne(30000) } catch [System.Threading.AbandonedMutexException] { $own = $true }; " +
-                "$r='" + r + "'; $k='" + k + "'; $p='" + p + "'; if (Test-Path $k) { Remove-ItemProperty -Path $k -Name '" + holder + "' -ErrorAction SilentlyContinue; " +
+            return "$m = New-Object System.Threading.Mutex($false, '" + mutex + "'); $own = $false; try { try { $own = $m.WaitOne(" + WaitMs.ToString(System.Globalization.CultureInfo.InvariantCulture) + ") } catch [System.Threading.AbandonedMutexException] { $own = $true }; " +
+                "if ($own) { $r='" + r + "'; $k='" + k + "'; $p='" + p + "'; if (Test-Path $k) { Remove-ItemProperty -Path $k -Name '" + holder + "' -ErrorAction SilentlyContinue; " +
                 "$v = Get-ItemProperty -Path $k; if (@($v.PSObject.Properties | Where-Object { $_.Name -like 'SupportMcp-*' }).Count -eq 0) { " +
                 "$c = (Get-ItemProperty -Path $p -ErrorAction SilentlyContinue).SoftwareSASGeneration; " +
                 "if ($v.written -ne $null -and $v.original -ne $null -and $c -eq $v.written) { if ($v.original -eq 'absent') { Remove-ItemProperty -Path $p -Name SoftwareSASGeneration } elseif ($v.original -match '^[0-9]+$') { Set-ItemProperty -Path $p -Name SoftwareSASGeneration -Value ([int]$v.original) -Type DWord } }; " +
-                "Remove-Item -Path $k; $g = Get-Item -Path $r; if ($g.SubKeyCount -eq 0 -and $g.ValueCount -eq 0) { Remove-Item -Path $r } } } } finally { if ($own) { $m.ReleaseMutex() }; $m.Close() }";
+                "Remove-Item -Path $k; $g = Get-Item -Path $r; if ($g.SubKeyCount -eq 0 -and $g.ValueCount -eq 0) { Remove-Item -Path $r } } } } } finally { if ($own) { $m.ReleaseMutex() }; $m.Close() }; if (-not $own) { exit 1 }";
         }
     }
 
@@ -1839,13 +1851,18 @@ namespace SupportMcp {
             return "(for /l %i in (1,1,20) do @(if exist \"" + folder + "\" (rd /s /q \"" + folder + "\" 2>nul & if exist \"" + folder + "\" " + System32("PING.EXE") + " -n 3 127.0.0.1 >nul)))";
         }
         public static string DeleteTask(string task) { return System32("schtasks.exe") + " /delete /tn \"" + task + "\" /f"; }
+        // cmd: delete the task only once the session has no entry left in the SoftwareSASGeneration record. An entry
+        // stays when the release could not take the mutex; the task then runs again an hour later (Xml).
+        public static string DeleteTaskWhenReleased(string sid8, string task) {
+            return "(" + System32("reg.exe") + " query \"HKLM\\" + SasShare.HoldersKey + "\" /v \"" + Name(sid8) + "\" /reg:64 >nul 2>&1 || " + DeleteTask(task) + ")";
+        }
         // The actions in order, as command and arguments.
         public static string[][] Actions(string sid8, string folder, string task) {
             string name = Name(sid8), sc = System32("sc.exe");
             return new string[][] {
                 new string[] { System32("cmd.exe"), "/c " + sc + " stop \"" + name + "\" & " + System32("PING.EXE") + " -n 6 127.0.0.1 >nul & " + System32("taskkill.exe") + " /f /fi \"SERVICES eq " + name + "\" & " + sc + " delete \"" + name + "\"" },
                 new string[] { System32(@"WindowsPowerShell\v1.0\powershell.exe"), "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"" + SasShare.ReleaseScript("HKLM:", name) + "\"" },
-                new string[] { System32("cmd.exe"), "/c " + RemoveFolder(folder) + " & " + DeleteTask(task) } };
+                new string[] { System32("cmd.exe"), "/c " + RemoveFolder(folder) + " & " + DeleteTaskWhenReleased(sid8, task) } };
         }
         public static string Xml(string[][] actions, long deadline) {
             // Whole seconds in UTC, rounded up, so the task never fires before the deadline.
@@ -1854,7 +1871,7 @@ namespace SupportMcp {
             foreach (string[] a in actions) exec.Append("<Exec><Command>" + System.Security.SecurityElement.Escape(a[0]) + "</Command><Arguments>" + System.Security.SecurityElement.Escape(a[1]) + "</Arguments></Exec>");
             return "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">" +
                 "<RegistrationInfo><Description>Removes a remote support session at its deadline if it is still installed.</Description></RegistrationInfo>" +
-                "<Triggers><TimeTrigger><StartBoundary>" + at + "</StartBoundary><Enabled>true</Enabled></TimeTrigger></Triggers>" +
+                "<Triggers><TimeTrigger><Repetition><Interval>PT1H</Interval></Repetition><StartBoundary>" + at + "</StartBoundary><Enabled>true</Enabled></TimeTrigger></Triggers>" +
                 "<Principals><Principal id=\"System\"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>" +
                 "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>" +
                 "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT10M</ExecutionTimeLimit><Enabled>true</Enabled></Settings>" +
@@ -1967,6 +1984,7 @@ namespace SupportMcp {
                 File.SetAccessControl(window, FullAcl.Window());
                 state.Save(folder);
                 Backstop.Register(sid8, folder, state); // before the registry share, so the backstop covers it from the start
+                // False when the mutex stayed busy: full control still works, and send_sas says that Windows refuses it.
                 using (var hklm = SasShare.Machine()) SasShare.Acquire(hklm, name);
                 Scm.Create(name, "\"" + Path.Combine(folder, "agent.exe") + "\" --service");
                 Scm.Start(name);
@@ -1980,9 +1998,11 @@ namespace SupportMcp {
         public static void Remove(string sid8) {
             string folder = Folder(sid8);
             Scm.Remove(Backstop.Name(sid8));
-            try { using (var hklm = SasShare.Machine()) SasShare.Release(hklm, Backstop.Name(sid8)); } catch (Exception) { }
+            bool released = false;
+            try { using (var hklm = SasShare.Machine()) released = SasShare.Release(hklm, Backstop.Name(sid8)); } catch (Exception) { }
             try { if (Directory.Exists(folder)) Directory.Delete(folder, true); else if (File.Exists(folder)) File.Delete(folder); } catch (Exception) { }
-            foreach (string task in Backstop.Tasks(sid8)) Backstop.Delete(task);
+            // A share that was not released keeps its backstop task, which releases it at the deadline.
+            if (released) foreach (string task in Backstop.Tasks(sid8)) Backstop.Delete(task);
         }
         // A running exe cannot delete itself: a detached cmd removes the folder after the service has exited, then the
         // backstop task, last. When cmd cannot start, Windows deletes the files at the next restart and the task stays
@@ -2427,7 +2447,10 @@ namespace SupportMcp {
             // The own-window guard covers the corner window this service started and the app that installed it, nothing else.
             var pids = new List<int>(); if (windowPid != 0) pids.Add(windowPid); if (state != null && state.AppPid != 0) pids.Add(state.AppPid);
             if (a != null && Wire.Text(a, "name") == "send_sas") {
-                // SendSAS works from a service only, with SoftwareSASGeneration allowing it (the install sets it).
+                // SendSAS works from a service only, with SoftwareSASGeneration allowing it (the install sets it). Windows
+                // drops it without an error otherwise, so check first: the install may have skipped the share (SasShare.Locked).
+                bool allowed; using (var hklm = SasShare.Machine()) allowed = SasShare.Allowed(hklm);
+                if (!allowed) return Wire.Map("ok", false, "error", SasShare.Refused);
                 string error = Native.SendSas(); if (error != null) return Wire.Map("ok", false, "error", error);
                 stop.WaitOne(1500);
                 bool shot = !a.ContainsKey("screenshot") || Wire.Flag(a, "screenshot");
@@ -2483,9 +2506,11 @@ namespace SupportMcp {
             if (timer != null) timer.Dispose();
             if (ui != null && ui.AnySeenWithin(3000)) Thread.Sleep(1500);
             if (helper != null) helper.Stop();
-            try { using (var hklm = SasShare.Machine()) SasShare.Release(hklm, ServiceName); } catch (Exception) { }
+            bool released = false;
+            try { using (var hklm = SasShare.Machine()) released = SasShare.Release(hklm, ServiceName); } catch (Exception) { }
             Scm.Delete(ServiceName);
-            FullInstall.RemoveLater(state != null ? new List<string> { state.Task } : Backstop.Tasks(sid8), folder);
+            // A share that was not released keeps the backstop task, which releases it at the deadline.
+            FullInstall.RemoveLater(!released ? new List<string>() : state != null ? new List<string> { state.Task } : Backstop.Tasks(sid8), folder);
         }
     }
 
