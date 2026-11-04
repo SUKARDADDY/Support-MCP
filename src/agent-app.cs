@@ -390,13 +390,17 @@ namespace SupportMcp {
     static class FocusReturn {
         // The window to hand the focus back to, or zero for none. Only while the support window still holds the
         // focus (the customer has not clicked elsewhere meanwhile), and never to one of our own windows or one
-        // that is gone or on another desktop.
-        public static IntPtr Target(IntPtr remembered, IntPtr foreground, Func<IntPtr, bool> ours, Func<IntPtr, bool> onThisDesktop) {
+        // that is gone, hidden, minimized, on another desktop or no longer the same window.
+        public static IntPtr Target(IntPtr remembered, IntPtr foreground, Func<IntPtr, bool> ours, Func<IntPtr, bool> usable) {
             if (remembered == IntPtr.Zero || foreground == IntPtr.Zero || ours(remembered) || !ours(foreground)) return IntPtr.Zero;
-            return onThisDesktop(remembered) ? remembered : IntPtr.Zero;
+            return usable(remembered) ? remembered : IntPtr.Zero;
         }
-        // True when the window is a top-level window of this thread's current desktop.
-        public static bool OnThisDesktop(IntPtr window) {
+        // True when the handle is still the same visible, not minimized top-level window of this thread's current desktop:
+        // the same process and thread own it as when it was remembered, so a reused handle is not mistaken for it.
+        public static bool Usable(IntPtr window, uint pid, uint thread) {
+            if (!Win.IsWindowVisible(window) || Win.IsIconic(window)) return false;
+            uint now; uint nowThread = Win.GetWindowThreadProcessId(window, out now);
+            if (now != pid || nowThread != thread) return false;
             bool found = false;
             Win.EnumDesktopWindows(Win.GetThreadDesktop(Win.GetCurrentThreadId()), delegate(IntPtr w, IntPtr data) { if (w == window) { found = true; return false; } return true; }, IntPtr.Zero);
             return found;
@@ -438,6 +442,8 @@ namespace SupportMcp {
         [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] public static extern int GetWindowLong(IntPtr window, int index);
         [DllImport("user32.dll", EntryPoint = "SetWindowLongW")] public static extern int SetWindowLong(IntPtr window, int index, int value);
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
+        [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
+        [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr window);
         [DllImport("user32.dll")] public static extern bool EnumDesktopWindows(IntPtr desktop, WindowProc proc, IntPtr data);
         [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
         [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr SetWindowsHookEx(int id, HookProc proc, IntPtr module, uint thread);
@@ -2654,13 +2660,16 @@ namespace SupportMcp {
     }
 
     // Flat rounded button with a hover color and a keyboard focus ring.
+    // A button in a window that never takes the focus (the corner window) must not be focusable: a click would move the keyboard
+    // focus into the window and activate it. Buttons of a dialog or confirm that is activated on purpose pass focusable: true,
+    // so Tab, Enter and screen readers reach them.
     public sealed class FlatButton : Button {
         readonly Brush rest, hover;
-        public FlatButton(object content, Brush foreground, Brush rest, Brush hover, Brush focusRing, double height, double minWidth, double padding, double radius, double fontSize) {
+        public FlatButton(object content, Brush foreground, Brush rest, Brush hover, Brush focusRing, double height, double minWidth, double padding, double radius, double fontSize, bool focusable = false) {
             this.rest = rest; this.hover = hover;
             Content = content; Foreground = foreground; Background = rest; Height = height; MinWidth = minWidth;
             Padding = new Thickness(padding, 0, padding, 0); FontSize = fontSize; FontWeight = FontWeights.SemiBold;
-            Cursor = Cursors.Hand; Focusable = false; FocusVisualStyle = null; BorderThickness = new Thickness(0);
+            Cursor = Cursors.Hand; Focusable = focusable; FocusVisualStyle = null; BorderThickness = new Thickness(0);
             var border = new FrameworkElementFactory(typeof(Border), "bd");
             border.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(Control.BackgroundProperty));
             border.SetValue(Border.CornerRadiusProperty, new CornerRadius(radius));
@@ -2785,8 +2794,8 @@ namespace SupportMcp {
             ask.Children.Add(askTitle); ask.Children.Add(askText); askBox.Child = ask;
             fullView.Children.Add(askBox);
             askFoot = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(8, 10, 12, 12), Visibility = Visibility.Collapsed };
-            keep = new FlatButton("Keep connected", p.Ink, Brushes.Transparent, p.Surface2, p.Work, 32, 0, 12, 6, 13);
-            sure = new FlatButton("End session", Brushes.White, p.StopSolid, p.StopSolidHover, p.Work, 32, 0, 14, 6, 13); sure.Margin = new Thickness(8, 0, 0, 0);
+            keep = new FlatButton("Keep connected", p.Ink, Brushes.Transparent, p.Surface2, p.Work, 32, 0, 12, 6, 13, true);
+            sure = new FlatButton("End session", Brushes.White, p.StopSolid, p.StopSolidHover, p.Work, 32, 0, 14, 6, 13, true); sure.Margin = new Thickness(8, 0, 0, 0);
             askFoot.Children.Add(keep); askFoot.Children.Add(sure);
             fullView.Children.Add(askFoot);
 
@@ -2802,7 +2811,7 @@ namespace SupportMcp {
             Ui.Drag(this, tuckView, OnDragged);
             stack.Children.Add(tuckView);
 
-            collapse.Click += delegate { tucked = true; confirming = false; Render(); };
+            collapse.Click += delegate { tucked = true; if (confirming) KeepConnected(); else Render(); };
             expand.Click += delegate { tucked = false; Render(); };
             endButton.Click += delegate { AskToEnd(); };
             tuckEnd.Click += delegate { AskToEnd(); };
@@ -2841,9 +2850,10 @@ namespace SupportMcp {
             // APPWINDOW keeps its taskbar button, so the taskbar's Close and Alt+F4 still reach OnClosing and ask "End the session?".
             ShowActivated = false;
             SourceInitialized += delegate { IntPtr h = new WindowInteropHelper(this).Handle; Win.SetWindowLong(h, -20, Win.GetWindowLong(h, -20) | unchecked((int)(Win.NoActivate | Win.AppWindow))); };
-            // FlatButton is not focusable, so a click cannot move the keyboard focus into the window and activate it. The two
-            // buttons of the confirm are the exception: the customer can answer it from the keyboard.
-            keep.Focusable = true; sure.Focusable = true;
+            // The corner window's buttons are not focusable (FlatButton), so a click cannot activate it. The two buttons of the
+            // confirm are, so the customer can answer it from the keyboard. Leaving the window while the confirm is open forgets
+            // the window to go back to: a later Keep must not pull the focus to an older window.
+            Deactivated += delegate { if (confirming) returnTo = IntPtr.Zero; };
             Closing += OnClosing;
             if (Application.Current != null)
                 Application.Current.SessionEnding += delegate(object sender, SessionEndingCancelEventArgs e) { sessionEnding = true; };
@@ -2919,18 +2929,24 @@ namespace SupportMcp {
             Render();
         }
 
-        // The window that had the focus before the confirm took it (never one of ours).
-        IntPtr returnTo;
+        // The window that had the focus before the confirm took it (never one of ours), with its process and thread ids so
+        // KeepConnected can tell that the handle still belongs to the same window.
+        IntPtr returnTo; uint returnPid, returnThread;
         internal void AskToEnd() {
             if (ended) return;
-            if (!confirming) { IntPtr fg = Win.GetForegroundWindow(); returnTo = FocusReturn.Ours(fg) ? IntPtr.Zero : fg; }
+            if (!confirming) {
+                IntPtr fg = Win.GetForegroundWindow();
+                returnTo = FocusReturn.Ours(fg) ? IntPtr.Zero : fg;
+                returnThread = returnTo == IntPtr.Zero ? 0 : Win.GetWindowThreadProcessId(returnTo, out returnPid);
+            }
             tucked = false; confirming = true; Render();
             UpdateLayout(); Activate(); keep.Focus();
         }
-        // Keep connected, or Escape: close the confirm and give the focus back to where it came from.
+        // Keep connected, Escape, or tucking the window: close the confirm and give the focus back to where it came from.
         internal void KeepConnected() {
             confirming = false; Render();
-            IntPtr back = FocusReturn.Target(returnTo, Win.GetForegroundWindow(), FocusReturn.Ours, FocusReturn.OnThisDesktop);
+            uint pid = returnPid, thread = returnThread;
+            IntPtr back = FocusReturn.Target(returnTo, Win.GetForegroundWindow(), FocusReturn.Ours, delegate(IntPtr w) { return FocusReturn.Usable(w, pid, thread); });
             returnTo = IntPtr.Zero;
             if (back != IntPtr.Zero) Win.SetForegroundWindow(back);
         }
@@ -3065,10 +3081,10 @@ namespace SupportMcp {
 
             var foot = new Border { BorderBrush = p.Line, BorderThickness = new Thickness(0, 1, 0, 0), Padding = new Thickness(8, 10, 12, 12) };
             var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
-            var deny = new FlatButton("Don't allow", p.Ink, p.Surface2, p.Line, p.Work, 32, 96, 14, 6, 13);
+            var deny = new FlatButton("Don't allow", p.Ink, p.Surface2, p.Line, p.Work, 32, 96, 14, 6, 13, true);
             var allow = administrator
-                ? new FlatButton("Allow", p.Stop, p.StopBg, p.StopBgHover, p.Work, 32, 80, 14, 6, 13)
-                : new FlatButton("Allow", p.Live, p.LiveSoft, p.LiveSoftHover, p.Work, 32, 80, 14, 6, 13);
+                ? new FlatButton("Allow", p.Stop, p.StopBg, p.StopBgHover, p.Work, 32, 80, 14, 6, 13, true)
+                : new FlatButton("Allow", p.Live, p.LiveSoft, p.LiveSoftHover, p.Work, 32, 80, 14, 6, 13, true);
             allow.Margin = new Thickness(8, 0, 0, 0);
             deny.IsDefault = true;
             buttons.Children.Add(deny); buttons.Children.Add(allow);

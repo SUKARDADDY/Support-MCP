@@ -747,7 +747,7 @@ public static class AppTests {
                 while (!ready && DateTime.UtcNow < end) { lock (lines) ready = lines.Contains("ready"); Thread.Sleep(25); }
                 Assert(ready, "Test setup: the peer window opened");
                 peer.Refresh(); IntPtr peerWindow = peer.MainWindowHandle;
-                bool styled = false, stillPeer = false, active = true, confirmActive = false, restored = false;
+                bool styled = false, stillPeer = false, active = true, confirmActive = false, restored = false, usable = false, wrongIds = true, olderKept = false, tuckBack = false;
                 var t = new Thread(delegate() {
                     Screen.Dpi();
                     Action pump = delegate { for (int i = 0; i < 20; i++) { Application.DoEvents(); System.Windows.Threading.Dispatcher.CurrentDispatcher.Invoke(System.Windows.Threading.DispatcherPriority.Background, new Action(delegate { })); Thread.Sleep(25); } };
@@ -759,16 +759,37 @@ public static class AppTests {
                     int ex = Win.GetWindowLong(handle, -20);
                     styled = (ex & unchecked((int)Win.NoActivate)) != 0 && (ex & unchecked((int)Win.AppWindow)) != 0;
                     stillPeer = Win.GetForegroundWindow() == peerWindow; active = window.IsActive;
+                    uint peerPid; uint peerThread = Win.GetWindowThreadProcessId(peerWindow, out peerPid);
+                    usable = FocusReturn.Usable(peerWindow, peerPid, peerThread);
+                    wrongIds = FocusReturn.Usable(peerWindow, peerPid + 1, peerThread) || FocusReturn.Usable(peerWindow, peerPid, peerThread + 1) || FocusReturn.Usable(IntPtr.Zero, 0, 0);
                     window.AskToEnd(); pump();
                     confirmActive = Win.GetForegroundWindow() == handle;
                     window.KeepConnected(); pump();
                     restored = Win.GetForegroundWindow() == peerWindow;
+                    // The customer leaves the window while the confirm is open and comes back to it (a click on Keep activates it
+                    // again): Keep must not pull the focus to the older window.
+                    Win.SetForegroundWindow(peerWindow); pump();
+                    window.AskToEnd(); pump();
+                    using (var elsewhere = new Form { StartPosition = FormStartPosition.Manual, Location = new System.Drawing.Point(display.X + 60, display.Y + 400), Size = new System.Drawing.Size(200, 150), TopMost = true }) {
+                        elsewhere.Show(); elsewhere.Activate(); pump();
+                        window.Activate(); pump();
+                        window.KeepConnected(); pump();
+                        olderKept = Win.GetForegroundWindow() != peerWindow;
+                    }
+                    // A second confirm and Keep (tucking the window while it is open calls the same method) gives the focus back again.
+                    Win.SetForegroundWindow(peerWindow); pump();
+                    window.AskToEnd(); pump();
+                    window.KeepConnected(); pump();
+                    tuckBack = Win.GetForegroundWindow() == peerWindow;
                     window.CloseQuietly();
                 }); t.SetApartmentState(ApartmentState.STA); t.Start(); t.Join();
                 Assert(styled, "The corner window must have WS_EX_NOACTIVATE and WS_EX_APPWINDOW");
                 Assert(stillPeer && !active, "Showing the corner window must leave the focus where it was");
                 Assert(confirmActive, "Asking to end must give the confirm the focus");
                 Assert(restored, "Keep connected must give the focus back to the window that had it");
+                Assert(usable && !wrongIds, "A remembered window is usable only with the same process and thread ids");
+                Assert(olderKept, "Keep must not pull the focus to an older window after the customer left the support window");
+                Assert(tuckBack, "Closing the confirm gives the focus back again");
             } finally { try { peer.Kill(); } catch (Exception) { } peer.Dispose(); }
         }
         Console.WriteLine("PASS the corner window does not take the focus, keeps its taskbar button, and Keep connected gives the focus back");

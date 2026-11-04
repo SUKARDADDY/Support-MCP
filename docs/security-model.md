@@ -130,8 +130,12 @@ apply to only one client say which.
   session?". Only asking to end activates it, so the customer can answer. When
   the customer answers Keep connected (or presses Escape), the window gives the
   focus back to the window that had it before, as long as it still exists and
-  the support window still holds the focus. The app does not move the focus for
-  support. The customer pause covers input only: screenshots, UI reads
+  the support window still holds the focus and the customer has not left it while
+  the confirm was open. It checks that the window is still the same visible,
+  not minimized window (same process and thread). Tucking the window while the
+  confirm is open does the same. The dialogs (consent, the limited-support
+  question, the full-control confirm) and the two confirm buttons take keyboard
+  focus, so Tab and Enter work. The app does not move the focus for support. The customer pause covers input only: screenshots, UI reads
   (`ui_tree`) and commands are not paused.
   Typing, key sequences and drags also stop at once when the session ends or the
   customer starts using the PC, and a drag releases the mouse button first.
