@@ -123,7 +123,25 @@ public static class AppTests {
         try { action(); } catch (ArgumentException e) { Assert(e.Message.Contains(part), "Wrong message: " + e.Message); return; }
         throw new Exception("Expected an error containing: " + part);
     }
+    static WindowFacts Win32(int handle) { return new WindowFacts { Handle = (IntPtr)handle, Visible = true, Class = "Notepad", Width = 800, Height = 600 }; }
+    static void FocusPickTests() {
+        var ok = Win32(10);
+        Assert(FocusPick.Usable(ok), "A visible, normal window can take the focus");
+        var own = ok; own.Own = true; var hidden = ok; hidden.Visible = false; var iconic = ok; iconic.Iconic = true; var cloaked = ok; cloaked.Cloaked = true;
+        var tool = ok; tool.ExStyle = 0x80; var toolApp = ok; toolApp.ExStyle = 0x80 | 0x40000; var noActivate = ok; noActivate.ExStyle = 0x08000000;
+        var tiny = ok; tiny.Width = 1; var desktop = ok; desktop.Class = "Progman"; var worker = ok; worker.Class = "WorkerW"; var tray = ok; tray.Class = "Shell_TrayWnd"; var none = ok; none.Handle = IntPtr.Zero;
+        foreach (var w in new WindowFacts[] { own, hidden, iconic, cloaked, tool, noActivate, tiny, desktop, worker, tray, none }) Assert(!FocusPick.Usable(w), "Not a window to type into: " + w.Class + " " + w.ExStyle);
+        Assert(FocusPick.Usable(toolApp), "A tool window that asks for a taskbar button is still a window");
+        // The remembered window wins while it is usable, else the first usable one in z-order, never ours.
+        var order = new List<WindowFacts> { own, tray, Win32(20), Win32(30) };
+        Assert(FocusPick.Choose(Win32(99), order) == (IntPtr)99, "The window that had the focus before is the first choice");
+        Assert(FocusPick.Choose(iconic, order) == (IntPtr)20, "A minimized remembered window is skipped for the next one in z-order");
+        Assert(FocusPick.Choose(new WindowFacts(), order) == (IntPtr)20, "With nothing remembered the first usable window in z-order takes the focus");
+        Assert(FocusPick.Choose(new WindowFacts(), new List<WindowFacts> { own, tray, desktop }) == IntPtr.Zero, "With no usable window there is no choice");
+        Console.WriteLine("PASS focus hand-off picks the remembered window, else the first usable one in z-order, and never ours");
+    }
     static void ScreenPureTests(string dir) {
+        FocusPickTests();
         int w, h;
         foreach (int[] c in new int[][] { new int[] { 1920, 1080, 1280, 720 }, new int[] { 2560, 1600, 1280, 800 }, new int[] { 3840, 2160, 1280, 720 }, new int[] { 1280, 1024, 1000, 800 },
             new int[] { 1024, 768, 1024, 768 }, new int[] { 800, 600, 800, 600 }, new int[] { 1366, 768, 1280, 720 }, new int[] { 1, 1, 1, 1 } }) {
@@ -704,7 +722,7 @@ public static class AppTests {
         }
         // Own-window guard: a window of this process at the target refuses the click and the keystrokes.
         using (var screen = new Screen()) {
-            screen.Start();
+            screen.Start(); screen.PickFocus = delegate { return IntPtr.Zero; }; // no other window to take the focus
             Dictionary<string, object> click = null, key = null, tree = null; var stop = new ManualResetEvent(false);
             var t = new Thread(delegate() {
                 Screen.Dpi();
@@ -717,10 +735,69 @@ public static class AppTests {
                 }
             }); t.SetApartmentState(ApartmentState.STA); t.Start(); t.Join();
             Assert(!Wire.Flag(click, "ok") && Wire.Text(click, "error").Contains("support window"), "A click on this process's window must be refused: " + Wire.Text(click, "error"));
-            Assert(!Wire.Flag(key, "ok") && Wire.Text(key, "error").Contains("support window"), "Keystrokes while this process has the focus must be refused: " + Wire.Text(key, "error") + " foreground " + ForegroundInfo());
+            Assert(!Wire.Flag(key, "ok") && Wire.Text(key, "error").Contains("support window has the keyboard focus"), "Keystrokes while this process has the focus and no other window can take it must be refused: " + Wire.Text(key, "error") + " foreground " + ForegroundInfo());
             Assert(!Wire.Flag(tree, "ok") && Wire.Text(tree, "error").Contains("support window"), "ui_tree must not read this process's window: " + Wire.Text(tree, "error"));
         }
         Console.WriteLine("PASS live screen: capture, zoom, exact cursor mapping, pause and own-window guards");
+        // Focus hand-off: while this process's window has the focus, typing and keys go to the window of another process
+        // (a peer started from this exe), and the support window never receives them. The peer is the chosen target, so the
+        // choice of window stays in FocusPickTests.
+        using (var screen = new Screen()) {
+            screen.Start();
+            var info = new ProcessStartInfo(System.Reflection.Assembly.GetExecutingAssembly().Location, "--peer") { UseShellExecute = false, RedirectStandardOutput = true, CreateNoWindow = true };
+            var lines = new List<string>(); Process peer = Process.Start(info);
+            peer.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e) { if (e.Data != null) lock (lines) lines.Add(e.Data); };
+            peer.BeginOutputReadLine();
+            Func<string, int, bool> seen = delegate(string line, int ms) {
+                var end = DateTime.UtcNow.AddMilliseconds(ms);
+                while (DateTime.UtcNow < end) { lock (lines) if (lines.Contains(line)) return true; Thread.Sleep(25); }
+                return false;
+            };
+            try {
+                Assert(seen("ready", 15000), "Test setup: the peer window opened");
+                peer.Refresh(); IntPtr peerWindow = peer.MainWindowHandle;
+                Assert(peerWindow != IntPtr.Zero, "Test setup: the peer has a window");
+                Dictionary<string, object> typed = null, pressed = null; bool foregroundWasOurs = false; IntPtr after = IntPtr.Zero; var stop = new ManualResetEvent(false);
+                var t = new Thread(delegate() {
+                    Screen.Dpi();
+                    using (var form = new Form { StartPosition = FormStartPosition.Manual, Location = new System.Drawing.Point(display.X + 60, display.Y + 60), Size = new System.Drawing.Size(300, 200), TopMost = true }) {
+                        form.Show(); form.Activate(); for (int i = 0; i < 20; i++) { Application.DoEvents(); Thread.Sleep(25); }
+                        IntPtr fg = Win.GetForegroundWindow(); uint pid; Win.GetWindowThreadProcessId(fg, out pid); foregroundWasOurs = (int)pid == Process.GetCurrentProcess().Id;
+                        screen.PickFocus = delegate { return peerWindow; };
+                        typed = screen.Run(Act("type", "text", "x", "screenshot", false), stop);
+                        form.Activate(); for (int i = 0; i < 20; i++) { Application.DoEvents(); Thread.Sleep(25); }
+                        pressed = screen.Run(Act("key", "keys", "b", "screenshot", false), stop);
+                        after = Win.GetForegroundWindow();
+                    }
+                }); t.SetApartmentState(ApartmentState.STA); t.Start(); t.Join();
+                Assert(foregroundWasOurs, "Test setup: this process's window had the focus");
+                Assert(Wire.Flag(typed, "ok") && Wire.Flag(pressed, "ok"), "Typing and keys must move the focus to another window and succeed: " + Wire.Text(typed, "error") + " / " + Wire.Text(pressed, "error"));
+                Assert(seen("text:xb", 5000), "The peer window must receive the typed text and the key, got: " + string.Join("|", lines.ToArray()));
+                Assert(after == peerWindow, "The peer window keeps the focus afterwards");
+            } finally { try { peer.Kill(); } catch (Exception) { } peer.Dispose(); }
+        }
+        // The corner window never takes the focus when it appears: the window that had it keeps it, and the style
+        // that keeps clicks from activating the window is set.
+        {
+            bool styled = false, stillOurs = false, active = true;
+            var t = new Thread(delegate() {
+                Screen.Dpi();
+                using (var other = new Form { StartPosition = FormStartPosition.Manual, Location = new System.Drawing.Point(display.X + 60, display.Y + 60), Size = new System.Drawing.Size(300, 200), TopMost = true }) {
+                    other.Show(); other.Activate(); for (int i = 0; i < 20; i++) { Application.DoEvents(); Thread.Sleep(25); }
+                    var window = new SupportWindow(Palette.Detect(), false, false, null);
+                    window.Show();
+                    for (int i = 0; i < 20; i++) { Application.DoEvents(); System.Windows.Threading.Dispatcher.CurrentDispatcher.Invoke(System.Windows.Threading.DispatcherPriority.Background, new Action(delegate { })); Thread.Sleep(25); }
+                    IntPtr handle = new System.Windows.Interop.WindowInteropHelper(window).Handle;
+                    styled = (Win.GetWindowLong(handle, -20) & unchecked((int)Win.NoActivate)) != 0;
+                    stillOurs = Win.GetForegroundWindow() == other.Handle; active = window.IsActive;
+                    window.CloseQuietly();
+                }
+            }); t.SetApartmentState(ApartmentState.STA); t.Start(); t.Join();
+            Assert(styled, "The corner window must have WS_EX_NOACTIVATE");
+            Assert(stillOurs && !active, "Showing the corner window must leave the focus where it was");
+        }
+        Console.WriteLine("PASS focus hand-off for typing and keys, and the corner window does not take the focus");
+
         // A key the app pressed whose up never arrived (a desktop switch) neither pauses support nor stays down:
         // Unstick sends the up. A key no one released and no input for 10 s is stuck and stops pausing. F23 and F22 are harmless.
         using (var screen = new Screen()) {
@@ -742,7 +819,21 @@ public static class AppTests {
         }
         Console.WriteLine("PASS a key the app left down is released, and a stuck key stops pausing after 10 s");
     }
-    public static int Main() {
+    // A window of another process: the focus hand-off test starts this exe again with --peer. It prints "ready" once
+    // shown and "text:<contents>" each time its text box changes.
+    static int PeerWindow() {
+        Application.EnableVisualStyles();
+        var display = Screen.Monitors()[0];
+        using (var form = new Form { Text = "focus peer", StartPosition = FormStartPosition.Manual, Location = new System.Drawing.Point(display.X + 400, display.Y + 60), Size = new System.Drawing.Size(300, 200), TopMost = true }) {
+            var box = new TextBox { Dock = DockStyle.Fill, Multiline = true }; form.Controls.Add(box);
+            box.TextChanged += delegate { Console.Out.WriteLine("text:" + box.Text); Console.Out.Flush(); };
+            form.Shown += delegate { form.Activate(); box.Focus(); Console.Out.WriteLine("ready"); Console.Out.Flush(); };
+            Application.Run(form);
+        }
+        return 0;
+    }
+    public static int Main(string[] args) {
+        if (args.Length == 1 && args[0] == "--peer") { Screen.Dpi(); return PeerWindow(); }
         string dir = Path.Combine(Path.GetTempPath(), "support-mcp-native-test-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
         try {
             Assert(Ui.Clock(TimeSpan.FromSeconds(0)) == "00:00:00" && Ui.Clock(TimeSpan.FromSeconds(3661)) == "01:01:01" && Ui.Clock(TimeSpan.FromHours(100)) == "100:00:00", "The session clock must format as hh:mm:ss");

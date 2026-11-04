@@ -118,8 +118,19 @@ apply to only one client say which.
   not install, the app first sends one harmless key (F24) to prove that the
   last-input time follows its own input, and refuses all input if it cannot
   prove it. Screenshots, UI reads and commands are not paused. The app refuses
-  to click its own window or type while its own window has the focus, and it
-  checks the focused window again before each key and each typed character.
+  to click its own windows. The corner window never takes the keyboard focus when
+  it appears or changes (it has `WS_EX_NOACTIVATE`), and a click on its buttons
+  does not activate it, except End session, which activates it so the customer
+  can answer "End the session?". When a key, typed text or `ui_tree` arrives
+  while one of the app's windows has the focus, the app first gives the focus to
+  the window that had it before, or else to the next window in z-order that the
+  customer can see and type into, then sends the input. If no other window can
+  take the focus, the input fails with `the support window has the keyboard focus
+  and no other window could take it; click another window first`. Keys and text
+  never reach the app's own windows. The app checks the focused window again
+  before each key and each typed character, and an input stops with `the support
+  window has the keyboard focus` if the customer moves the focus to the support
+  window in the middle of it.
   Typing, key sequences and drags also stop at once when the session ends or the
   customer starts using the PC, and a drag releases the mouse button first.
   While `block_input` holds the customer's input, the pause does not apply.

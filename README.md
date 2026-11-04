@@ -368,13 +368,16 @@ check are in [docs/development.md](docs/development.md).
 - The app is unsigned, and it installs a service. Antivirus may remove or block
   it, which is why the download page says "If your antivirus removes the file,
   tell support." The backstop task does not depend on the app's file.
-- Normal mode works in the customer's own desktop session only. It cannot see
-  or control UAC prompts, the lock screen or the sign-in screen (the result
-  reports `desktop: unknown` and input fails), and it refuses to click or type
-  into a window that runs as administrator. Under full control that limit (UIPI)
-  no longer applies. Both modes refuse input aimed at the app's own windows, and
-  input fails for 3 seconds after the customer last used the mouse or keyboard,
-  except while `block_input` holds it.
+- Normal mode works in the customer's own desktop session only. It cannot see or
+  control UAC prompts, the lock screen or the sign-in screen (the result reports
+  `desktop: unknown` and input fails), and it refuses to click or type into a
+  window that runs as administrator. Under full control that limit (UIPI) no
+  longer applies. Both modes refuse clicks on the app's own windows and never
+  send keys to them: the corner window does not take the keyboard focus when it
+  appears, and when it has the focus anyway (the customer clicked End session)
+  typing, keys and `ui_tree` first move the focus back to the window it came
+  from. Input also fails for 3 seconds after the customer last used the mouse or
+  keyboard, except while `block_input` holds it.
 - Commands run in the 32-bit Windows PowerShell, because the app is x86. On
   64-bit Windows, use `C:\Windows\Sysnative\...` to reach 64-bit tools such
   as `logoff.exe`, and `reg.exe /reg:64` for the 64-bit registry view.

@@ -130,7 +130,7 @@ session, so they are not part of `node --test`; CI runs them in the `windows-app
 job. Besides the client, they cover the pure parts of screen control: coordinate
 scaling, key parsing, the customer pause (hooks and the `GetLastInputInfo`
 cross-check), the cap on `ui_tree` text and on the display count, the choice
-of display for `ui_tree`, the stop and pause checks of typing, the replacement of
+of display for `ui_tree`, the stop and pause checks of typing, the focus hand-off (the choice of the window that takes the focus, and a real hand-off from this process's window to a window of a peer process the test starts from its own exe) and the corner window's `WS_EX_NOACTIVATE`, the replacement of
 a result the relay refuses, `as` in normal mode and the screen consent of a
 prepared reconnect. For full control they cover the parts that need no
 administrator: the consent path (UAC prompt, the app's own confirm, or
@@ -159,7 +159,7 @@ Windows 11 PC or VM with UAC on, against `wrangler dev` (see below; raise
 `http://127.0.0.1` as its relay, so in a VM forward the port with `netsh interface
 portproxy add v4tov4 listenaddress=127.0.0.1 listenport=8787
 connectaddress=<host> connectport=8787`. Then check, with screenshots through the
-relay: UAC Yes gives `control: full`; a UAC prompt in the user's session shows
+relay: UAC Yes gives `control: full`; with Notepad focused before the app starts, `type_text` right after the attach goes to Notepad, and it still does after the customer clicks End session (which gives the corner window the focus); a `click` on the corner window is refused; a UAC prompt in the user's session shows
 `desktop: secure` and can be clicked; the lock screen can be unlocked with
 `type_secret`; after a restart the session comes back within its deadline and the
 sign-in screen is reachable; `block_input` blocks the physical keyboard and
