@@ -347,12 +347,25 @@ namespace SupportMcp {
 
     public static class UiLines {
         // [12] Button "OK" (640,412): the ref, the control type, the name and the center in screenshot pixels.
-        public static string Line(int n, string type, string name, int x, int y) {
+        // The verbs ui_act can use on an element, from the UI Automation patterns it supports: invoke (InvokePattern), set_value
+        // (ValuePattern, not read-only), toggle, expand and collapse (ExpandCollapsePattern), select (SelectionItemPattern), and focus
+        // when the element can take the keyboard focus. Empty when none.
+        public static string Verbs(bool invoke, bool value, bool readOnly, bool toggle, bool expand, bool select, bool focus) {
+            var list = new List<string>();
+            if (invoke) list.Add("invoke");
+            if (value && !readOnly) list.Add("set_value");
+            if (toggle) list.Add("toggle");
+            if (expand) { list.Add("expand"); list.Add("collapse"); }
+            if (select) list.Add("select");
+            if (focus) list.Add("focus");
+            return string.Join(",", list.ToArray());
+        }
+        public static string Line(int n, string type, string name, int x, int y, string verbs = "") {
             if (type.StartsWith("ControlType.")) type = type.Substring(12);
             var clean = new StringBuilder();
             foreach (char c in name) clean.Append(char.IsControl(c) ? ' ' : c == '"' ? '\'' : c);
             string text = clean.ToString().Trim(); if (text.Length > 80) text = text.Substring(0, 77) + "...";
-            return "[" + n + "] " + type + (text.Length > 0 ? " \"" + text + "\"" : "") + " (" + x + "," + y + ")";
+            return "[" + n + "] " + type + (text.Length > 0 ? " \"" + text + "\"" : "") + " (" + x + "," + y + ")" + (verbs.Length > 0 ? " " + verbs : "");
         }
         // The relay takes at most 200,000 characters of result text. Stop at MaxChars and say that more exists.
         public const int MaxChars = 190000;
@@ -878,12 +891,21 @@ namespace SupportMcp {
         }
 
         // UI Automation of the foreground window. Refs are numbers in the lines and live until the next ui_tree.
+        // The verbs of an element, read from the cache the walk already asked for (one round trip per element, not one per pattern).
+        static string VerbsOf(AutomationElement e) {
+            bool value = Cached(e, AutomationElement.IsValuePatternAvailableProperty), readOnly = false;
+            if (value) { object o = e.GetCachedPropertyValue(ValuePattern.IsReadOnlyProperty); readOnly = !(o is bool) || (bool)o; } // unknown counts as read-only
+            return UiLines.Verbs(Cached(e, AutomationElement.IsInvokePatternAvailableProperty), value, readOnly, Cached(e, AutomationElement.IsTogglePatternAvailableProperty),
+                Cached(e, AutomationElement.IsExpandCollapsePatternAvailableProperty), Cached(e, AutomationElement.IsSelectionItemPatternAvailableProperty), e.Cached.IsKeyboardFocusable);
+        }
+        static bool Cached(AutomationElement e, AutomationProperty p) { object o = e.GetCachedPropertyValue(p); return o is bool && (bool)o; }
         string Tree(View v, int max) {
             IntPtr fg = Win.GetForegroundWindow();
             if (fg == IntPtr.Zero) throw new ScreenError("no window is in the foreground");
             if (Owns(fg)) throw new ScreenError("the foreground window is the support window");
             var cache = new CacheRequest { TreeScope = TreeScope.Element };
-            foreach (var p in new AutomationProperty[] { AutomationElement.NameProperty, AutomationElement.ControlTypeProperty, AutomationElement.BoundingRectangleProperty, AutomationElement.IsOffscreenProperty, AutomationElement.IsKeyboardFocusableProperty }) cache.Add(p);
+            foreach (var p in new AutomationProperty[] { AutomationElement.NameProperty, AutomationElement.ControlTypeProperty, AutomationElement.BoundingRectangleProperty, AutomationElement.IsOffscreenProperty, AutomationElement.IsKeyboardFocusableProperty, AutomationElement.IsInvokePatternAvailableProperty, AutomationElement.IsValuePatternAvailableProperty, AutomationElement.IsTogglePatternAvailableProperty, AutomationElement.IsExpandCollapsePatternAvailableProperty, AutomationElement.IsSelectionItemPatternAvailableProperty }) cache.Add(p);
+            cache.Add(ValuePattern.IsReadOnlyProperty);
             var list = new List<AutomationElement>(); var lines = new List<string>(); var clock = Stopwatch.StartNew(); int visited = 0; bool more = false;
             using (cache.Activate()) {
                 var walker = TreeWalker.ControlViewWalker; Action<AutomationElement, int> walk = null;
@@ -895,7 +917,7 @@ namespace SupportMcp {
                         if (!r.IsEmpty && (c.Name.Length > 0 || c.IsKeyboardFocusable)) {
                             int cx = (int)(r.X + r.Width / 2) - v.Phys.X, cy = (int)(r.Y + r.Height / 2) - v.Phys.Y;
                             if (cx >= 0 && cy >= 0 && cx < v.Phys.Width && cy < v.Phys.Height) {
-                                list.Add(e); lines.Add(UiLines.Line(list.Count, c.ControlType.ProgrammaticName, c.Name, ScreenMath.ToImage(cx, v.W, v.Phys.Width), ScreenMath.ToImage(cy, v.H, v.Phys.Height)));
+                                list.Add(e); lines.Add(UiLines.Line(list.Count, c.ControlType.ProgrammaticName, c.Name, ScreenMath.ToImage(cx, v.W, v.Phys.Width), ScreenMath.ToImage(cy, v.H, v.Phys.Height), VerbsOf(e)));
                             }
                         }
                         if (depth < 40) for (var child = walker.GetFirstChild(e, cache); child != null; child = walker.GetNextSibling(child, cache)) walk(child, depth + 1);

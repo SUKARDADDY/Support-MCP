@@ -26,6 +26,19 @@ test('ui=0 hides ui_tree and ui_act and keeps everything else', () => {
   assert.deepEqual(names({ ui: false }), [...BASE, ...SPLIT, ...EXTRAS].sort());
 });
 
+test('with ui=0 no description mentions ui_tree or ui_act, and the screenshot text still says to use zoom and Ctrl+F', () => {
+  const tools = listTools({ ui: false });
+  for (const t of tools) {
+    assert.doesNotMatch(t.description, /ui_tree|ui_act/, t.name);
+    for (const prop of Object.values(t.inputSchema.properties ?? {})) assert.doesNotMatch(prop.description ?? '', /ui_tree|ui_act/, t.name);
+  }
+  const shot = tools.find((t) => t.name === 'screenshot').description;
+  assert.match(shot, /Work from screenshots\. Use zoom to read small text/);
+  assert.doesNotMatch(shot, /fallback/);
+  // With ui on, the mentions are only fallback guidance: nothing says to prefer the tree.
+  for (const t of listTools({ ui: true })) assert.doesNotMatch(t.description, /[Pp]refer ui_tree|[Cc]heaper and more exact/, t.name);
+});
+
 test('parseToolOptions reads ui and rejects unknown values and the removed shape parameter', () => {
   const q = (s) => new URLSearchParams(s);
   assert.deepEqual(parseToolOptions(q('')), { ui: true });
@@ -62,7 +75,13 @@ test('descriptions carry the safety guidance and mark the aliases deprecated', (
     assert.match(d, /At the sign-in screen, type the password with type_secret if the operator gave you one in this conversation; if not, stop and ask\./);
     assert.doesNotMatch(d, /stop and tell the operator/);
   }
-  assert.match(by.screenshot, /Prefer ui_tree and ui_act/);
+  assert.doesNotMatch(by.screenshot, /Prefer ui_tree/);
+  assert.match(by.screenshot, /Work from screenshots\. Use zoom to read small text, and the app's own search \(Ctrl\+F\) to find text on a long page\./);
+  assert.match(by.screenshot, /ui_tree and ui_act are a fallback: use them only when a screenshot and zoom leave you unsure what a control is or where it is, or when a click did not land where you meant\./);
+  assert.match(by.ui_tree, /A fallback for when a screenshot and zoom are not enough\. It usually costs more than a screenshot, so do not call it by default\. It lists only controls that are on screen\./);
+  assert.doesNotMatch(by.ui_tree, /Cheaper and more exact/);
+  assert.match(by.ui_act, /A control supports only some verbs/);
+  assert.match(by.ui_act, /If a verb is refused, click the control's coordinates from ui_tree instead\./);
   assert.match(by.type_secret, /only with a secret the operator gave you/);
   assert.match(by.type_secret, /not even its length/);
   assert.match(by.block_input, /only when the operator asks/);

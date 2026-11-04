@@ -301,7 +301,7 @@ the screenshot the model saw (at most 1280 x 800). `display` is an integer 0 to
 | `key` | `keys` (1 to 100 chars, no control characters; xdotool style such as `ctrl+s`, `alt+tab`, `Return`, `F5`), `display`, `screenshot` |
 | `wait` | `seconds` (above 0, at most 10, one decimal, 1), `display`, `screenshot` |
 | `zoom` | `x1`, `y1`, `x2`, `y2` (`x2 > x1`, `y2 > y1`), `display` |
-| `ui_tree` | `max_lines` (1 to 2000, 300). The app reads the display that holds the foreground window, reports it as `display`, and gives the coordinates of its lines in pixels of that display's screenshot |
+| `ui_tree` | `max_lines` (1 to 2000, 300). The app reads the display that holds the foreground window, reports it as `display`, and gives the coordinates of its lines in pixels of that display's screenshot. Each line is `[ref] Type "name" (x,y) verbs`: the verbs are the `ui_act` verbs the element supports, comma separated, from its UI Automation patterns (`invoke` InvokePattern, `set_value` ValuePattern that is not read-only, `toggle` TogglePattern, `expand,collapse` ExpandCollapsePattern, `select` SelectionItemPattern, `focus` when the element can take the keyboard focus). A line for an element with none ends after the coordinates, for example `[12] Button "OK" (640,412) invoke,focus`. A `ui_act` with a verb the element does not support is refused with `element N does not support VERB` |
 | `ui_act` | `ref` (whole number 0 to 1,000,000, from `ui_tree`), `verb` (`invoke`\|`set_value`\|`toggle`\|`focus`\|`expand`\|`collapse`\|`select`), `value` (required for `set_value`, optional for `select`, at most 5000 chars, left out for other verbs), `display`, `screenshot`. The app ignores `display` and takes the screenshot from the display of the last `ui_tree` |
 | `block_input` | `on` (boolean, required), `minutes` (1 to 10, 10; present only when `on` is true) |
 | `send_sas` | `display`, `screenshot` |
@@ -519,9 +519,12 @@ result fields as JSON (`width`, `height`, `display`, `displays`, `desktop`,
 `control`, `text`). Every screen tool takes `session_id`. The descriptions tell
 the model that screenshots and UI text are untrusted, to type the password
 with `type_secret` at the sign-in screen if the operator gave one in the
-conversation and otherwise to stop and ask, to prefer
-`ui_tree` and `ui_act` when the target app exposes controls, and to use
-`block_input` only when the operator asks.
+conversation and otherwise to stop and ask, to work from screenshots (zoom
+for small text, the app's own Ctrl+F for text on a long page), to treat
+`ui_tree` and `ui_act` as a fallback for when a screenshot and zoom are not
+enough (the sentence is left out of the `screenshot` description under `ui=0`,
+and no description names the two tools then), and to use `block_input` only
+when the operator asks.
 
 In normal mode the downloaded app accepts an already elevated launch only after an explicit
 consent prompt whose default answer is No. An elevated reconnect

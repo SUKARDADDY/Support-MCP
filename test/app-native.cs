@@ -192,6 +192,16 @@ public static class AppTests {
         Assert(UiLines.Line(3, "ControlType.Pane", "", 10, 20) == "[3] Pane (10,20)", "No name");
         Assert(UiLines.Line(4, "Edit", "say \"hi\"\r\nnow", 1, 2) == "[4] Edit \"say 'hi'  now\" (1,2)", "Quotes and line breaks");
         Assert(UiLines.Line(5, "Text", new string('x', 200), 1, 2).Length == "[5] Text \"".Length + 80 + "\" (1,2)".Length, "Long names are cut at 80 characters");
+        // Each line ends with the verbs ui_act can use, from the patterns the element supports.
+        Assert(UiLines.Line(12, "ControlType.Button", "OK", 640, 412, "invoke,focus") == "[12] Button \"OK\" (640,412) invoke,focus", "A line with verbs");
+        Assert(UiLines.Line(12, "ControlType.Button", "OK", 640, 412, "") == "[12] Button \"OK\" (640,412)", "A line without verbs has no trailing space");
+        Assert(UiLines.Verbs(true, false, false, false, false, false, true) == "invoke,focus", "A button: invoke and focus");
+        Assert(UiLines.Verbs(false, true, false, false, false, false, true) == "set_value,focus", "A writable edit: set_value and focus");
+        Assert(UiLines.Verbs(false, true, true, false, false, false, true) == "focus", "A read-only value is not set_value");
+        Assert(UiLines.Verbs(false, false, false, true, false, false, false) == "toggle", "A check box that cannot take the focus: toggle only");
+        Assert(UiLines.Verbs(false, false, false, false, true, false, true) == "expand,collapse,focus", "A tree node or combo box: expand, collapse and focus");
+        Assert(UiLines.Verbs(true, true, false, true, true, true, true) == "invoke,set_value,toggle,expand,collapse,select,focus", "Every verb, in a fixed order");
+        Assert(UiLines.Verbs(false, false, false, false, false, false, false) == "", "No pattern and no focus: no verbs");
         Console.WriteLine("PASS ui_tree line formatting");
         // ui_tree text stays under the relay's 200,000 character limit and says when it was cut.
         var many = new List<string>(); for (int i = 1; i <= 3000; i++) many.Add(UiLines.Line(i, "ControlType.Text", new string('n', 80), 1000, 700));
