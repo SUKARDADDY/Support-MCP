@@ -493,29 +493,33 @@ text content item, not JSON-RPC errors.
 | `get_file` | `session_id`, `path`, `offset?`, `length?` | data_b64, size, eof |
 | `session_end` | `session_id` | `{ended:true}`; sends `end` to agent first |
 
-The tools above are in every connection. The screen tools are chosen per
-connection by the `/mcp` URL: `?shape=computer` (the default) or
-`?shape=split`, and `?ui=0` to hide `ui_tree` and `ui_act` (`?ui=1` is the
-default). Any other value of either parameter gets 400 `{"error":"unknown ..."}`
-after the Access check. A tool that the connection does not list is
-`unknown tool`.
+The tools above are in every connection, with the screen tools below. `?ui=0`
+hides `ui_tree` and `ui_act` (`?ui=1` is the default); any other value gets 400
+`{"error":"unknown ui value; use 0 or 1"}` after the Access check. The `shape`
+parameter no longer exists: a request that carries it, with any value, gets 400
+`{"error":"the shape parameter was removed; ..."}` rather than a silently
+different tool list. A tool that the connection does not list is `unknown tool`.
+Every tool except `session_create` and `session_list` requires `session_id`. When
+it is missing, empty or not a string, `tools/call` returns a tool error
+`session_id is required; call session_list to find it` and nothing reaches the
+backend. There is no default session.
 
-| Tool | Shape | Maps to |
+| Tool | When listed | Maps to |
 |---|---|---|
-| `computer` | `computer` | one `action` enum: `screenshot`, `left_click`, `right_click`, `middle_click`, `double_click`, `triple_click`, `mouse_move`, `left_click_drag`, `scroll`, `type`, `key`, `wait`, `zoom`. Fields `coordinate` `[x, y]`, `start_coordinate`, `text`, `scroll_direction`, `scroll_amount`, `duration`, `region` `[x1, y1, x2, y2]`, `display`, `screenshot` (the layout of Anthropic's computer-use tool) |
-| `screenshot`, `click`, `move_mouse`, `drag`, `scroll`, `type_text`, `press_key`, `wait`, `zoom` | `split` | `screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `wait`, `zoom`, with the field names of the `screen` frame table |
-| `ui_tree`, `ui_act` | both, hidden by `ui=0` | `ui_tree`, `ui_act` |
-| `block_input`, `send_sas`, `type_secret` | both | `block_input`, `send_sas`, `type_secret`. The first two are refused without full control; `type_secret` works in both modes |
-| `request_full_control` | both | a `control` frame; returns `{control, text?, desktop?}`. A normal-mode app asks the customer through UAC; on success the result comes from the service's `hello` (`full control is on`) |
+| `screenshot`, `click`, `move_mouse`, `drag`, `scroll`, `type_text`, `press_key`, `wait`, `zoom` | always | `screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `wait`, `zoom`, with the field names of the `screen` frame table |
+| `ui_tree`, `ui_act` | unless `ui=0` | `ui_tree`, `ui_act` |
+| `block_input`, `send_sas`, `type_secret` | always | `block_input`, `send_sas`, `type_secret`. The first two are refused without full control; `type_secret` works in both modes |
+| `request_full_control` | always | a `control` frame; returns `{control, text?, desktop?}`. A normal-mode app asks the customer through UAC; on success the result comes from the service's `hello` (`full control is on`) |
 
-Both shapes call one backend: `mcp.js` turns a tool call into the normalized
+`mcp.js` turns a tool call into the normalized
 action and `backend.screen({session_id, action})`, and the Session checks the
 action again. A screen tool returns an image content block (`{type:"image",
 data, mimeType}`) when the result has an image, then a text block with the other
 result fields as JSON (`width`, `height`, `display`, `displays`, `desktop`,
 `control`, `text`). Every screen tool takes `session_id`. The descriptions tell
-the model that screenshots and UI text are untrusted, to stop at the sign-in
-screen unless the operator supplied a secret for `type_secret`, to prefer
+the model that screenshots and UI text are untrusted, to type the password
+with `type_secret` at the sign-in screen if the operator gave one in the
+conversation and otherwise to stop and ask, to prefer
 `ui_tree` and `ui_act` when the target app exposes controls, and to use
 `block_input` only when the operator asks.
 
@@ -681,10 +685,10 @@ window's two requests, and the Client's full-control path with a fake service.
 
 1. `node --test` green; `npx wrangler deploy --dry-run` bundles without error.
 2. Local stack (`wrangler dev`, `.dev.vars` with `DEV_SKIP_ACCESS=1`): MCP
-   `initialize` → `tools/list` returns the 7 base tools plus `computer`,
-   `ui_tree`, `ui_act`, `block_input`, `send_sas`, `type_secret` and
-   `request_full_control` (14), and `?shape=split` swaps `computer` for the
-   nine split tools (curl).
+   `initialize` → `tools/list` returns the 7 base tools plus the nine screen
+   tools, `ui_tree`, `ui_act`, `block_input`, `send_sas`, `type_secret` and
+   `request_full_control` (22), `?ui=0` drops `ui_tree` and `ui_act`, and
+   `?shape=...` is a 400 (curl).
 3. `/mcp` without the JWT on a non-localhost host → 403 (unit test with a fake
    host + a test for bad aud / expired / wrong sig using a locally generated
    RSA key).

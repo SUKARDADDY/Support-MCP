@@ -555,16 +555,19 @@ const mcp = async (f, query, method, params) => {
   return { status: r.status, body: await r.json() };
 };
 
-test('/mcp picks the tool shape from the URL and refuses unknown values', async () => {
+test('/mcp offers only the split tools, honours ui, and refuses shape and unknown values', async () => {
   const f = fixture();
   const names = async (q) => (await mcp(f, q, 'tools/list')).body.result.tools.map((t) => t.name);
-  assert.ok((await names('')).includes('computer'));
-  assert.ok((await names('?shape=computer')).includes('computer'));
-  const split = await names('?shape=split');
-  assert.ok(split.includes('click') && !split.includes('computer'));
+  const all = await names('');
+  assert.ok(all.includes('click') && all.includes('type_text') && all.includes('ui_act') && !all.includes('computer'));
   assert.ok(!(await names('?ui=0')).includes('ui_tree'));
-  assert.ok((await names('?shape=split&ui=1')).includes('ui_act'));
-  for (const q of ['?shape=other', '?shape=', '?ui=2', '?shape=split&ui=yes']) {
+  assert.ok((await names('?ui=1')).includes('ui_act'));
+  for (const q of ['?shape=split', '?shape=computer', '?shape=', '?shape=split&ui=1']) {
+    const r = await mcp(f, q, 'tools/list');
+    assert.equal(r.status, 400, q);
+    assert.match(r.body.error, /shape parameter was removed/);
+  }
+  for (const q of ['?ui=2', '?ui=yes']) {
     const r = await mcp(f, q, 'tools/list');
     assert.equal(r.status, 400, q);
     assert.match(r.body.error, /unknown/);
@@ -573,7 +576,7 @@ test('/mcp picks the tool shape from the URL and refuses unknown values', async 
 
 test('/mcp returns an image block then the metadata for a screenshot, end to end', async () => {
   const f = await attach();
-  const call = mcp(f, '', 'tools/call', { name: 'computer', arguments: { session_id: SID, action: 'screenshot' } });
+  const call = mcp(f, '', 'tools/call', { name: 'screenshot', arguments: { session_id: SID } });
   await until(() => f.session.httpCommands.screen);
   await f.result(await f.poll({ busy_lanes: [] }), shotResult());
   const { body } = await call;
@@ -585,7 +588,7 @@ test('/mcp returns an image block then the metadata for a screenshot, end to end
 
 test('/mcp surfaces relay errors for screen tools as tool errors', async () => {
   const f = await attach({ caps: undefined });
-  const { body } = await mcp(f, '?shape=split', 'tools/call', { name: 'click', arguments: { session_id: SID, x: 1, y: 2 } });
+  const { body } = await mcp(f, '', 'tools/call', { name: 'click', arguments: { session_id: SID, x: 1, y: 2 } });
   assert.equal(body.result.isError, true);
   assert.equal(body.result.content[0].text, 'this support app is too old for screen control');
 });

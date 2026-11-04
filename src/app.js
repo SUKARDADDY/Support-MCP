@@ -127,7 +127,8 @@ function appPage(url, state = 'pending', sid = '', expiredStatus = 410) {
 // ---- MCP backend: each tool talks to the DOs -------------------------------
 function makeBackend(env, origin, devTtlMs, actor) {
   const sessionStub = (sid) => {
-    if (!/^[0-9a-f]{64}$/.test(String(sid || ''))) throw new Error('session_id required (64 hex chars)');
+    if (sid === undefined || sid === null || sid === '') throw new Error('session_id is required; call session_list to find it');
+    if (!/^[0-9a-f]{64}$/.test(String(sid))) throw new Error('session_id must be the 64 hex characters from session_create or session_list');
     return env.SESSION.get(env.SESSION.idFromString(sid));
   };
   async function cmd(sid, body) {
@@ -393,7 +394,7 @@ async function handleMcp(request, env, url, origin, devTtlMs) {
   if (!isJsonContentType(request)) return json({ error: 'unsupported media type' }, 415);
   const actor = await accessCaller(request, env, url);
   if (!actor) return json({ error: 'forbidden' }, 403);
-  // ?shape=computer|split and ?ui=0|1 pick this connection's tools.
+  // ?ui=0|1 picks this connection's tools. The old ?shape parameter is a 400.
   let options;
   try {
     options = parseToolOptions(url.searchParams);

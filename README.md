@@ -51,8 +51,8 @@ AI agent does the diagnosis and the fix while a person watches.
    continue (see [Unsigned app](docs/security-model.md#unsigned-app)). The corner
    window says "Windows will ask for permission to give support full control.",
    and the customer clicks **Yes** in the UAC prompt.
-3. The app connects to the relay. You call `computer` (or the split screen
-   tools), `run`, `put_file` and `get_file`.
+3. The app connects to the relay. You call the screen tools (`screenshot`,
+   `click`, `type_text` and the rest), `run`, `put_file` and `get_file`.
 4. The session ends when you call `session_end`, the customer clicks
    **End session**, or 24 hours pass.
 
@@ -196,19 +196,20 @@ an error.
 | `put_file` | writes base64 data to a path, with append for chunking. As SYSTEM under full control |
 | `get_file` | reads a byte range as base64, with `eof` for chunking. As SYSTEM under full control |
 | `session_end` | tells the client to stop and marks the session ended |
-| `computer` | the screen, mouse and keyboard in one tool: `screenshot`, clicks, `mouse_move`, `left_click_drag`, `scroll`, `type`, `key`, `wait`, `zoom`. A screenshot comes back as an image, then the size, display and desktop (`default`, or `secure` for UAC, the lock and sign-in screens and Ctrl+Alt+Del) as JSON. An input that switched the desktop and left no screenshot still succeeds, with the note "input sent; no screenshot". `key` refuses Win+L, which Windows ignores: lock with `run` as `user` and `rundll32.exe user32.dll,LockWorkStation` |
+| `screenshot`, `click`, `move_mouse`, `drag`, `scroll`, `type_text`, `press_key`, `wait`, `zoom` | the screen, mouse and keyboard, one tool per action. A screenshot comes back as an image, then the size, display and desktop (`default`, or `secure` for UAC, the lock and sign-in screens and Ctrl+Alt+Del) as JSON. Every input takes `screenshot:false` to skip the screenshot that follows it. An input that switched the desktop and left no screenshot still succeeds, with the note "input sent; no screenshot". `press_key` refuses Win+L, which Windows ignores: lock with `run` as `user` and `rundll32.exe user32.dll,LockWorkStation` |
 | `ui_tree`, `ui_act` | read a window's controls and act on one by its ref, through UI Automation |
 | `block_input` | lock the customer's mouse and keyboard for up to 10 minutes; it lifts by itself, and Ctrl+Alt+Del lifts it at once. Full control only |
 | `send_sas` | send Ctrl+Alt+Del. Full control only |
-| `type_secret` | type a secret the operator supplied into the focused field, such as the Windows password on the sign-in screen. It works in normal mode too. It is never logged or returned, and a failure says only `type_secret failed` |
+| `type_secret` | type a secret the operator supplied in the conversation into the focused field, such as the Windows password on the sign-in screen. At that screen the model types the password with this tool if the operator gave it one, and stops and asks if not. It works in normal mode too. It is never logged or returned, and a failure says only `type_secret failed` |
 | `request_full_control` | from normal mode, ask the customer for full control through a UAC prompt. On Yes the session continues under full control |
 
-`computer` copies the action layout of Anthropic's computer-use tool. Add
-`?shape=split` to the MCP URL to get one tool per action (`screenshot`, `click`,
-`move_mouse`, `drag`, `scroll`, `type_text`, `press_key`, `wait`, `zoom`)
-instead, and `?ui=0` to hide `ui_tree` and `ui_act`. An unknown value of either
-is an error. `run`, `put_file` and `get_file` use their own lane, so a long
-command does not block the screen.
+Add `?ui=0` to the MCP URL to hide `ui_tree` and `ui_act`; any other value is a
+400 error. The old `?shape=` parameter is gone: the server offers only the tools
+above, and a request that still sends `shape` gets a 400 error. Every tool except
+`session_create` and `session_list` needs a `session_id`; a call without one
+fails with `session_id is required; call session_list to find it`, and the relay
+never picks a session for you. `run`, `put_file` and `get_file` use their own
+lane, so a long command does not block the screen.
 
 ## Architecture
 
@@ -241,7 +242,7 @@ alarm for expiry. A second Durable Object keeps the list for `session_list`.
 | `src/app.js` | router, Access JWT gate, MCP handler, download page |
 | `src/session.js` | `Session` Durable Object: states, audit log, alarm, tagged sockets, the app's polling transport |
 | `src/registry.js` | `Registry` Durable Object for `session_list` |
-| `src/mcp.js` | JSON-RPC dispatch, the tool schemas for both shapes, and the mapping of each screen tool to one normalized action |
+| `src/mcp.js` | JSON-RPC dispatch, the tool schemas, and the mapping of each screen tool to one normalized action |
 | `src/screen.js` | the screen actions, their audit text, and the strict check of every field an app result may carry |
 | `src/jwt.js` | RS256 verification of the Access JWT with WebCrypto |
 | `src/template.js` | builds the served script and the downloaded executable, validates every value placed in them, and maps the mode aliases |

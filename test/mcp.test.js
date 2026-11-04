@@ -17,53 +17,52 @@ const EXTRAS = ['block_input', 'request_full_control', 'send_sas', 'type_secret'
 const SPLIT = ['click', 'drag', 'move_mouse', 'press_key', 'screenshot', 'scroll', 'type_text', 'wait', 'zoom'];
 const names = (options) => listTools(options).map((t) => t.name).sort();
 
-test('the default shape is computer: the base tools, one computer tool, ui_tree and ui_act, and the extras', () => {
-  assert.deepEqual(names(), [...BASE, 'computer', 'ui_act', 'ui_tree', ...EXTRAS].sort());
+test('the tools are the base tools, one tool per screen action, ui_tree and ui_act, and the extras', () => {
+  assert.deepEqual(names(), [...BASE, ...SPLIT, 'ui_act', 'ui_tree', ...EXTRAS].sort());
+  assert.ok(!names().includes('computer'));
 });
 
-test('shape=split lists one tool per action in place of computer', () => {
-  assert.deepEqual(names({ shape: 'split', ui: true }), [...BASE, ...SPLIT, 'ui_act', 'ui_tree', ...EXTRAS].sort());
+test('ui=0 hides ui_tree and ui_act and keeps everything else', () => {
+  assert.deepEqual(names({ ui: false }), [...BASE, ...SPLIT, ...EXTRAS].sort());
 });
 
-test('ui=0 hides ui_tree and ui_act in both shapes, and keeps everything else', () => {
-  assert.deepEqual(names({ shape: 'computer', ui: false }), [...BASE, 'computer', ...EXTRAS].sort());
-  assert.deepEqual(names({ shape: 'split', ui: false }), [...BASE, ...SPLIT, ...EXTRAS].sort());
-});
-
-test('parseToolOptions reads shape and ui and rejects unknown values', () => {
+test('parseToolOptions reads ui and rejects unknown values and the removed shape parameter', () => {
   const q = (s) => new URLSearchParams(s);
-  assert.deepEqual(parseToolOptions(q('')), { shape: 'computer', ui: true });
-  assert.deepEqual(parseToolOptions(q('shape=split&ui=0')), { shape: 'split', ui: false });
-  assert.deepEqual(parseToolOptions(q('shape=computer&ui=1')), { shape: 'computer', ui: true });
-  for (const bad of ['shape=Computer', 'shape=', 'shape=both', 'ui=2', 'ui=', 'ui=false']) {
+  assert.deepEqual(parseToolOptions(q('')), { ui: true });
+  assert.deepEqual(parseToolOptions(q('ui=0')), { ui: false });
+  assert.deepEqual(parseToolOptions(q('ui=1')), { ui: true });
+  for (const bad of ['ui=2', 'ui=', 'ui=false']) {
     assert.throws(() => parseToolOptions(q(bad)), /unknown/, bad);
+  }
+  for (const bad of ['shape=split', 'shape=computer', 'shape=', 'shape=split&ui=0']) {
+    assert.throws(() => parseToolOptions(q(bad)), /shape parameter was removed/, bad);
   }
 });
 
 test('tools/list follows the connection options', async () => {
   const { status, body } = await handleRpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, backend);
   assert.equal(status, 200);
-  assert.equal(body.result.tools.length, 7 + 1 + 2 + 4);
-  const split = await handleRpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, backend, { shape: 'split', ui: false });
-  assert.equal(split.body.result.tools.length, 7 + 9 + 4);
+  assert.equal(body.result.tools.length, 7 + 9 + 2 + 4);
+  const noUi = await handleRpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, backend, { ui: false });
+  assert.equal(noUi.body.result.tools.length, 7 + 9 + 4);
 });
 
 test('every tool takes a session_id, and the schemas stay JSON', () => {
-  for (const options of [{ shape: 'computer', ui: true }, { shape: 'split', ui: true }]) {
-    for (const t of listTools(options)) {
-      assert.equal(t.inputSchema.type, 'object', t.name);
-      if (!['session_create', 'session_list'].includes(t.name)) assert.ok(t.inputSchema.required.includes('session_id'), t.name);
-    }
+  for (const t of listTools()) {
+    assert.equal(t.inputSchema.type, 'object', t.name);
+    if (!['session_create', 'session_list'].includes(t.name)) assert.ok(t.inputSchema.required?.includes('session_id'), t.name);
   }
   assert.doesNotThrow(() => JSON.stringify(listTools()));
 });
 
 test('descriptions carry the safety guidance and mark the aliases deprecated', () => {
-  const by = Object.fromEntries(listTools({ shape: 'split', ui: true }).map((t) => [t.name, t.description]));
-  const computer = listTools().find((t) => t.name === 'computer').description;
-  for (const d of [computer, by.screenshot, by.type_secret]) assert.match(d, /untrusted/);
-  for (const d of [computer, by.type_secret, by.send_sas]) assert.match(d, /sign-in screen, stop and tell the operator/);
-  assert.match(computer, /Prefer ui_tree and ui_act/);
+  const by = Object.fromEntries(listTools().map((t) => [t.name, t.description]));
+  for (const d of [by.screenshot, by.type_secret]) assert.match(d, /untrusted/);
+  for (const d of [by.screenshot, by.type_secret, by.send_sas]) {
+    assert.match(d, /At the sign-in screen, type the password with type_secret if the operator gave you one in this conversation; if not, stop and ask\./);
+    assert.doesNotMatch(d, /stop and tell the operator/);
+  }
+  assert.match(by.screenshot, /Prefer ui_tree and ui_act/);
   assert.match(by.type_secret, /only with a secret the operator gave you/);
   assert.match(by.type_secret, /not even its length/);
   assert.match(by.block_input, /only when the operator asks/);
@@ -85,7 +84,7 @@ test('descriptions carry the safety guidance and mark the aliases deprecated', (
   assert.match(by.press_key, /LockWorkStation/);
   assert.match(by.click, /input sent; no screenshot/);
   assert.match(by.ui_tree, /reports it as display/);
-  assert.equal('display' in listTools({ shape: 'split', ui: true }).find((t) => t.name === 'ui_act').inputSchema.properties, false);
+  assert.equal('display' in listTools().find((t) => t.name === 'ui_act').inputSchema.properties, false);
   const status = by.session_status;
   for (const word of ['control', 'caps', 'desktop', 'input_blocked_until', 'paused_until', 'client_version']) assert.match(status, new RegExp(word));
 });
@@ -135,7 +134,7 @@ const call = (name, args, b, options) => handleRpc({ jsonrpc: '2.0', id: 1, meth
 
 test('a screen result is an image block followed by the metadata as JSON', async () => {
   const b = screenBackend();
-  const r = await call('computer', { session_id: 's', action: 'screenshot' }, b);
+  const r = await call('screenshot', { session_id: 's' }, b);
   assert.equal(r.body.result.isError, undefined);
   const [image, meta, ...rest] = r.body.result.content;
   assert.equal(rest.length, 0);
@@ -151,28 +150,9 @@ test('a result without an image is only the metadata text', async () => {
   assert.equal(JSON.parse(r.body.result.content[0].text).text, 'Button "OK" [3]');
 });
 
-test('computer actions map to the normalized vocabulary', async () => {
+test('screen tools map to the normalized vocabulary', async () => {
   const b = screenBackend();
-  const act = async (args) => { await call('computer', { session_id: 's', ...args }, b); return b.calls.at(-1).action; };
-  assert.deepEqual(await act({ action: 'left_click', coordinate: [640, 412] }), { name: 'click', x: 640, y: 412, button: 'left', count: 1, display: 0, screenshot: true });
-  assert.deepEqual(await act({ action: 'right_click', coordinate: [1, 2], screenshot: false }), { name: 'click', x: 1, y: 2, button: 'right', count: 1, display: 0, screenshot: false });
-  assert.equal((await act({ action: 'middle_click', coordinate: [1, 2] })).button, 'middle');
-  const dbl = await act({ action: 'double_click', coordinate: [1, 2], display: 1 });
-  assert.deepEqual([dbl.count, dbl.display], [2, 1]);
-  assert.equal((await act({ action: 'triple_click', coordinate: [1, 2] })).count, 3);
-  assert.deepEqual(await act({ action: 'mouse_move', coordinate: [5, 6] }), { name: 'move', x: 5, y: 6, display: 0, screenshot: true });
-  assert.deepEqual(await act({ action: 'left_click_drag', start_coordinate: [1, 2], coordinate: [3, 4] }), { name: 'drag', x1: 1, y1: 2, x2: 3, y2: 4, display: 0, screenshot: true });
-  assert.deepEqual(await act({ action: 'scroll', coordinate: [9, 9], scroll_direction: 'down', scroll_amount: 5 }), { name: 'scroll', x: 9, y: 9, direction: 'down', amount: 5, display: 0, screenshot: true });
-  assert.deepEqual(await act({ action: 'type', text: 'שלום' }), { name: 'type', text: 'שלום', display: 0, screenshot: true });
-  assert.deepEqual(await act({ action: 'key', text: 'ctrl+s' }), { name: 'key', keys: 'ctrl+s', display: 0, screenshot: true });
-  assert.deepEqual(await act({ action: 'wait', duration: 2 }), { name: 'wait', seconds: 2, display: 0, screenshot: true });
-  assert.deepEqual(await act({ action: 'zoom', region: [0, 0, 100, 50] }), { name: 'zoom', x1: 0, y1: 0, x2: 100, y2: 50, display: 0 });
-});
-
-test('split and shared tools map to the same actions', async () => {
-  const b = screenBackend();
-  const opts = { shape: 'split', ui: true };
-  const act = async (name, args) => { await call(name, { session_id: 's', ...args }, b, opts); return b.calls.at(-1).action; };
+  const act = async (name, args) => { await call(name, { session_id: 's', ...args }, b); return b.calls.at(-1).action; };
   assert.deepEqual(await act('click', { x: 1, y: 2, button: 'right', count: 2 }), { name: 'click', x: 1, y: 2, button: 'right', count: 2, display: 0, screenshot: true });
   assert.equal((await act('move_mouse', { x: 1, y: 2 })).name, 'move');
   assert.equal((await act('type_text', { text: 'hi' })).name, 'type');
@@ -184,19 +164,20 @@ test('split and shared tools map to the same actions', async () => {
   assert.deepEqual(await act('block_input', { on: true }), { name: 'block_input', on: true, minutes: 10 });
   assert.equal((await act('send_sas', {})).name, 'send_sas');
   assert.equal((await act('type_secret', { text: 'pw' })).name, 'type_secret');
-  // The shared tools behave the same in the computer shape.
-  await call('send_sas', { session_id: 's' }, b);
-  assert.equal(b.calls.at(-1).action.name, 'send_sas');
+  assert.deepEqual(await act('scroll', { x: 9, y: 9, direction: 'down', amount: 5 }), { name: 'scroll', x: 9, y: 9, direction: 'down', amount: 5, display: 0, screenshot: true });
+  assert.deepEqual(await act('wait', { seconds: 2 }), { name: 'wait', seconds: 2, display: 0, screenshot: true });
+  assert.deepEqual(await act('zoom', { x1: 0, y1: 0, x2: 100, y2: 50 }), { name: 'zoom', x1: 0, y1: 0, x2: 100, y2: 50, display: 0 });
+  assert.deepEqual(await act('type_text', { text: 'שלום' }), { name: 'type', text: 'שלום', display: 0, screenshot: true });
 });
 
 test('a bad screen call is a tool error and never reaches the backend', async () => {
   const b = screenBackend();
   for (const [name, args] of [
-    ['computer', { action: 'left_click' }],
-    ['computer', { action: 'left_click', coordinate: [1] }],
-    ['computer', { action: 'teleport' }],
-    ['computer', { action: 'zoom', region: [1, 2, 3] }],
-    ['computer', { action: 'wait', duration: 11 }],
+    ['click', {}],
+    ['click', { x: 1 }],
+    ['click', { x: 1, y: 2, count: 4 }],
+    ['zoom', { x1: 1, y1: 2, x2: 3 }],
+    ['wait', { seconds: 11 }],
     ['ui_act', { ref: 1, verb: 'explode' }],
     ['block_input', {}],
   ]) {
@@ -206,15 +187,31 @@ test('a bad screen call is a tool error and never reaches the backend', async ()
   assert.equal(b.calls.length, 0);
 });
 
-test('a tool the connection does not list is unknown, even if the other shape has it', async () => {
+test('a tool the connection does not list is unknown', async () => {
   const b = screenBackend();
   const unknown = async (name, options) => (await call(name, { session_id: 's' }, b, options)).body.result;
-  assert.match((await unknown('ui_tree', { shape: 'computer', ui: false })).content[0].text, /unknown tool/);
-  assert.match((await unknown('ui_act', { shape: 'split', ui: false })).content[0].text, /unknown tool/);
-  assert.match((await unknown('click', { shape: 'computer', ui: true })).content[0].text, /unknown tool/);
-  assert.match((await unknown('computer', { shape: 'split', ui: true })).content[0].text, /unknown tool/);
-  assert.match((await unknown('screen', { shape: 'computer', ui: true })).content[0].text, /unknown tool/);
+  assert.match((await unknown('ui_tree', { ui: false })).content[0].text, /unknown tool/);
+  assert.match((await unknown('ui_act', { ui: false })).content[0].text, /unknown tool/);
+  assert.match((await unknown('computer', { ui: true })).content[0].text, /unknown tool/);
+  assert.match((await unknown('screen', { ui: true })).content[0].text, /unknown tool/);
   assert.equal(b.calls.length, 0);
+});
+
+test('a missing session_id is a clear tool error for every tool that needs one, and nothing reaches the backend', async () => {
+  const b = screenBackend();
+  const withId = listTools().filter((t) => t.inputSchema.required?.includes('session_id'));
+  assert.equal(withId.length, listTools().length - 2);
+  for (const t of withId) {
+    for (const args of [{}, { session_id: '' }, { session_id: null }, { session_id: 7 }]) {
+      const r = await call(t.name, args, b);
+      assert.equal(r.body.result.isError, true, `${t.name} ${JSON.stringify(args)}`);
+      assert.equal(r.body.result.content[0].text, 'session_id is required; call session_list to find it');
+    }
+  }
+  assert.equal(b.calls.length, 0);
+  // The tools that need no session still work without one.
+  assert.ok(!(await call('session_list', {}, b)).body.result.isError);
+  assert.ok(!(await call('session_create', {}, b)).body.result.isError);
 });
 
 test('request_full_control is a text result', async () => {
@@ -225,7 +222,7 @@ test('request_full_control is a text result', async () => {
 test('tool error surfaces as isError text, not JSON-RPC error', async () => {
   const bad = { ...backend, run: async () => { throw new Error('agent not attached'); } };
   const r = await handleRpc(
-    { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'run', arguments: {} } },
+    { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'run', arguments: { session_id: 's', command: 'x' } } },
     bad,
   );
   assert.equal(r.body.result.isError, true);
