@@ -361,6 +361,37 @@ public static class AppTests {
         public void Welcomed(long expiresAtMs) { WelcomedAt = expiresAtMs; }
     }
 
+    // One process gets at most 2 connections of the window pipe, idle ones are cut off after 5 s, and an end the service
+    // never confirms finishes as Lost. A connection counts once its server thread takes it, and the threads of clients
+    // that connect together can take them in any order. So each idle client first gets an answer, which proves it is
+    // counted, and the test then waits for the server to cut them off (it counts a client out before it disconnects it).
+    static void PerProcessLimit(string uiSddl) {
+        string sid8b = Guid.NewGuid().ToString("N").Substring(0, 8), name = Backstop.Name(sid8b) + "-ui"; int endedB = 0;
+        new UiServer(name, delegate { return Wire.Map("connected", true, "link", true, "ended", false); }, delegate { Interlocked.Increment(ref endedB); }, delegate(uint session) { return true; }, uiSddl);
+        var idle = new List<System.IO.Pipes.NamedPipeClientStream>(); var asked = new List<Stopwatch>();
+        try {
+            for (int i = 0; i < UiServer.PerProcess; i++) {
+                var c = Pipes.Client(name); idle.Add(c); c.Connect(2000);
+                asked.Add(Stopwatch.StartNew()); Pipes.Write(c, Wire.Map("type", "status"));
+                Assert(Wire.Flag(Pipes.Read(c, 4096, UiServer.ReadMs), "connected"), "An idle client is served first");
+            }
+            Assert(!ServiceLink.Running(sid8b), "A third connection of the same process is refused");
+            for (int i = 0; i < idle.Count; i++) {
+                try { Pipes.Read(idle[i], 4096, UiServer.ReadMs + 30000); throw new Exception("an idle client got a message"); } catch (IOException) { }
+                // Windows may end a wait up to a clock tick early.
+                Assert(asked[i].ElapsedMilliseconds >= UiServer.ReadMs - 100, "An idle client was cut off after " + asked[i].ElapsedMilliseconds + " ms");
+            }
+        } finally { foreach (var c in idle) c.Dispose(); }
+        Assert(ServiceLink.Running(sid8b), "The idle clients were cut off and the process gets through again");
+        // A service that never confirms the end: the window says it cannot reach it, not that the session ended.
+        ServiceLink.EndMs = 2000;
+        try {
+            var stubborn = new ServiceLink(sid8b); int stubbornDone = 0; stubborn.Finished += delegate { stubbornDone++; }; stubborn.Start();
+            Thread.Sleep(800); stubborn.Stop(); stubborn.Flush(10000);
+            Assert(stubbornDone == 1 && stubborn.Lost && endedB >= 3, "The end goes out on the connection the window holds, again and again, and an unconfirmed end finishes as Lost: " + endedB);
+        } finally { ServiceLink.EndMs = 30000; }
+    }
+
     static void FullControlTests(string dir) {
         Assert(ConsentPath.Decide(true, 2, 1, 5) == Consent.Confirm && ConsentPath.Decide(true, 1, 0, -1) == Consent.Confirm, "An elevated app (or UAC off for an administrator) gets no UAC prompt, so it asks itself");
         Assert(ConsentPath.Decide(false, 3, 1, 0) == Consent.Confirm && ConsentPath.Decide(false, 3, -1, 0) == Consent.Confirm, "An administrator who elevates without a prompt is asked by the app");
@@ -593,25 +624,11 @@ public static class AppTests {
         link.Stop(); link.Flush(5000);
         for (int i = 0; i < 100 && finished == 0; i++) Thread.Sleep(50);
         Assert(ended >= 1 && finished == 1 && !link.Lost && !ServiceLink.Running(sid8), "End session reaches the service, and the window sees the session end");
-        // One process gets at most 2 connections, and idle ones are cut off after 5 s.
-        string sid8b = Guid.NewGuid().ToString("N").Substring(0, 8); int endedB = 0;
-        new UiServer(Backstop.Name(sid8b) + "-ui", delegate { return Wire.Map("connected", true, "link", true, "ended", false); }, delegate { endedB++; }, anySession, uiSddl);
-        var idle = new List<System.IO.Pipes.NamedPipeClientStream>();
-        for (int i = 0; i < UiServer.PerProcess; i++) { var c = Pipes.Client(Backstop.Name(sid8b) + "-ui"); c.Connect(2000); idle.Add(c); }
-        Assert(!ServiceLink.Running(sid8b), "A third connection of the same process is refused");
-        Thread.Sleep(UiServer.ReadMs + 1500);
-        Assert(ServiceLink.Running(sid8b), "The idle clients were cut off and the process gets through again");
-        foreach (var c in idle) c.Dispose();
+        PerProcessLimit(uiSddl);
         // Only the active console session is served: a process of another session (a switched user, Remote Desktop) is refused.
         string sid8c = Guid.NewGuid().ToString("N").Substring(0, 8);
         new UiServer(Backstop.Name(sid8c) + "-ui", delegate { return Wire.Map("connected", true, "ended", false); }, delegate { }, delegate(uint session) { return false; }, uiSddl);
         Assert(!ServiceLink.Running(sid8c), "A client from another session is refused");
-        // A service that never confirms the end: the window says it cannot reach it, not that the session ended.
-        ServiceLink.EndMs = 2000;
-        var stubborn = new ServiceLink(sid8b); int stubbornDone = 0; stubborn.Finished += delegate { stubbornDone++; }; stubborn.Start();
-        Thread.Sleep(800); stubborn.Stop(); stubborn.Flush(10000);
-        Assert(stubbornDone == 1 && stubborn.Lost && endedB >= 3, "The end goes out on the connection the window holds, again and again, and an unconfirmed end finishes as Lost: " + endedB);
-        ServiceLink.EndMs = 30000;
         // Pipe clients let the server identify them, never act as them.
         string me8 = Guid.NewGuid().ToString("N").Substring(0, 8); string secret = Path.Combine(dir, "only-me.txt"); File.WriteAllText(secret, "x"); Exception asClient = null;
         using (var server = Native.PipeServer("SupportMcpTest-" + me8, "D:P(A;;GA;;;" + me.Value + ")", 1, true)) {
