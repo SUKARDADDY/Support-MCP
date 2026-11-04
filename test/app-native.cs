@@ -299,8 +299,14 @@ public static class AppTests {
             Assert(caps.Count == 1 && caps.Contains("lanes") && !caps.Contains("screen"), "Hello without screen consent reports only lanes");
             var shot = withoutScreen.Call(Act("screenshot")); Assert(!Wire.Flag(shot, "ok") && Wire.Text(shot, "error").Contains("not approved"), "A screen frame is refused without consent: " + Wire.Text(shot, "error"));
             var run = withoutScreen.Call(Run("[Console]::Write('cmd')", 20)); Assert(Wire.Flag(run, "ok") && Decode(run, "stdout_b64") == "cmd", "Commands still run");
+            // No Screen means no global input hooks and no F24 probe on the customer's PC.
+            var screenField = typeof(Client).GetField("screen", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            Assert(screenField != null && screenField.GetValue(withoutScreen.Agent) == null, "No Screen is created without screen consent");
+            Assert(!withoutScreen.Agent.Paused, "Paused is false without a Screen");
+            var lastPoll = withoutScreen.LastPoll;
+            Assert(lastPoll != null && lastPoll.ContainsKey("desktop") && !lastPoll.ContainsKey("paused_until"), "The poll reports the desktop and no pause without a Screen");
         } finally { withoutScreen.Dispose(); }
-        Console.WriteLine("PASS a reconnect without screen consent has commands and files only");
+        Console.WriteLine("PASS a reconnect without screen consent has commands and files only, and installs no input hooks");
         // Stop flag and pause between the steps of an input; type_secret keeps its errors generic.
         using (var screen = new Screen()) {
             screen.Start();
