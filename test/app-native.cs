@@ -202,6 +202,10 @@ public static class AppTests {
         Assert(UiLines.Verbs(false, false, false, false, true, false, true) == "expand,collapse,focus", "A tree node or combo box: expand, collapse and focus");
         Assert(UiLines.Verbs(true, true, false, true, true, true, true) == "invoke,set_value,toggle,expand,collapse,select,focus", "Every verb, in a fixed order");
         Assert(UiLines.Verbs(false, false, false, false, false, false, false) == "", "No pattern and no focus: no verbs");
+        Assert(UiLines.Verbs(true, true, false, true, true, true, true, false) == "disabled", "A disabled element has no verbs and says so");
+        Assert(UiLines.Line(5, "ControlType.Button", "Find next", 1, 2, UiLines.Verbs(true, false, false, false, false, false, true, false)) == "[5] Button \"Find next\" (1,2) disabled", "A disabled line");
+        Assert(UiLines.Verbs(false, false, false, false, true, false, true, true, true) == "focus", "A leaf node has no expand or collapse");
+        Assert(UiLines.Verbs(true, false, false, false, true, true, true, true, true) == "invoke,select,focus", "A leaf keeps its other verbs");
         Console.WriteLine("PASS ui_tree line formatting");
         // ui_tree text stays under the relay's 200,000 character limit and says when it was cut.
         var many = new List<string>(); for (int i = 1; i <= 3000; i++) many.Add(UiLines.Line(i, "ControlType.Text", new string('n', 80), 1000, 700));

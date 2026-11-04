@@ -348,14 +348,16 @@ namespace SupportMcp {
     public static class UiLines {
         // [12] Button "OK" (640,412): the ref, the control type, the name and the center in screenshot pixels.
         // The verbs ui_act can use on an element, from the UI Automation patterns it supports: invoke (InvokePattern), set_value
-        // (ValuePattern, not read-only), toggle, expand and collapse (ExpandCollapsePattern), select (SelectionItemPattern), and focus
-        // when the element can take the keyboard focus. Empty when none.
-        public static string Verbs(bool invoke, bool value, bool readOnly, bool toggle, bool expand, bool select, bool focus) {
+        // (ValuePattern, not read-only), toggle, expand and collapse (ExpandCollapsePattern, unless the element is a leaf), select
+        // (SelectionItemPattern), and focus when the element can take the keyboard focus. A disabled element has none and is
+        // marked "disabled" instead, because every verb on it would fail. Empty when none.
+        public static string Verbs(bool invoke, bool value, bool readOnly, bool toggle, bool expand, bool select, bool focus, bool enabled = true, bool leaf = false) {
+            if (!enabled) return "disabled";
             var list = new List<string>();
             if (invoke) list.Add("invoke");
             if (value && !readOnly) list.Add("set_value");
             if (toggle) list.Add("toggle");
-            if (expand) { list.Add("expand"); list.Add("collapse"); }
+            if (expand && !leaf) { list.Add("expand"); list.Add("collapse"); }
             if (select) list.Add("select");
             if (focus) list.Add("focus");
             return string.Join(",", list.ToArray());
@@ -895,8 +897,11 @@ namespace SupportMcp {
         static string VerbsOf(AutomationElement e) {
             bool value = Cached(e, AutomationElement.IsValuePatternAvailableProperty), readOnly = false;
             if (value) { object o = e.GetCachedPropertyValue(ValuePattern.IsReadOnlyProperty); readOnly = !(o is bool) || (bool)o; } // unknown counts as read-only
+            bool expand = Cached(e, AutomationElement.IsExpandCollapsePatternAvailableProperty), leaf = false;
+            if (expand) { object o = e.GetCachedPropertyValue(ExpandCollapsePattern.ExpandCollapseStateProperty); leaf = o is ExpandCollapseState && (ExpandCollapseState)o == ExpandCollapseState.LeafNode; }
+            object enabled = e.GetCachedPropertyValue(AutomationElement.IsEnabledProperty); // unknown counts as enabled
             return UiLines.Verbs(Cached(e, AutomationElement.IsInvokePatternAvailableProperty), value, readOnly, Cached(e, AutomationElement.IsTogglePatternAvailableProperty),
-                Cached(e, AutomationElement.IsExpandCollapsePatternAvailableProperty), Cached(e, AutomationElement.IsSelectionItemPatternAvailableProperty), e.Cached.IsKeyboardFocusable);
+                expand, Cached(e, AutomationElement.IsSelectionItemPatternAvailableProperty), e.Cached.IsKeyboardFocusable, !(enabled is bool) || (bool)enabled, leaf);
         }
         static bool Cached(AutomationElement e, AutomationProperty p) { object o = e.GetCachedPropertyValue(p); return o is bool && (bool)o; }
         string Tree(View v, int max) {
@@ -904,8 +909,8 @@ namespace SupportMcp {
             if (fg == IntPtr.Zero) throw new ScreenError("no window is in the foreground");
             if (Owns(fg)) throw new ScreenError("the foreground window is the support window");
             var cache = new CacheRequest { TreeScope = TreeScope.Element };
-            foreach (var p in new AutomationProperty[] { AutomationElement.NameProperty, AutomationElement.ControlTypeProperty, AutomationElement.BoundingRectangleProperty, AutomationElement.IsOffscreenProperty, AutomationElement.IsKeyboardFocusableProperty, AutomationElement.IsInvokePatternAvailableProperty, AutomationElement.IsValuePatternAvailableProperty, AutomationElement.IsTogglePatternAvailableProperty, AutomationElement.IsExpandCollapsePatternAvailableProperty, AutomationElement.IsSelectionItemPatternAvailableProperty }) cache.Add(p);
-            cache.Add(ValuePattern.IsReadOnlyProperty);
+            foreach (var p in new AutomationProperty[] { AutomationElement.NameProperty, AutomationElement.ControlTypeProperty, AutomationElement.BoundingRectangleProperty, AutomationElement.IsOffscreenProperty, AutomationElement.IsKeyboardFocusableProperty, AutomationElement.IsInvokePatternAvailableProperty, AutomationElement.IsValuePatternAvailableProperty, AutomationElement.IsTogglePatternAvailableProperty, AutomationElement.IsExpandCollapsePatternAvailableProperty, AutomationElement.IsSelectionItemPatternAvailableProperty, AutomationElement.IsEnabledProperty }) cache.Add(p);
+            cache.Add(ValuePattern.IsReadOnlyProperty); cache.Add(ExpandCollapsePattern.ExpandCollapseStateProperty);
             var list = new List<AutomationElement>(); var lines = new List<string>(); var clock = Stopwatch.StartNew(); int visited = 0; bool more = false;
             using (cache.Activate()) {
                 var walker = TreeWalker.ControlViewWalker; Action<AutomationElement, int> walk = null;
@@ -921,7 +926,7 @@ namespace SupportMcp {
                             }
                         }
                         if (depth < 40) for (var child = walker.GetFirstChild(e, cache); child != null; child = walker.GetNextSibling(child, cache)) walk(child, depth + 1);
-                    } catch (ElementNotAvailableException) { }
+                    } catch (ElementNotAvailableException) { } catch (InvalidOperationException) { } catch (COMException) { } // one bad element must not end the tree
                 };
                 walk(AutomationElement.FromHandle(fg), 0);
             }
