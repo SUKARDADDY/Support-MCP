@@ -372,11 +372,11 @@ check are in [docs/development.md](docs/development.md).
   control UAC prompts, the lock screen or the sign-in screen (the result reports
   `desktop: unknown` and input fails), and it refuses to click or type into a
   window that runs as administrator. Under full control that limit (UIPI) no
-  longer applies. Both modes refuse clicks on the app's own windows and never
-  send keys to them: the corner window does not take the keyboard focus when it
-  appears, and when it has the focus anyway (the customer clicked End session)
-  typing, keys and `ui_tree` first move the focus back to the window it came
-  from. Input also fails for 3 seconds after the customer last used the mouse or
+  longer applies. Both modes refuse clicks on the app's own windows, and keys,
+  typed text and `ui_tree` while one of them has the keyboard focus. The corner
+  window does not take the focus when it appears; only asking to end activates
+  it, and Keep connected gives the focus back to the window that had it. Input
+  also fails for 3 seconds after the customer last used the mouse or keyboard,
   keyboard, except while `block_input` holds it.
 - Commands run in the 32-bit Windows PowerShell, because the app is x86. On
   64-bit Windows, use `C:\Windows\Sysnative\...` to reach 64-bit tools such

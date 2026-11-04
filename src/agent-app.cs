@@ -385,33 +385,30 @@ namespace SupportMcp {
         }
     }
 
-    // What a window looks like to the focus hand-off: the facts FocusPick.Usable needs, read once per window.
-    struct WindowFacts {
-        public IntPtr Handle; public bool Visible, Iconic, Cloaked, Own; public uint ExStyle; public string Class; public int Width, Height;
-    }
-    // Chooses the window that takes the keyboard focus when the support window has it: the first window in z-order
-    // that the customer can see and type into, never one of ours.
-    static class FocusPick {
-        const uint ToolWindow = 0x80, AppWindow = 0x40000;
-        public static bool Usable(WindowFacts w) {
-            if (w.Handle == IntPtr.Zero || w.Own || !w.Visible || w.Iconic || w.Cloaked || w.Width < 32 || w.Height < 32) return false;
-            if ((w.ExStyle & Win.NoActivate) != 0 || ((w.ExStyle & ToolWindow) != 0 && (w.ExStyle & AppWindow) == 0)) return false;
-            // The desktop and the taskbar are windows too, but nothing is typed into them.
-            string c = w.Class ?? "";
-            return c != "Progman" && c != "WorkerW" && c != "Shell_TrayWnd" && c != "Shell_SecondaryTrayWnd";
+    // After the customer answers "End the session?" with Keep connected, the focus goes back to the window that had it
+    // before the confirm took it, so support is not left with the support window in front.
+    static class FocusReturn {
+        // The window to hand the focus back to, or zero for none. Only while the support window still holds the
+        // focus (the customer has not clicked elsewhere meanwhile), and never to one of our own windows or one
+        // that is gone or on another desktop.
+        public static IntPtr Target(IntPtr remembered, IntPtr foreground, Func<IntPtr, bool> ours, Func<IntPtr, bool> onThisDesktop) {
+            if (remembered == IntPtr.Zero || foreground == IntPtr.Zero || ours(remembered) || !ours(foreground)) return IntPtr.Zero;
+            return onThisDesktop(remembered) ? remembered : IntPtr.Zero;
         }
-        // The remembered window when it is still usable, else the first usable one in z-order (top first).
-        public static IntPtr Choose(WindowFacts remembered, IList<WindowFacts> zOrder) {
-            if (Usable(remembered)) return remembered.Handle;
-            foreach (var w in zOrder) if (Usable(w)) return w.Handle;
-            return IntPtr.Zero;
+        // True when the window is a top-level window of this thread's current desktop.
+        public static bool OnThisDesktop(IntPtr window) {
+            bool found = false;
+            Win.EnumDesktopWindows(Win.GetThreadDesktop(Win.GetCurrentThreadId()), delegate(IntPtr w, IntPtr data) { if (w == window) { found = true; return false; } return true; }, IntPtr.Zero);
+            return found;
         }
+        public static bool Ours(IntPtr window) { uint pid; Win.GetWindowThreadProcessId(window, out pid); return pid == Win.GetCurrentProcessId(); }
     }
 
     sealed class ScreenError : Exception { public ScreenError(string message) : base(message) { } }
 
     static class Win {
-        public const uint NoActivate = 0x08000000;
+        public const uint NoActivate = 0x08000000, AppWindow = 0x00040000;
+        public delegate bool WindowProc(IntPtr window, IntPtr data);
         [StructLayout(LayoutKind.Sequential)] public struct Rc { public int L, T, R, B; }
         [StructLayout(LayoutKind.Sequential)] public struct Msg { public IntPtr Window; public uint Message; public IntPtr W, L; public uint Time; public int X, Y; }
         [StructLayout(LayoutKind.Sequential)] public struct MonitorInfo { public int Size; public Rc Monitor, Work; public uint Flags; }
@@ -438,17 +435,10 @@ namespace SupportMcp {
         [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(Gdi.Point p);
         [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr window, uint flags);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-        public delegate bool WindowProc(IntPtr window, IntPtr data);
-        [DllImport("user32.dll")] public static extern bool EnumWindows(WindowProc proc, IntPtr data);
-        [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
-        [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr window);
         [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] public static extern int GetWindowLong(IntPtr window, int index);
         [DllImport("user32.dll", EntryPoint = "SetWindowLongW")] public static extern int SetWindowLong(IntPtr window, int index, int value);
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr window, StringBuilder name, int max);
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
-        [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr window);
-        [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint from, uint to, bool attach);
-        [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr window, int attribute, out int value, int size);
+        [DllImport("user32.dll")] public static extern bool EnumDesktopWindows(IntPtr desktop, WindowProc proc, IntPtr data);
         [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
         [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr SetWindowsHookEx(int id, HookProc proc, IntPtr module, uint thread);
         [DllImport("user32.dll")] public static extern bool UnhookWindowsHookEx(IntPtr hook);
@@ -678,11 +668,9 @@ namespace SupportMcp {
         // The display of the last ui_tree, or the primary one when displays changed since: the ref may still be good.
         static View GetViewOrPrimary(int i) { return GetView(i >= 0 && i < Monitors().Count ? i : 0); }
         // ui_tree reads the foreground window, so it uses the display that holds the center of that window.
-        // When the support window has the focus, the focus goes back to the window it came from first, as for typing.
-        View ForegroundView() {
+        static View ForegroundView() {
             IntPtr fg = Win.GetForegroundWindow();
             if (fg == IntPtr.Zero) throw new ScreenError("no window is in the foreground");
-            if (Owns(fg)) { IntPtr moved = HandOffFocus(fg); if (moved != IntPtr.Zero) fg = moved; }
             Win.Rc rc; int index = 0;
             if (Win.GetWindowRect(fg, out rc)) index = Math.Max(0, ScreenMath.MonitorAt(Monitors(), (rc.L + rc.R) / 2, (rc.T + rc.B) / 2));
             return GetView(index);
@@ -742,57 +730,13 @@ namespace SupportMcp {
         }
         // Waits ms, or throws when support access ends first.
         static void Wait(WaitHandle stop, int ms) { if (stop.WaitOne(ms)) throw new ScreenError("support access ended"); }
-        // The window that had the keyboard before the support window took it, for the hand-off below.
-        volatile IntPtr lastForeign;
-        // Tests replace this to choose the window that takes the focus; null means the real choice.
-        internal Func<IntPtr> PickFocus = null;
-        static WindowFacts Facts(IntPtr window) {
-            var f = new WindowFacts { Handle = window };
-            if (window == IntPtr.Zero || !Win.IsWindowVisible(window)) return f;
-            f.Visible = true; f.Iconic = Win.IsIconic(window); f.Own = Owns(window); f.ExStyle = unchecked((uint)Win.GetWindowLong(window, -20));
-            int cloaked; f.Cloaked = Win.DwmGetWindowAttribute(window, 14, out cloaked, 4) == 0 && cloaked != 0;
-            var name = new StringBuilder(64); Win.GetClassName(window, name, 64); f.Class = name.ToString();
-            Win.Rc rc; if (Win.GetWindowRect(window, out rc)) { f.Width = rc.R - rc.L; f.Height = rc.B - rc.T; }
-            return f;
-        }
-        IntPtr FocusTarget() {
-            var pick = PickFocus; if (pick != null) return pick();
-            var all = new List<WindowFacts>();
-            Win.EnumWindows(delegate(IntPtr w, IntPtr data) { all.Add(Facts(w)); return true; }, IntPtr.Zero);
-            return FocusPick.Choose(Facts(lastForeign), all);
-        }
-        // The support window has the focus, usually because the customer clicked it or it appeared at the start of the
-        // session. Give the focus back to the window that had it before (or the next usable one in z-order), so the
-        // input does not fail. Returns the window that has the focus now, or zero when no other window could take it.
-        IntPtr HandOffFocus(IntPtr from) {
-            IntPtr target = FocusTarget();
-            if (target == IntPtr.Zero) return IntPtr.Zero;
-            uint pid, theirs = Win.GetWindowThreadProcessId(from, out pid), mine = Win.GetCurrentThreadId();
-            // A process that does not have the foreground may not take it. Sharing the input queue of the foreground thread makes the request count as its own.
-            bool attached = theirs != 0 && theirs != mine && Win.AttachThreadInput(mine, theirs, true);
-            try { Win.SetForegroundWindow(target); Win.BringWindowToTop(target); }
-            finally { if (attached) Win.AttachThreadInput(mine, theirs, false); }
-            for (int i = 0; i < 20; i++) {
-                IntPtr now = Win.GetForegroundWindow();
-                if (now == target) { Thread.Sleep(60); return Win.GetForegroundWindow() == target ? target : IntPtr.Zero; }
-                Thread.Sleep(15);
-            }
-            return IntPtr.Zero;
-        }
-        // Keystrokes go to the foreground window: never to the support window, and not to an elevated window. At the
-        // start of an input (handOff) a focus that sits on the support window is first moved to another window; in the
-        // middle of one the check is repeated for every step, because the focus can change between steps, and a focus
-        // that has moved to the support window then stops the input.
-        void KeyTarget(ref IntPtr seen, bool handOff) {
+        // Keystrokes go to the foreground window: refuse the support window and an elevated window. The check
+        // is repeated for every step of a multi-step input, because the focus can change between steps.
+        static void KeyTarget(ref IntPtr seen) {
             IntPtr fg = Win.GetForegroundWindow();
             if (fg == seen) return;
-            if (fg != IntPtr.Zero && Owns(fg)) {
-                IntPtr moved = handOff ? HandOffFocus(fg) : IntPtr.Zero;
-                if (moved == IntPtr.Zero) throw new ScreenError("the support window has the keyboard focus" + (handOff ? " and no other window could take it" : "") + "; click another window first");
-                fg = moved;
-            }
+            if (fg != IntPtr.Zero && Owns(fg)) throw new ScreenError("the support window has the keyboard focus; click another window first");
             NotElevated(fg);
-            if (fg != IntPtr.Zero) lastForeign = fg;
             seen = fg;
         }
         internal static void Send(params Win.In[] inputs) {
@@ -858,7 +802,7 @@ namespace SupportMcp {
                         // right before the event. A check before the gap would be 20 ms old by the time it is sent.
                         // Thread.Sleep(1), not WaitOne(1): with the timer at 1 ms the sleep takes about 2 ms, but a 1 ms wait on a handle still takes about 15 ms.
                         while (gap.IsRunning && gap.ElapsedMilliseconds < TypeGapMs) { if (!secondHalf) Between(stop); Thread.Sleep(1); }
-                        if (!secondHalf) { Between(stop); KeyTarget(ref seen, false); }
+                        if (!secondHalf) { Between(stop); KeyTarget(ref seen); }
                         if (c == '\n') Tap(0x0D); else if (c == '\t') Tap(0x09);
                         else Send(KeyEvent(0, c, 4), KeyEvent(0, c, 6));
                     } catch (ScreenError e) {
@@ -899,7 +843,7 @@ namespace SupportMcp {
         void Input(string name, Dictionary<string, object> a, View v, WaitHandle stop) {
             Free();
             IntPtr seen = IntPtr.Zero;
-            if (name == "type" || name == "type_secret" || name == "key") KeyTarget(ref seen, true);
+            if (name == "type" || name == "type_secret" || name == "key") KeyTarget(ref seen);
             // type_secret shares the typing code; the name is mapped so the switch stays small (see the note at the top).
             switch (name == "type_secret" ? "type" : name) {
                 case "move": v.Check((int)Wire.Number(a, "x"), (int)Wire.Number(a, "y")); MoveTo(v.PhysX((int)Wire.Number(a, "x")), v.PhysY((int)Wire.Number(a, "y"))); break;
@@ -922,7 +866,7 @@ namespace SupportMcp {
                     TypeText(text, stop, name == "type_secret"); break;
                 }
                 default:
-                    foreach (int[] combo in KeySpec.Parse(Wire.Text(a, "keys"))) { Between(stop); KeyTarget(ref seen, false); Press(combo); Wait(stop, 20); }
+                    foreach (int[] combo in KeySpec.Parse(Wire.Text(a, "keys"))) { Between(stop); KeyTarget(ref seen); Press(combo); Wait(stop, 20); }
                     break;
             }
         }
@@ -2716,7 +2660,7 @@ namespace SupportMcp {
             this.rest = rest; this.hover = hover;
             Content = content; Foreground = foreground; Background = rest; Height = height; MinWidth = minWidth;
             Padding = new Thickness(padding, 0, padding, 0); FontSize = fontSize; FontWeight = FontWeights.SemiBold;
-            Cursor = Cursors.Hand; Focusable = true; FocusVisualStyle = null; BorderThickness = new Thickness(0);
+            Cursor = Cursors.Hand; Focusable = false; FocusVisualStyle = null; BorderThickness = new Thickness(0);
             var border = new FrameworkElementFactory(typeof(Border), "bd");
             border.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(Control.BackgroundProperty));
             border.SetValue(Border.CornerRadiusProperty, new CornerRadius(radius));
@@ -2862,14 +2806,14 @@ namespace SupportMcp {
             expand.Click += delegate { tucked = false; Render(); };
             endButton.Click += delegate { AskToEnd(); };
             tuckEnd.Click += delegate { AskToEnd(); };
-            keep.Click += delegate { confirming = false; Render(); };
+            keep.Click += delegate { KeepConnected(); };
             // Full control: the session is over only when the service confirms it (or the window says it cannot reach it).
             sure.Click += delegate {
                 EndedByCustomer = true;
                 if (link == null || !link.SurvivesSignOut) { if (link != null) link.Stop(); ShowEnded(); return; }
                 ending = true; confirming = false; link.Stop(); Render();
             };
-            PreviewKeyDown += delegate(object sender, KeyEventArgs e) { if (e.Key == Key.Escape && confirming) { confirming = false; Render(); e.Handled = true; } };
+            PreviewKeyDown += delegate(object sender, KeyEventArgs e) { if (e.Key == Key.Escape && confirming) { KeepConnected(); e.Handled = true; } };
 
             tick.Interval = TimeSpan.FromSeconds(1); tick.Tick += delegate { UpdateTimer(); };
             pause.Interval = TimeSpan.FromMilliseconds(250);
@@ -2893,9 +2837,13 @@ namespace SupportMcp {
             Closed += delegate { SystemParameters.StaticPropertyChanged -= workAreaChanged; };
 
             // The window never takes the keyboard focus when it appears or changes, so support can type into the app the customer was
-            // using. Clicks on its buttons still work without activating it. Only AskToEnd activates it, after the customer clicked End.
+            // using. Clicks on its buttons still work without activating it. Only AskToEnd activates it, after the customer asked to end.
+            // APPWINDOW keeps its taskbar button, so the taskbar's Close and Alt+F4 still reach OnClosing and ask "End the session?".
             ShowActivated = false;
-            SourceInitialized += delegate { IntPtr h = new WindowInteropHelper(this).Handle; Win.SetWindowLong(h, -20, Win.GetWindowLong(h, -20) | unchecked((int)Win.NoActivate)); };
+            SourceInitialized += delegate { IntPtr h = new WindowInteropHelper(this).Handle; Win.SetWindowLong(h, -20, Win.GetWindowLong(h, -20) | unchecked((int)(Win.NoActivate | Win.AppWindow))); };
+            // FlatButton is not focusable, so a click cannot move the keyboard focus into the window and activate it. The two
+            // buttons of the confirm are the exception: the customer can answer it from the keyboard.
+            keep.Focusable = true; sure.Focusable = true;
             Closing += OnClosing;
             if (Application.Current != null)
                 Application.Current.SessionEnding += delegate(object sender, SessionEndingCancelEventArgs e) { sessionEnding = true; };
@@ -2971,10 +2919,20 @@ namespace SupportMcp {
             Render();
         }
 
-        void AskToEnd() {
+        // The window that had the focus before the confirm took it (never one of ours).
+        IntPtr returnTo;
+        internal void AskToEnd() {
             if (ended) return;
+            if (!confirming) { IntPtr fg = Win.GetForegroundWindow(); returnTo = FocusReturn.Ours(fg) ? IntPtr.Zero : fg; }
             tucked = false; confirming = true; Render();
             UpdateLayout(); Activate(); keep.Focus();
+        }
+        // Keep connected, or Escape: close the confirm and give the focus back to where it came from.
+        internal void KeepConnected() {
+            confirming = false; Render();
+            IntPtr back = FocusReturn.Target(returnTo, Win.GetForegroundWindow(), FocusReturn.Ours, FocusReturn.OnThisDesktop);
+            returnTo = IntPtr.Zero;
+            if (back != IntPtr.Zero) Win.SetForegroundWindow(back);
         }
         void ShowEnded() {
             if (ended) return;
