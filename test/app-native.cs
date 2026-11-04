@@ -716,7 +716,24 @@ public static class AppTests {
             relay.WaitExit(); Thread.Sleep(300);
             Assert(!relay.HasResult(id) && !relay.End, "A handed-over client sends no result and no end");
         }
-        Console.WriteLine("PASS request_full_control: the full cap, a declined request, and the silent handover");
+        // The cooldown: a decline at the first start blocks an immediate request as much as a later decline; a failure does not.
+        {
+            int asks = 0; Func<Dictionary<string, object>> ask = delegate { asks++; return Wire.Map("ok", false, "error", "asked"); };
+            long t = PauseClock.Now();
+            var gate = new FullRequestGate(); gate.Record(Elevation.Declined, t);
+            Assert(Wire.Text(gate.Request(ask, t + 1), "error") == FullRequestGate.Cooling && asks == 0, "A decline at the first start: an immediate request gets the cooldown error and no prompt");
+            Assert(Wire.Text(gate.Request(ask, t + FullRequestGate.CooldownMs - 1), "error") == FullRequestGate.Cooling && asks == 0, "Still within the minute");
+            Assert(Wire.Text(gate.Request(ask, t + FullRequestGate.CooldownMs), "error") == "asked" && asks == 1, "After a minute it prompts again");
+            gate = new FullRequestGate(); gate.Record(Elevation.Failed, t); gate.Record(Elevation.Installed, t);
+            Assert(Wire.Text(gate.Request(ask, t + 1), "error") == "asked" && asks == 2, "A failure is not a decline: it prompts at once");
+            gate = new FullRequestGate(); var inside = new ManualResetEvent(false); var leave = new ManualResetEvent(false); Dictionary<string, object> second = null;
+            var first = new Thread(delegate() { gate.Request(delegate { inside.Set(); leave.WaitOne(); return null; }, t); }); first.Start(); inside.WaitOne();
+            second = gate.Request(ask, t); leave.Set(); first.Join();
+            Assert(Wire.Text(second, "error") == FullRequestGate.Waiting && asks == 2, "One prompt at a time");
+            gate.Record(Elevation.Declined, t + 5);
+            Assert(Wire.Text(gate.Request(ask, t + 6), "error") == FullRequestGate.Cooling && asks == 2, "A later decline starts the cooldown too");
+        }
+        Console.WriteLine("PASS request_full_control: the full cap, a declined request, the silent handover, the cooldown after any decline");
     }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder text, int max);
     static string ForegroundInfo() { IntPtr fg = Win.GetForegroundWindow(); uint pid; Win.GetWindowThreadProcessId(fg, out pid); var t = new StringBuilder(200); GetWindowText(fg, t, 200); string name = ""; try { name = Process.GetProcessById((int)pid).ProcessName; } catch (Exception) { } return fg + " pid " + pid + " " + name + " \"" + t + "\" (this process " + Process.GetCurrentProcess().Id + ")"; }

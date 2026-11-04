@@ -2514,12 +2514,28 @@ namespace SupportMcp {
         }
     }
 
+    // request_full_control's two limits: one prompt at a time, and none within a minute of a declined one, so the operator
+    // cannot nag the customer. A decline is UAC No or Don't allow, at the first start or on a request; a failure is not one.
+    public sealed class FullRequestGate {
+        public const long CooldownMs = 60000;
+        public const string Cooling = "the customer declined full control less than a minute ago; ask them first, then try again";
+        public const string Waiting = "a request for full control is already waiting for the customer";
+        long declinedAt = long.MinValue / 2; int requesting;
+        // Every elevation outcome goes through here, so a decline at the first start counts as much as a later one.
+        public void Record(int outcome, long now) { if (outcome == Elevation.Declined) Interlocked.Exchange(ref declinedAt, now); }
+        public Dictionary<string, object> Request(Func<Dictionary<string, object>> ask, long now) {
+            if (now - Interlocked.Read(ref declinedAt) < CooldownMs) return Wire.Map("ok", false, "error", Cooling);
+            if (Interlocked.CompareExchange(ref requesting, 1, 0) != 0) return Wire.Map("ok", false, "error", Waiting);
+            try { return ask(); } finally { Interlocked.Exchange(ref requesting, 0); }
+        }
+    }
+
     // The customer's app from its first start: full control first, the fallback to normal mode, and the handover of a
     // normal-mode session to the service after request_full_control.
     sealed class StartFlow {
         readonly SupportWindow window; readonly Dictionary<string, object> config; readonly string exe, sid8; readonly long connectBy;
         Thread thread, clientThread, ender; Client client; ServiceLink link; Mutex windowMutex;
-        long declinedAt = long.MinValue / 2; int requesting;
+        readonly FullRequestGate gate = new FullRequestGate();
         public StartFlow(SupportWindow window, Dictionary<string, object> config, string exe, long connectBy) {
             this.window = window; this.config = config; this.exe = exe; this.connectBy = connectBy; sid8 = FullInstall.Sid8(config);
         }
@@ -2544,6 +2560,7 @@ namespace SupportMcp {
                 if (ServiceLink.Running(sid8)) { Ui(BecomeWindow); return; }
                 Consent path = ConsentPath.Detect();
                 int outcome = path == Consent.Unavailable ? Elevation.Declined : Elevate(path, connectBy, false);
+                if (path != Consent.Unavailable) gate.Record(outcome, PauseClock.Now()); // no request_full_control when Unavailable
                 if (window.EndedByCustomer) { if (outcome == Elevation.Installed) EndOrWarn(); return; }
                 if (outcome == Elevation.Installed) { Ui(BecomeWindow); return; }
                 // UAC No, a failure, or Don't allow: limited support, if the customer wants it. Don't allow is the default.
@@ -2569,12 +2586,7 @@ namespace SupportMcp {
         }
         // request_full_control, on the client's screen lane. On success the service has said hello, which answers the
         // operator; this client then stops without sending anything and the window shows the service.
-        Dictionary<string, object> RequestFull() {
-            // One prompt at a time, and none within a minute of a declined one: the operator cannot nag the customer.
-            if (PauseClock.Now() - Interlocked.Read(ref declinedAt) < 60000) return Wire.Map("ok", false, "error", "the customer declined full control less than a minute ago; ask them first, then try again");
-            if (Interlocked.CompareExchange(ref requesting, 1, 0) != 0) return Wire.Map("ok", false, "error", "a request for full control is already waiting for the customer");
-            try { return AskFull(); } finally { Interlocked.Exchange(ref requesting, 0); }
-        }
+        Dictionary<string, object> RequestFull() { return gate.Request(AskFull, PauseClock.Now()); }
         Dictionary<string, object> AskFull() {
             Consent path = ConsentPath.Detect();
             if (path == Consent.Unavailable) return Wire.Map("ok", false, "error", "this Windows account cannot get administrator rights, so full control is not possible");
@@ -2586,7 +2598,7 @@ namespace SupportMcp {
                 Ui(delegate { window.Hold(false); });
             }
             if (outcome == Elevation.Installed) return null;
-            if (outcome == Elevation.Declined) Interlocked.Exchange(ref declinedAt, PauseClock.Now());
+            gate.Record(outcome, PauseClock.Now());
             return Wire.Map("ok", false, "error", outcome == Elevation.Declined ? "the customer declined full control" : "full control could not be set up on this PC");
         }
         void BecomeWindow() {
