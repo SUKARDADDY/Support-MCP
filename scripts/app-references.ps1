@@ -4,7 +4,7 @@
 # adding the newer framework installed on this PC, so it cannot bind to a method
 # that 4.5.2 lacks.
 function Get-AppCompilerReferences([string]$ReferenceDir) {
-    $names = 'mscorlib.dll', 'System.dll', 'System.Core.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll', 'System.Web.Extensions.dll', 'PresentationFramework.dll', 'PresentationCore.dll', 'WindowsBase.dll', 'System.Xaml.dll'
+    $names = 'mscorlib.dll', 'System.dll', 'System.Core.dll', 'System.Drawing.dll', 'System.Windows.Forms.dll', 'System.Web.Extensions.dll', 'PresentationFramework.dll', 'PresentationCore.dll', 'WindowsBase.dll', 'System.Xaml.dll', 'UIAutomationClient.dll', 'UIAutomationTypes.dll'
     $flags = @('/noconfig', '/nostdlib+')
     foreach ($name in $names) {
         $file = Join-Path $ReferenceDir $name

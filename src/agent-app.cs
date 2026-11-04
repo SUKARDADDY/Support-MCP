@@ -1,5 +1,10 @@
 // .NET Framework 4 client for Windows 7 and PowerShell 2.0. No installation,
 // elevation request, autostart, WebSocket, or third-party runtime. Build with csc v4.
+// Screen control (capture, input, UI Automation) runs in the user's own process.
+// The compiler names a helper class with a random GUID for a constant primitive
+// array initializer of three or more elements and for a string switch with more than
+// six cases, and that breaks the reproducible build. Use loops, if-else and
+// non-constant arrays instead (docs/development.md).
 // The customer window is WPF (part of .NET Framework 4); WinForms is used only
 // for MessageBox and the DialogResult type of SupportAccess.Confirm.
 using System;
@@ -15,6 +20,7 @@ using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Documents;
 using System.Windows.Input;
@@ -23,6 +29,8 @@ using System.Windows.Media.Animation;
 using System.Windows.Media.Effects;
 using System.Windows.Threading;
 using Microsoft.Win32.SafeHandles;
+using Gdi = System.Drawing;
+using Img = System.Drawing.Imaging;
 using WF = System.Windows.Forms;
 using Shapes = System.Windows.Shapes;
 
@@ -32,15 +40,20 @@ namespace SupportMcp {
             using (var identity = WindowsIdentity.GetCurrent())
                 return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
         }
-        public static string ConsentMessage(bool administrator) {
+        public static string ConsentMessage(bool administrator) { return ConsentMessage(administrator, true); }
+        // screen = false is a reconnect whose earlier approval did not cover screen control: the prompt must say what will happen.
+        public static string ConsentMessage(bool administrator, bool screen) {
+            string what = screen ? "see your screen, control your mouse and keyboard, run commands and read or change files" : "run commands and read or change files";
             string rights = administrator
-                ? "This client is running as Administrator. Allow remote support to run commands and read or change files with administrator rights?\n\nSupport can change system settings and files for all users."
-                : "Allow remote support to run commands and read or change files as your signed-in user?";
+                ? "This client is running as Administrator. Allow remote support to " + what + " with administrator rights?\n\nSupport can change system settings and files for all users."
+                : "Allow remote support to " + what + " as your signed-in user?";
+            if (!screen) rights += "\n\nScreen, mouse and keyboard control stay off for this reconnect.";
             return rights + "\n\nA small window stays in the corner of your screen while support is connected. Access ends when you close it, click End session, or after 24 hours. Nothing reconnects after reboot unless separately prepared.";
         }
-        public static bool Confirm(bool administrator, bool resume, Func<string, WF.DialogResult> prompt) {
+        public static bool Confirm(bool administrator, bool resume, Func<string, WF.DialogResult> prompt) { return Confirm(administrator, resume, true, prompt); }
+        public static bool Confirm(bool administrator, bool resume, bool screen, Func<string, WF.DialogResult> prompt) {
             // A prepared reconnect never grants administrator access silently.
-            return (resume && !administrator) || prompt(ConsentMessage(administrator)) == WF.DialogResult.Yes;
+            return (resume && !administrator) || prompt(ConsentMessage(administrator, screen)) == WF.DialogResult.Yes;
         }
     }
 
@@ -179,16 +192,635 @@ namespace SupportMcp {
         public void Dispose() { Close(ref job); Close(ref process); }
     }
 
+    // Pure helpers. Screenshots fit 1280x800 and are never scaled up. Clients send
+    // coordinates in screenshot pixels; these map them to physical pixels and back.
+    public static class ScreenMath {
+        public const int MaxW = 1280, MaxH = 800;
+        public static void Fit(int w, int h, out int tw, out int th) {
+            double s = Math.Min(1.0, Math.Min((double)MaxW / w, (double)MaxH / h));
+            tw = Math.Max(1, (int)Math.Round(w * s)); th = Math.Max(1, (int)Math.Round(h * s));
+        }
+        // A screenshot pixel to the physical pixel at its center, and a region edge to the nearest physical edge.
+        public static int ToPhysical(int v, int imageLen, int physLen) { return Math.Max(0, Math.Min(physLen - 1, (int)((v + 0.5) * physLen / imageLen))); }
+        public static int EdgeToPhysical(int v, int imageLen, int physLen) { return Math.Max(0, Math.Min(physLen, (int)Math.Round((double)v * physLen / imageLen))); }
+        public static int ToImage(int phys, int imageLen, int physLen) { return Math.Max(0, Math.Min(imageLen - 1, (int)((phys + 0.5) * imageLen / physLen))); }
+        // The relay accepts display numbers 0 to 15, so a result may report at most 16 displays.
+        public const int MaxDisplays = 16;
+        public static void CapDisplays(List<Gdi.Rectangle> list) { if (list.Count > MaxDisplays) list.RemoveRange(MaxDisplays, list.Count - MaxDisplays); }
+        // The display that holds a point, or the nearest one when the point is on none of them. -1 for an empty list.
+        public static int MonitorAt(IList<Gdi.Rectangle> list, int x, int y) {
+            int best = -1; long bestDistance = long.MaxValue;
+            for (int i = 0; i < list.Count; i++) {
+                var r = list[i];
+                long dx = x < r.Left ? r.Left - x : x >= r.Right ? x - r.Right + 1 : 0, dy = y < r.Top ? r.Top - y : y >= r.Bottom ? y - r.Bottom + 1 : 0;
+                long d = dx * dx + dy * dy;
+                if (d < bestDistance) { bestDistance = d; best = i; }
+            }
+            return best;
+        }
+    }
+
+    // GetLastInputInfo covers the customer's input and the app's own. This tells the two apart by the tick of the
+    // app's last injected input, so the pause still works when Windows has dropped a hook. The tick has the
+    // resolution of the system clock (about 15.6 ms), so on its own it can miss a key pressed in the same tick as the
+    // app's last event; Screen also watches the keys and buttons that are held down.
+    public static class InputIdle {
+        // SendInput updates the last-input time before it returns (300 of 300 on Windows 11), so no slack is needed on
+        // that system. A little stays in case an older Windows updates it a moment later; it is far below the 20 ms gap.
+        public const int SlackMs = 10;
+        // Milliseconds since the customer last used the mouse or keyboard, or -1 when the last input was the app's own.
+        public static long CustomerAgoMs(uint lastInputTick, uint nowTick, uint lastInjectedTick, bool injected) {
+            if (injected && unchecked((int)(lastInputTick - lastInjectedTick)) <= SlackMs) return -1;
+            // Unsigned: a PC idle for more than 24.8 days still reads as idle. A time a moment ahead of now (the clock
+            // was read just before the input) reads as "just now".
+            uint ago = unchecked(nowTick - lastInputTick);
+            return ago > uint.MaxValue - 1000 ? 0 : ago;
+        }
+        // Milliseconds left of the pause window for that age, 0 when there is none.
+        public static long RemainingMs(long agoMs) { return agoMs < 0 ? 0 : Math.Max(0, PauseClock.WindowMs - agoMs); }
+    }
+
+    // Customer input wins: agent input is refused for 3 s after the last physical event.
+    public sealed class PauseClock {
+        public const long WindowMs = 3000;
+        long last = long.MinValue / 2;
+        public static long Now() { return Stopwatch.GetTimestamp() * 1000 / Stopwatch.Frequency; }
+        public void Touch(long now) { Interlocked.Exchange(ref last, now); }
+        public bool Paused(long now) { return RemainingMs(now) > 0; }
+        public long RemainingMs(long now) { return Math.Max(0, WindowMs - (now - Interlocked.Read(ref last))); }
+    }
+
+    // xdotool-style key names (ctrl+s, alt+tab, Return, F5, "ctrl+a Delete") to virtual-key codes.
+    public static class KeySpec {
+        static readonly Dictionary<string, int> Names = Build();
+        static Dictionary<string, int> Build() {
+            var d = new Dictionary<string, int>();
+            foreach (string pair in ("ctrl=11 control=11 alt=12 shift=10 super=5B win=5B meta=5B cmd=5B return=0D enter=0D tab=09 escape=1B esc=1B space=20 backspace=08 delete=2E del=2E insert=2D home=24 end=23 " +
+                "page_up=21 prior=21 pageup=21 page_down=22 next=22 pagedown=22 up=26 down=28 left=25 right=27 minus=BD equal=BB comma=BC period=BE slash=BF backslash=DC semicolon=BA apostrophe=DE grave=C0 bracketleft=DB bracketright=DD capslock=14").Split(' '))
+                d[pair.Split('=')[0]] = Convert.ToInt32(pair.Split('=')[1], 16);
+            return d;
+        }
+        public static bool IsModifier(int vk) { return vk == 0x10 || vk == 0x11 || vk == 0x12 || vk == 0x5B; }
+        public static bool IsExtended(int vk) { return (vk >= 0x21 && vk <= 0x28) || vk == 0x2D || vk == 0x2E || vk == 0x5B; }
+        public static List<int[]> Parse(string keys) {
+            var combos = new List<int[]>();
+            foreach (string combo in keys.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries)) {
+                var mods = new List<int>(); var rest = new List<int>();
+                foreach (string raw in combo.Split('+')) {
+                    string t = raw.ToLowerInvariant(); int vk;
+                    if (!Names.TryGetValue(t, out vk)) {
+                        var m = System.Text.RegularExpressions.Regex.Match(t, "^f([1-9]|1[0-9]|2[0-4])$");
+                        if (m.Success) vk = 0x6F + int.Parse(m.Groups[1].Value);
+                        else if (t.Length == 1 && ((t[0] >= 'a' && t[0] <= 'z') || (t[0] >= '0' && t[0] <= '9'))) vk = char.ToUpperInvariant(t[0]);
+                        else throw new ArgumentException("Unknown key \"" + raw + "\".");
+                    }
+                    (IsModifier(vk) ? mods : rest).Add(vk);
+                }
+                mods.AddRange(rest);
+                if (mods.Contains(0x11) && mods.Contains(0x12) && mods.Contains(0x2E)) throw new ArgumentException("Ctrl+Alt+Del cannot be sent as a key; use send_sas.");
+                combos.Add(mods.ToArray());
+            }
+            if (combos.Count == 0) throw new ArgumentException("No keys given.");
+            return combos;
+        }
+    }
+
+    public static class UiLines {
+        // [12] Button "OK" (640,412): the ref, the control type, the name and the center in screenshot pixels.
+        public static string Line(int n, string type, string name, int x, int y) {
+            if (type.StartsWith("ControlType.")) type = type.Substring(12);
+            var clean = new StringBuilder();
+            foreach (char c in name) clean.Append(char.IsControl(c) ? ' ' : c == '"' ? '\'' : c);
+            string text = clean.ToString().Trim(); if (text.Length > 80) text = text.Substring(0, 77) + "...";
+            return "[" + n + "] " + type + (text.Length > 0 ? " \"" + text + "\"" : "") + " (" + x + "," + y + ")";
+        }
+        // The relay takes at most 200,000 characters of result text. Stop at MaxChars and say that more exists.
+        public const int MaxChars = 190000;
+        public const string MoreByCount = "[more elements not shown; raise max_lines]", MoreByChars = "[more elements not shown; the text limit was reached]";
+        public static string Join(IList<string> lines, bool moreByCount, int maxChars, out int kept) {
+            var text = new StringBuilder(); kept = 0; bool cut = false;
+            foreach (string line in lines) {
+                if (text.Length + line.Length + 1 > maxChars - MoreByChars.Length - 1) { cut = true; break; }
+                if (kept > 0) text.Append('\n');
+                text.Append(line); kept++;
+            }
+            if (cut || moreByCount) { if (kept > 0) text.Append('\n'); text.Append(cut ? MoreByChars : MoreByCount); }
+            return text.ToString();
+        }
+    }
+
+    public static class JpegFit {
+        // Steps the quality down until the base64 text is under maxChars.
+        public static byte[] Encode(Gdi.Image image, int maxChars, out int quality) {
+            Img.ImageCodecInfo codec = null;
+            foreach (var c in Img.ImageCodecInfo.GetImageEncoders()) if (c.MimeType == "image/jpeg") codec = c;
+            for (int q = 80; q >= 10; q -= 10) { // a loop, not an array initializer: the compiler would name a helper class with a random GUID and break the reproducible build
+                using (var ms = new MemoryStream()) using (var parameters = new Img.EncoderParameters(1)) {
+                    parameters.Param[0] = new Img.EncoderParameter(Img.Encoder.Quality, (long)q);
+                    image.Save(ms, codec, parameters);
+                    if ((ms.Length + 2) / 3 * 4 < maxChars) { quality = q; return ms.ToArray(); }
+                }
+            }
+            throw new ScreenError("the screenshot is too large to send");
+        }
+    }
+
+    sealed class ScreenError : Exception { public ScreenError(string message) : base(message) { } }
+
+    static class Win {
+        [StructLayout(LayoutKind.Sequential)] public struct Rc { public int L, T, R, B; }
+        [StructLayout(LayoutKind.Sequential)] public struct Msg { public IntPtr Window; public uint Message; public IntPtr W, L; public uint Time; public int X, Y; }
+        [StructLayout(LayoutKind.Sequential)] public struct MonitorInfo { public int Size; public Rc Monitor, Work; public uint Flags; }
+        [StructLayout(LayoutKind.Sequential)] public struct MouseIn { public int Dx, Dy; public uint Data, Flags, Time; public IntPtr Extra; }
+        [StructLayout(LayoutKind.Sequential)] public struct KeyIn { public ushort Vk, Scan; public uint Flags, Time; public IntPtr Extra; }
+        // The INPUT union starts at offset 4 on x86, the only platform this app builds for (28 bytes in all).
+        [StructLayout(LayoutKind.Explicit)] public struct In { [FieldOffset(0)] public uint Type; [FieldOffset(4)] public MouseIn Mouse; [FieldOffset(4)] public KeyIn Key; }
+        public delegate bool MonitorProc(IntPtr monitor, IntPtr dc, ref Rc rect, IntPtr data);
+        public delegate IntPtr HookProc(int code, IntPtr w, IntPtr l);
+        [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+        [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+        [DllImport("user32.dll")] public static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, MonitorProc proc, IntPtr data);
+        [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfo info);
+        [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+        [DllImport("user32.dll", SetLastError = true)] public static extern uint SendInput(uint count, In[] inputs, int size);
+        [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint code, uint type);
+        [StructLayout(LayoutKind.Sequential)] public struct LastInput { public uint Size, Time; }
+        [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LastInput info);
+        [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vk);
+        [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr window, out Rc rect);
+        [DllImport("winmm.dll")] public static extern uint timeBeginPeriod(uint ms);
+        [DllImport("winmm.dll")] public static extern uint timeEndPeriod(uint ms);
+        [DllImport("user32.dll")] public static extern bool GetCursorPos(out Gdi.Point p);
+        [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(Gdi.Point p);
+        [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr window, uint flags);
+        [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
+        [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr SetWindowsHookEx(int id, HookProc proc, IntPtr module, uint thread);
+        [DllImport("user32.dll")] public static extern bool UnhookWindowsHookEx(IntPtr hook);
+        [DllImport("user32.dll")] public static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr w, IntPtr l);
+        [DllImport("user32.dll")] public static extern int GetMessage(out Msg m, IntPtr window, uint min, uint max);
+        [DllImport("user32.dll")] public static extern bool PostThreadMessage(uint thread, uint message, IntPtr w, IntPtr l);
+        [DllImport("user32.dll")] public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
+        [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr desktop);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool GetUserObjectInformation(IntPtr obj, int index, StringBuilder name, int length, out int needed);
+        [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr window);
+        [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr window, IntPtr dc);
+        [DllImport("gdi32.dll")] public static extern bool BitBlt(IntPtr dest, int x, int y, int w, int h, IntPtr source, int sx, int sy, uint op);
+        [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+        [DllImport("kernel32.dll")] public static extern uint GetCurrentProcessId();
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr GetModuleHandle(string name);
+        [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+        [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+        [DllImport("advapi32.dll", SetLastError = true)] public static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+        [DllImport("advapi32.dll")] public static extern bool GetTokenInformation(IntPtr token, int kind, out int value, int length, out int returned);
+    }
+
+    // Physical input detection: low-level hooks on their own message-loop thread. The
+    // injected flag is set on everything SendInput sends, so only the customer's input counts.
+    public sealed class InputWatch : IDisposable {
+        public readonly PauseClock Clock = new PauseClock();
+        public volatile bool Ok;
+        readonly Win.HookProc mouse, keys; // fields, so the delegates are not collected
+        readonly ManualResetEvent ready = new ManualResetEvent(false);
+        Thread thread; uint threadId;
+        public InputWatch() {
+            mouse = delegate(int code, IntPtr w, IntPtr l) { if (code >= 0 && (Marshal.ReadInt32(l, 12) & 3) == 0) Clock.Touch(PauseClock.Now()); return Win.CallNextHookEx(IntPtr.Zero, code, w, l); };
+            keys = delegate(int code, IntPtr w, IntPtr l) { if (code >= 0 && (Marshal.ReadInt32(l, 8) & 0x12) == 0) Clock.Touch(PauseClock.Now()); return Win.CallNextHookEx(IntPtr.Zero, code, w, l); };
+        }
+        public void Start() {
+            thread = new Thread(Loop); thread.IsBackground = true; thread.Start(); ready.WaitOne(5000);
+        }
+        void Loop() {
+            threadId = Win.GetCurrentThreadId();
+            IntPtr module = Win.GetModuleHandle(null), m = Win.SetWindowsHookEx(14, mouse, module, 0), k = Win.SetWindowsHookEx(13, keys, module, 0);
+            Ok = m != IntPtr.Zero && k != IntPtr.Zero; ready.Set();
+            Win.Msg msg; while (Ok && Win.GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) { }
+            if (m != IntPtr.Zero) Win.UnhookWindowsHookEx(m);
+            if (k != IntPtr.Zero) Win.UnhookWindowsHookEx(k);
+        }
+        public void Dispose() {
+            Ok = false; if (thread == null) return;
+            Win.PostThreadMessage(threadId, 0x12, IntPtr.Zero, IntPtr.Zero); thread.Join(3000);
+        }
+    }
+
+    // Capture, input and UI Automation for one screen operation at a time, all in the user's own process.
+    public sealed class Screen : IDisposable {
+        public const string PauseText = "customer is using the PC; try again in a few seconds";
+        public const string NoFull = "full control is not available in this build";
+        // The only error text type_secret ever returns. Nothing about the secret or the target can leak through it.
+        public const string SecretFailed = "type_secret failed";
+        // Least time between two typed characters. Windows 11 Notepad reads the character of a Unicode key event late,
+        // so a character injected before it has read the previous one replaces it (see TypeText). 20 ms is twice the
+        // slowest gap that still went wrong in the measurements, and it holds the relay's 35 ms per character budget.
+        public const int TypeGapMs = 20;
+        internal readonly InputWatch Watch = new InputWatch();
+        volatile List<AutomationElement> refs = new List<AutomationElement>();
+        volatile int treeDisplay; // the display the last ui_tree read; ui_act's screenshot comes from it
+        static int injectedTick; static volatile bool injectedAny; // the app's own last injected input, for GetLastInputInfo
+        public void Start() { Watch.Start(); if (!Watch.Ok) ProveFallback(); }
+        public void Dispose() { Watch.Dispose(); }
+        public bool Paused { get { return PausedForMs > 0; } }
+        // The pause comes from three sources. The low-level hooks see only physical input, but Windows removes a hook
+        // that times out, without telling the app. So there are two that cannot be dropped. GetLastInputInfo also
+        // counts the app's own input, so it is compared with the tick of the app's last injection (Send records it
+        // from the same call), and a later input counts. That tick is only as fine as the system clock, so a key
+        // pressed in the same tick as the app's last event shows only in the third source: a key or mouse button that
+        // is down right now. The app's own key events go down and up inside one SendInput call, so between its calls
+        // nothing of its own is down.
+        public long PausedForMs {
+            get {
+                var info = new Win.LastInput { Size = (uint)Marshal.SizeOf(typeof(Win.LastInput)) };
+                long external = Win.GetLastInputInfo(ref info)
+                    ? InputIdle.RemainingMs(InputIdle.CustomerAgoMs(info.Time, unchecked((uint)Environment.TickCount), unchecked((uint)Thread.VolatileRead(ref injectedTick)), injectedAny)) : 0;
+                if (AnyInputDown()) Watch.Clock.Touch(PauseClock.Now());
+                return Math.Max(external, Watch.Clock.RemainingMs(PauseClock.Now()));
+            }
+        }
+        static int holding; // above 0 while the app itself keeps a key or mouse button down (Press, Drag)
+        static bool AnyInputDown() {
+            if (Thread.VolatileRead(ref holding) > 0) return false;
+            for (int vk = 1; vk < 255; vk++) if ((Win.GetAsyncKeyState(vk) & 0x8000) != 0) return true;
+            return false;
+        }
+        // After the app's own input: the time Windows gave it. Any input later than this is the customer's.
+        static void RecordInjection() {
+            int now = Environment.TickCount, stamp = now;
+            var info = new Win.LastInput { Size = (uint)Marshal.SizeOf(typeof(Win.LastInput)) };
+            if (Win.GetLastInputInfo(ref info) && unchecked((int)(info.Time - (uint)now)) > 0) stamp = unchecked((int)info.Time);
+            Interlocked.Exchange(ref injectedTick, stamp); injectedAny = true;
+        }
+        // When the hooks did not install, the two other sources are the only guard. Prove first that this session's
+        // last-input time follows the app's own input: send one harmless key (F24) and read the time back.
+        volatile bool fallbackProven;
+        internal bool ProveFallback() {
+            try {
+                Send(KeyEvent(0x87, 0, 0), KeyEvent(0x87, 0, 2));
+                var info = new Win.LastInput { Size = (uint)Marshal.SizeOf(typeof(Win.LastInput)) };
+                bool ok = Win.GetLastInputInfo(ref info) && Math.Abs(unchecked((int)(info.Time - (uint)Environment.TickCount))) <= 100;
+                fallbackProven = ok; return ok;
+            } catch (ScreenError) { return false; }
+        }
+
+        // Physical pixels on every display: per-monitor aware for this thread on Windows 10 1607+,
+        // system aware for the process before that. The manifest stays as it is, so the WPF
+        // corner window keeps its look.
+        internal static void Dpi() {
+            try { if (Win.SetThreadDpiAwarenessContext(new IntPtr(-4)) == IntPtr.Zero) Win.SetThreadDpiAwarenessContext(new IntPtr(-3)); }
+            catch (EntryPointNotFoundException) { Win.SetProcessDPIAware(); }
+        }
+        internal static List<Gdi.Rectangle> Monitors() {
+            var others = new List<Gdi.Rectangle>(); Gdi.Rectangle? primary = null;
+            Win.EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, delegate(IntPtr monitor, IntPtr dc, ref Win.Rc rect, IntPtr data) {
+                var info = new Win.MonitorInfo { Size = Marshal.SizeOf(typeof(Win.MonitorInfo)) };
+                if (!Win.GetMonitorInfo(monitor, ref info)) return true;
+                var r = Gdi.Rectangle.FromLTRB(info.Monitor.L, info.Monitor.T, info.Monitor.R, info.Monitor.B);
+                if ((info.Flags & 1) != 0) primary = r; else others.Add(r);
+                return true;
+            }, IntPtr.Zero);
+            others.Sort(delegate(Gdi.Rectangle a, Gdi.Rectangle b) { return a.X != b.X ? a.X.CompareTo(b.X) : a.Y.CompareTo(b.Y); });
+            if (primary.HasValue) others.Insert(0, primary.Value);
+            ScreenMath.CapDisplays(others); // the relay rejects a result that reports more displays than it can number
+            return others;
+        }
+        // "default" when the input desktop is reachable; the secure desktop (UAC, lock, sign-in) is not.
+        internal static string Desktop() {
+            IntPtr d = Win.OpenInputDesktop(0, false, 1);
+            if (d == IntPtr.Zero) return "unknown";
+            try {
+                var name = new StringBuilder(64); int needed;
+                return Win.GetUserObjectInformation(d, 2, name, 128, out needed) && name.ToString() == "Default" ? "default" : "unknown";
+            } finally { Win.CloseDesktop(d); }
+        }
+
+        sealed class View {
+            public Gdi.Rectangle Phys; public int Index, Count, W, H;
+            public int PhysX(int x) { return Phys.X + ScreenMath.ToPhysical(x, W, Phys.Width); }
+            public int PhysY(int y) { return Phys.Y + ScreenMath.ToPhysical(y, H, Phys.Height); }
+            public void Check(int x, int y) { if (x < 0 || y < 0 || x >= W || y >= H) throw new ScreenError("coordinate " + x + "," + y + " is outside the " + W + "x" + H + " screenshot"); }
+        }
+        static View GetView(int i) {
+            var list = Monitors();
+            if (i < 0 || i >= list.Count) throw new ScreenError("no display " + i + "; this PC has " + list.Count);
+            var v = new View { Phys = list[i], Index = i, Count = list.Count }; ScreenMath.Fit(v.Phys.Width, v.Phys.Height, out v.W, out v.H); return v;
+        }
+        static View GetView(Dictionary<string, object> a) { return GetView((int)Wire.Number(a, "display")); }
+        // The display of the last ui_tree, or the primary one when displays changed since: the ref may still be good.
+        static View GetViewOrPrimary(int i) { return GetView(i >= 0 && i < Monitors().Count ? i : 0); }
+        // ui_tree reads the foreground window, so it uses the display that holds the center of that window.
+        static View ForegroundView() {
+            IntPtr fg = Win.GetForegroundWindow();
+            if (fg == IntPtr.Zero) throw new ScreenError("no window is in the foreground");
+            Win.Rc rc; int index = 0;
+            if (Win.GetWindowRect(fg, out rc)) index = Math.Max(0, ScreenMath.MonitorAt(Monitors(), (rc.L + rc.R) / 2, (rc.T + rc.B) / 2));
+            return GetView(index);
+        }
+        static Gdi.Bitmap Grab(Gdi.Rectangle r) {
+            var bmp = new Gdi.Bitmap(r.Width, r.Height, Img.PixelFormat.Format24bppRgb);
+            // BitBlt with CAPTUREBLT, because CopyFromScreen cannot ask for layered windows (menus, tooltips).
+            IntPtr screen = Win.GetDC(IntPtr.Zero); bool ok = false;
+            try {
+                using (var g = Gdi.Graphics.FromImage(bmp)) { IntPtr dc = g.GetHdc(); try { ok = Win.BitBlt(dc, 0, 0, r.Width, r.Height, screen, r.X, r.Y, 0x40CC0020); } finally { g.ReleaseHdc(dc); } }
+            } finally { Win.ReleaseDC(IntPtr.Zero, screen); }
+            if (!ok) { bmp.Dispose(); throw new ScreenError("cannot capture the screen; Windows may be locked"); }
+            return bmp;
+        }
+        // A region in physical pixels, scaled down to fit 1280x800 and encoded under 700,000 base64 characters.
+        static Dictionary<string, object> Shot(Gdi.Rectangle region) {
+            int w, h, quality; ScreenMath.Fit(region.Width, region.Height, out w, out h);
+            using (var full = Grab(region)) {
+                var shown = full;
+                if (w != region.Width || h != region.Height) {
+                    shown = new Gdi.Bitmap(w, h, Img.PixelFormat.Format24bppRgb);
+                    using (var g = Gdi.Graphics.FromImage(shown)) {
+                        g.InterpolationMode = Gdi.Drawing2D.InterpolationMode.HighQualityBicubic; g.PixelOffsetMode = Gdi.Drawing2D.PixelOffsetMode.HighQuality;
+                        g.DrawImage(full, new Gdi.Rectangle(0, 0, w, h), 0, 0, region.Width, region.Height, Gdi.GraphicsUnit.Pixel);
+                    }
+                }
+                try { return Wire.Map("image_b64", Convert.ToBase64String(JpegFit.Encode(shown, 700000, out quality)), "mime", "image/jpeg", "width", w, "height", h); }
+                finally { if (shown != full) shown.Dispose(); }
+            }
+        }
+
+        static bool Owns(IntPtr window) { uint pid; Win.GetWindowThreadProcessId(window, out pid); return pid == Win.GetCurrentProcessId(); }
+        // Normal mode cannot drive a window that runs elevated: Windows silently drops the input.
+        static void NotElevated(IntPtr window) {
+            if (window == IntPtr.Zero || SupportAccess.IsAdministrator()) return;
+            uint pid; Win.GetWindowThreadProcessId(window, out pid);
+            IntPtr process = Win.OpenProcess(0x1000, false, pid), token = IntPtr.Zero;
+            if (process == IntPtr.Zero) return;
+            try {
+                int elevated = 0, size;
+                bool opened = Win.OpenProcessToken(process, 8, out token); int error = Marshal.GetLastWin32Error();
+                if ((opened && Win.GetTokenInformation(token, 20, out elevated, 4, out size) && elevated != 0) || (!opened && error == 5))
+                    throw new ScreenError("that window runs as administrator; this app cannot control it");
+            } finally { if (token != IntPtr.Zero) Win.CloseHandle(token); Win.CloseHandle(process); }
+        }
+        void Free() {
+            if (!Watch.Ok && !fallbackProven) throw new ScreenError("cannot watch for customer input");
+            if (Paused) throw new ScreenError(PauseText);
+        }
+        // Between the steps of a longer input: stop when support access has ended, and give way to the customer.
+        void Between(WaitHandle stop) {
+            if (stop.WaitOne(0)) throw new ScreenError("support access ended");
+            Free();
+        }
+        // Waits ms, or throws when support access ends first.
+        static void Wait(WaitHandle stop, int ms) { if (stop.WaitOne(ms)) throw new ScreenError("support access ended"); }
+        // Keystrokes go to the foreground window: refuse the support window and an elevated window. The check
+        // is repeated for every step of a multi-step input, because the focus can change between steps.
+        static void KeyTarget(ref IntPtr seen) {
+            IntPtr fg = Win.GetForegroundWindow();
+            if (fg == seen) return;
+            if (fg != IntPtr.Zero && Owns(fg)) throw new ScreenError("the support window has the keyboard focus; click another window first");
+            NotElevated(fg);
+            seen = fg;
+        }
+        static void Send(params Win.In[] inputs) {
+            uint sent = Win.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Win.In)));
+            RecordInjection();
+            if (sent != inputs.Length) throw new ScreenError("Windows refused the input");
+        }
+        static Win.In MouseEvent(int dx, int dy, int data, uint flags) {
+            var i = new Win.In { Type = 0 }; i.Mouse = new Win.MouseIn { Dx = dx, Dy = dy, Data = unchecked((uint)data), Flags = flags }; return i;
+        }
+        static Win.In KeyEvent(int vk, ushort scan, uint flags) {
+            var i = new Win.In { Type = 1 }; i.Key = new Win.KeyIn { Vk = (ushort)vk, Scan = scan, Flags = flags }; return i;
+        }
+        // Absolute move over the whole virtual desktop, rounded up so Windows lands on this exact pixel.
+        static void MoveTo(int px, int py) {
+            int vx = Win.GetSystemMetrics(76), vy = Win.GetSystemMetrics(77), vw = Math.Max(1, Win.GetSystemMetrics(78)), vh = Math.Max(1, Win.GetSystemMetrics(79));
+            Send(MouseEvent((int)(((long)(px - vx) * 65536 + vw - 1) / vw), (int)(((long)(py - vy) * 65536 + vh - 1) / vh), 0, 0xC001));
+        }
+        static void Press(int[] combo) {
+            var down = new List<Win.In>(); var up = new List<Win.In>();
+            foreach (int vk in combo) {
+                ushort scan = (ushort)Win.MapVirtualKey((uint)vk, 0); uint ext = KeySpec.IsExtended(vk) ? 1u : 0u;
+                down.Add(KeyEvent(vk, scan, ext)); up.Insert(0, KeyEvent(vk, scan, ext | 2u));
+            }
+            Interlocked.Increment(ref holding);
+            try { Send(down.ToArray()); Thread.Sleep(30); Send(up.ToArray()); } finally { Interlocked.Decrement(ref holding); }
+        }
+        // One real key press, down and up in a single call.
+        static void Tap(int vk) {
+            ushort scan = (ushort)Win.MapVirtualKey((uint)vk, 0); uint ext = KeySpec.IsExtended(vk) ? 1u : 0u;
+            Send(KeyEvent(vk, scan, ext), KeyEvent(vk, scan, ext | 2u));
+        }
+        // Unicode key events type any character the target accepts, whatever the keyboard layout. Newline and tab are
+        // real Return and Tab keys. A character above U+FFFF goes as its two surrogate halves, one event pair each.
+        //
+        // Pacing matters. Windows 11 Notepad does not take the character from each Unicode key event. It reads it
+        // when it gets to the event, and by then a faster sender has already replaced it: "abc def 123" became
+        // "abc 3333333". One call with every event gave the same result, so the fix is time between characters.
+        // The old code slept 2 ms, which is 2 ms only while something (a browser, a WPF animation like this app's
+        // own window) has raised the system timer to 1 ms; otherwise Windows rounds it up to 15.6 ms and the bug hid.
+        // So this raises the timer itself and waits TypeGapMs between characters. Typing 5000 characters takes
+        // about 100 s.
+        internal void TypeText(string text, WaitHandle stop, bool secret) {
+            int sent = 0, total = 0; IntPtr seen = IntPtr.Zero; var gap = new Stopwatch(); bool afterHigh = false;
+            foreach (char c in text) if (c != '\r') total++;
+            Win.timeBeginPeriod(1);
+            try {
+                foreach (char c in text) {
+                    if (c == '\r') continue;
+                    // The two halves of a surrogate pair go out as one character: nothing is checked between them.
+                    bool secondHalf = afterHigh && char.IsLowSurrogate(c);
+                    try {
+                        // Wait out the gap, watching the customer and the stop flag all the time, then check once more
+                        // right before the event. A check before the gap would be 20 ms old by the time it is sent.
+                        // Thread.Sleep(1), not WaitOne(1): with the timer at 1 ms the sleep takes about 2 ms, but a 1 ms wait on a handle still takes about 15 ms.
+                        while (gap.IsRunning && gap.ElapsedMilliseconds < TypeGapMs) { if (!secondHalf) Between(stop); Thread.Sleep(1); }
+                        if (!secondHalf) { Between(stop); KeyTarget(ref seen); }
+                        if (c == '\n') Tap(0x0D); else if (c == '\t') Tap(0x09);
+                        else Send(KeyEvent(0, c, 4), KeyEvent(0, c, 6));
+                    } catch (ScreenError e) {
+                        // A secret's error carries no count, and the relay drops its text anyway.
+                        if (secret || sent == 0) throw;
+                        throw new ScreenError(e.Message + " (typed " + sent + " of " + total + " characters)");
+                    }
+                    gap.Reset(); gap.Start(); sent++; afterHigh = char.IsHighSurrogate(c);
+                }
+            } finally { Win.timeEndPeriod(1); }
+        }
+        // Refuse a target in this process's own windows (the corner window, dialogs) or in an elevated window.
+        static void Target(int px, int py) {
+            IntPtr hit = Win.WindowFromPoint(new Gdi.Point(px, py)), root = hit == IntPtr.Zero ? IntPtr.Zero : Win.GetAncestor(hit, 2);
+            if (root != IntPtr.Zero && Owns(root)) throw new ScreenError("that spot is the support window; use another spot");
+            NotElevated(root);
+        }
+        void Click(View v, int x, int y, string button, int count, WaitHandle stop) {
+            v.Check(x, y); int px = v.PhysX(x), py = v.PhysY(y);
+            Target(px, py); MoveTo(px, py);
+            uint down = button == "right" ? 8u : button == "middle" ? 0x20u : 2u;
+            for (int i = 0; i < count; i++) { if (i > 0) Between(stop); Send(MouseEvent(0, 0, 0, down), MouseEvent(0, 0, 0, down * 2)); Wait(stop, 40); }
+        }
+        // The button is released even when the drag stops early, so a pause never leaves it held down.
+        void Drag(View v, int x1, int y1, int x2, int y2, WaitHandle stop) {
+            v.Check(x1, y1); v.Check(x2, y2); int ax = v.PhysX(x1), ay = v.PhysY(y1), bx = v.PhysX(x2), by = v.PhysY(y2);
+            Target(ax, ay); Target(bx, by);
+            MoveTo(ax, ay); Wait(stop, 50);
+            Interlocked.Increment(ref holding);
+            try {
+                Send(MouseEvent(0, 0, 0, 2));
+                for (int i = 1; i <= 10; i++) { Wait(stop, 20); Between(stop); MoveTo(ax + (bx - ax) * i / 10, ay + (by - ay) * i / 10); }
+                Wait(stop, 50);
+            } finally { try { Send(MouseEvent(0, 0, 0, 4)); } finally { Interlocked.Decrement(ref holding); } }
+        }
+
+        // Input actions: refuse during a customer pause, in the support window and in elevated windows.
+        void Input(string name, Dictionary<string, object> a, View v, WaitHandle stop) {
+            Free();
+            IntPtr seen = IntPtr.Zero;
+            if (name == "type" || name == "type_secret" || name == "key") KeyTarget(ref seen);
+            // type_secret shares the typing code; the name is mapped so the switch stays small (see the note at the top).
+            switch (name == "type_secret" ? "type" : name) {
+                case "move": v.Check((int)Wire.Number(a, "x"), (int)Wire.Number(a, "y")); MoveTo(v.PhysX((int)Wire.Number(a, "x")), v.PhysY((int)Wire.Number(a, "y"))); break;
+                case "click": {
+                    string button = Wire.Text(a, "button") == "" ? "left" : Wire.Text(a, "button");
+                    if (button != "left" && button != "right" && button != "middle") throw new ScreenError("button must be left, right or middle");
+                    Click(v, (int)Wire.Number(a, "x"), (int)Wire.Number(a, "y"), button, (int)Math.Max(1, Math.Min(3, a.ContainsKey("count") ? Wire.Number(a, "count") : 1)), stop); break;
+                }
+                case "drag": Drag(v, (int)Wire.Number(a, "x1"), (int)Wire.Number(a, "y1"), (int)Wire.Number(a, "x2"), (int)Wire.Number(a, "y2"), stop); break;
+                case "scroll": {
+                    string dir = Wire.Text(a, "direction") == "" ? "down" : Wire.Text(a, "direction");
+                    int amount = (int)Math.Max(1, Math.Min(50, a.ContainsKey("amount") ? Wire.Number(a, "amount") : 3));
+                    if (dir != "up" && dir != "down" && dir != "left" && dir != "right") throw new ScreenError("direction must be up, down, left or right");
+                    if (a.ContainsKey("x")) Click(v, (int)Wire.Number(a, "x"), (int)Wire.Number(a, "y"), "none", 0, stop);
+                    Send(MouseEvent(0, 0, 120 * amount * (dir == "up" || dir == "right" ? 1 : -1), dir == "up" || dir == "down" ? 0x800u : 0x1000u)); break;
+                }
+                case "type": {
+                    string text = Wire.Text(a, "text");
+                    if (text.Length > 5000) throw new ScreenError("text is longer than 5000 characters");
+                    TypeText(text, stop, name == "type_secret"); break;
+                }
+                default:
+                    foreach (int[] combo in KeySpec.Parse(Wire.Text(a, "keys"))) { Between(stop); KeyTarget(ref seen); Press(combo); Wait(stop, 20); }
+                    break;
+            }
+        }
+
+        // UI Automation of the foreground window. Refs are numbers in the lines and live until the next ui_tree.
+        string Tree(View v, int max) {
+            IntPtr fg = Win.GetForegroundWindow();
+            if (fg == IntPtr.Zero) throw new ScreenError("no window is in the foreground");
+            if (Owns(fg)) throw new ScreenError("the foreground window is the support window");
+            var cache = new CacheRequest { TreeScope = TreeScope.Element };
+            foreach (var p in new AutomationProperty[] { AutomationElement.NameProperty, AutomationElement.ControlTypeProperty, AutomationElement.BoundingRectangleProperty, AutomationElement.IsOffscreenProperty, AutomationElement.IsKeyboardFocusableProperty }) cache.Add(p);
+            var list = new List<AutomationElement>(); var lines = new List<string>(); var clock = Stopwatch.StartNew(); int visited = 0; bool more = false;
+            using (cache.Activate()) {
+                var walker = TreeWalker.ControlViewWalker; Action<AutomationElement, int> walk = null;
+                walk = delegate(AutomationElement e, int depth) {
+                    if (lines.Count >= max || ++visited > 4000 || clock.ElapsedMilliseconds > 8000) { more = true; return; }
+                    try {
+                        var c = e.Cached; if (c.IsOffscreen) return;
+                        var r = c.BoundingRectangle;
+                        if (!r.IsEmpty && (c.Name.Length > 0 || c.IsKeyboardFocusable)) {
+                            int cx = (int)(r.X + r.Width / 2) - v.Phys.X, cy = (int)(r.Y + r.Height / 2) - v.Phys.Y;
+                            if (cx >= 0 && cy >= 0 && cx < v.Phys.Width && cy < v.Phys.Height) {
+                                list.Add(e); lines.Add(UiLines.Line(list.Count, c.ControlType.ProgrammaticName, c.Name, ScreenMath.ToImage(cx, v.W, v.Phys.Width), ScreenMath.ToImage(cy, v.H, v.Phys.Height)));
+                            }
+                        }
+                        if (depth < 40) for (var child = walker.GetFirstChild(e, cache); child != null; child = walker.GetNextSibling(child, cache)) walk(child, depth + 1);
+                    } catch (ElementNotAvailableException) { }
+                };
+                walk(AutomationElement.FromHandle(fg), 0);
+            }
+            int kept; string text = UiLines.Join(lines, more, UiLines.MaxChars, out kept);
+            if (kept < list.Count) list.RemoveRange(kept, list.Count - kept); // a ref the text does not show is not offered
+            refs = list; treeDisplay = v.Index;
+            return text;
+        }
+        static bool Limited(Action action, int ms) {
+            Exception error = null; var t = new Thread(delegate() { try { action(); } catch (Exception e) { error = e; } }); t.IsBackground = true; t.Start();
+            if (!t.Join(ms)) return false;
+            if (error != null) throw new ScreenError(error.Message);
+            return true;
+        }
+        string UiAct(Dictionary<string, object> a) {
+            Free();
+            int n = (int)Wire.Number(a, "ref"); var list = refs; string verb = Wire.Text(a, "verb"), note = null;
+            if (n < 1 || n > list.Count) throw new ScreenError("unknown ref " + n + "; call ui_tree first");
+            var e = list[n - 1];
+            try {
+                if (e.Current.ProcessId == (int)Win.GetCurrentProcessId()) throw new ScreenError("that element belongs to the support window");
+                Func<AutomationPattern, object> pattern = delegate(AutomationPattern p) {
+                    object o; if (!e.TryGetCurrentPattern(p, out o)) throw new ScreenError("element " + n + " does not support " + verb); return o;
+                };
+                // if-else, not a switch on strings: the compiler would add a hash helper class named with a random GUID and break the reproducible build.
+                if (verb == "invoke") { var invoke = (InvokePattern)pattern(InvokePattern.Pattern); if (!Limited(delegate { invoke.Invoke(); }, 5000)) note = "still running after 5 s; a dialog may be open"; }
+                else if (verb == "set_value") ((ValuePattern)pattern(ValuePattern.Pattern)).SetValue(Wire.Text(a, "value"));
+                else if (verb == "toggle") ((TogglePattern)pattern(TogglePattern.Pattern)).Toggle();
+                else if (verb == "focus") e.SetFocus();
+                else if (verb == "expand") ((ExpandCollapsePattern)pattern(ExpandCollapsePattern.Pattern)).Expand();
+                else if (verb == "collapse") ((ExpandCollapsePattern)pattern(ExpandCollapsePattern.Pattern)).Collapse();
+                else if (verb == "select") ((SelectionItemPattern)pattern(SelectionItemPattern.Pattern)).Select();
+                else throw new ScreenError("verb must be invoke, set_value, toggle, focus, expand, collapse or select");
+            } catch (ElementNotAvailableException) { throw new ScreenError("element " + n + " is gone; call ui_tree again"); }
+            catch (InvalidOperationException x) { throw new ScreenError("element " + n + " cannot do " + verb + ": " + x.Message); }
+            return note;
+        }
+
+        static void Merge(Dictionary<string, object> into, Dictionary<string, object> from) { foreach (var kv in from) into[kv.Key] = kv.Value; }
+        static double Seconds(Dictionary<string, object> a) { object v; return a.TryGetValue("seconds", out v) && v != null ? Math.Max(0, Math.Min(10, Convert.ToDouble(v))) : 1; }
+        // Runs one "screen" or "control" frame and returns its result. Never throws.
+        public Dictionary<string, object> Run(Dictionary<string, object> frame, WaitHandle stop) {
+            string desktop = "unknown"; bool secret = false;
+            try {
+                Dpi(); desktop = Desktop();
+                var a = frame.ContainsKey("action") ? frame["action"] as Dictionary<string, object> : null;
+                if (Wire.Text(frame, "type") == "control" || a == null) throw new ScreenError(Wire.Text(frame, "type") == "control" ? NoFull : "missing screen action");
+                string name = Wire.Text(a, "name");
+                secret = name == "type_secret";
+                if (name == "block_input" || name == "send_sas" || name == "request_full_control") throw new ScreenError(NoFull);
+                if (Array.IndexOf(new string[] { "screenshot", "zoom", "wait", "ui_tree", "ui_act", "click", "move", "drag", "scroll", "type", "type_secret", "key" }, name) < 0) throw new ScreenError("unknown screen action");
+                var r = Wire.Map("ok", true);
+                if (name == "wait") stop.WaitOne((int)(Seconds(a) * 1000));
+                else if (desktop != "default") throw new ScreenError("cannot reach the screen; Windows may be locked or showing a security prompt");
+                // ui_tree reads the display of the foreground window and ui_act answers with the display of its ui_tree, so refs and pixels agree.
+                View v = name == "wait" && !Wire.Flag(a, "screenshot") ? null : name == "ui_tree" ? ForegroundView() : name == "ui_act" ? GetViewOrPrimary(treeDisplay) : GetView(a);
+                bool input = name == "click" || name == "move" || name == "drag" || name == "scroll" || name == "type" || name == "type_secret" || name == "key" || name == "ui_act";
+                if (name == "screenshot" || (name == "wait" && v != null)) Merge(r, Shot(v.Phys));
+                else if (name == "zoom") {
+                    v.Check((int)Wire.Number(a, "x1"), (int)Wire.Number(a, "y1")); int x2 = (int)Wire.Number(a, "x2"), y2 = (int)Wire.Number(a, "y2");
+                    int px1 = ScreenMath.EdgeToPhysical((int)Wire.Number(a, "x1"), v.W, v.Phys.Width), py1 = ScreenMath.EdgeToPhysical((int)Wire.Number(a, "y1"), v.H, v.Phys.Height);
+                    int px2 = ScreenMath.EdgeToPhysical(x2, v.W, v.Phys.Width), py2 = ScreenMath.EdgeToPhysical(y2, v.H, v.Phys.Height);
+                    if (px2 <= px1 || py2 <= py1) throw new ScreenError("zoom needs x2 > x1 and y2 > y1");
+                    Merge(r, Shot(new Gdi.Rectangle(v.Phys.X + px1, v.Phys.Y + py1, px2 - px1, py2 - py1)));
+                }
+                else if (name == "ui_tree") r["text"] = Tree(v, (int)Math.Max(1, Math.Min(2000, a.ContainsKey("max_lines") ? Wire.Number(a, "max_lines") : 300)));
+                else if (name == "ui_act") { string note = UiAct(a); if (note != null) r["text"] = note; }
+                else if (name != "wait") Input(name, a, v, stop);
+                if (input && (!a.ContainsKey("screenshot") || Wire.Flag(a, "screenshot"))) { Wait(stop, 300); Merge(r, Shot(v.Phys)); }
+                if (v != null) { r["display"] = v.Index; r["displays"] = v.Count; }
+                r["desktop"] = desktop;
+                return r;
+            } catch (Exception e) {
+                // Nothing of a secret, and no detail about where it went, can come back in an error.
+                if (secret) return Wire.Map("ok", false, "error", SecretFailed);
+                return Wire.Map("ok", false, "error", e is ScreenError || e is ArgumentException ? e.Message : e.GetType().Name + ": " + e.Message);
+            }
+        }
+    }
+
     public sealed class Client : IDisposable {
         readonly Dictionary<string, object> config;
         readonly ManualResetEvent stop = new ManualResetEvent(false);
         readonly Stopwatch clock = Stopwatch.StartNew();
         readonly object gate = new object();
         readonly System.Threading.Timer deadlineTimer;
+        // Raised when a lane finishes, so a parked poll ends and the result goes out at once.
+        readonly AutoResetEvent signal = new AutoResetEvent(false);
         HttpWebRequest request;
-        long deadlineMs, generation, expiresAtMs;
+        bool polling, woke;
+        // The status code of the last 4xx answer the relay gave to a request, 0 if the last request had none.
+        int rejected;
+        long deadlineMs, generation, expiresAtMs, serverOffsetMs;
         int busy;
         string work;
+        volatile Screen screen;
+        // False when this run was resumed after a restart whose consent did not cover screen control. The app then
+        // reports no screen cap and refuses any screen frame, so only commands and files work (see RestartResume).
+        public volatile bool ScreenAllowed = true;
         public event Action<string> Log;
         public event Action<string> Status;
         public event Action Finished;
@@ -219,6 +851,24 @@ namespace SupportMcp {
             }
         }
         public int BusyCount { get { return Thread.VolatileRead(ref busy); } }
+        // True for 3 s after the customer last used the mouse or keyboard.
+        public bool Paused { get { var s = screen; return s != null && s.Paused; } }
+        // One operation at a time per lane. Screen operations run while a command runs.
+        sealed class Lane {
+            public readonly string Name; public readonly ManualResetEvent Done = new ManualResetEvent(false);
+            public Thread Op; public Dictionary<string, object> OpResult, Result; public string ActiveId = "", LastId = "";
+            public bool Rejected; // the relay refused this lane's result, which was replaced by a plain error
+            public Lane(string name) { Name = name; }
+            public bool Busy { get { return ActiveId != ""; } }
+        }
+        static string LaneOf(string type) { return type == "run" || type == "put_file" || type == "get_file" ? "cmd" : type == "screen" || type == "control" ? "screen" : null; }
+        void Wake() {
+            signal.Set();
+            lock (gate) { woke = true; if (polling && request != null) request.Abort(); }
+        }
+        bool Woken(bool poll) {
+            lock (gate) { if (!poll || !woke || stop.WaitOne(0)) return false; woke = false; return true; }
+        }
         void Work(int delta) {
             int n = Interlocked.Add(ref busy, delta);
             var changed = BusyChanged; if (changed != null) changed(n);
@@ -237,15 +887,21 @@ namespace SupportMcp {
         public void Stop() {
             stop.Set(); lock (gate) { if (request != null) request.Abort(); }
         }
-        Dictionary<string, object> Send(Dictionary<string, object> body, bool ending) {
+        // A poll that Wake ended early returns null.
+        Dictionary<string, object> Send(Dictionary<string, object> body, bool ending, bool poll) {
             if (!ending && stop.WaitOne(0)) throw new OperationCanceledException();
             var req = (HttpWebRequest)WebRequest.Create(Wire.Text(config, "origin") + "/agent?sid=" + Wire.Text(config, "sid"));
             req.Method = "POST"; req.ContentType = "application/json"; req.AllowAutoRedirect = false;
+            rejected = 0;
             req.Timeout = ending ? 3000 : 30000; req.ReadWriteTimeout = req.Timeout;
             req.Headers["X-Attach-Key"] = Wire.Text(config, "key");
             req.Proxy = WebRequest.DefaultWebProxy;
             byte[] bytes = Encoding.UTF8.GetBytes(Wire.Json().Serialize(body)); req.ContentLength = bytes.Length;
-            lock (gate) { if (!ending && stop.WaitOne(0)) throw new OperationCanceledException(); request = req; }
+            lock (gate) {
+                if (!ending && stop.WaitOne(0)) throw new OperationCanceledException();
+                if (poll && woke) { woke = false; return null; }
+                request = req; polling = poll;
+            }
             try {
                 using (var s = req.GetRequestStream()) s.Write(bytes, 0, bytes.Length);
                 using (var response = (HttpWebResponse)req.GetResponse()) {
@@ -260,13 +916,16 @@ namespace SupportMcp {
                     }
                 }
             } catch (WebException e) {
+                if (Woken(poll)) return null;
                 var r = e.Response as HttpWebResponse;
                 if (r != null) {
                     int code = (int)r.StatusCode; r.Close();
+                    if (code >= 400 && code < 500) rejected = code;
                     if (code == 401 || code == 403 || code == 409 || code == 410) throw new OperationCanceledException("Support access has ended.");
                 }
                 throw;
-            } finally { lock (gate) { if (request == req) request = null; } }
+            } catch (IOException) { if (Woken(poll)) return null; throw; }
+            finally { lock (gate) { if (request == req) { request = null; polling = false; } } }
         }
         static string AbsolutePath(string path) {
             // Only normal local absolute paths. Refuse relative, device, UNC,
@@ -279,7 +938,16 @@ namespace SupportMcp {
             try {
                 if (stop.WaitOne(0)) throw new OperationCanceledException();
                 string type = Wire.Text(frame, "type");
+                if (type == "screen" || type == "control") {
+                    var s = screen;
+                    if (!ScreenAllowed || s == null) return Wire.Map("ok", false, "error", "the customer has not approved screen control for this session");
+                    return s.Run(frame, stop);
+                }
                 if (type == "run") {
+                    // Every command runs as the signed-in user. SYSTEM needs full control, which this app does not have.
+                    string runAs = Wire.Text(frame, "as");
+                    if (runAs == "system") return Wire.Map("ok", false, "error", "as: \"system\" needs full control");
+                    if (runAs != "" && runAs != "user") return Wire.Map("ok", false, "error", "as must be user");
                     string file = Path.Combine(work, "command.ps1");
                     string prefix = "$ProgressPreference = 'SilentlyContinue'\r\n[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)\r\n";
                     File.WriteAllText(file, prefix + Wire.Text(frame, "command"), new UTF8Encoding(true));
@@ -307,25 +975,58 @@ namespace SupportMcp {
                 }
             } catch (Exception e) { return Wire.Map("ok", false, "error", e.Message); }
         }
+        // The largest request body the relay takes. A result over it, or one the relay answers with a 4xx
+        // (400 invalid result, 413 too large), would be refused every time it is resent, and the client would
+        // never poll again. So it is replaced once by a plain error result and the lane carries on.
+        const int ResultMax = 750000;
+        void RejectResult(Lane lane) {
+            lane.Rejected = true;
+            lane.Result = Wire.Map("type", "result", "id", lane.ActiveId, "generation", generation, "ok", false, "error", "result rejected by relay");
+        }
+        // Returns the relay's answer type: "ack" or "end".
+        string SendResult(Lane lane) {
+            while (true) {
+                string json = null;
+                try { json = Wire.Json().Serialize(lane.Result); } catch (InvalidOperationException) { }
+                if (json == null || Encoding.UTF8.GetByteCount(json) > ResultMax) {
+                    if (lane.Rejected) return "ack"; // even the plain error does not fit: drop it
+                    RejectResult(lane); continue;
+                }
+                try { return Wire.Text(Send(lane.Result, false, false), "type"); }
+                catch (WebException) {
+                    // Only 400 (invalid result) and 413 (too large) say the result itself is bad. Anything else, 408 or 429
+                    // for example, is a failure of the moment and takes the normal retry path.
+                    if (rejected != 400 && rejected != 413) throw;
+                    // The relay refused the plain error too. It always validates, so this is not expected. Drop it and
+                    // carry on: the operator's call then ends with the relay's own timeout instead of hanging for ever.
+                    if (lane.Rejected) return "ack";
+                    RejectResult(lane);
+                }
+            }
+        }
         public void Run() {
-            Thread operation = null; Dictionary<string, object> result = null, operationResult = null; string activeId = "", lastId = "", networkError = "";
-            var done = new ManualResetEvent(false);
+            var lanes = new Lane[] { new Lane("cmd"), new Lane("screen") }; string networkError = "";
             try {
                 var security = new DirectorySecurity();
                 security.SetAccessRuleProtection(true, false);
                 security.AddAccessRule(new FileSystemAccessRule(WindowsIdentity.GetCurrent().User, FileSystemRights.FullControl, InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
                 work = Path.Combine(Path.GetTempPath(), "remote-support-" + Guid.NewGuid().ToString("N"));
                 Directory.CreateDirectory(work, security);
+                // Without screen consent there is no Screen at all: no global input hooks and no F24 probe. Execute
+                // refuses screen frames, and the poll reports no pause.
+                if (ScreenAllowed) { screen = new Screen(); screen.Start(); }
                 ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2 on .NET 4.5.2
                 while (!stop.WaitOne(0)) {
                     try {
                         if (generation == 0) {
                             var welcome = Send(Wire.Map("type", "hello", "machine", Environment.MachineName, "user", Environment.UserName,
-                                "ps", PowerShellVersion(), "agent", "windows-app-1", "elevated", SupportAccess.IsAdministrator()), false);
+                                "ps", PowerShellVersion(), "agent", "windows-app-2", "elevated", SupportAccess.IsAdministrator(),
+                                "caps", ScreenAllowed ? new string[] { "screen", "uia", "lanes" } : new string[] { "lanes" }, "control", "normal"), false, false);
                             if (Wire.Text(welcome, "type") != "welcome") throw new InvalidDataException("Invalid support handshake.");
                             generation = Wire.Number(welcome, "generation");
                             long expires = Wire.Number(welcome, "expires_at"), now = Wire.Number(welcome, "server_time");
                             if (now == 0) now = UnixNow();
+                            serverOffsetMs = now - UnixNow(); // the relay reports deadlines on its own clock
                             long remainingMs = Math.Max(0, Math.Min(86400000, expires - now));
                             Interlocked.Exchange(ref deadlineMs, clock.ElapsedMilliseconds + remainingMs);
                             Interlocked.Exchange(ref expiresAtMs, UnixNow() + remainingMs);
@@ -333,35 +1034,53 @@ namespace SupportMcp {
                             Print("Connected. Commands run as " + Environment.UserName + (SupportAccess.IsAdministrator() ? " with administrator rights." : " with normal user rights."));
                             var connected = Connected; if (connected != null) connected();
                         }
-                        if (operation != null && done.WaitOne(0)) {
-                            operation.Join(); operation = null; result = operationResult;
-                            result["type"] = "result"; result["id"] = activeId; result["generation"] = generation;
+                        lock (gate) woke = false;
+                        bool over = false;
+                        foreach (var lane in lanes) {
+                            if (lane.Op != null && lane.Done.WaitOne(0)) {
+                                lane.Op.Join(); lane.Op = null; lane.Result = lane.OpResult;
+                                lane.Result["type"] = "result"; lane.Result["id"] = lane.ActiveId; lane.Result["generation"] = generation;
+                            }
+                            if (lane.Result != null) {
+                                string ack = SendResult(lane);
+                                if (ack == "end") { over = true; break; }
+                                if (ack != "ack") throw new InvalidDataException("Result not acknowledged.");
+                                lane.LastId = lane.ActiveId; lane.ActiveId = ""; lane.Result = null; lane.Rejected = false; Work(-1);
+                            }
                         }
-                        if (result != null) {
-                            var ack = Send(result, false);
-                            if (Wire.Text(ack, "type") == "end") break;
-                            if (Wire.Text(ack, "type") != "ack") throw new InvalidDataException("Result not acknowledged.");
-                            lastId = activeId; activeId = ""; result = null; Work(-1);
-                        }
-                        if (operation != null) {
-                            // The relay answers a busy poll at once, so do not spin on it. Wait for
-                            // the operation and poll busy every 2 s. That keeps the client marked alive
-                            // and notices an operator end or expiry within about 2 s.
-                            if (WaitHandle.WaitAny(new WaitHandle[] { done, stop }, 2000) == 0) continue;
+                        if (over) break;
+                        if (lanes[0].Busy && lanes[1].Busy) {
+                            // The relay answers a poll at once when no lane is free, so do not spin on it. Wait
+                            // for a lane and poll every 2 s. That keeps the client marked alive and notices an
+                            // operator end or expiry within about 2 s.
+                            if (WaitHandle.WaitAny(new WaitHandle[] { signal, stop }, 2000) == 0) continue;
                             if (stop.WaitOne(0)) break;
                         }
-                        var frame = Send(Wire.Map("type", "poll", "generation", generation, "busy", operation != null), false);
+                        // While one lane works, keep polling for the other, so screen operations reach the
+                        // client during a long command. A finishing lane ends the parked poll through Wake.
+                        var busyLanes = new List<string>(); foreach (var lane in lanes) if (lane.Busy) busyLanes.Add(lane.Name);
+                        var pollClock = Stopwatch.StartNew();
+                        var poll = Wire.Map("type", "poll", "generation", generation, "busy", lanes[0].Busy, "busy_lanes", busyLanes);
+                        poll["desktop"] = Screen.Desktop();
+                        var watching = screen; if (watching != null) poll["paused_until"] = watching.Paused ? UnixNow() + serverOffsetMs + watching.PausedForMs : (object)null;
+                        var frame = Send(poll, false, true);
+                        if (frame == null) continue;
                         if (networkError != "") { networkError = ""; ShowStatus("Support session active. Close this window to end access."); Print("Connection restored."); Link(true); }
                         string type = Wire.Text(frame, "type"), id = Wire.Text(frame, "id");
                         if (type == "end") break;
-                        if (type == "idle") continue;
-                        if (operation != null || id == lastId) { stop.WaitOne(1000); continue; }
-                        if (id == "" || (type != "run" && type != "put_file" && type != "get_file")) throw new InvalidDataException("Invalid support operation.");
-                        Print(type == "run" ? "$ " + Wire.Text(frame, "command") : type + " " + Wire.Text(frame, "path"));
-                        activeId = id; done.Reset(); Work(1);
-                        var command = frame;
-                        operation = new Thread(delegate() { operationResult = Execute(command); done.Set(); });
-                        operation.IsBackground = true; operation.Start();
+                        if (type == "idle") {
+                            // An older relay answers a poll at once while a command runs: do not spin on it.
+                            if ((lanes[0].Busy || lanes[1].Busy) && pollClock.ElapsedMilliseconds < 1000 && WaitHandle.WaitAny(new WaitHandle[] { signal, stop }, 2000) == 1) break;
+                            continue;
+                        }
+                        string laneName = LaneOf(type); Lane target = laneName == null ? null : lanes[laneName == "cmd" ? 0 : 1];
+                        if (id == "" || target == null) throw new InvalidDataException("Invalid support operation.");
+                        if (target.Busy || id == target.LastId) { stop.WaitOne(1000); continue; }
+                        Print(type == "run" ? "$ " + Wire.Text(frame, "command") : type == "screen" || type == "control" ? type : type + " " + Wire.Text(frame, "path"));
+                        target.ActiveId = id; target.Done.Reset(); Work(1);
+                        var command = frame; var running = target;
+                        target.Op = new Thread(delegate() { running.OpResult = Execute(command); running.Done.Set(); Wake(); });
+                        target.Op.IsBackground = true; target.Op.Start();
                         stop.WaitOne(100);
                     } catch (OperationCanceledException) { break; }
                     catch (WebException e) {
@@ -372,14 +1091,15 @@ namespace SupportMcp {
             } catch (Exception e) { LastError = e.Message; Print("Stopped: " + e.Message); }
             finally {
                 Stop();
-                if (operation != null) operation.Join(15000);
-                if (EndRemote && generation != 0) { try { Send(Wire.Map("type", "end", "generation", generation), true); } catch { } }
+                foreach (var lane in lanes) if (lane.Op != null) lane.Op.Join(15000);
+                if (EndRemote && generation != 0) { try { Send(Wire.Map("type", "end", "generation", generation), true, false); } catch { } }
                 if (work != null) { try { Directory.Delete(work, true); } catch { } }
                 Print(EndRemote ? "Support access stopped." : "Windows is restarting. One-time reconnect is prepared.");
                 ShowStatus("Support session ended. You can close this window.");
                 if (Interlocked.Exchange(ref busy, 0) > 0) { var changed = BusyChanged; if (changed != null) changed(0); }
                 var finished = Finished; if (finished != null) finished();
-                done.Close();
+                // The lanes' wait handles stay open: an op thread that outlived the join above may still Set one.
+                if (screen != null) { var s = screen; screen = null; s.Dispose(); }
             }
         }
         public void Dispose() { Stop(); deadlineTimer.Dispose(); /* callbacks may still hold stop */ }
@@ -404,6 +1124,14 @@ namespace SupportMcp {
             using (var identity = WindowsIdentity.GetCurrent())
                 return identity.User.Value + "|" + Wire.Number(cfg, "resume_expires_at").ToString(System.Globalization.CultureInfo.InvariantCulture);
         }
+        // Screen control, mouse and keyboard are part of what the customer approves. A reconnect runs without a
+        // prompt, so it may use them only when the prepare prompt said so. Arm records that approval under its own
+        // value name; a reconnect prepared by an older app, or without it, gets commands and files only.
+        static string ScreenValueName(Dictionary<string, object> cfg) { return Wire.Text(cfg, "sid") + "|screen"; }
+        public static bool HasScreenConsent(Dictionary<string, object> cfg) {
+            using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(ConsentKey))
+                return key != null && String.Equals(key.GetValue(ScreenValueName(cfg)) as string, ConsentValue(cfg), StringComparison.Ordinal);
+        }
         public static bool HasAdministratorConsent(Dictionary<string, object> cfg) {
             using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(ConsentKey))
                 return key != null && String.Equals(key.GetValue(Wire.Text(cfg, "sid")) as string, ConsentValue(cfg), StringComparison.Ordinal);
@@ -415,6 +1143,7 @@ namespace SupportMcp {
             using (var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(ConsentKey)) {
                 if (administrator) key.SetValue(Wire.Text(cfg, "sid"), ConsentValue(cfg), Microsoft.Win32.RegistryValueKind.String);
                 else key.DeleteValue(Wire.Text(cfg, "sid"), false);
+                key.SetValue(ScreenValueName(cfg), ConsentValue(cfg), Microsoft.Win32.RegistryValueKind.String);
             }
             using (var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunOnce))
                 key.SetValue(ValueName(cfg), "\"" + PathFor(cfg) + "\" --resume", Microsoft.Win32.RegistryValueKind.String);
@@ -423,7 +1152,7 @@ namespace SupportMcp {
             using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunOnce, true))
                 if (key != null) key.DeleteValue(ValueName(cfg), false);
             using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(ConsentKey, true))
-                if (key != null) key.DeleteValue(Wire.Text(cfg, "sid"), false);
+                if (key != null) { key.DeleteValue(Wire.Text(cfg, "sid"), false); key.DeleteValue(ScreenValueName(cfg), false); }
         }
         public static void Cleanup(Dictionary<string, object> cfg) {
             Disarm(cfg);
@@ -593,11 +1322,11 @@ namespace SupportMcp {
         readonly Palette p;
         readonly bool preparing;
         public volatile bool Preserve;
-        bool connectedOnce, linkOk = true, busy, workShown, ended, tucked, confirming, sessionEnding, sweeping, userMoved, placing;
+        bool connectedOnce, linkOk = true, busy, paused, workShown, ended, tucked, confirming, sessionEnding, sweeping, userMoved, placing;
         readonly Stopwatch session = new Stopwatch(), workClock = new Stopwatch();
         TimeSpan endedAfter;
         double userLeft, userCardBottom;
-        readonly DispatcherTimer tick = new DispatcherTimer(), hold = new DispatcherTimer(), closer = new DispatcherTimer();
+        readonly DispatcherTimer tick = new DispatcherTimer(), hold = new DispatcherTimer(), closer = new DispatcherTimer(), pause = new DispatcherTimer();
         readonly Grid root;
         readonly Border card, tile, tuckTile, edge;
         readonly Glyph tileGlyph, tuckGlyph;
@@ -714,6 +1443,8 @@ namespace SupportMcp {
             PreviewKeyDown += delegate(object sender, KeyEventArgs e) { if (e.Key == Key.Escape && confirming) { confirming = false; Render(); e.Handled = true; } };
 
             tick.Interval = TimeSpan.FromSeconds(1); tick.Tick += delegate { UpdateTimer(); };
+            pause.Interval = TimeSpan.FromMilliseconds(250);
+            pause.Tick += delegate { bool now = client.Paused; if (now != paused) { paused = now; Render(); } };
             hold.Tick += delegate { hold.Stop(); if (!busy) workShown = false; Render(); };
             closer.Interval = TimeSpan.FromSeconds(4); closer.Tick += delegate { closer.Stop(); Close(); };
 
@@ -774,7 +1505,7 @@ namespace SupportMcp {
 
         void OnConnected() {
             if (connectedOnce || ended) return;
-            connectedOnce = true; linkOk = true; session.Start(); tick.Start(); Render();
+            connectedOnce = true; linkOk = true; session.Start(); tick.Start(); pause.Start(); Render();
         }
         void OnLink(bool up) { if (ended || linkOk == up) return; linkOk = up; Render(); }
         void OnBusy(bool now) {
@@ -798,7 +1529,7 @@ namespace SupportMcp {
         }
         void ShowEnded() {
             if (ended) return;
-            ended = true; endedAfter = session.Elapsed; session.Stop(); tick.Stop(); hold.Stop();
+            ended = true; endedAfter = session.Elapsed; session.Stop(); tick.Stop(); pause.Stop(); hold.Stop(); paused = false;
             confirming = false; tucked = false; workShown = false; busy = false;
             Render(); closer.Start();
         }
@@ -845,6 +1576,8 @@ namespace SupportMcp {
                 status.Inlines.Add(new Run("Session ended after " + Ui.Clock(endedAfter) + ". Support can no longer reach this PC."));
             } else if (!connectedOnce) {
                 status.Inlines.Add(new Run("This window stays open while support is connected."));
+            } else if (paused && linkOk) {
+                status.Inlines.Add(new Run("Paused while you use the PC") { FontWeight = FontWeights.SemiBold, Foreground = p.Ink });
             } else if (working) {
                 status.Inlines.Add(new Run("Support is working on your PC") { FontWeight = FontWeights.SemiBold, Foreground = p.Ink });
             } else {
@@ -952,7 +1685,9 @@ namespace SupportMcp {
                     // Resume is pre-consented through the existing support
                     // session and restricted to its private path and deadline.
                     bool approvedAdministratorResume = resume && !preparing && administrator && RestartResume.HasAdministratorConsent(config);
-                    if (!approvedAdministratorResume && !SupportAccess.Confirm(administrator, resume && !preparing, delegate(string message) {
+                    // Read before Disarm clears it. A normal start and the prepare prompt show the screen control text themselves.
+                    bool screenAllowed = !resume || preparing || RestartResume.HasScreenConsent(config);
+                    if (!approvedAdministratorResume && !SupportAccess.Confirm(administrator, resume && !preparing, screenAllowed, delegate(string message) {
                         if (preparing) message += "\n\nAlso allow ONE automatic reconnect at the next Windows sign-in with these same rights, without another prompt? It keeps this session's original expiry. End session cancels it.";
                         return ConsentDialog.Ask(message, administrator) ? WF.DialogResult.Yes : WF.DialogResult.No;
                     })) return;
@@ -961,8 +1696,9 @@ namespace SupportMcp {
                     SupportWindow window = null;
                     try {
                         using (var client = new Client(config)) {
+                            client.ScreenAllowed = screenAllowed;
                             string note = preparing ? "One automatic reconnect is enabled at the next sign-in. End session cancels it."
-                                : resume ? "Reconnected after restart. No further automatic reconnect is installed." : null;
+                                : resume ? "Reconnected after restart. No further automatic reconnect is installed." + (screenAllowed ? "" : " Screen control stays off, because this reconnect was approved before it existed.") : null;
                             window = new SupportWindow(client, Palette.Detect(), administrator, preparing, note);
                             var win = window;
                             client.Finished += delegate { if (resume && !win.Preserve) RestartResume.Disarm(config); };

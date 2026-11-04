@@ -33,6 +33,30 @@ to the file name `support-mcp-app.exe`, because the compiler embeds that name in
 the exe. Run it with `-OutDir <folder>` to write only the exe into that folder
 and leave `src/app-bundle.json` untouched.
 
+### Keep the build reproducible
+
+The v4 compiler (`csc.exe` 4.8.9221.0) adds a helper class for two kinds of
+source, and it names that class with a new GUID on every build. The GUID changes
+the metadata and the type name, so the normalized exe differs from run to run
+and the CI check fails even though the source is the same. Avoid both:
+
+- A constant primitive array initializer of three or more elements, such as
+  `new int[] { 1, 2, 3 }` or `new byte[] { 0x4D, 0x5A, 0x90 }`. The compiler
+  copies the data from a `<PrivateImplementationDetails>{GUID}` class. Build
+  the array in a loop or from a string, or use a list. An array of non-constant
+  values, an array of strings, and an initializer of one or two elements are
+  fine.
+- A `switch` on a string with more than six cases. The compiler computes a hash
+  of the string with a helper class named the same way. Use if-else, a
+  dictionary or a loop. `switch` on an int or an enum is fine.
+
+`src/agent-app.cs` already follows both rules, and says so in a comment where
+it matters (`JpegFit.Encode`, `Screen.UiAct`, `Screen.Input`). Test code in
+`test/app-native.cs` is not part of the shipped exe, so it may use both. If a
+rebuild of the same source gives a different `exe_b64` and
+`scripts/verify-app-binary.mjs` fails, look for one of the two first: build
+twice and compare the type names in the metadata.
+
 ### What CI proves about the committed exe
 
 `node --test` fails when the source or manifest hash in the bundle no longer
@@ -103,18 +127,37 @@ the result. They start the real client against a fake relay and exercise HTTP
 operations, Unicode, chunking, retry deduplication, process-tree cancellation,
 timeout, local expiry and the reconnect rules. They need a Windows desktop
 session, so they are not part of `node --test`; CI runs them in the `windows-app`
-job. `scripts/test-app-native.ps1` also takes `-ReferenceDir`, so the tests are
+job. Besides the client, they cover the pure parts of screen control: coordinate
+scaling, key parsing, the customer pause (hooks and the `GetLastInputInfo`
+cross-check), the cap on `ui_tree` text and on the display count, the choice
+of display for `ui_tree`, the stop and pause checks of typing, the replacement of
+a result the relay refuses, `as` in normal mode and the screen consent of a
+prepared reconnect. `scripts/test-app-native.ps1` also takes `-ReferenceDir`, so the tests are
 compiled against the 4.5.2 references and the compile fails if the app or the
 tests call a method 4.5.2 lacks. They still run on the build PC's framework, so
 they cannot catch a method that is missing at run time on 4.5.2 by themselves;
 the reference assembly build does that. The first connection from a real
 Windows 7 PC was checked live (see [Limits](../README.md#limits)).
 
+Typing into other programs is not in the native tests, because the target has
+to be another process. When you change `Screen.TypeText`, check it by hand on
+Windows 11: type `abc def 123`, `The quick brown fox 12345`, `split shape` and
+`Hello world, שלום עולם! 123` into Notepad, a WinForms `TextBox` and a text
+field in Edge, and read each field back with UI Automation (use `ValuePattern`;
+Chromium's `TextPattern` returns right-to-left text in visual order). Run it
+with the system timer at 1 ms as well, for example while a browser or an
+animated WPF window is open. The reason is in the comment above `TypeText`:
+Windows 11 Notepad reads the character of a Unicode key event late, so events
+sent less than about 10 ms apart replace one another. The code waits 20 ms
+between characters and the relay budgets 35 ms for each (the app measures about 21 ms; Windows 11 can ignore its 1 ms timer request for a minimized window, which costs about 31 ms).
+
 An operator can prepare one automatic reconnect after a restart the customer
 authorized. `scripts/prepare-app-restart.ps1` runs inside the live session on
 the customer's PC, combines the tested app payload with the existing downloaded
 configuration (the attach key never leaves the PC), and asks the customer to
-approve one reconnect with the same rights at the next sign-in. The reconnect
+approve one reconnect with the same rights at the next sign-in. The prompt
+also records that the customer saw the screen control text, and a reconnect
+without that record starts with commands and files only. The reconnect
 cannot extend the session's original 24-hour deadline, and End session or the
 operator ending the session cancels it.
 

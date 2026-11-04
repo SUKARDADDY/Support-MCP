@@ -42,12 +42,13 @@ refuses the other mode's transport (`/ws` for an `app` session, `/agent` for a
 | `src/index.js` | Worker entry: imports `agent.ps1` and `app-bundle.json`, wires `src/app.js`, exports the DO classes |
 | `src/app.js` | router, Access gate, MCP JSON-RPC handler, download page (pure: no `.ps1` import or DO classes, so `node --test` can drive routes) |
 | `src/session.js` | `Session` Durable Object (SQLite-backed), one per session |
+| `src/screen.js` | the screen vocabulary: lanes, the normalized actions, their audit text, and the strict check of every app result field (pure, shared by `mcp.js` and `session.js`) |
 | `src/registry.js` | `Registry` Durable Object, single instance `idFromName("registry")`, lists sessions |
 | `src/agent.ps1` | PowerShell agent template (imported as text, placeholders substituted) |
 | `src/agent-app.cs`, `src/agent-app.manifest` | the Windows app: .NET Framework 4 source (WPF window) and an `asInvoker` manifest |
 | `src/app-bundle.json` | the compiled x86 app plus the SHA-256 of its source and manifest, built by `scripts/build-app.ps1` and checked by tests |
 | `scripts/prepare-app-restart.ps1` | optional one-time reconnect after an authorized restart |
-| `test/` | `node --test` unit tests for pure logic (JWT checks, MCP dispatch, template fill) |
+| `test/` | `node --test` unit tests for pure logic (JWT checks, MCP dispatch, template fill, screen validation) and for the Durable Object (lanes, screen and control frames, audit rules) |
 
 `wrangler.toml`: add DO bindings `SESSION` → `Session`, `REGISTRY` → `Registry`,
 `[[migrations]] tag="v1" new_sqlite_classes=["Session","Registry"]` (free plan
@@ -168,54 +169,240 @@ with the key in `X-Attach-Key`, and the relay answers in JSON with
 `hello` can never resurrect an ended session. Messages from the app:
 
 ```
-{"type":"hello","machine":"..","user":"..","ps":"..","agent":"windows-app-1","elevated":<bool>}
-{"type":"poll","generation":<n>,"busy":<bool>}
+{"type":"hello","machine":"..","user":"..","ps":"..","agent":"windows-app-2","elevated":<bool>,
+ "caps":["screen","uia","lanes","full"],"control":"full"|"normal"}
+{"type":"poll","generation":<n>,"busy_lanes":["cmd","screen"],"busy":<bool>,
+ "desktop":"default"|"secure"|"unknown","paused_until":<ms>,"input_blocked_until":<ms>}
 {"type":"result","id":"<uuid>","generation":<n>,"ok":true, ...}
 {"type":"end","generation":<n>}
 ```
+
+`caps`, `control`, `busy_lanes`, `desktop`, `paused_until` and
+`input_blocked_until` are new. An older app (agent `windows-app-1`) sends none
+of them and keeps working: see [Lanes](#lanes-screen-and-control-frames).
 
 - `hello` attaches. It is the only message that works without a generation. It
   returns `{"type":"welcome","generation":<n>,"expires_at":<ms>,"server_time":<ms>}`.
   The first `hello` from a `consumed` session sets `expires_at` to now + 24 h. Any
   later `hello` (a reconnect) gets a new generation and the same `expires_at`.
   Machine, user and `ps` are cut to 100, 100 and 40 characters, `agent` to 40.
-  `elevated` is stored only when it is a boolean, else `null`. The audit log gets
-  an `attached` row (`http<n>`, `reattach` when it is not the first, and
-  `elevated=true|false|unknown`) and a `hello` row.
+  `elevated` is stored only when it is a boolean, else `null`. `caps` keeps the
+  names the relay knows (`screen`, `uia`, `lanes`, `full`) and drops the rest;
+  no `caps` means `[]`. `control` is stored only when it is `full` or `normal`,
+  else `null`. A hello also clears the stored `desktop`, `paused_until` and
+  `input_blocked_until`. The audit log gets an `attached` row (`http<n>`,
+  `reattach` when it is not the first, and `elevated=true|false|unknown`) and a
+  `hello` row that adds `control=` and `caps=`.
 - Every other message must carry the current generation, else 409
   `{"type":"end","reason":"replaced"}`. Each one counts as a sign of life.
   `session_status.attached` is true while the state is `attached` and the last
   request was under 60 s ago.
-- `poll` is a long poll. The relay holds one for up to 25 s and answers
-  `{"type":"idle"}`, or with the waiting command frame as soon as there is one,
+- `poll` is a long poll. The relay holds one for up to 25 s (shorter when a
+  frame is held back by the redelivery guard below) and answers
+  `{"type":"idle"}`, or with a waiting command frame as soon as there is one,
   or with `{"type":"end"}` when the session ends. A second poll releases the
-  first. A poll with `"busy":true` means the client already holds its command. It
-  is answered `idle` at once, even while a command frame is waiting, so the
-  frame is not sent twice and no poll is parked. The app does not poll in a loop
-  while it works: it waits for its operation to finish and sends a busy poll
-  only every 2 s, as a sign of life that also lets it notice an operator end or expiry quickly. Any poll with the current generation
-  counts as a sign of life.
-- The command frames are the same `run`, `put_file` and `get_file` frames as on
-  the WebSocket. At most one operation is in flight: a second `run`, `put_file`
-  or `get_file` call from the operator while one is waiting returns the error
-  `agent busy; wait for the current operation`.
+  first. Any poll with the current generation counts as a sign of life. A
+  client with one lane (no `lanes` cap) sends `"busy":true` while it holds its
+  command. That poll is answered `idle` at once, even while a command frame is
+  waiting, so the frame is not sent twice and no poll is parked. It waits for
+  its operation to finish and sends a busy poll only every 2 s, as a sign of
+  life that also lets it notice an operator end or expiry quickly. A client
+  with lanes sends `busy_lanes` and keeps long-polling while a lane runs: see
+  [Lanes](#lanes-screen-and-control-frames).
+- The command frames are the `run`, `put_file` and `get_file` frames of the
+  WebSocket, with a `lane` field, plus the `screen` and `control` frames below.
+  At most one operation per lane is in flight: a second call for a lane that is
+  busy returns the error `agent busy; wait for the current operation`.
 - `result` answers the in-flight command. The relay checks the generation and
   the command id, and a repeated result for a command it already holds is
   acknowledged with `{"type":"ack"}` and not applied twice. Results use base64:
   `run` carries `stdout_b64`, `stderr_b64`, `exit_code`, `timed_out` and
   `stdout_truncated` / `stderr_truncated` flags (each stream at most 90,000
   base64 characters; a truncated stream gets a `[truncated]` marker),
-  `put_file` carries `bytes`, `get_file` carries `data_b64`, `size` and `eof`.
-  A malformed result gets 400 and does not resolve the command.
+  `put_file` carries `bytes`, `get_file` carries `data_b64`, `size` and `eof`,
+  and `screen` and `control` results are described below. A malformed result
+  gets 400 `{"error":"invalid result"}` and does not resolve the command, which
+  keeps waiting for a valid one until its timeout. The app does not resend a
+  result the relay refuses with 400 or 413: it replaces that result once with
+  `{"ok":false,"error":"result rejected by relay"}`, sends that, and carries on
+  polling. A result it cannot serialize under 750,000 bytes gets the same
+  replacement. Any other failure, including 408, 429 and other 4xx answers, takes
+  the normal retry path with the same result. That replacement carries only
+  `type`, `id`, `generation`, `ok` and `error`, so the relay always accepts it. If
+  it is refused anyway, the app drops it and carries on, and the operator's call
+  ends with the relay's `timeout waiting for agent`.
 - `end` is the customer ending the session: the relay marks it `ended` with
   reason `customer`. An operator `session_end`, the alarm and the 24-hour limit
   answer any waiting poll with `{"type":"end"}`, fail the waiting command, and
   every later request gets 410.
 
+### Lanes, screen and control frames
+
+**Lanes.** Every operation frame carries `"lane":"cmd"` or `"lane":"screen"`.
+Lane `cmd` takes `run`, `put_file` and `get_file`. Lane `screen` takes `screen`
+and `control` frames. The relay keeps one pending command per lane, so a
+`run` and a screenshot are in flight together, but two screenshots (or two
+`run` calls) are not. An operator call for a busy lane returns `agent busy;
+wait for the current operation`. The relay forwards only the lanes the client
+can use:
+
+| Client | Detected by | Behaviour |
+|---|---|---|
+| lanes client | `caps` contains `lanes` | both lanes. Screen frames also need `caps` to contain `screen` |
+| lanes client without `screen` | `caps` has `lanes` but not `screen` | commands and files only. Screen calls fail with `the customer has not approved screen control for this session`. The app sends these caps when it was resumed from a restart whose consent did not cover screen control |
+| old app | no `lanes` in `caps` | the one `cmd` lane, as before, and `busy` in the poll. Screen and control calls fail with `this support app is too old for screen control`, and `run` with `as:"system"` with `this support app is too old to run as system`. Its frames also carry `lane`, which it ignores |
+| PowerShell agent | `windows_mode` is `powershell` | no screen. Screen and control calls fail with `the PowerShell fallback has no screen access` (before the agent is attached too), and `run` with `as:"system"` with `the PowerShell fallback cannot run as system` |
+
+**Poll for a lanes client.** `busy_lanes` lists the lanes with an operation
+running, a subset of `["cmd","screen"]`; unknown names are ignored. When it is
+absent, `"busy":true` means `["cmd"]`. The relay answers:
+
+1. every lane busy: `{"type":"idle"}` at once, nothing parked;
+2. a lane that is not busy has a waiting frame: that frame (`cmd` is checked
+   first). One frame per poll, so a client with two waiting frames polls again;
+3. otherwise the poll parks for up to 25 s and is answered `idle`, or with a
+   frame as soon as one arrives for a lane the poll did not call busy.
+
+So a client with a running `run` must keep a poll parked with
+`busy_lanes:["cmd"]`, or screen frames never reach it. When a `result` is
+accepted for a lane, the relay clears that lane from the parked poll's busy set,
+so the next frame for it is delivered without a new poll.
+
+**Duplicates.** A frame the relay already sent is not sent again within 5 s,
+whatever the next poll says, and then only to a poll that says the lane is
+free. A frame can be written to a poll the app has already aborted (it aborts
+its parked poll when a lane finishes, so the result goes out at once). The
+relay does not know, and the app's next poll arrives inside the 5 s window. That
+poll parks until the guard window ends (5 s after the frame was sent) instead
+of the full 25 s, and the relay then answers it with the frame. The client must mark a lane busy before it sends the next poll, and must
+ignore a frame whose `id` it already ran. A result for a command the relay no
+longer holds (timed out, replaced) is acknowledged and dropped.
+
+**`screen` frame** (relay to app, lane `screen`):
+
+```
+{"type":"screen","id":"<uuid>","lane":"screen","action":{"name":"<action>", ...}}
+```
+
+The relay normalizes `action` before sending: it keeps only the fields below,
+fills the defaults shown, rounds numbers to whole numbers, and refuses anything
+else without sending a frame. Coordinates are integers 0 to 20000 in pixels of
+the screenshot the model saw (at most 1280 x 800). `display` is an integer 0 to
+15 (0 is the primary monitor).
+
+| `name` | Fields (default) |
+|---|---|
+| `screenshot` | `display` (0) |
+| `click` | `x`, `y`, `button` (`left`\|`right`\|`middle`, left), `count` (1 to 3, 1), `display`, `screenshot` |
+| `move` | `x`, `y`, `display`, `screenshot` |
+| `drag` | `x1`, `y1`, `x2`, `y2`, `display`, `screenshot` |
+| `scroll` | `x`, `y`, `direction` (`up`\|`down`\|`left`\|`right`), `amount` (1 to 50, 3), `display`, `screenshot` |
+| `type` | `text` (1 to 5000 chars), `display`, `screenshot` |
+| `key` | `keys` (1 to 100 chars, no control characters; xdotool style such as `ctrl+s`, `alt+tab`, `Return`, `F5`), `display`, `screenshot` |
+| `wait` | `seconds` (above 0, at most 10, one decimal, 1), `display`, `screenshot` |
+| `zoom` | `x1`, `y1`, `x2`, `y2` (`x2 > x1`, `y2 > y1`), `display` |
+| `ui_tree` | `max_lines` (1 to 2000, 300). The app reads the display that holds the foreground window, reports it as `display`, and gives the coordinates of its lines in pixels of that display's screenshot |
+| `ui_act` | `ref` (whole number 0 to 1,000,000, from `ui_tree`), `verb` (`invoke`\|`set_value`\|`toggle`\|`focus`\|`expand`\|`collapse`\|`select`), `value` (required for `set_value`, optional for `select`, at most 5000 chars, left out for other verbs), `display`, `screenshot`. The app ignores `display` and takes the screenshot from the display of the last `ui_tree` |
+| `block_input` | `on` (boolean, required), `minutes` (1 to 10, 10; present only when `on` is true) |
+| `send_sas` | `display`, `screenshot` |
+| `type_secret` | `text` (1 to 1000 chars), `display`, `screenshot` |
+
+`screenshot` (boolean, default `true`) asks for a fresh screenshot of `display`
+after the action, taken after a short settle (about 300 ms). The app, not the
+relay, enforces everything that depends on the PC: the 3-second customer
+pause, the own-window guard, the refusal of elevated windows and the refusal of
+Ctrl+Alt+Del in `key`. The relay itself refuses `block_input` and
+`send_sas` unless the stored `control` is `full`, with the error `<name> needs
+full control`, so a normal-mode app never receives them (it would also answer
+`full control is not available in this build`). `type_secret` is forwarded in
+both modes.
+
+**`control` frame** (relay to app, lane `screen`):
+
+```
+{"type":"control","id":"<uuid>","lane":"screen","action":"request_full_control"}
+```
+
+The relay waits up to 120 s (plus 15 s) for it, because the customer may have to
+answer UAC and dialogs. The app answers with a `result` before it hands the
+connection over, or the service says `hello` with `control:"full"`. A new
+`hello` while this frame is the pending command resolves it: `control:"full"`
+gives `{ok:true, control:"full", text:"full control is on"}`, anything else
+gives the error `the app restarted without full control`. Every other pending
+command fails with `agent replaced`, as for any new `hello`.
+
+**`run` frame** gains `lane:"cmd"` and, for a lanes client only, `as`:
+`"user"` (default) or `"system"`. The relay accepts only those two values
+(`as must be user or system`). It refuses `system` unless the session's stored
+`control` is `full`, with `as: "system" needs full control`, and sends nothing.
+The app refuses it too, and any value but `user`, in normal mode (`as: "system"
+needs full control`, `as must be user`). `put_file` and `get_file` frames gain
+`lane:"cmd"`.
+
+**Screen and control results** (app to relay, `ok:true`):
+
+```
+{"type":"result","id":"<uuid>","generation":<n>,"ok":true,
+ "image_b64":"<base64>","mime":"image/jpeg"|"image/png","width":<int>,"height":<int>,
+ "display":<int>,"displays":<int>,"desktop":"default"|"secure"|"unknown","text":"<string>"}
+{"type":"result","id":"<uuid>","generation":<n>,"ok":true,"control":"full"|"normal","desktop":"..","text":".."}   (control)
+{"type":"result","id":"<uuid>","generation":<n>,"ok":false,"error":"<text>"}
+```
+
+Every field is optional unless noted, and `null` counts as absent. The relay
+checks all of them and answers 400 `invalid result` for any violation. Fields
+it does not list are dropped.
+
+| Field | Rule |
+|---|---|
+| `ok` | exactly `true` (or `false` with `error`, cut to 1000 chars; an error result carries nothing else) |
+| `image_b64` | string of at most 700,000 characters, length a multiple of 4, standard base64 alphabet with `=` padding only at the end. It must start with the JPEG signature (`/9j/`) when `mime` is `image/jpeg`, or the PNG signature (`iVBORw0KGgo`) when `mime` is `image/png`. **Required** for `screenshot` and `zoom` |
+| `mime` | `image/jpeg` or `image/png`; required with `image_b64`, refused without it |
+| `width`, `height` | whole numbers 1 to 8192; required with `image_b64`, refused without it |
+| `display` | whole number 0 to 15 |
+| `displays` | whole number 1 to 16, and above `display` when both are sent. The app reports at most 16 |
+| `desktop` | `default`, `secure` or `unknown` (`secure` is the Winlogon desktop: UAC, lock, sign-in, Ctrl+Alt+Del) |
+| `text` | string of at most 200,000 characters (2000 for `control`). **Required** for `ui_tree`. The app stops a `ui_tree` at about 190,000 characters and ends it with a `[more elements not shown...]` line |
+| `control` | `full` or `normal` (`control` results only) |
+
+The request body limit stays 750,000 characters, so the app steps JPEG quality
+down until the image is under 700,000 base64 characters. The relay stores
+`desktop` from any accepted result as the session's last seen desktop, and adds
+the stored `control` to the operator's result when the app did not send one.
+`type_secret` results never carry `text`. When the app reports `ok:false` for
+`type_secret`, the relay drops the app's `error` and returns `type_secret
+failed`. The app does the same on its side, so a secret can not come back in an
+error.
+
+**Poll report.** A poll may carry `desktop`, `paused_until` and
+`input_blocked_until`. The first is one of the `desktop` values. The other two
+are Unix milliseconds in the relay's clock (the app converts with `server_time`
+from the welcome): `paused_until` is when the customer's 3-second input pause
+ends, and `input_blocked_until` is when `block_input` lifts. A field the poll
+leaves out keeps its stored value, `null` or an invalid value clears it, and a
+bad value is never an error. `session_status` returns a deadline only while it
+is in the future.
+
+**Timeouts.** The relay waits `30 s + 15 s` for a `screen` result, plus the
+seconds of a `wait` and 35 ms per character of `type` or `type_secret` text (the app types one character every 20 ms, about 21 ms measured, and about 31 ms when Windows ignores its 1 ms timer request),
+then answers the operator `timeout waiting for agent`.
+
 Audit log: DO SQLite table `log(ts INTEGER ms, kind TEXT, detail TEXT)`;
 kinds `created, consumed, hello, attached, detached, run, put_file, get_file,
-ended`. Command text is logged, cut to 512 characters; file content is not
-(path + byte count only). A `hello` row holds the stored, truncated machine
+screen, control, ended`. Command text is logged, cut to 512 characters (a
+`run` as SYSTEM starts with `(system) `); file content is not (path + byte
+count only). A `screen` row holds the action in one short line, and **never**
+content: `screenshot 1280x800` (written when the result arrives; `screenshot
+failed` if it did not), `click 640,412` (then `right` and `x2` for a right or
+double click), `move 5,6`, `drag 1,2 3,4`, `scroll down 3 at 5,6`, `type 12
+chars` (a length, never the text), `key ctrl+s`, `wait 2s`, `zoom 1,2,3,4`,
+`ui_tree`, `ui_act invoke 12` (the verb and ref, never the value),
+`block_input on 10m` or `block_input off`, `send_sas`, and `type_secret` with
+no length and no text. A non-zero display adds ` display <n>` (not for
+`type_secret`). A `control` row is `request_full_control`. Screenshots and
+every other image are never stored: not in SQLite, not in the registry, not in
+a log. The relay does not write to the Worker log at all, so tool arguments and
+results can not reach it. A `hello` row holds the stored, truncated machine
 (100), user (100), ps (40) and agent (40) values, never the raw message. The
 relay accepts one `hello` per socket: storage key `hello_tag` holds the tag of
 the socket that has already sent one, and a reattach gets a new tag.
@@ -279,17 +466,41 @@ text content item, not JSON-RPC errors.
 
 | Tool | Args | Returns (text content, JSON) |
 |---|---|---|
-| `session_create` | `label?` string, `windows_mode?` (`app` default, `powershell`; aliases `legacy`, `standard`) | `app`: `{session_id, windows_mode, download_url, one_liner, code_expires_at}` with `download_url` = `<origin>/j/<code>?client=app` and one-liner = `Start-Process '<download_url>'`. `powershell`: `{session_id, windows_mode, one_liner, code_expires_at}` with one-liner = `irm <origin>/j/<code> \| iex`. An unknown mode is a tool error and creates nothing. |
+| `session_create` | `label?` string, `windows_mode?` (`app` default, `powershell`; deprecated aliases `legacy`, `standard`) | `app`: `{session_id, windows_mode, download_url, one_liner, code_expires_at}` with `download_url` = `<origin>/j/<code>?client=app` and one-liner = `Start-Process '<download_url>'`. `powershell`: `{session_id, windows_mode, one_liner, code_expires_at}` with one-liner = `irm <origin>/j/<code> \| iex`. An unknown mode is a tool error and creates nothing. |
 | `session_list` | — | sessions from Registry with state + expires_at + machine |
-| `session_status` | `session_id`, `log_tail?` (default 20) | state, `windows_mode` (`app` or `powershell`), machine, user, expires_at, startup_expires_at, attached now?, last log rows; `app` sessions add `elevated` (`true`, `false`, or `null` when the app did not report it) |
-| `run` | `session_id`, `command`, `timeout_s?` | exit_code (null if timed out), stdout, stderr, timed_out |
+| `session_status` | `session_id`, `log_tail?` (default 20) | state, `windows_mode` (`app` or `powershell`), machine, user, expires_at, startup_expires_at, attached now?, `client_version` (the `agent` string of the last hello), last log rows; `app` sessions add `elevated` (`true`, `false`, or `null` when the app did not report it), `control` (`full`, `normal` or `null`), `caps` (array), `desktop` (`default`, `secure`, `unknown` or `null`), `paused_until` and `input_blocked_until` (Unix ms while in the future, else `null`) |
+| `run` | `session_id`, `command`, `timeout_s?`, `as?` (`user` default; `system` needs full control and is refused otherwise) | exit_code (null if timed out), stdout, stderr, timed_out |
 | `put_file` | `session_id`, `path`, `data_b64`, `append?` | bytes |
 | `get_file` | `session_id`, `path`, `offset?`, `length?` | data_b64, size, eof |
 | `session_end` | `session_id` | `{ended:true}`; sends `end` to agent first |
 
-No elevate tool, no screen tools.
+The tools above are in every connection. The screen tools are chosen per
+connection by the `/mcp` URL: `?shape=computer` (the default) or
+`?shape=split`, and `?ui=0` to hide `ui_tree` and `ui_act` (`?ui=1` is the
+default). Any other value of either parameter gets 400 `{"error":"unknown ..."}`
+after the Access check. A tool that the connection does not list is
+`unknown tool`.
 
-The downloaded app accepts an already elevated launch only after an explicit
+| Tool | Shape | Maps to |
+|---|---|---|
+| `computer` | `computer` | one `action` enum: `screenshot`, `left_click`, `right_click`, `middle_click`, `double_click`, `triple_click`, `mouse_move`, `left_click_drag`, `scroll`, `type`, `key`, `wait`, `zoom`. Fields `coordinate` `[x, y]`, `start_coordinate`, `text`, `scroll_direction`, `scroll_amount`, `duration`, `region` `[x1, y1, x2, y2]`, `display`, `screenshot` (the layout of Anthropic's computer-use tool) |
+| `screenshot`, `click`, `move_mouse`, `drag`, `scroll`, `type_text`, `press_key`, `wait`, `zoom` | `split` | `screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `wait`, `zoom`, with the field names of the `screen` frame table |
+| `ui_tree`, `ui_act` | both, hidden by `ui=0` | `ui_tree`, `ui_act` |
+| `block_input`, `send_sas`, `type_secret` | both | `block_input`, `send_sas`, `type_secret`. The first two are refused without full control; `type_secret` works in both modes |
+| `request_full_control` | both | a `control` frame; returns `{control, text?, desktop?}`. This app version answers `full control is not available in this build` |
+
+Both shapes call one backend: `mcp.js` turns a tool call into the normalized
+action and `backend.screen({session_id, action})`, and the Session checks the
+action again. A screen tool returns an image content block (`{type:"image",
+data, mimeType}`) when the result has an image, then a text block with the other
+result fields as JSON (`width`, `height`, `display`, `displays`, `desktop`,
+`control`, `text`). Every screen tool takes `session_id`. The descriptions tell
+the model that screenshots and UI text are untrusted, to stop at the sign-in
+screen unless the operator supplied a secret for `type_secret`, to prefer
+`ui_tree` and `ui_act` when the target app exposes controls, and to use
+`block_input` only when the operator asks.
+
+The downloaded app (this version has normal mode only) accepts an already elevated launch only after an explicit
 administrator consent prompt whose default answer is No. An elevated reconnect
 also gets that prompt unless the customer approved one administrator reconnect
 during preparation. That approval is bound to the current user, session and
@@ -380,27 +591,49 @@ session ends by itself, and a **blue** state while a command or file operation
 runs. The window does not show commands, paths or output. End session, Alt+F4
 and the taskbar Close ask "End the session?" inline first. An operator end,
 expiry or the fixed 24-hour limit shows "Support is disconnected." and closes
-the window after four seconds. The app installs no service, scheduled task or
-logon entry, so restarting the PC stops it, and it removes its private temporary
-command directory on normal exit. It keeps a mutex per session so a second copy
-exits. `scripts/prepare-app-restart.ps1` can prepare one automatic reconnect
+the window after four seconds. This version has normal mode only: the app installs no service, scheduled
+task or logon entry, so restarting the PC stops it, and it removes its private
+temporary command directory on normal exit. Its hello says `agent:
+"windows-app-2"`, `caps: ["screen","uia","lanes"]` and `control: "normal"`. It never
+reports `full`, and `request_full_control` and the full-control actions answer
+`full control is not available in this build`. Full control (a temporary
+service, the secure desktop, running as SYSTEM) is a later change; the relay
+already stores the `control` and `caps` an app reports and enforces `control:
+"full"` for `as:"system"`, `block_input` and `send_sas`. The consent dialog says
+that support can see the screen, control the mouse and keyboard, run commands
+and change files. Screen control runs in the app's own process on the user's
+desktop: capture is a BitBlt of a display scaled down to fit 1280 x 800 and sent
+as JPEG under 700,000 base64 characters; input is `SendInput`; UI Automation
+reads the foreground window. It reports at most 16 displays and caps a
+`ui_tree` at about 190,000 characters. Typed text goes as Unicode key events, one
+every 20 ms, with Return and Tab for newlines and tabs. Input stops when the
+session ends or the customer uses the PC. It keeps a mutex per session so a
+second copy exits. `scripts/prepare-app-restart.ps1` can prepare one automatic reconnect
 after a restart the customer authorized: it combines the tested payload with
 the existing downloaded configuration under
 `%LOCALAPPDATA%\SupportMcp\<sid8>\agent.exe` and arms a one-time `HKCU` RunOnce
-entry. The reconnect never extends the session's `expires_at`.
+entry. The reconnect never extends the session's `expires_at`. The prepare
+prompt records the customer's approval of screen, mouse and keyboard control next
+to the reconnect (a second registry value, bound to the user and the deadline). A
+reconnect that finds no such record starts without the `screen` cap.
 
 `scripts/build-app.ps1` compiles on Windows and writes `src/app-bundle.json`.
 `node --test` fails when the source or manifest hash in the bundle is stale.
 `test/app-native.cs` is compiled with the app source (`/main:AppTests`) on a
 Windows host. It runs the real client against a fake relay and covers HTTP
 operations, Unicode, chunking, retry deduplication, process-tree cancellation,
-timeout, local expiry and the reconnect rules.
+timeout, local expiry, the reconnect rules, the two lanes, the 4xx result
+replacement, the pause cross-check, the display and ui_tree caps, and the stop
+and pause checks of typing.
 
 ## Acceptance (each names its check)
 
 1. `node --test` green; `npx wrangler deploy --dry-run` bundles without error.
 2. Local stack (`wrangler dev`, `.dev.vars` with `DEV_SKIP_ACCESS=1`): MCP
-   `initialize` → `tools/list` returns exactly the 7 tools (curl).
+   `initialize` → `tools/list` returns the 7 base tools plus `computer`,
+   `ui_tree`, `ui_act`, `block_input`, `send_sas`, `type_secret` and
+   `request_full_control` (14), and `?shape=split` swaps `computer` for the
+   nine split tools (curl).
 3. `/mcp` without the JWT on a non-localhost host → 403 (unit test with a fake
    host + a test for bad aud / expired / wrong sig using a locally generated
    RSA key).
@@ -433,6 +666,11 @@ timeout, local expiry and the reconnect rules.
 ## Must keep
 
 - `/healthz` stays public and 200.
-- Nothing ever runs elevated; no code path requests UAC.
+- The PowerShell agent never runs elevated and no relay code path requests UAC.
+  This version of the app never asks for elevation. When full control exists, the
+  app will ask only for it, only after the customer agrees, and the relay will
+  ask for it only through an explicit `request_full_control` call.
+- A screenshot, typed text and a secret are never stored by the relay: not in
+  the audit log, the Session storage, the registry or the Worker log.
 - `ended` is terminal; no path reopens a session or extends `expires_at`.
 - No secrets in the repo: `.dev.vars` gitignored; attach keys stored hashed.
