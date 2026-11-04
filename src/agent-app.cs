@@ -412,7 +412,7 @@ namespace SupportMcp {
         public const string SecretFailed = "type_secret failed";
         // Least time between two typed characters. Windows 11 Notepad reads the character of a Unicode key event late,
         // so a character injected before it has read the previous one replaces it (see TypeText). 20 ms is twice the
-        // slowest gap that still went wrong in the measurements, and it holds the relay's 25 ms per character budget.
+        // slowest gap that still went wrong in the measurements, and it holds the relay's 35 ms per character budget.
         public const int TypeGapMs = 20;
         internal readonly InputWatch Watch = new InputWatch();
         volatile List<AutomationElement> refs = new List<AutomationElement>();
@@ -1012,7 +1012,9 @@ namespace SupportMcp {
                 security.AddAccessRule(new FileSystemAccessRule(WindowsIdentity.GetCurrent().User, FileSystemRights.FullControl, InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
                 work = Path.Combine(Path.GetTempPath(), "remote-support-" + Guid.NewGuid().ToString("N"));
                 Directory.CreateDirectory(work, security);
-                screen = new Screen(); screen.Start();
+                // Without screen consent there is no Screen at all: no global input hooks and no F24 probe. Execute
+                // refuses screen frames, and the poll reports no pause.
+                if (ScreenAllowed) { screen = new Screen(); screen.Start(); }
                 ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2 on .NET 4.5.2
                 while (!stop.WaitOne(0)) {
                     try {
@@ -1059,7 +1061,8 @@ namespace SupportMcp {
                         var busyLanes = new List<string>(); foreach (var lane in lanes) if (lane.Busy) busyLanes.Add(lane.Name);
                         var pollClock = Stopwatch.StartNew();
                         var poll = Wire.Map("type", "poll", "generation", generation, "busy", lanes[0].Busy, "busy_lanes", busyLanes);
-                        if (screen != null) { poll["desktop"] = Screen.Desktop(); poll["paused_until"] = screen.Paused ? UnixNow() + serverOffsetMs + screen.PausedForMs : (object)null; }
+                        poll["desktop"] = Screen.Desktop();
+                        var watching = screen; if (watching != null) poll["paused_until"] = watching.Paused ? UnixNow() + serverOffsetMs + watching.PausedForMs : (object)null;
                         var frame = Send(poll, false, true);
                         if (frame == null) continue;
                         if (networkError != "") { networkError = ""; ShowStatus("Support session active. Close this window to end access."); Print("Connection restored."); Link(true); }
