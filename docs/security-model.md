@@ -19,8 +19,10 @@ apply to only one client say which.
   flashing taskbar button the customer may miss, and an app in the background
   (a start from a download or Explorer, or `request_full_control`) cannot take
   the foreground by itself. The customer's click on Allow gives it to the app.
-  Allow does nothing for its first half second, so typing meant for another
-  window cannot answer it. The app never answers UAC. The question is not a
+  Allow does nothing for its first half second, so a click or typing meant for
+  another window cannot press it; Escape, Enter or Space decline at once
+  (**Don't allow** has the focus), which starts the one-minute cooldown. The
+  app never answers UAC. The question is not a
   barrier against the operator: in normal mode the operator's `run` and screen
   tools work as the customer and can press Allow through UI Automation. UAC
   **Yes**, which only the customer can click on the secure desktop, is the
@@ -28,12 +30,23 @@ apply to only one client say which.
   runs as administrator, UAC is off, or an administrator elevates without a
   prompt), the question is the only consent, and an operator in normal mode
   already has the customer's administrator rights. The question is modeless,
-  so End session in the corner window works while it waits and while UAC asks.
-  If the app stops waiting before the customer answers UAC (End session, the
-  session ended, `request_full_control` unanswered for 110 s, the app closed),
-  it withdraws the request: the elevated installer checks a named event of the
-  app before it installs and again before it starts the service, and installs
-  nothing once the app withdrew or exited. If the customer says No anywhere,
+  so End session in the corner window works while it waits. While UAC shows on
+  the secure desktop, only UAC itself can be answered; a prompt parked in the
+  taskbar leaves End session usable. If the app stops waiting before the
+  customer answers UAC (End session, the session ended, `request_full_control`
+  unanswered for 110 s, the app closed), it withdraws the request: each attempt
+  makes a named event with a random nonce, which only it may create, and the
+  elevated installer goes ahead only if that event exists and is not set. The
+  installer keeps it open and checks it again before it starts the service, so
+  a withdrawal stops an install that already runs, and the app exiting after
+  Yes (a sign-out) does not. Like the question, the withdrawal is no barrier
+  against the operator: in normal mode the operator's code runs as the customer
+  and could start a process outside the command's Job that holds the event. What
+  holds is UAC **Yes**, which only the customer can click, and End session or
+  `session_end`: the relay refuses the new service's `hello` for a session that
+  ended. Until a withdrawn prompt is gone (answered, or dropped by Windows),
+  `request_full_control` asks no new one, so only one prompt exists, and a No
+  on it starts the cooldown. If the customer says No anywhere,
   or elevation fails, the app asks "Continue with limited support? Support can
   see your screen and control your mouse and keyboard, but not Windows
   security prompts." Every dialog has **Don't allow** selected by default, and
@@ -113,7 +126,8 @@ apply to only one client say which.
   second for a program the command did not wait for (as SYSTEM and as the
   user), and the output caps. `request_full_control` asks one prompt at a time,
   and not again within a minute after the customer declined. One that gets no
-  answer in 110 s returns `the customer did not answer`, without the minute.
+  answer in 110 s returns `the customer did not answer`, without the minute,
+  and while its Windows prompt is still open the next request is refused.
 - **Normal mode.** Without full control, screen capture, mouse, keyboard and UI
   Automation run inside the customer's own process and desktop session, with the
   customer's token. It cannot see or operate the secure desktop, it cannot run as

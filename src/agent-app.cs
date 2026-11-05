@@ -1964,16 +1964,24 @@ namespace SupportMcp {
             if (got != all.Length) throw new IOException("short read");
             return all;
         }
-        // --elevate-install <deadline, Unix ms> <1 when the session is already connected>. Exit code 0: installed and
-        // running. Anything else: nothing of this install is left.
+        // --elevate-install <deadline, Unix ms> <1 when the session is already connected> <app pid> <attempt nonce>. Exit
+        // code 0: installed and running. Anything else: nothing of this install is left.
         public static int Install(byte[] self, Dictionary<string, object> cfg, string[] args) {
             long now = Client.UnixNow(), deadline;
             int appPid;
-            if (args.Length != 4 || !long.TryParse(args[1], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out deadline) || deadline <= now
-                || !int.TryParse(args[3], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out appPid)) return 2;
-            string sid = Wire.Text(cfg, "sid"), sid8 = Sid8(cfg), name = Backstop.Name(sid8), folder = Folder(sid8);
+            if (args.Length != 5 || !long.TryParse(args[1], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out deadline) || deadline <= now
+                || !int.TryParse(args[3], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out appPid)
+                || !System.Text.RegularExpressions.Regex.IsMatch(args[4], "^[0-9a-f]{32}$")) return 2;
+            string sid8 = Sid8(cfg);
+            // The app stopped waiting (or exited) before this Yes: install nothing. The event stays open from here on, so
+            // the app exiting after the Yes (a sign-out) withdraws nothing; only setting it does.
+            var want = Elevation.Wanted(sid8, args[4]);
+            if (want == null) return 1;
+            using (want) return Install(self, cfg, sid8, deadline, now, args[2] == "1", appPid, want);
+        }
+        static int Install(byte[] self, Dictionary<string, object> cfg, string sid8, long deadline, long now, bool welcomed, int appPid, EventWaitHandle want) {
+            string sid = Wire.Text(cfg, "sid"), name = Backstop.Name(sid8), folder = Folder(sid8);
             if (!System.Text.RegularExpressions.Regex.IsMatch(folder, @"^[A-Za-z]:\\[^%&|<>^""]+$")) return 2; // it goes into cmd lines
-            if (!Elevation.Wanted(sid8, appPid)) return 1; // the app stopped waiting (or exited) before this Yes
             var status = Scm.Status(name);
             if (status != null || Directory.Exists(folder) || File.Exists(folder) || Backstop.Tasks(sid8).Count > 0) {
                 // A leftover (a crash in the middle of an install) or a running service. Only this session's is touched:
@@ -1987,7 +1995,7 @@ namespace SupportMcp {
                 if (Backstop.Tasks(sid8).Count > 0 || Directory.Exists(folder)) return 3;
             }
             try { Native.CreateLocked(folder, LockedFolder()); } catch (Exception) { return 1; } // not ours: leave it alone
-            var state = new FullState { Sid = sid, Task = Backstop.NewTask(sid8), Deadline = FullState.Clamp(deadline, now), Welcomed = args[2] == "1", AppPid = appPid };
+            var state = new FullState { Sid = sid, Task = Backstop.NewTask(sid8), Deadline = FullState.Clamp(deadline, now), Welcomed = welcomed, AppPid = appPid };
             try {
                 File.WriteAllBytes(Path.Combine(folder, "agent.exe"), self);
                 string window = Path.Combine(folder, "window.exe");
@@ -1998,7 +2006,7 @@ namespace SupportMcp {
                 // False when the mutex stayed busy: full control still works, and send_sas says that Windows refuses it.
                 using (var hklm = SasShare.Machine()) SasShare.Acquire(hklm, name);
                 Scm.Create(name, "\"" + Path.Combine(folder, "agent.exe") + "\" --service");
-                if (!Elevation.Wanted(sid8, appPid)) { Remove(sid8); return 1; }
+                if (want.WaitOne(0)) { Remove(sid8); return 1; } // withdrawn while this install ran
                 Scm.Start(name);
                 return 0;
             } catch (Exception) { Remove(sid8); return 1; }
@@ -2035,52 +2043,75 @@ namespace SupportMcp {
         public const int Installed = 0, Declined = 1, Failed = 2, NoAnswer = 3;
         // The elevated child runs from a copy in a new folder of its own under the user's Temp, so nothing that sits
         // next to the download (an .exe.config, a DLL) is loaded by the elevated process. The caller deletes the folder.
+        public const string StagePrefix = "SupportMcpStage-";
         public static string Stage(string exe) {
-            string dir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N")), copy = Path.Combine(dir, Path.GetFileName(exe));
+            string dir = Path.Combine(Path.GetTempPath(), StagePrefix + Guid.NewGuid().ToString("N")), copy = Path.Combine(dir, Path.GetFileName(exe));
             Directory.CreateDirectory(dir); File.Copy(exe, copy); return copy;
         }
+        // Staged copies an earlier run left behind (it exited while UAC still asked), older than an hour.
+        public static void SweepStaged() {
+            try {
+                foreach (string dir in Directory.GetDirectories(Path.GetTempPath(), StagePrefix + "*"))
+                    try { if (Directory.GetCreationTimeUtc(dir) < DateTime.UtcNow.AddHours(-1)) Directory.Delete(dir, true); } catch (Exception) { }
+            } catch (Exception) { }
+        }
         // The app may stop waiting while UAC still asks: the customer ended, the session ended, the request timed out, or
-        // the app exited. A Yes after that must install nothing. So each attempt holds a named event of this process, and
-        // the elevated installer goes ahead only while the event exists and is not set (Wanted), checked before it installs
-        // and again before it starts the service. The event is gone when this process is.
-        public static string WantName(string sid8, int appPid) { return "Local\\SupportMcpElevate-" + sid8 + "-" + appPid.ToString(System.Globalization.CultureInfo.InvariantCulture); }
+        // the app exited. A Yes after that must install nothing. So each attempt creates a named event with a random nonce,
+        // which it passes to the installer, and the installer goes ahead only if the event exists and is not set (Wanted).
+        // It keeps the event open and checks it again before it starts the service. The event is gone when the app is,
+        // unless the installer holds it. This stops a late Yes; it is no barrier against code that runs as the customer.
+        public static string WantName(string sid8, string nonce) { return "Local\\SupportMcpElevate-" + sid8 + "-" + nonce; }
+        public static string Nonce() {
+            var b = new byte[16]; using (var rng = new System.Security.Cryptography.RNGCryptoServiceProvider()) rng.GetBytes(b);
+            return BitConverter.ToString(b).Replace("-", "").ToLowerInvariant();
+        }
         // An installer that runs as another administrator (the credential prompt of a standard user) may only wait on it.
-        public static EventWaitHandle Want(string sid8, int appPid) {
+        // Fails when the event exists already: whoever made it first could keep it unset.
+        public static EventWaitHandle Want(string sid8, string nonce) {
             var sec = new EventWaitHandleSecurity(); bool created;
             sec.AddAccessRule(new EventWaitHandleAccessRule(WindowsIdentity.GetCurrent().User, EventWaitHandleRights.FullControl, AccessControlType.Allow));
             foreach (var sid in new SecurityIdentifier[] { FullAcl.SystemSid, FullAcl.AdminsSid })
                 sec.AddAccessRule(new EventWaitHandleAccessRule(sid, EventWaitHandleRights.Synchronize, AccessControlType.Allow));
-            var e = new EventWaitHandle(false, EventResetMode.ManualReset, WantName(sid8, appPid), out created, sec);
-            e.Reset(); return e;
+            var e = new EventWaitHandle(false, EventResetMode.ManualReset, WantName(sid8, nonce), out created, sec);
+            if (!created) { e.Dispose(); throw new IOException("the event of this attempt exists already"); }
+            return e;
         }
-        public static bool Wanted(string sid8, int appPid) {
+        // The installer's side: the open event while the attempt still wants the install, else null.
+        public static EventWaitHandle Wanted(string sid8, string nonce) {
             EventWaitHandle e;
-            if (!EventWaitHandle.TryOpenExisting(WantName(sid8, appPid), EventWaitHandleRights.Synchronize, out e)) return false;
-            using (e) return !e.WaitOne(0);
+            if (!EventWaitHandle.TryOpenExisting(WantName(sid8, nonce), EventWaitHandleRights.Synchronize, out e)) return null;
+            if (!e.WaitOne(0)) return e;
+            e.Dispose(); return null;
         }
         // One UAC request and the install after it, on a fresh STA thread, as ShellExecuteEx wants. Answered: the customer
         // said Yes and the installer runs. Withdraw: install nothing from now on (the installer removes what it made).
         public sealed class Attempt {
             readonly EventWaitHandle want; readonly ManualResetEvent done = new ManualResetEvent(false);
-            volatile int outcome = Failed; volatile bool answered;
+            volatile int outcome = Failed; volatile bool answered, dropped;
             public WaitHandle Done { get { return done; } }
             public int Outcome { get { return outcome; } }
+            // Windows drops an unanswered prompt after about 120 s (measured on 7 and 11) and reports it as a No.
+            public const long DropMs = 115000;
+            public bool Dropped { get { return dropped; } }
             public bool Answered { get { return answered; } }
             public void Withdraw() { try { want.Set(); } catch (ObjectDisposedException) { } }
+            volatile string staged;
+            // The app exits while UAC still asks: remove the staged copy (a Yes then starts nothing), as the thread cannot.
+            public void Discard() { var s = staged; if (s != null && !answered) try { Directory.Delete(Path.GetDirectoryName(s), true); } catch (Exception) { } }
             internal Attempt(string exe, string sid8, long deadline, bool connected, IntPtr owner, Action onAnswered) {
-                int pid = Process.GetCurrentProcess().Id; want = Want(sid8, pid);
+                string nonce = Nonce(); want = Want(sid8, nonce);
                 var t = new Thread(delegate() {
-                    string staged = null;
+                    var asked = Stopwatch.StartNew();
                     try {
                         staged = Stage(exe);
-                        // The last argument is this process: the corner window until the service starts one, which the helper must
-                        // not click, and the owner of the event the installer checks.
+                        // The app pid: the corner window until the service starts one, which the helper must not click.
                         int code = Native.RunElevated(staged, "--elevate-install " + deadline.ToString(System.Globalization.CultureInfo.InvariantCulture) + (connected ? " 1 " : " 0 ")
-                            + pid.ToString(System.Globalization.CultureInfo.InvariantCulture), owner, delegate { answered = true; onAnswered(); });
+                            + Process.GetCurrentProcess().Id.ToString(System.Globalization.CultureInfo.InvariantCulture) + " " + nonce, owner, delegate { answered = true; onAnswered(); });
                         outcome = code == 0 ? Installed : code == -1223 ? Declined : Failed;
+                        dropped = code == -1223 && asked.ElapsedMilliseconds >= DropMs;
                     } catch (Exception) { outcome = Failed; }
                     finally {
-                        if (staged != null) try { Directory.Delete(Path.GetDirectoryName(staged), true); } catch (Exception) { }
+                        var s = staged; if (s != null) try { Directory.Delete(Path.GetDirectoryName(s), true); } catch (Exception) { }
                         done.Set(); want.Dispose();
                     }
                 });
@@ -2564,11 +2595,19 @@ namespace SupportMcp {
         public const long CooldownMs = 60000;
         public const string Cooling = "the customer declined full control less than a minute ago; ask them first, then try again";
         public const string Waiting = "a request for full control is already waiting for the customer";
-        long declinedAt = long.MinValue / 2; int requesting;
+        public const string StillOpen = "the Windows permission prompt of an earlier request is still open; ask the customer to answer it, then try again";
+        long declinedAt = long.MinValue / 2; int requesting; volatile WaitHandle open;
         // Every elevation outcome goes through here, so a decline at the first start counts as much as a later one.
         public void Record(int outcome, long now) { if (outcome == Elevation.Declined) Interlocked.Exchange(ref declinedAt, now); }
+        // A UAC prompt the app stopped waiting for stays on screen until the customer answers it or Windows drops it. Until
+        // then no new prompt, so there is only ever one; and when it ends, its outcome counts (a No starts the cooldown).
+        public void Leave(WaitHandle done, Func<int> outcome) {
+            open = done;
+            ThreadPool.RegisterWaitForSingleObject(done, delegate { Record(outcome(), PauseClock.Now()); }, null, Timeout.Infinite, true);
+        }
         public Dictionary<string, object> Request(Func<Dictionary<string, object>> ask, long now) {
             if (now - Interlocked.Read(ref declinedAt) < CooldownMs) return Wire.Map("ok", false, "error", Cooling);
+            var left = open; if (left != null && !left.WaitOne(0)) return Wire.Map("ok", false, "error", StillOpen);
             if (Interlocked.CompareExchange(ref requesting, 1, 0) != 0) return Wire.Map("ok", false, "error", Waiting);
             try { return ask(); } finally { Interlocked.Exchange(ref requesting, 0); }
         }
@@ -2578,15 +2617,16 @@ namespace SupportMcp {
     // normal-mode session to the service after request_full_control.
     sealed class StartFlow {
         readonly SupportWindow window; readonly Dictionary<string, object> config; readonly string exe, sid8; readonly long connectBy;
-        Thread thread, clientThread, ender; Client client; ServiceLink link; Mutex windowMutex;
+        Thread thread, clientThread, ender; Client client; ServiceLink link; Mutex windowMutex; volatile Elevation.Attempt stale;
         readonly FullRequestGate gate = new FullRequestGate();
         public StartFlow(SupportWindow window, Dictionary<string, object> config, string exe, long connectBy) {
             this.window = window; this.config = config; this.exe = exe; this.connectBy = connectBy; sid8 = FullInstall.Sid8(config);
         }
-        public void Begin() { thread = new Thread(Run); thread.IsBackground = true; thread.Start(); }
+        public void Begin() { Elevation.SweepStaged(); thread = new Thread(Run); thread.IsBackground = true; thread.Start(); }
         // After the window closed: finish an install in progress (it ends the service if the customer ended), stop the client.
         public void Finish() {
             if (thread != null) thread.Join(120000);
+            var s = stale; if (s != null) s.Discard();
             if (ender != null) ender.Join(35000);
             if (client != null) { client.Stop(); if (clientThread != null) clientThread.Join(20000); }
             if (link != null) link.Flush(3000);
@@ -2639,13 +2679,15 @@ namespace SupportMcp {
                 if (over()) return Elevation.NoAnswer;
                 IntPtr owner = Ui(delegate { return path == Consent.Prompt ? new WindowInteropHelper(dialog).Handle : new WindowInteropHelper(window).Handle; });
                 // Once UAC is answered the question has done its work: it goes, and the corner window shows the install.
-                var attempt = Elevation.Start(exe, sid8, deadline, connected, owner, close);
+                Elevation.Attempt attempt;
+                try { attempt = Elevation.Start(exe, sid8, deadline, connected, owner, close); } catch (Exception) { return Elevation.Failed; }
                 while (!attempt.Done.WaitOne(250)) {
                     // After Yes only the customer's End session withdraws: the old client stops by itself when the new
-                    // service says hello, and a sign-out keeps full control, as a restart does.
+                    // service says hello, and a sign-out (it ends this app) keeps full control, as a restart does, because
+                    // the installer already holds the event.
                     if (withdrew || !(attempt.Answered ? window.EndedByCustomer : over())) continue;
                     attempt.Withdraw(); withdrew = true;
-                    if (!attempt.Answered) return Elevation.NoAnswer;
+                    if (!attempt.Answered) { stale = attempt; var a = attempt; gate.Leave(a.Done, delegate { return a.Dropped ? Elevation.NoAnswer : a.Outcome; }); return Elevation.NoAnswer; }
                 }
                 return attempt.Outcome;
             } finally { close(); }

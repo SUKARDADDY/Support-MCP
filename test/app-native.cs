@@ -392,6 +392,34 @@ public static class AppTests {
         } finally { ServiceLink.EndMs = 30000; }
     }
 
+    // A program the command started without waiting (like rundll32 user32.dll,LockWorkStation) gets up to a second to
+    // finish: here a script that waits 250 ms, started last. One that keeps running is killed once that second is over,
+    // and the client's stop ends the second at once.
+    internal static void SettleTests(FakeRelay relay, string dir) {
+        string tag = Guid.NewGuid().ToString("N").Substring(0, 8);
+        string quick = Path.Combine(dir, "settle-quick-" + tag), slowPid = Path.Combine(dir, "settle-pid-" + tag), js = Path.Combine(dir, "settle-" + tag + ".js");
+        File.WriteAllText(js, "WScript.Sleep(250); var f = new ActiveXObject('Scripting.FileSystemObject').CreateTextFile('" + quick.Replace("\\", "\\\\") + "', true); f.Write('done'); f.Close();");
+        var r = relay.Call(Run("$s = Start-Process cmd.exe -WindowStyle Hidden -PassThru -ArgumentList '/c ping -n 30 127.0.0.1 >nul'; Set-Content -LiteralPath '" + slowPid.Replace("'", "''")
+            + "' -Value ([string]$s.Id + ' ' + $s.StartTime.ToUniversalTime().Ticks); Start-Process cscript.exe -WindowStyle Hidden -ArgumentList '//nologo //e:jscript \"" + js.Replace("'", "''") + "\"'; [Console]::Write([DateTime]::UtcNow.Ticks)", 30));
+        long settledMs = (DateTime.UtcNow.Ticks - long.Parse(Decode(r, "stdout_b64"))) / 10000;
+        Assert(Wire.Flag(r, "ok") && File.Exists(quick), "A program the command did not wait for finishes");
+        Assert(settledMs >= CommandJob.SettleMs - 100 && settledMs < 10000, "The result waits about a second for a program that keeps running: " + settledMs + " ms");
+        // The pid with its start time, so a reused pid cannot pass for the slow child.
+        string[] slow = File.ReadAllText(slowPid).Trim().Split(' '); bool slowGone = true;
+        try { using (var p = Process.GetProcessById(int.Parse(slow[0]))) if (p.StartTime.ToUniversalTime().Ticks == long.Parse(slow[1])) slowGone = p.WaitForExit(1000); }
+        catch (ArgumentException) { } catch (InvalidOperationException) { }
+        Assert(slowGone, "The program that keeps running is killed after that second");
+        // The stop comes 400 ms after the script's last line, so in the settle second unless PowerShell took longer to exit.
+        string marker = Path.Combine(dir, "settle-marker-" + tag), script = Path.Combine(dir, "settle-stop-" + tag + ".ps1");
+        File.WriteAllText(script, "Start-Process cmd.exe -WindowStyle Hidden -ArgumentList '/c ping -n 30 127.0.0.1 >nul'; Set-Content -LiteralPath '" + marker.Replace("'", "''") + "' -Value x");
+        var stop = new ManualResetEvent(false); var clock = Stopwatch.StartNew(); long stoppedAt = long.MaxValue;
+        var stopper = new Thread(delegate() { while (!File.Exists(marker) && clock.ElapsedMilliseconds < 30000) Thread.Sleep(5); Thread.Sleep(400); stoppedAt = clock.ElapsedMilliseconds; stop.Set(); });
+        stopper.Start();
+        try { using (var job = new CommandJob()) job.Run(script, dir, 30, stop); } catch (OperationCanceledException) { }
+        long ended = clock.ElapsedMilliseconds; stopper.Join();
+        Assert(ended - stoppedAt < 300, "The client's stop ends the settle second at once: " + (ended - stoppedAt) + " ms after it");
+    }
+
     static void FullControlTests(string dir) {
         Assert(ConsentPath.Decide(true, 2, 1, 5) == Consent.Confirm && ConsentPath.Decide(true, 1, 0, -1) == Consent.Confirm, "An elevated app (or UAC off for an administrator) gets no UAC prompt, so it asks itself");
         Assert(ConsentPath.Decide(false, 3, 1, 0) == Consent.Confirm && ConsentPath.Decide(false, 3, -1, 0) == Consent.Confirm, "An administrator who elevates without a prompt is asked by the app");
@@ -749,6 +777,17 @@ public static class AppTests {
             Assert(Wire.Text(second, "error") == FullRequestGate.Waiting && asks == 2, "One prompt at a time");
             gate.Record(Elevation.Declined, t + 5);
             Assert(Wire.Text(gate.Request(ask, t + 6), "error") == FullRequestGate.Cooling && asks == 2, "A later decline starts the cooldown too");
+            gate = new FullRequestGate(); gate.Record(Elevation.NoAnswer, t);
+            Assert(Wire.Text(gate.Request(ask, t + 1), "error") == "asked" && asks == 3, "No answer starts no cooldown");
+            // A UAC prompt the app stopped waiting for: no new request while it is open; a No on it starts the cooldown.
+            var stale = new ManualResetEvent(false); int staleOutcome = Elevation.Declined;
+            gate.Leave(stale, delegate { return staleOutcome; });
+            Assert(Wire.Text(gate.Request(ask, PauseClock.Now()), "error") == FullRequestGate.StillOpen && asks == 3, "No second prompt while an earlier one is open");
+            stale.Set(); Thread.Sleep(300);
+            Assert(Wire.Text(gate.Request(ask, PauseClock.Now()), "error") == FullRequestGate.Cooling && asks == 3, "A No on the earlier prompt starts the cooldown");
+            gate = new FullRequestGate(); stale = new ManualResetEvent(false); staleOutcome = Elevation.Failed;
+            gate.Leave(stale, delegate { return staleOutcome; }); stale.Set(); Thread.Sleep(300);
+            Assert(Wire.Text(gate.Request(ask, PauseClock.Now()), "error") == "asked" && asks == 4, "Once it is gone without a No, the next request asks");
         }
         Console.WriteLine("PASS request_full_control: the full cap, a declined request, the silent handover, the cooldown after any decline");
     }
@@ -880,10 +919,10 @@ public static class AppTests {
                 Func<System.Windows.DependencyObject, string, System.Windows.Controls.Button> button = delegate(System.Windows.DependencyObject w, string text) { return Find<System.Windows.Controls.Button>(w, delegate(System.Windows.Controls.Button b) { return text.Equals(b.Content); }); };
                 var corner = new SupportWindow(Palette.Detect(), false, false, null); corner.Show(); pump();
                 IntPtr cornerHandle = new System.Windows.Interop.WindowInteropHelper(corner).Handle;
-                var d = ConsentDialog.Open(true);
+                var d = ConsentDialog.Open(true); pump(); // Loaded comes asynchronously: let it run, so only the time guards Allow
                 var allow = button(d, "Allow");
-                Press(allow); early = d.Allowed || d.Decided.WaitOne(0);
-                pump(); cornerOpen = IsWindowEnabled(cornerHandle);
+                Press(allow); pump(); early = d.Allowed || d.Decided.WaitOne(0) || !allow.IsVisible;
+                cornerOpen = IsWindowEnabled(cornerHandle);
                 Thread.Sleep(ConsentDialog.ArmMs); pump();
                 Press(allow); pump();
                 allowHeld = d.IsVisible && d.Allowed && d.Decided.WaitOne(0) && !allow.IsVisible
@@ -905,15 +944,30 @@ public static class AppTests {
             Assert(closeRefused && finished, "The question cannot be closed while UAC asks, only finished by the app");
             Assert(denyClosed, "Don't allow closes the question");
             Assert(confirmClosed, "Allow on the app's own confirm closes it");
-            // The installer goes ahead only while the app's event for this attempt exists and is not set.
-            string w8 = Guid.NewGuid().ToString("N").Substring(0, 8); int pid = Process.GetCurrentProcess().Id;
-            Assert(!Elevation.Wanted(w8, pid), "No attempt: the installer installs nothing");
-            using (var want = Elevation.Want(w8, pid)) {
-                Assert(Elevation.Wanted(w8, pid) && !Elevation.Wanted(w8, pid + 1), "The attempt of this process is wanted");
-                want.Set();
-                Assert(!Elevation.Wanted(w8, pid), "A withdrawn attempt is not");
+            // The installer goes ahead only while the event of its own attempt (a random nonce) exists and is not set, and it
+            // keeps the event: the app exiting afterwards withdraws nothing, setting it does. Nobody can make the event first.
+            string w8 = Guid.NewGuid().ToString("N").Substring(0, 8), n1 = Elevation.Nonce(), n2 = Elevation.Nonce();
+            Func<string, bool> wanted = delegate(string nonce) { using (var h = Elevation.Wanted(w8, nonce)) return h != null; };
+            Assert(n1 != n2 && System.Text.RegularExpressions.Regex.IsMatch(n1, "^[0-9a-f]{32}$"), "Each attempt has a nonce of its own");
+            Assert(!wanted(n1), "No attempt: the installer installs nothing");
+            EventWaitHandle held;
+            using (var want = Elevation.Want(w8, n1)) {
+                Assert(wanted(n1) && !wanted(n2), "Only the attempt with that nonce is wanted");
+                using (var other = Elevation.Want(w8, n2)) { other.Set(); Assert(wanted(n1) && !wanted(n2), "Withdrawing one attempt leaves another alone"); }
+                held = Elevation.Wanted(w8, n1);
             }
-            Assert(!Elevation.Wanted(w8, pid), "Nor one whose app is gone");
+            Assert(held != null && !held.WaitOne(0), "The installer's open event outlives the app and stays unset");
+            held.Dispose();
+            Assert(!wanted(n1), "With no one holding it, an attempt whose app is gone is not wanted");
+            using (var want = Elevation.Want(w8, n1)) {
+                held = Elevation.Wanted(w8, n1); want.Set();
+                Assert(held.WaitOne(0) && !wanted(n1), "A withdrawal reaches an installer that already holds the event");
+                held.Dispose();
+            }
+            using (var squat = new EventWaitHandle(false, EventResetMode.ManualReset, Elevation.WantName(w8, n2))) {
+                bool refused = false; try { Elevation.Want(w8, n2).Dispose(); } catch (IOException) { refused = true; }
+                Assert(refused, "An event someone made first is refused");
+            }
         }
         Console.WriteLine("PASS the full-control question stays open as the owner of the UAC prompt");
 
@@ -1047,20 +1101,7 @@ public static class AppTests {
                 r = relay.Call(Run(ChildCommand(late, started), 1));
                 Assert(Wire.Flag(r, "timed_out") && r["exit_code"] == null, "Timeout result");
                 Thread.Sleep(3500); Assert(!File.Exists(late), "Timeout must kill descendants");
-                // A program the command started without waiting (like rundll32 user32.dll,LockWorkStation) gets up to a second to
-                // finish: here a script that needs 400 ms, started last. One that keeps running is killed once that second is over.
-                string quick = Path.Combine(dir, "settle-quick"), slowPid = Path.Combine(dir, "settle-pid"), js = Path.Combine(dir, "settle.js");
-                late = Path.Combine(dir, "settle-late");
-                File.WriteAllText(js, "WScript.Sleep(400); var f = new ActiveXObject('Scripting.FileSystemObject').CreateTextFile('" + quick.Replace("\\", "\\\\") + "', true); f.Write('done'); f.Close();");
-                r = relay.Call(Run("$s = Start-Process cmd.exe -WindowStyle Hidden -PassThru -ArgumentList '/c ping -n 30 127.0.0.1 >nul & echo late> \"" + late.Replace("'", "''") + "\"'; Set-Content -LiteralPath '" + slowPid.Replace("'", "''")
-                    + "' -Value $s.Id; Start-Process cscript.exe -WindowStyle Hidden -ArgumentList '//nologo //e:jscript \"" + js.Replace("'", "''") + "\"'; [Console]::Write([DateTime]::UtcNow.Ticks)", 30));
-                long settledMs = (DateTime.UtcNow.Ticks - long.Parse(Decode(r, "stdout_b64"))) / 10000;
-                Assert(Wire.Flag(r, "ok") && File.Exists(quick), "A program the command did not wait for finishes");
-                Assert(settledMs >= CommandJob.SettleMs - 100 && settledMs < 10000, "The result waits about a second for a program that keeps running: " + settledMs + " ms");
-                int slow = int.Parse(File.ReadAllText(slowPid).Trim()); bool slowGone = true;
-                try { using (var p = Process.GetProcessById(slow)) slowGone = p.WaitForExit(1000); } catch (ArgumentException) { }
-                Assert(slowGone, "The program that keeps running is killed after that second");
-                Thread.Sleep(1500); Assert(!File.Exists(late), "It never finishes");
+                SettleTests(relay, dir);
                 late = Path.Combine(dir, "end-late"); started = Path.Combine(dir, "end-started");
                 relay.Queue(Run(ChildCommand(late, started), 20)); WaitFile(started); relay.End = true; relay.WaitExit();
                 Thread.Sleep(3500); Assert(!File.Exists(late), "Operator end must kill descendants");
