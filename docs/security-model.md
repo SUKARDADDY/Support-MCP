@@ -70,7 +70,10 @@ apply to only one client say which.
 - **Full control is a temporary SYSTEM service.** UAC elevates a copy of the
   app that the app first puts alone in a new folder under the user's Temp, so
   nothing next to the download (an `.exe.config`, a DLL) loads into the elevated
-  process. That process reads its own file once, through a handle that stops
+  process. The app deletes that folder through handles: each level is
+  opened as itself and checked, entries are opened relative to their folder, and
+  a junction or link is removed, never followed. Copies left behind are swept at
+  a later start only when the app runs without administrator rights. The elevated process reads its own file once, through a handle that stops
   anyone from changing or renaming it, and installs from those bytes. Between the
   copy and that read, another process of the same user could swap the copy. That
   is accepted: such a process already runs as the customer, and the threat model

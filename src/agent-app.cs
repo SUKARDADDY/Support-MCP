@@ -1572,6 +1572,85 @@ namespace SupportMcp {
         }
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern int GetFinalPathNameByHandle(SafeFileHandle h, StringBuilder path, int size, int flags);
         [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetFileInformationByHandle(SafeFileHandle h, int kind, ref byte delete, int size);
+        [StructLayout(LayoutKind.Sequential)] struct BasicInfo { public long Created, Accessed, Written, Changed; public uint Attributes; }
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetFileInformationByHandle(SafeFileHandle h, int kind, ref BasicInfo info, int size);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetFileInformationByHandleEx(SafeFileHandle h, int kind, IntPtr buffer, int size);
+        [StructLayout(LayoutKind.Sequential)] struct UnicodeString { public ushort Length, MaximumLength; public IntPtr Buffer; }
+        [StructLayout(LayoutKind.Sequential)] struct ObjectAttributes { public int Length; public IntPtr Root, Name; public uint Attributes; public IntPtr Security, Quality; }
+        [StructLayout(LayoutKind.Sequential)] struct IoStatus { public IntPtr Status, Information; }
+        [DllImport("ntdll.dll")] static extern int NtCreateFile(out SafeFileHandle h, uint access, ref ObjectAttributes attributes, out IoStatus io, IntPtr size, uint fileAttributes, uint share, uint disposition, uint options, IntPtr ea, uint eaLength);
+        // DELETE, SYNCHRONIZE, read and write attributes, list the folder. Shared for reading and writing only, never for
+        // deleting: nobody can rename, delete or replace what one of these handles holds while it is open.
+        const uint TreeAccess = 0x10000 | 0x100000 | 0x80 | 0x100 | 0x1, TreeShare = 3;
+        // Tests: BeforeOpen runs between listing a folder and opening an entry of it, AfterCheck between checking a folder
+        // through its handle and listing it. A swap at either point must not make DeleteTree follow a link.
+        internal static Action<string> BeforeOpen = null, AfterCheck = null;
+        // Deletes a folder and what is in it. Every level is opened as itself (FILE_OPEN_REPARSE_POINT) and checked through
+        // its handle; an entry is opened relative to the handle of its folder, never through a path that could be resolved
+        // again, and removed through its own handle. So a link (a junction, also the top folder itself, or one swapped in
+        // at any moment) is removed and never followed, and a held folder cannot be swapped while it is worked on.
+        public static void DeleteTree(string dir) {
+            var h = CreateFile(dir, TreeAccess, TreeShare, IntPtr.Zero, 3, 0x02000000 | 0x00200000, IntPtr.Zero);
+            if (h.IsInvalid) throw new Win32Exception();
+            using (h) DeleteOpen(h, Path.GetFileName(dir));
+        }
+        static void DeleteOpen(SafeFileHandle h, string name) {
+            FileInfo info; if (!GetFileInformationByHandle(h, out info)) throw new Win32Exception();
+            bool link = (info.Attributes & 0x400) != 0, folder = (info.Attributes & 0x10) != 0;
+            if (folder && !link) {
+                var check = AfterCheck; if (check != null) check(name);
+                foreach (string entry in Entries(h)) {
+                    var hook = BeforeOpen; if (hook != null) hook(entry);
+                    using (var child = OpenIn(h, entry)) if (child != null) try { DeleteOpen(child, entry); } catch (Exception) { }
+                }
+            }
+            if (!link && (info.Attributes & 1) != 0) {
+                // Attributes belong to the file, not to the name: clearing ReadOnly on one of several hard links would change
+                // a file elsewhere, so such a file stays.
+                if (!folder && info.Links > 1) return;
+                var basic = new BasicInfo { Attributes = (info.Attributes & ~1u) == 0 ? 0x80 : info.Attributes & ~1u };
+                if (!SetFileInformationByHandle(h, 0, ref basic, Marshal.SizeOf(typeof(BasicInfo)))) throw new Win32Exception();
+            }
+            byte yes = 1; if (!SetFileInformationByHandle(h, 4, ref yes, 1)) throw new Win32Exception();
+        }
+        // The names in a folder, read through its handle (FileIdBothDirectoryInfo).
+        static List<string> Entries(SafeFileHandle h) {
+            var names = new List<string>(); const int Size = 65536; IntPtr buffer = Marshal.AllocHGlobal(Size);
+            try {
+                int kind = 11; // restart from the first entry
+                while (GetFileInformationByHandleEx(h, kind, buffer, Size)) {
+                    kind = 10;
+                    for (int at = 0; ; ) {
+                        IntPtr e = buffer + at; int next = Marshal.ReadInt32(e, 0), length = Marshal.ReadInt32(e, 60);
+                        string name = Marshal.PtrToStringUni(e + 104, length / 2);
+                        if (name != "." && name != "..") names.Add(name);
+                        if (next == 0) break;
+                        at += next;
+                    }
+                }
+                int error = Marshal.GetLastWin32Error(); if (error != 18) throw new Win32Exception(error); // 18: no more files
+            } finally { Marshal.FreeHGlobal(buffer); }
+            return names;
+        }
+        // Opens name inside the folder of dir, as itself, or null.
+        static SafeFileHandle OpenIn(SafeFileHandle dir, string name) {
+            IntPtr text = Marshal.StringToHGlobalUni(name), unicode = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeString)));
+            bool added = false;
+            try {
+                Marshal.StructureToPtr(new UnicodeString { Length = (ushort)(name.Length * 2), MaximumLength = (ushort)(name.Length * 2 + 2), Buffer = text }, unicode, false);
+                dir.DangerousAddRef(ref added);
+                var attributes = new ObjectAttributes { Length = Marshal.SizeOf(typeof(ObjectAttributes)), Root = dir.DangerousGetHandle(), Name = unicode, Attributes = 0x40 };
+                SafeFileHandle h; IoStatus io;
+                // FILE_OPEN; FILE_OPEN_REPARSE_POINT, synchronous, backup intent (folders).
+                int status = NtCreateFile(out h, TreeAccess, ref attributes, out io, IntPtr.Zero, 0, TreeShare, 1, 0x200000 | 0x20 | 0x4000, IntPtr.Zero, 0);
+                if (status >= 0) return h;
+                if (h != null) h.Dispose();
+                return null;
+            } finally {
+                if (added) dir.DangerousRelease();
+                Marshal.FreeHGlobal(unicode); Marshal.FreeHGlobal(text);
+            }
+        }
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateDirectory(string path, IntPtr security);
         static string FinalPath(SafeFileHandle h) {
             var name = new StringBuilder(1024); int n = GetFinalPathNameByHandle(h, name, name.Capacity, 0);
@@ -2057,17 +2136,8 @@ namespace SupportMcp {
                     try { if (Directory.GetCreationTimeUtc(dir) < DateTime.UtcNow.AddHours(-1)) DeleteTree(dir); } catch (Exception) { }
             } catch (Exception) { }
         }
-        // Deletes a folder and what is in it. A junction or link inside is removed itself, never followed (Directory.Delete
-        // with recursive refuses one with access denied).
-        internal static void DeleteTree(string dir) {
-            foreach (string entry in Directory.GetFileSystemEntries(dir)) {
-                var a = File.GetAttributes(entry);
-                if ((a & FileAttributes.ReparsePoint) != 0) { if ((a & FileAttributes.Directory) != 0) Directory.Delete(entry); else File.Delete(entry); }
-                else if ((a & FileAttributes.Directory) != 0) DeleteTree(entry);
-                else { File.SetAttributes(entry, FileAttributes.Normal); File.Delete(entry); }
-            }
-            Directory.Delete(dir);
-        }
+        // Deletes a folder and what is in it, through handles (Native.DeleteTree): a link is removed itself, never followed.
+        internal static void DeleteTree(string dir) { Native.DeleteTree(dir); }
         // The app may stop waiting while UAC still asks: the customer ended, the session ended, the request timed out, or
         // the app exited. A Yes after that must install nothing. So each attempt creates a named event with a random nonce,
         // which it passes to the installer, and the installer goes ahead only if the event exists and is not set (Wanted).
@@ -2617,18 +2687,18 @@ namespace SupportMcp {
         public const string StillOpen = "the Windows permission prompt of an earlier request is still open; ask the customer to answer it, then try again";
         long declinedAt = long.MinValue / 2; int requesting;
         sealed class Open { public WaitHandle Done; public Func<int> Outcome; public Func<long> EndedAt; }
-        volatile Open open;
+        Open open;
         // Every elevation outcome goes through here, so a decline at the first start counts as much as a later one.
         public void Record(int outcome, long now) { if (outcome == Elevation.Declined) Interlocked.Exchange(ref declinedAt, now); }
         // A UAC prompt the app stopped waiting for stays on screen until the customer answers it or Windows drops it. Until
         // then no new prompt, so there is only ever one; once it ended, its outcome counts first, at the time it ended
         // (endedAt is set before done), so a No on it starts the cooldown before the next request can ask.
-        public void Leave(WaitHandle done, Func<int> outcome, Func<long> endedAt) { open = new Open { Done = done, Outcome = outcome, EndedAt = endedAt }; }
+        public void Leave(WaitHandle done, Func<int> outcome, Func<long> endedAt) { Interlocked.Exchange(ref open, new Open { Done = done, Outcome = outcome, EndedAt = endedAt }); }
         public Dictionary<string, object> Request(Func<Dictionary<string, object>> ask, long now) {
-            var left = open;
+            var left = Volatile.Read(ref open);
             if (left != null) {
                 if (!left.Done.WaitOne(0)) return Wire.Map("ok", false, "error", StillOpen);
-                Record(left.Outcome(), left.EndedAt()); open = null;
+                Record(left.Outcome(), left.EndedAt()); Interlocked.CompareExchange(ref open, null, left);
             }
             if (now - Interlocked.Read(ref declinedAt) < CooldownMs) return Wire.Map("ok", false, "error", Cooling);
             if (Interlocked.CompareExchange(ref requesting, 1, 0) != 0) return Wire.Map("ok", false, "error", Waiting);
@@ -2645,7 +2715,8 @@ namespace SupportMcp {
         public StartFlow(SupportWindow window, Dictionary<string, object> config, string exe, long connectBy) {
             this.window = window; this.config = config; this.exe = exe; this.connectBy = connectBy; sid8 = FullInstall.Sid8(config);
         }
-        public void Begin() { Elevation.SweepStaged(); thread = new Thread(Run); thread.IsBackground = true; thread.Start(); }
+        // The sweep never runs with administrator rights: an unelevated start removes old staged copies just as well.
+        public void Begin() { if (!SupportAccess.IsAdministrator()) Elevation.SweepStaged(); thread = new Thread(Run); thread.IsBackground = true; thread.Start(); }
         // After the window closed: finish an install in progress (it ends the service if the customer ended), stop the client.
         public void Finish() {
             if (thread != null) thread.Join(120000);

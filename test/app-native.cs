@@ -421,7 +421,7 @@ public static class AppTests {
         stopper.Start();
         try { using (var job = new CommandJob()) job.Run(script, dir, 30, stop); } catch (OperationCanceledException) { }
         long ended = clock.ElapsedMilliseconds; stopper.Join();
-        Assert(ended - stoppedAt < 300, "The client's stop ends the settle second at once: " + (ended - stoppedAt) + " ms after it");
+        Assert(stoppedAt <= ended && ended - stoppedAt < 300, "The client's stop ends the settle second at once: " + (ended - stoppedAt) + " ms after it");
     }
 
     // One elevation attempt with a stand-in for staging and UAC. The drop clock starts at the prompt, not at the staging; a
@@ -453,14 +453,59 @@ public static class AppTests {
         Directory.CreateDirectory(victim); File.WriteAllText(Path.Combine(victim, "keep.txt"), "x");
         string old = Path.Combine(temp, Elevation.StagePrefix + "old"), young = Path.Combine(temp, Elevation.StagePrefix + "young"), other = Path.Combine(temp, "other-old"), deep = Path.Combine(other, Elevation.StagePrefix + "deep");
         foreach (string d in new string[] { old, young, deep }) Directory.CreateDirectory(d);
-        using (var mk = Process.Start(new ProcessStartInfo("cmd.exe", "/c mklink /J \"" + Path.Combine(old, "link") + "\" \"" + victim + "\"") { UseShellExecute = false, CreateNoWindow = true })) mk.WaitForExit();
+        MkLink("/J", Path.Combine(old, "link"), victim);
         Assert(Directory.Exists(Path.Combine(old, "link")), "Test setup: the junction exists");
         foreach (string d in new string[] { old, other, deep }) Directory.SetCreationTimeUtc(d, DateTime.UtcNow.AddHours(-2));
         Elevation.SweepStaged(temp);
         Assert(!Directory.Exists(old) && Directory.Exists(young) && Directory.Exists(deep) && File.Exists(Path.Combine(victim, "keep.txt")),
             "The sweep removes only an old staged folder directly in Temp, and not what a junction inside points to: old " + Directory.Exists(old)
             + " young " + Directory.Exists(young) + " deep " + Directory.Exists(deep) + " victim " + File.Exists(Path.Combine(victim, "keep.txt")));
+        DeleteTreeTests(dir);
         try { Directory.Delete(dir, true); } catch (Exception) { }
+    }
+    static void MkLink(string kind, string link, string target) {
+        using (var mk = Process.Start(new ProcessStartInfo("cmd.exe", "/c mklink " + kind + " \"" + link + "\" \"" + target + "\"") { UseShellExecute = false, CreateNoWindow = true })) mk.WaitForExit();
+    }
+    // DeleteTree never follows a link: not the folder it is asked to delete, not a junction inside, not a folder swapped
+    // for a junction after it was listed; and it never changes the attributes of a file another hard link shares.
+    static void DeleteTreeTests(string dir) {
+        string t8 = Guid.NewGuid().ToString("N").Substring(0, 8), root = Path.Combine(dir, "tree-" + t8);
+        Func<string, string> victimOf = delegate(string name) { string v = Path.Combine(root, "victim-" + name); Directory.CreateDirectory(v); File.WriteAllText(Path.Combine(v, "keep.txt"), "x"); return v; };
+        Directory.CreateDirectory(root);
+        string top = victimOf("top"), topLink = Path.Combine(root, Elevation.StagePrefix + "link");
+        MkLink("/J", topLink, top);
+        Elevation.DeleteTree(topLink);
+        Assert(!Directory.Exists(topLink) && File.Exists(Path.Combine(top, "keep.txt")), "A staged folder that is itself a junction: the link goes, its target stays");
+        // A subfolder swapped for a junction between the listing of its parent and its own opening, and between its check
+        // and its listing (the folder is then held, so the swap itself fails).
+        string swapped = victimOf("swap"), race = Path.Combine(root, Elevation.StagePrefix + "race"), sub = Path.Combine(race, "sub");
+        Action<string> swap = delegate(string name) {
+            if (name != "sub" || Directory.Exists(sub + "-moved")) return;
+            try { Directory.Move(sub, sub + "-moved"); MkLink("/J", sub, swapped); } catch (IOException) { }
+        };
+        Directory.CreateDirectory(sub); File.WriteAllText(Path.Combine(sub, "inner.txt"), "x");
+        Native.BeforeOpen = swap;
+        try { Elevation.DeleteTree(race); } catch (Exception) { } finally { Native.BeforeOpen = null; }
+        Assert(!Directory.Exists(sub) && File.Exists(Path.Combine(swapped, "keep.txt")), "A folder swapped for a junction after the listing: the junction goes, its target stays: swapped "
+            + Directory.Exists(sub + "-moved") + ", left " + Directory.Exists(sub) + ", target kept " + File.Exists(Path.Combine(swapped, "keep.txt")));
+        if (Directory.Exists(sub + "-moved")) Directory.Delete(sub + "-moved", true);
+        Directory.CreateDirectory(sub); File.WriteAllText(Path.Combine(sub, "inner.txt"), "x");
+        Native.AfterCheck = swap;
+        try { Elevation.DeleteTree(race); } catch (Exception) { } finally { Native.AfterCheck = null; }
+        Assert(File.Exists(Path.Combine(swapped, "keep.txt")), "A folder swapped for a junction after its check is not followed");
+        string shared = Path.Combine(victimOf("hard"), "shared.txt"), hard = Path.Combine(root, Elevation.StagePrefix + "hard");
+        File.WriteAllText(shared, "x"); File.SetAttributes(shared, FileAttributes.ReadOnly | FileAttributes.Hidden);
+        Directory.CreateDirectory(hard); MkLink("/H", Path.Combine(hard, "link.txt"), shared);
+        var before = File.GetAttributes(shared);
+        Assert((before & (FileAttributes.ReadOnly | FileAttributes.Hidden)) == (FileAttributes.ReadOnly | FileAttributes.Hidden), "Test setup: the shared file is read-only and hidden");
+        try { Elevation.DeleteTree(hard); } catch (Exception) { }
+        Assert(File.Exists(shared) && File.GetAttributes(shared) == before, "The attributes of a file another hard link shares stay as they were: " + File.GetAttributes(shared));
+        string plain = Path.Combine(root, Elevation.StagePrefix + "plain"), ro = Path.Combine(plain, "deep", "ro.txt");
+        Directory.CreateDirectory(Path.GetDirectoryName(ro)); File.WriteAllText(ro, "x"); File.SetAttributes(ro, FileAttributes.ReadOnly);
+        Elevation.DeleteTree(plain);
+        Assert(!Directory.Exists(plain), "A plain staged folder goes, with a read-only file in a subfolder");
+        File.SetAttributes(shared, FileAttributes.Normal);
+        foreach (string f in Directory.GetFiles(root, "*", SearchOption.AllDirectories)) try { File.SetAttributes(f, FileAttributes.Normal); } catch (Exception) { }
     }
 
     static void QuestionTests() {
