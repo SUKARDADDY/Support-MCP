@@ -7,16 +7,21 @@ The customer runs a program that came from a link, so the design starts from
 what that program may and may not do. The app is the default. Bullets that
 apply to only one client say which.
 
-- **Consent is always a click.** Full control is the default, and Windows' own
-  UAC prompt is its consent: the corner window first says "Windows will ask for
-  permission to give support full control.", then UAC asks, with **No** as its
-  default. When no UAC prompt would appear (the app already runs as
-  administrator, UAC is off, or an administrator elevates without a prompt), the
-  app shows its own dialog first: "Give support full control of this PC?
-  Support can see your screen, control your mouse and keyboard, work through
-  Windows security prompts and the sign-in screen, and keep working after a
-  restart. Access ends when you click End session, or after 24 hours, and
-  everything is removed." If the customer says No anywhere, or elevation fails,
+- **Consent is always a click.** Full control is the default. The app first
+  asks "Give support full control of this PC? Support can see your screen,
+  control your mouse and keyboard, work through Windows security prompts and
+  the sign-in screen, and keep working after a restart. Access ends when you
+  click End session, or after 24 hours, and everything is removed." On **Allow**
+  the question stays open, says "Windows will ask for permission to give
+  support full control.", and Windows' own UAC prompt asks, with **No** as its
+  default. The question is the prompt's owner window. Windows shows a UAC
+  prompt on the secure desktop only for an app in the foreground, otherwise as a
+  flashing taskbar button the customer may miss, and an app in the background
+  (a start from a download or Explorer, or `request_full_control`) cannot take
+  the foreground by itself. The customer's click on Allow gives it to the app.
+  The app never answers UAC. When no UAC prompt would appear (the app already
+  runs as administrator, UAC is off, or an administrator elevates without a
+  prompt), the question is the consent. If the customer says No anywhere, or elevation fails,
   the app asks "Continue with limited support? Support can see your screen and
   control your mouse and keyboard, but not Windows security prompts." Every
   dialog has **Don't allow** selected by default, and only a click on Allow

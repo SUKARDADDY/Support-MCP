@@ -2576,13 +2576,19 @@ namespace SupportMcp {
                 Ui(delegate { StartNormal(admin, path != Consent.Unavailable); });
             } catch (Exception e) { Ui(delegate { WF.MessageBox.Show(e.Message, "Remote support"); window.CloseQuietly(); }); }
         }
-        // Our own confirm when no UAC prompt will appear, the notice before UAC, then --elevate-install.
+        // The full-control question, then --elevate-install. Windows shows its UAC prompt on the secure desktop only when the
+        // app that asks is in the foreground; otherwise it parks it as a flashing taskbar button that customers miss. An app in
+        // the background cannot take the foreground (request_full_control, or a start from Explorer or a download), but the
+        // customer's click on Allow gives it to the dialog. So before UAC the dialog stays open as the prompt's owner, saying
+        // that Windows asks now, until UAC is answered. When no prompt will appear, the dialog is the consent and closes.
         int Elevate(Consent path, long deadline, bool connected) {
-            if (path == Consent.Confirm && !Ask(SupportAccess.FullHeading, SupportAccess.FullText, true)) return Elevation.Declined;
-            if (path == Consent.Prompt) { Ui(delegate { window.Notice(SupportAccess.Asking); }); Thread.Sleep(1500); }
-            IntPtr owner = Ui(delegate { return new WindowInteropHelper(window).Handle; });
-            try { return Elevation.Install(exe, deadline, connected, owner); }
-            finally { Ui(delegate { window.Notice(null); }); }
+            if (window.EndedByCustomer) return Elevation.Declined;
+            var dialog = Ui(delegate { return ConsentDialog.Full(path == Consent.Prompt); });
+            window.Dispatcher.BeginInvoke(new Action(delegate { dialog.ShowDialog(); }));
+            while (!dialog.Decided.WaitOne(500)) if (window.Dispatcher.HasShutdownStarted) return Elevation.Declined;
+            if (!dialog.Allowed) return Elevation.Declined;
+            try { return Elevation.Install(exe, deadline, connected, Ui(delegate { return path == Consent.Prompt ? new WindowInteropHelper(dialog).Handle : new WindowInteropHelper(window).Handle; })); }
+            finally { Ui(dialog.Finish); }
         }
         void StartNormal(bool admin, bool canElevate) {
             window.SetAccess(admin, admin ? null : SupportAccess.NoAdminNote);
@@ -2768,7 +2774,7 @@ namespace SupportMcp {
     }
 
     // The window the customer sees while support is connected. Bind gives it the session to show: the normal-mode
-    // Client, or the full-control service through ServiceLink. Before that it can show a notice, such as the one before UAC.
+    // Client, or the full-control service through ServiceLink.
     public sealed class SupportWindow : Window {
         const double CardWidth = 336, Gap = 12, Pad = 20;
         ISupportLink link;
@@ -2778,7 +2784,6 @@ namespace SupportMcp {
         // Set when the customer ended the session, so a full-control install still running can end the service it made.
         public volatile bool EndedByCustomer;
         bool connectedOnce, linkOk = true, busy, paused, blocked, workShown, ended, tucked, confirming, sessionEnding, sweeping, userMoved, placing, held, heldEnd, ending, lostEnd;
-        string notice;
         readonly Stopwatch session = new Stopwatch(), workClock = new Stopwatch();
         TimeSpan endedAfter;
         double userLeft, userCardBottom;
@@ -2949,7 +2954,6 @@ namespace SupportMcp {
         }
         // While the app asks for full control, an end of the current link waits: the service may be taking over.
         public void Hold(bool on) { held = on; if (!on && heldEnd) { heldEnd = false; ShowEnded(); } }
-        public void Notice(string text) { notice = text; Render(); }
         public void SetAccess(bool administrator, string note) { this.administrator = administrator; noteLine.Text = note ?? ""; Render(); }
         // A session that never started (Don't allow, or another window already shows it) closes without a message.
         public void CloseQuietly() { ended = true; Close(); }
@@ -3079,7 +3083,7 @@ namespace SupportMcp {
             } else if (ended) {
                 status.Inlines.Add(new Run("Session ended after " + Ui.Clock(endedAfter) + ". Support can no longer reach this PC."));
             } else if (!connectedOnce) {
-                status.Inlines.Add(new Run(notice ?? "This window stays open while support is connected."));
+                status.Inlines.Add(new Run("This window stays open while support is connected."));
             } else if (blocked && linkOk) {
                 status.Inlines.Add(new Run("Support has locked your mouse and keyboard. Press Ctrl+Alt+Del to unlock.") { FontWeight = FontWeights.SemiBold, Foreground = p.Ink });
             } else if (paused && linkOk) {
@@ -3113,15 +3117,23 @@ namespace SupportMcp {
 
     // Consent prompt in the same visual language. "Don't allow" is the default.
     public sealed class ConsentDialog : Window {
-        bool allowed;
+        bool allowed, held, finished, closed;
+        readonly bool holds;
+        // Set when the customer answered: Don't allow (the dialog closed) or Allow (closed, or held open before UAC).
+        public readonly ManualResetEvent Decided = new ManualResetEvent(false);
+        public bool Allowed { get { return allowed; } }
         public static bool Ask(string message, bool administrator) { return Ask("Allow remote support?", message, administrator); }
         // administrator: the warning look, for a grant of administrator rights or of full control.
         public static bool Ask(string heading, string message, bool administrator) {
-            var dialog = new ConsentDialog(Palette.Detect(), heading, message, administrator);
+            var dialog = new ConsentDialog(Palette.Detect(), heading, message, administrator, false);
             dialog.ShowDialog();
             return dialog.allowed;
         }
-        ConsentDialog(Palette p, string headingText, string message, bool administrator) {
+        // The full-control question. beforeUac: Allow keeps it open and says that Windows asks now; Finish closes it.
+        public static ConsentDialog Full(bool beforeUac) { return new ConsentDialog(Palette.Detect(), SupportAccess.FullHeading, SupportAccess.FullText, true, beforeUac); }
+        public void Finish() { finished = true; if (!closed) Close(); }
+        ConsentDialog(Palette p, string headingText, string message, bool administrator, bool holds) {
+            this.holds = holds;
             const double CardWidth = 440, Pad = 20;
             Ui.Transparent(this);
             Width = CardWidth + 2 * Pad; SizeToContent = SizeToContent.Height; WindowStartupLocation = WindowStartupLocation.CenterScreen;
@@ -3167,8 +3179,14 @@ namespace SupportMcp {
             foot.Child = buttons; stack.Children.Add(foot);
 
             deny.Click += delegate { allowed = false; Close(); };
-            allow.Click += delegate { allowed = true; Close(); };
-            PreviewKeyDown += delegate(object sender, KeyEventArgs e) { if (e.Key == Key.Escape) { e.Handled = true; allowed = false; Close(); } };
+            allow.Click += delegate {
+                allowed = true;
+                if (!holds) { Close(); return; }
+                held = true; copy.Text = SupportAccess.Asking; foot.Visibility = Visibility.Collapsed; Decided.Set();
+            };
+            PreviewKeyDown += delegate(object sender, KeyEventArgs e) { if (e.Key == Key.Escape && !held) { e.Handled = true; allowed = false; Close(); } };
+            Closing += delegate(object sender, System.ComponentModel.CancelEventArgs e) { if (held && !finished) e.Cancel = true; }; // UAC's owner stays until UAC is answered
+            Closed += delegate { closed = true; Decided.Set(); };
             Loaded += delegate { Activate(); deny.Focus(); Keyboard.Focus(deny); };
         }
     }

@@ -15,7 +15,7 @@ reports the canonical name as `windows_mode`.
 
 | `windows_mode` | Customer does | Clients | Transport |
 |---|---|---|---|
-| `app` (default) | opens a link, clicks a button, runs the downloaded `remote-support-<sid8>.exe`, clicks Yes in the UAC prompt (or Allow for limited support) | Windows 7 to 11 with .NET Framework 4.5.2 or later (Windows 10 and 11 include it; 8.1 needs the 4.5.2 update; 7 needs it installed). The app requests TLS 1.2 itself; Windows 7 needs no registry change | HTTPS polling on `POST /agent` |
+| `app` (default) | opens a link, clicks a button, runs the downloaded `remote-support-<sid8>.exe`, clicks Allow and then Yes in the UAC prompt (or Allow for limited support) | Windows 7 to 11 with .NET Framework 4.5.2 or later (Windows 10 and 11 include it; 8.1 needs the 4.5.2 update; 7 needs it installed). The app requests TLS 1.2 itself; Windows 7 needs no registry change | HTTPS polling on `POST /agent` |
 | `powershell` | pastes `irm <link> \| iex` | Windows 8 and later, Windows PowerShell 5.1 | WebSocket on `/ws` |
 
 `legacy` is accepted as an alias for `app` and `standard` for `powershell`, in
@@ -652,7 +652,7 @@ Roles, by the first argument of the one exe:
 
 | Role | Runs as | Does |
 |---|---|---|
-| none | the customer | shows the corner window, decides the consent path (UAC prompt, the app's own confirm when no prompt will appear, or unavailable when a standard user has UAC off), runs `--elevate-install` with `ShellExecuteEx` `runas`, and reads its exit code. On 0 it becomes the corner window of the service; on UAC No (1223), any failure or Don't allow it shows the fallback dialog |
+| none | the customer | shows the corner window, decides the consent path (UAC prompt, the app's own confirm when no prompt will appear, or unavailable when a standard user has UAC off), asks "Give support full control of this PC?", runs `--elevate-install` with `ShellExecuteEx` `runas`, and reads its exit code. Before a UAC prompt the question stays open after Allow and is the prompt's owner window (`SHELLEXECUTEINFO.hwnd`): Windows shows the prompt on the secure desktop only for an app in the foreground, and the customer's click puts the app there. On 0 it becomes the corner window of the service; on UAC No (1223), any failure or Don't allow it shows the fallback dialog |
 | `--elevate-install <deadline> <0\|1>` | administrator, through UAC | runs from a copy the app put alone in a new Temp folder, reads its own file once through a handle that denies writing and renaming, creates `%ProgramFiles%\SupportMCP-<sid8>\` with `CreateDirectoryW` and its final ACL (SYSTEM and Administrators only, inheritance off), failing if it exists, copies the exe as `agent.exe` and, cut before its configuration, as `window.exe` (Users may read and run it), writes `state.json` (the full session id and the deadline), takes a share of `SoftwareSASGeneration` under `HKLM\SOFTWARE\SupportMCP` and sets it when needed, registers the backstop task, then creates and starts the service. Any failure removes all of it. The deadline is UTC milliseconds: `connect_by` before the first connection, the session's expiry after it |
 | `--service` | LocalSystem, session 0 | the relay connection with both lanes (`control:"full"`, caps with `full`). It checks its deadline at start and every 2 s, moves the backstop task to `expires_at` at the first welcome (later welcomes can only bring it closer), follows session changes, sends Ctrl+Alt+Del with `SendSAS`, and runs cleanup |
 | `--helper <service pid>` | SYSTEM, on the console session (`TokenSessionId`), `winsta0\default` | every screen operation, each on a fresh thread switched to the input desktop (`OpenInputDesktop`, `SetThreadDesktop`); low-level hooks re-armed on each desktop; `block_input` on one thread that holds `BlockInput` and runs every operation while it lasts. It serves two pipes only SYSTEM can open, checks that the client is the service, and runs in a kill-on-close Job of the service |
@@ -726,7 +726,7 @@ window's two requests, and the Client's full-control path with a fake service.
     Opening or refreshing that page leaves `session_status.state` at `pending`.
     The button downloads `remote-support-<sid8>.exe` once, the state becomes
     `consumed`, a second click shows "Check your downloads", and the app attaches
-    over `/agent` after the customer clicks Yes in the UAC prompt (the service's `hello` says `control: full`), or Allow in the fallback dialog (`control: normal`). `windows_mode: "legacy"` and
+    over `/agent` after the customer clicks Allow and then Yes in the UAC prompt (the service's `hello` says `control: full`), or Allow in the fallback dialog (`control: normal`). `windows_mode: "legacy"` and
     `"standard"` behave as `app` and `powershell`.
 
 ## Must keep

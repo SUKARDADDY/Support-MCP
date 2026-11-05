@@ -869,6 +869,33 @@ public static class AppTests {
             } finally { try { peer.Kill(); } catch (Exception) { } peer.Dispose(); }
         }
         Console.WriteLine("PASS the corner window does not take the focus, keeps its taskbar button, and Keep connected gives the focus back");
+        // Before UAC the full-control question stays open after Allow, as the owner of the UAC prompt (Windows shows the prompt in
+        // front only for an app in the foreground, and the click on Allow gives it that), says that Windows asks now, and cannot
+        // be closed until the app finishes it. Don't allow closes it. As the app's own confirm (no UAC prompt), Allow closes it.
+        {
+            bool allowHeld = false, closeRefused = false, finished = false, denyClosed = false, confirmClosed = false;
+            var t = new Thread(delegate() {
+                Action pump = delegate { for (int i = 0; i < 10; i++) { Application.DoEvents(); System.Windows.Threading.Dispatcher.CurrentDispatcher.Invoke(System.Windows.Threading.DispatcherPriority.Background, new Action(delegate { })); Thread.Sleep(25); } };
+                var d = ConsentDialog.Full(true); d.Show(); pump();
+                var allow = Find<System.Windows.Controls.Button>(d, delegate(System.Windows.Controls.Button b) { return "Allow".Equals(b.Content); });
+                Press(allow); pump();
+                allowHeld = d.IsVisible && d.Allowed && d.Decided.WaitOne(0) && !allow.IsVisible
+                    && Find<System.Windows.Controls.TextBlock>(d, delegate(System.Windows.Controls.TextBlock b) { return b.Text == SupportAccess.Asking && b.IsVisible; }) != null;
+                d.Close(); pump(); closeRefused = d.IsVisible;
+                d.Finish(); pump(); finished = !d.IsVisible;
+                var n = ConsentDialog.Full(true); n.Show(); pump();
+                Press(Find<System.Windows.Controls.Button>(n, delegate(System.Windows.Controls.Button b) { return "Don't allow".Equals(b.Content); })); pump();
+                denyClosed = !n.IsVisible && !n.Allowed && n.Decided.WaitOne(0); n.Finish();
+                var c = ConsentDialog.Full(false); c.Show(); pump();
+                Press(Find<System.Windows.Controls.Button>(c, delegate(System.Windows.Controls.Button b) { return "Allow".Equals(b.Content); })); pump();
+                confirmClosed = !c.IsVisible && c.Allowed && c.Decided.WaitOne(0); c.Finish();
+            }); t.SetApartmentState(ApartmentState.STA); t.Start(); t.Join();
+            Assert(allowHeld, "Allow before UAC keeps the question open and says that Windows asks now");
+            Assert(closeRefused && finished, "The question cannot be closed while UAC asks, only finished by the app");
+            Assert(denyClosed, "Don't allow closes the question");
+            Assert(confirmClosed, "Allow on the app's own confirm closes it");
+        }
+        Console.WriteLine("PASS the full-control question stays open as the owner of the UAC prompt");
 
         // A key the app pressed whose up never arrived (a desktop switch) neither pauses support nor stays down:
         // Unstick sends the up. A key no one released and no input for 10 s is stuck and stops pausing. F23 and F22 are harmless.
@@ -891,6 +918,15 @@ public static class AppTests {
         }
         Console.WriteLine("PASS a key the app left down is released, and a stuck key stops pausing after 10 s");
     }
+    static T Find<T>(System.Windows.DependencyObject root, Func<T, bool> match) where T : System.Windows.DependencyObject {
+        foreach (object child in System.Windows.LogicalTreeHelper.GetChildren(root)) {
+            var hit = child as T; if (hit != null && match(hit)) return hit;
+            var node = child as System.Windows.DependencyObject; if (node == null) continue;
+            var found = Find<T>(node, match); if (found != null) return found;
+        }
+        return null;
+    }
+    static void Press(System.Windows.Controls.Button button) { button.RaiseEvent(new System.Windows.RoutedEventArgs(System.Windows.Controls.Primitives.ButtonBase.ClickEvent)); }
     [DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(int pid);
     // A window of another process: the focus-return test starts this exe again with --peer <parent pid>. It lets the
     // parent take the foreground, and prints "ready" once its window is shown.
