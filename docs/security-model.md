@@ -7,21 +7,58 @@ The customer runs a program that came from a link, so the design starts from
 what that program may and may not do. The app is the default. Bullets that
 apply to only one client say which.
 
-- **Consent is always a click.** Full control is the default, and Windows' own
-  UAC prompt is its consent: the corner window first says "Windows will ask for
-  permission to give support full control.", then UAC asks, with **No** as its
-  default. When no UAC prompt would appear (the app already runs as
-  administrator, UAC is off, or an administrator elevates without a prompt), the
-  app shows its own dialog first: "Give support full control of this PC?
-  Support can see your screen, control your mouse and keyboard, work through
-  Windows security prompts and the sign-in screen, and keep working after a
-  restart. Access ends when you click End session, or after 24 hours, and
-  everything is removed." If the customer says No anywhere, or elevation fails,
-  the app asks "Continue with limited support? Support can see your screen and
-  control your mouse and keyboard, but not Windows security prompts." Every
-  dialog has **Don't allow** selected by default, and only a click on Allow
-  grants access. Don't allow on the last one ends the app with nothing
-  installed.
+- **Consent is always a click.** Full control is the default. The app first
+  asks "Give support full control of this PC? Support can see your screen,
+  control your mouse and keyboard, work through Windows security prompts and
+  the sign-in screen, and keep working after a restart. Access ends when you
+  click End session, or after 24 hours, and everything is removed." On **Allow**
+  the question stays open, says "Windows will ask for permission to give
+  support full control.", and Windows' own UAC prompt asks, with **No** as its
+  default. The question is the prompt's owner window. Windows shows a UAC
+  prompt on the secure desktop only for an app in the foreground, otherwise as a
+  flashing taskbar button the customer may miss, and an app in the background
+  (a start from a download or Explorer, or `request_full_control`) cannot take
+  the foreground by itself. The customer's click on Allow gives it to the app.
+  Allow does nothing for its first half second, so a click or typing meant for
+  another window cannot press it; Escape, Enter or Space decline at once
+  (**Don't allow** has the focus), which starts the one-minute cooldown. The
+  app never answers UAC. The question is not a
+  barrier against the operator: in normal mode the operator's `run` and screen
+  tools work as the customer and can press Allow through UI Automation. UAC
+  **Yes**, which only the customer can click on the secure desktop, is the
+  consent to full control. When no UAC prompt would appear (the app already
+  runs as administrator, UAC is off, or an administrator elevates without a
+  prompt), the question is the only consent, and an operator in normal mode
+  already has the customer's administrator rights. The question is modeless,
+  so End session in the corner window works while it waits. While UAC shows on
+  the secure desktop, only UAC itself can be answered; a prompt parked in the
+  taskbar leaves End session usable. If the app stops waiting before the
+  customer answers UAC (End session, the session ended, `request_full_control`
+  unanswered for 110 s, the app closed), it withdraws the request: each attempt
+  makes a named event with a random nonce, which only it may create, and the
+  elevated installer goes ahead only if that event exists and is not set. The
+  installer keeps it open and checks it again before it starts the service, so
+  a withdrawal stops an install that already runs, and the app exiting after
+  Yes (a sign-out) does not. Like the question, the withdrawal is no barrier
+  against the operator: in normal mode the operator's code runs as the customer
+  and could start a process outside the command's Job that holds the event. What
+  holds is UAC **Yes**, which only the customer can click, and End session or
+  `session_end`: the relay refuses the new service's `hello` for a session that
+  ended. Until a withdrawn prompt is gone (answered, or dropped by Windows),
+  `request_full_control` asks no new one, so only one prompt exists, and a No
+  on it starts the cooldown. Windows drops an unanswered prompt after about
+  two minutes and reports that as a No; the app counts only a No given within
+  115 seconds of the prompt as a decline, so a dropped prompt starts no
+  cooldown, also at the first start, which then still offers limited support.
+  A prompt parked as a taskbar button is not dropped (measured for 8 minutes on
+  Windows 11 and 7 on Windows 7), so a refusal because an earlier prompt is
+  still open lasts until the customer answers that prompt.
+  If the customer says No anywhere,
+  or elevation fails, the app asks "Continue with limited support? Support can
+  see your screen and control your mouse and keyboard, but not Windows
+  security prompts." Every dialog has **Don't allow** selected by default, and
+  the customer decides with a click. Don't allow on the last one ends the app
+  with nothing installed.
 - **The window shows that access exists.** The app's window stays on top in the
   bottom-right corner while support is connected. It shows a running timer and
   when the session ends by itself, turns blue while a command, file or screen
@@ -33,7 +70,10 @@ apply to only one client say which.
 - **Full control is a temporary SYSTEM service.** UAC elevates a copy of the
   app that the app first puts alone in a new folder under the user's Temp, so
   nothing next to the download (an `.exe.config`, a DLL) loads into the elevated
-  process. That process reads its own file once, through a handle that stops
+  process. The app deletes that folder through handles: each level is
+  opened as itself and checked, entries are opened relative to their folder, and
+  a junction or link is removed, never followed. Copies left behind are swept at
+  a later start only when the app runs without administrator rights. The elevated process reads its own file once, through a handle that stops
   anyone from changing or renaming it, and installs from those bytes. Between the
   copy and that read, another process of the same user could swap the copy. That
   is accepted: such a process already runs as the customer, and the threat model
@@ -92,9 +132,12 @@ apply to only one client say which.
   task, which tries again at the deadline and then every hour. The own-window
   guard of the helper covers the corner window the service started and the app
   that installed it, not every process that talks to the window pipe. UIPI no longer limits input, so support can work
-  in windows that run as administrator. Commands keep the Job Object and the
-  output caps. `request_full_control` asks one prompt at a time, and not again
-  within a minute after the customer declined.
+  in windows that run as administrator. Commands keep the Job Object, its one
+  second for a program the command did not wait for (as SYSTEM and as the
+  user), and the output caps. `request_full_control` asks one prompt at a time,
+  and not again within a minute after the customer declined. One that gets no
+  answer in 110 s returns `the customer did not answer`, without the minute,
+  and while its Windows prompt is still open the next request is refused.
 - **Normal mode.** Without full control, screen capture, mouse, keyboard and UI
   Automation run inside the customer's own process and desktop session, with the
   customer's token. It cannot see or operate the secure desktop, it cannot run as
@@ -246,7 +289,9 @@ apply to only one client say which.
 - **Normal mode leaves nothing behind.** It installs no service, scheduled task
   or logon entry, so restarting the PC ends access, and it deletes its temporary
   command folder on exit. A command runs inside a Windows Job Object, so a
-  timeout, an end or the app exiting kills the whole process tree. The
+  timeout, an end or the app exiting kills the whole process tree. A program
+  the command started without waiting for it gets up to a second after the
+  command exits to finish by itself, then it is stopped too. The
   optional restart-reconnect script is the one exception, and it needs the
   customer's approval for one reconnect. That approval covers screen, mouse and
   keyboard control only if the prompt that recorded it carried the text above.

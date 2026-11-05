@@ -29,8 +29,9 @@ AI agent does the diagnosis and the fix while a person watches.
 
 ## At a glance
 
-- The customer opens a link, runs the app it downloads, and clicks **Yes** when
-  Windows asks for permission. That gives support full control: the app installs
+- The customer opens a link, runs the app it downloads, clicks **Allow** when it
+  asks "Give support full control of this PC?", and **Yes** when Windows asks for
+  permission. That gives support full control: the app installs
   a temporary service that reaches UAC prompts, the lock screen and the sign-in
   screen, runs commands as the signed-in user or as SYSTEM, and keeps working
   after a restart.
@@ -48,9 +49,9 @@ AI agent does the diagnosis and the fix while a person watches.
 1. You call `session_create`. It returns a link that works once, within 10 minutes.
 2. You send the link to the customer. They download the app and run it. Windows
    warns that the app is unsigned, and the download page shows them how to
-   continue (see [Unsigned app](docs/security-model.md#unsigned-app)). The corner
-   window says "Windows will ask for permission to give support full control.",
-   and the customer clicks **Yes** in the UAC prompt.
+   continue (see [Unsigned app](docs/security-model.md#unsigned-app)). The app
+   asks "Give support full control of this PC?", the customer clicks **Allow**,
+   and then **Yes** in the UAC prompt.
 3. The app connects to the relay. You call the screen tools (`screenshot`,
    `click`, `type_text` and the rest), `run`, `put_file` and `get_file`.
 4. The session ends when you call `session_end`, the customer clicks
@@ -69,7 +70,7 @@ sequenceDiagram
   W-->>PC: download page, the code is not used
   PC->>W: POST from the page's button, same origin
   W-->>PC: remote-support-ID.exe, and the code is used up
-  Note over PC: The customer runs it and clicks Yes in the UAC prompt
+  Note over PC: The customer runs it, clicks Allow, then Yes in the UAC prompt
   Note over PC: The app installs a temporary SYSTEM service
   PC->>W: POST /agent hello from the service, control full
   Note over PC: A small window docks in the corner, with an End session button
@@ -97,9 +98,13 @@ removes itself when it passes, even if the PC was off at the time.
 
 ### Full control and the fallback
 
-Full control is the default. When the customer runs the app, the corner window
-says "Windows will ask for permission to give support full control.", and
-Windows shows its UAC prompt. On **Yes** the app installs, for this session only:
+Full control is the default. When the customer runs the app, it asks "Give
+support full control of this PC?". On **Allow** the question stays open and says
+"Windows will ask for permission to give support full control.", and Windows
+shows its UAC prompt. Windows brings that prompt to the front only for an app
+in the foreground, and the click on **Allow** puts the app there; otherwise the
+prompt would wait as a flashing taskbar button. On **Yes** the app installs,
+for this session only:
 
 - the folder `%ProgramFiles%\SupportMCP-<first 8 characters of the session id>\`,
   readable only by SYSTEM and Administrators, with a copy of the app, its
@@ -113,8 +118,8 @@ Windows shows its UAC prompt. On **Yes** the app installs, for this session only
   its absence, back, unless an administrator changed it meanwhile.
 
 If no UAC prompt will appear (the app already runs as administrator, UAC is off,
-or an administrator elevates without a prompt), the app asks itself first: "Give
-support full control of this PC?". If the customer says No, or anything fails,
+or an administrator elevates without a prompt), the same question is the
+consent, and Allow installs at once. If the customer says No, or anything fails,
 the app asks "Continue with limited support?" with **Don't allow** selected.
 **Allow** gives normal mode, **Don't allow** ends the app with nothing installed.
 From normal mode, `request_full_control` asks again.
@@ -178,7 +183,7 @@ canonical name.
 
 | Value | Customer does | Works on |
 |---|---|---|
-| `app` (default) | opens a link, downloads and runs the app, clicks Yes in the UAC prompt (or Allow for limited support) | Windows 7 to 11 (7 and 8.1 need .NET Framework 4.5.2 or later; the app asks for TLS 1.2 itself, so Windows 7 needs no registry change) |
+| `app` (default) | opens a link, downloads and runs the app, clicks Allow and then Yes in the UAC prompt (or Allow for limited support) | Windows 7 to 11 (7 and 8.1 need .NET Framework 4.5.2 or later; the app asks for TLS 1.2 itself, so Windows 7 needs no registry change) |
 | `powershell` | pastes one line | Windows 8 and later |
 
 The PowerShell mode is the fallback: it runs commands and moves files, and it
@@ -201,7 +206,7 @@ an error.
 | `block_input` | lock the customer's mouse and keyboard for up to 10 minutes; it lifts by itself, and Ctrl+Alt+Del lifts it at once. Full control only |
 | `send_sas` | send Ctrl+Alt+Del. Full control only |
 | `type_secret` | type a secret the operator supplied in the conversation into the focused field, such as the Windows password on the sign-in screen. At that screen the model types the password with this tool if the operator gave it one, and stops and asks if not. It works in normal mode too. It is never logged or returned, and a failure says only `type_secret failed` |
-| `request_full_control` | from normal mode, ask the customer for full control through a UAC prompt. On Yes the session continues under full control |
+| `request_full_control` | from normal mode, ask the customer for full control: the app shows the same question, then Windows its UAC prompt. On Allow and Yes the session continues under full control |
 
 Add `?ui=0` to the MCP URL to hide `ui_tree` and `ui_act`; any other value is a
 400 error. The old `?shape=` parameter is gone: the server offers only the tools

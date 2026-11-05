@@ -361,6 +361,219 @@ public static class AppTests {
         public void Welcomed(long expiresAtMs) { WelcomedAt = expiresAtMs; }
     }
 
+    // One process gets at most 2 connections of the window pipe, idle ones are cut off after 5 s, and an end the service
+    // never confirms finishes as Lost. A connection counts once its server thread takes it, and the threads of clients
+    // that connect together can take them in any order. So each idle client first gets an answer, which proves it is
+    // counted, and the test then waits for the server to cut them off (it counts a client out before it disconnects it).
+    static void PerProcessLimit(string uiSddl) {
+        string sid8b = Guid.NewGuid().ToString("N").Substring(0, 8), name = Backstop.Name(sid8b) + "-ui"; int endedB = 0;
+        new UiServer(name, delegate { return Wire.Map("connected", true, "link", true, "ended", false); }, delegate { Interlocked.Increment(ref endedB); }, delegate(uint session) { return true; }, uiSddl);
+        var idle = new List<System.IO.Pipes.NamedPipeClientStream>(); var asked = new List<Stopwatch>();
+        try {
+            for (int i = 0; i < UiServer.PerProcess; i++) {
+                var c = Pipes.Client(name); idle.Add(c); c.Connect(2000);
+                asked.Add(Stopwatch.StartNew()); Pipes.Write(c, Wire.Map("type", "status"));
+                Assert(Wire.Flag(Pipes.Read(c, 4096, UiServer.ReadMs), "connected"), "An idle client is served first");
+            }
+            Assert(!ServiceLink.Running(sid8b), "A third connection of the same process is refused");
+            for (int i = 0; i < idle.Count; i++) {
+                try { Pipes.Read(idle[i], 4096, UiServer.ReadMs + 30000); throw new Exception("an idle client got a message"); } catch (IOException) { }
+                // Windows may end a wait up to a clock tick early.
+                Assert(asked[i].ElapsedMilliseconds >= UiServer.ReadMs - 100, "An idle client was cut off after " + asked[i].ElapsedMilliseconds + " ms");
+            }
+        } finally { foreach (var c in idle) c.Dispose(); }
+        Assert(ServiceLink.Running(sid8b), "The idle clients were cut off and the process gets through again");
+        // A service that never confirms the end: the window says it cannot reach it, not that the session ended.
+        ServiceLink.EndMs = 2000;
+        try {
+            var stubborn = new ServiceLink(sid8b); int stubbornDone = 0; stubborn.Finished += delegate { stubbornDone++; }; stubborn.Start();
+            Thread.Sleep(800); stubborn.Stop(); stubborn.Flush(10000);
+            Assert(stubbornDone == 1 && stubborn.Lost && endedB >= 3, "The end goes out on the connection the window holds, again and again, and an unconfirmed end finishes as Lost: " + endedB);
+        } finally { ServiceLink.EndMs = 30000; }
+    }
+
+    // A program the command started without waiting (like rundll32 user32.dll,LockWorkStation) gets up to a second to
+    // finish: here a script that waits 250 ms, started last. One that keeps running is killed once that second is over,
+    // and the client's stop ends the second at once.
+    internal static void SettleTests(FakeRelay relay, string dir) {
+        string tag = Guid.NewGuid().ToString("N").Substring(0, 8);
+        string quick = Path.Combine(dir, "settle-quick-" + tag), slowPid = Path.Combine(dir, "settle-pid-" + tag), js = Path.Combine(dir, "settle-" + tag + ".js");
+        File.WriteAllText(js, "WScript.Sleep(250); var f = new ActiveXObject('Scripting.FileSystemObject').CreateTextFile('" + quick.Replace("\\", "\\\\") + "', true); f.Write('done'); f.Close();");
+        var r = relay.Call(Run("$s = Start-Process cmd.exe -WindowStyle Hidden -PassThru -ArgumentList '/c ping -n 30 127.0.0.1 >nul'; Set-Content -LiteralPath '" + slowPid.Replace("'", "''")
+            + "' -Value ([string]$s.Id + ' ' + $s.StartTime.ToUniversalTime().Ticks); Start-Process cscript.exe -WindowStyle Hidden -ArgumentList '//nologo //e:jscript \"" + js.Replace("'", "''") + "\"'; [Console]::Write([DateTime]::UtcNow.Ticks)", 30));
+        long settledMs = (DateTime.UtcNow.Ticks - long.Parse(Decode(r, "stdout_b64"))) / 10000;
+        Assert(Wire.Flag(r, "ok") && File.Exists(quick), "A program the command did not wait for finishes");
+        Assert(settledMs >= CommandJob.SettleMs - 100 && settledMs < 10000, "The result waits about a second for a program that keeps running: " + settledMs + " ms");
+        // The pid with its start time, so a reused pid cannot pass for the slow child.
+        string[] slow = File.ReadAllText(slowPid).Trim().Split(' '); bool slowGone = true;
+        try { using (var p = Process.GetProcessById(int.Parse(slow[0]))) if (p.StartTime.ToUniversalTime().Ticks == long.Parse(slow[1])) slowGone = p.WaitForExit(1000); }
+        catch (ArgumentException) { } catch (InvalidOperationException) { }
+        Assert(slowGone, "The program that keeps running is killed after that second");
+        // The stop comes 50 ms after PowerShell itself exited (the script writes its pid), so it falls in the settle second.
+        string marker = Path.Combine(dir, "settle-marker-" + tag), script = Path.Combine(dir, "settle-stop-" + tag + ".ps1");
+        File.WriteAllText(script, "Start-Process cmd.exe -WindowStyle Hidden -ArgumentList '/c ping -n 30 127.0.0.1 >nul'; Set-Content -LiteralPath '" + marker.Replace("'", "''") + "' -Value $PID");
+        var stop = new ManualResetEvent(false); var clock = Stopwatch.StartNew(); long stoppedAt = long.MaxValue;
+        var stopper = new Thread(delegate() {
+            while (clock.ElapsedMilliseconds < 30000) { try { if (File.Exists(marker) && File.ReadAllText(marker).Trim().Length > 0) break; } catch (IOException) { } Thread.Sleep(5); }
+            try { using (var ps = Process.GetProcessById(int.Parse(File.ReadAllText(marker).Trim()))) ps.WaitForExit(30000); } catch (ArgumentException) { }
+            Thread.Sleep(50); stoppedAt = clock.ElapsedMilliseconds; stop.Set();
+        });
+        stopper.Start();
+        try { using (var job = new CommandJob()) job.Run(script, dir, 30, stop); } catch (OperationCanceledException) { }
+        long ended = clock.ElapsedMilliseconds; stopper.Join();
+        Assert(stoppedAt <= ended && ended - stoppedAt < 300, "The client's stop ends the settle second at once: " + (ended - stoppedAt) + " ms after it");
+    }
+
+    // One elevation attempt with a stand-in for staging and UAC. The drop clock starts at the prompt, not at the staging; a
+    // withdrawal during the staging shows no prompt; Discard removes the staged copy of a prompt nobody answered; and the
+    // sweep at start removes only old staged folders directly in Temp, without following a junction inside.
+    static void AttemptTests() {
+        string a8 = Guid.NewGuid().ToString("N").Substring(0, 8), dir = Path.Combine(Path.GetTempPath(), "support-mcp-attempt-" + a8); Directory.CreateDirectory(dir);
+        Func<string> slowStage = delegate { Thread.Sleep(1200); string d = Path.Combine(dir, Elevation.StagePrefix + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(d); File.WriteAllText(Path.Combine(d, "app.exe"), "x"); return Path.Combine(d, "app.exe"); };
+        var no = new Elevation.Attempt(a8, slowStage, delegate(string copy, string nonce, Action answered) { Thread.Sleep(100); return -1223; }, 1000, delegate { });
+        Assert(no.Done.WaitOne(10000) && no.Outcome == Elevation.Declined, "A No 100 ms into the prompt is a No, however long the staging took: " + no.Outcome);
+        var drop = new Elevation.Attempt(a8, slowStage, delegate(string copy, string nonce, Action answered) { Thread.Sleep(1100); return -1223; }, 1000, delegate { });
+        Assert(drop.Done.WaitOne(10000) && drop.Outcome == Elevation.NoAnswer, "A No after the drop time is Windows dropping the prompt: " + drop.Outcome);
+        bool prompted = false; ManualResetEvent staging = new ManualResetEvent(false), go = new ManualResetEvent(false);
+        var early = new Elevation.Attempt(a8, delegate { staging.Set(); go.WaitOne(); return slowStage(); }, delegate(string copy, string nonce, Action answered) { prompted = true; return 0; }, 300, delegate { });
+        staging.WaitOne(); early.Withdraw(); go.Set();
+        Assert(early.Done.WaitOne(10000) && !prompted && early.Outcome == Elevation.NoAnswer, "A withdrawal during the staging shows no prompt");
+        string staged = null; ManualResetEvent asking = new ManualResetEvent(false), answer = new ManualResetEvent(false);
+        var open = new Elevation.Attempt(a8, delegate { staged = slowStage(); return staged; }, delegate(string copy, string nonce, Action answered) { asking.Set(); answer.WaitOne(); return -1223; }, 300, delegate { });
+        asking.WaitOne(); open.Discard();
+        Assert(!Directory.Exists(Path.GetDirectoryName(staged)), "Discard removes the staged copy of a prompt nobody answered");
+        answer.Set(); open.Done.WaitOne(10000);
+        var yes = new Elevation.Attempt(a8, delegate { staged = slowStage(); return staged; }, delegate(string copy, string nonce, Action answered) { answered(); asking.Set(); answer.WaitOne(); return 0; }, 300, delegate { });
+        asking.Reset(); answer.Reset(); asking.WaitOne(); yes.Discard();
+        Assert(Directory.Exists(Path.GetDirectoryName(staged)), "Discard leaves the copy of an answered prompt alone");
+        answer.Set(); Assert(yes.Done.WaitOne(10000) && yes.Outcome == Elevation.Installed && yes.EndedAt > 0, "The installer's exit code 0 is Installed");
+        // The sweep: an hour-old staged folder (with a junction to a folder outside), a young one, another name, and a staged
+        // name one level down.
+        string temp = Path.Combine(dir, "sweep-" + a8), victim = Path.Combine(dir, "victim-" + a8);
+        Directory.CreateDirectory(victim); File.WriteAllText(Path.Combine(victim, "keep.txt"), "x");
+        string old = Path.Combine(temp, Elevation.StagePrefix + "old"), young = Path.Combine(temp, Elevation.StagePrefix + "young"), other = Path.Combine(temp, "other-old"), deep = Path.Combine(other, Elevation.StagePrefix + "deep");
+        foreach (string d in new string[] { old, young, deep }) Directory.CreateDirectory(d);
+        MkLink("/J", Path.Combine(old, "link"), victim);
+        Assert(Directory.Exists(Path.Combine(old, "link")), "Test setup: the junction exists");
+        foreach (string d in new string[] { old, other, deep }) Directory.SetCreationTimeUtc(d, DateTime.UtcNow.AddHours(-2));
+        Elevation.SweepStaged(temp);
+        Assert(!Directory.Exists(old) && Directory.Exists(young) && Directory.Exists(deep) && File.Exists(Path.Combine(victim, "keep.txt")),
+            "The sweep removes only an old staged folder directly in Temp, and not what a junction inside points to: old " + Directory.Exists(old)
+            + " young " + Directory.Exists(young) + " deep " + Directory.Exists(deep) + " victim " + File.Exists(Path.Combine(victim, "keep.txt")));
+        DeleteTreeTests(dir);
+        try { Directory.Delete(dir, true); } catch (Exception) { }
+    }
+    static void MkLink(string kind, string link, string target) {
+        using (var mk = Process.Start(new ProcessStartInfo("cmd.exe", "/c mklink " + kind + " \"" + link + "\" \"" + target + "\"") { UseShellExecute = false, CreateNoWindow = true })) mk.WaitForExit();
+    }
+    // DeleteTree never follows a link: not the folder it is asked to delete, not a junction inside, not a folder swapped
+    // for a junction after it was listed; and it never changes the attributes of a file another hard link shares.
+    static void DeleteTreeTests(string dir) {
+        string t8 = Guid.NewGuid().ToString("N").Substring(0, 8), root = Path.Combine(dir, "tree-" + t8);
+        Func<string, string> victimOf = delegate(string name) { string v = Path.Combine(root, "victim-" + name); Directory.CreateDirectory(v); File.WriteAllText(Path.Combine(v, "keep.txt"), "x"); return v; };
+        Directory.CreateDirectory(root);
+        string top = victimOf("top"), topLink = Path.Combine(root, Elevation.StagePrefix + "link");
+        MkLink("/J", topLink, top);
+        Elevation.DeleteTree(topLink);
+        Assert(!Directory.Exists(topLink) && File.Exists(Path.Combine(top, "keep.txt")), "A staged folder that is itself a junction: the link goes, its target stays");
+        // A subfolder swapped for a junction between the listing of its parent and its own opening, and between its check
+        // and its listing (the folder is then held, so the swap itself fails).
+        string swapped = victimOf("swap"), race = Path.Combine(root, Elevation.StagePrefix + "race"), sub = Path.Combine(race, "sub");
+        Action<string> swap = delegate(string name) {
+            if (name != "sub" || Directory.Exists(sub + "-moved")) return;
+            try { Directory.Move(sub, sub + "-moved"); MkLink("/J", sub, swapped); } catch (IOException) { }
+        };
+        Directory.CreateDirectory(sub); File.WriteAllText(Path.Combine(sub, "inner.txt"), "x");
+        Native.BeforeOpen = swap;
+        try { Elevation.DeleteTree(race); } catch (Exception) { } finally { Native.BeforeOpen = null; }
+        Assert(!Directory.Exists(sub) && File.Exists(Path.Combine(swapped, "keep.txt")), "A folder swapped for a junction after the listing: the junction goes, its target stays: swapped "
+            + Directory.Exists(sub + "-moved") + ", left " + Directory.Exists(sub) + ", target kept " + File.Exists(Path.Combine(swapped, "keep.txt")));
+        if (Directory.Exists(sub + "-moved")) Directory.Delete(sub + "-moved", true);
+        Directory.CreateDirectory(sub); File.WriteAllText(Path.Combine(sub, "inner.txt"), "x");
+        Native.AfterCheck = swap;
+        try { Elevation.DeleteTree(race); } catch (Exception) { } finally { Native.AfterCheck = null; }
+        Assert(File.Exists(Path.Combine(swapped, "keep.txt")), "A folder swapped for a junction after its check is not followed");
+        string shared = Path.Combine(victimOf("hard"), "shared.txt"), hard = Path.Combine(root, Elevation.StagePrefix + "hard");
+        File.WriteAllText(shared, "x"); File.SetAttributes(shared, FileAttributes.ReadOnly | FileAttributes.Hidden);
+        Directory.CreateDirectory(hard); MkLink("/H", Path.Combine(hard, "link.txt"), shared);
+        var before = File.GetAttributes(shared);
+        Assert((before & (FileAttributes.ReadOnly | FileAttributes.Hidden)) == (FileAttributes.ReadOnly | FileAttributes.Hidden), "Test setup: the shared file is read-only and hidden");
+        try { Elevation.DeleteTree(hard); } catch (Exception) { }
+        Assert(File.Exists(shared) && File.GetAttributes(shared) == before, "The attributes of a file another hard link shares stay as they were: " + File.GetAttributes(shared));
+        string plain = Path.Combine(root, Elevation.StagePrefix + "plain"), ro = Path.Combine(plain, "deep", "ro.txt");
+        Directory.CreateDirectory(Path.GetDirectoryName(ro)); File.WriteAllText(ro, "x"); File.SetAttributes(ro, FileAttributes.ReadOnly);
+        Elevation.DeleteTree(plain);
+        Assert(!Directory.Exists(plain), "A plain staged folder goes, with a read-only file in a subfolder");
+        File.SetAttributes(shared, FileAttributes.Normal);
+        foreach (string f in Directory.GetFiles(root, "*", SearchOption.AllDirectories)) try { File.SetAttributes(f, FileAttributes.Normal); } catch (Exception) { }
+    }
+
+    static void QuestionTests() {
+        // Before UAC the full-control question stays open after Allow, as the owner of the UAC prompt (Windows shows the prompt in
+        // front only for an app in the foreground, and the click on Allow gives it that), says that Windows asks now, and cannot
+        // be closed until the app finishes it. It is modeless: the corner window, with End session, stays enabled throughout.
+        // Allow does nothing in its first 500 ms. Don't allow closes it at once. As the app's own confirm (no UAC), Allow closes it.
+        {
+            bool cornerOpen = false, cornerHeld = false, early = true, allowHeld = false, closeRefused = false, finished = false, denyClosed = false, confirmClosed = false;
+            var t = new Thread(delegate() {
+                Action pump = delegate { for (int i = 0; i < 10; i++) { Application.DoEvents(); System.Windows.Threading.Dispatcher.CurrentDispatcher.Invoke(System.Windows.Threading.DispatcherPriority.Background, new Action(delegate { })); Thread.Sleep(25); } };
+                Func<System.Windows.DependencyObject, string, System.Windows.Controls.Button> button = delegate(System.Windows.DependencyObject w, string text) { return Find<System.Windows.Controls.Button>(w, delegate(System.Windows.Controls.Button b) { return text.Equals(b.Content); }); };
+                var corner = new SupportWindow(Palette.Detect(), false, false, null); corner.Show(); pump();
+                IntPtr cornerHandle = new System.Windows.Interop.WindowInteropHelper(corner).Handle;
+                var d = ConsentDialog.Open(true);
+                // Loaded comes asynchronously: wait for it, so only the time guards Allow, and press at once after it.
+                for (int i = 0; i < 400 && !d.IsLoaded; i++) { System.Windows.Threading.Dispatcher.CurrentDispatcher.Invoke(System.Windows.Threading.DispatcherPriority.Background, new Action(delegate { })); Thread.Sleep(5); }
+                var allow = button(d, "Allow");
+                Press(allow); pump(); early = d.Allowed || d.Decided.WaitOne(0) || !allow.IsVisible;
+                cornerOpen = IsWindowEnabled(cornerHandle);
+                Thread.Sleep(ConsentDialog.ArmMs); pump();
+                Press(allow); pump();
+                allowHeld = d.IsVisible && d.Allowed && d.Decided.WaitOne(0) && !allow.IsVisible
+                    && Find<System.Windows.Controls.TextBlock>(d, delegate(System.Windows.Controls.TextBlock b) { return b.Text == SupportAccess.Asking && b.IsVisible; }) != null;
+                cornerHeld = IsWindowEnabled(cornerHandle);
+                d.Close(); pump(); closeRefused = d.IsVisible;
+                d.Finish(); pump(); finished = !d.IsVisible;
+                var n = ConsentDialog.Open(true); pump();
+                Press(button(n, "Don't allow")); pump();
+                denyClosed = !n.IsVisible && !n.Allowed && n.Decided.WaitOne(0); n.Finish();
+                var c = ConsentDialog.Open(false); pump(); Thread.Sleep(ConsentDialog.ArmMs);
+                Press(button(c, "Allow")); pump();
+                confirmClosed = !c.IsVisible && c.Allowed && c.Decided.WaitOne(0); c.Finish();
+                corner.CloseQuietly(); pump();
+            }); t.SetApartmentState(ApartmentState.STA); t.Start(); t.Join();
+            Assert(cornerOpen && cornerHeld, "The corner window stays enabled while the question is open and while it waits for UAC");
+            Assert(!early, "Allow does nothing right after the question appears");
+            Assert(allowHeld, "Allow before UAC keeps the question open and says that Windows asks now");
+            Assert(closeRefused && finished, "The question cannot be closed while UAC asks, only finished by the app");
+            Assert(denyClosed, "Don't allow closes the question");
+            Assert(confirmClosed, "Allow on the app's own confirm closes it");
+            // The installer goes ahead only while the event of its own attempt (a random nonce) exists and is not set, and it
+            // keeps the event: the app exiting afterwards withdraws nothing, setting it does. Nobody can make the event first.
+            string w8 = Guid.NewGuid().ToString("N").Substring(0, 8), n1 = Elevation.Nonce(), n2 = Elevation.Nonce();
+            Func<string, bool> wanted = delegate(string nonce) { using (var h = Elevation.Wanted(w8, nonce)) return h != null; };
+            Assert(n1 != n2 && System.Text.RegularExpressions.Regex.IsMatch(n1, "^[0-9a-f]{32}$"), "Each attempt has a nonce of its own");
+            Assert(!wanted(n1), "No attempt: the installer installs nothing");
+            EventWaitHandle held;
+            using (var want = Elevation.Want(w8, n1)) {
+                Assert(wanted(n1) && !wanted(n2), "Only the attempt with that nonce is wanted");
+                using (var other = Elevation.Want(w8, n2)) { other.Set(); Assert(wanted(n1) && !wanted(n2), "Withdrawing one attempt leaves another alone"); }
+                held = Elevation.Wanted(w8, n1);
+            }
+            Assert(held != null && !held.WaitOne(0), "The installer's open event outlives the app and stays unset");
+            held.Dispose();
+            Assert(!wanted(n1), "With no one holding it, an attempt whose app is gone is not wanted");
+            using (var want = Elevation.Want(w8, n1)) {
+                held = Elevation.Wanted(w8, n1); want.Set();
+                Assert(held.WaitOne(0) && !wanted(n1), "A withdrawal reaches an installer that already holds the event");
+                held.Dispose();
+            }
+            using (var squat = new EventWaitHandle(false, EventResetMode.ManualReset, Elevation.WantName(w8, n2))) {
+                bool refused = false; try { Elevation.Want(w8, n2).Dispose(); } catch (IOException) { refused = true; }
+                Assert(refused, "An event someone made first is refused");
+            }
+        }
+    }
+
     static void FullControlTests(string dir) {
         Assert(ConsentPath.Decide(true, 2, 1, 5) == Consent.Confirm && ConsentPath.Decide(true, 1, 0, -1) == Consent.Confirm, "An elevated app (or UAC off for an administrator) gets no UAC prompt, so it asks itself");
         Assert(ConsentPath.Decide(false, 3, 1, 0) == Consent.Confirm && ConsentPath.Decide(false, 3, -1, 0) == Consent.Confirm, "An administrator who elevates without a prompt is asked by the app");
@@ -593,25 +806,11 @@ public static class AppTests {
         link.Stop(); link.Flush(5000);
         for (int i = 0; i < 100 && finished == 0; i++) Thread.Sleep(50);
         Assert(ended >= 1 && finished == 1 && !link.Lost && !ServiceLink.Running(sid8), "End session reaches the service, and the window sees the session end");
-        // One process gets at most 2 connections, and idle ones are cut off after 5 s.
-        string sid8b = Guid.NewGuid().ToString("N").Substring(0, 8); int endedB = 0;
-        new UiServer(Backstop.Name(sid8b) + "-ui", delegate { return Wire.Map("connected", true, "link", true, "ended", false); }, delegate { endedB++; }, anySession, uiSddl);
-        var idle = new List<System.IO.Pipes.NamedPipeClientStream>();
-        for (int i = 0; i < UiServer.PerProcess; i++) { var c = Pipes.Client(Backstop.Name(sid8b) + "-ui"); c.Connect(2000); idle.Add(c); }
-        Assert(!ServiceLink.Running(sid8b), "A third connection of the same process is refused");
-        Thread.Sleep(UiServer.ReadMs + 1500);
-        Assert(ServiceLink.Running(sid8b), "The idle clients were cut off and the process gets through again");
-        foreach (var c in idle) c.Dispose();
+        PerProcessLimit(uiSddl);
         // Only the active console session is served: a process of another session (a switched user, Remote Desktop) is refused.
         string sid8c = Guid.NewGuid().ToString("N").Substring(0, 8);
         new UiServer(Backstop.Name(sid8c) + "-ui", delegate { return Wire.Map("connected", true, "ended", false); }, delegate { }, delegate(uint session) { return false; }, uiSddl);
         Assert(!ServiceLink.Running(sid8c), "A client from another session is refused");
-        // A service that never confirms the end: the window says it cannot reach it, not that the session ended.
-        ServiceLink.EndMs = 2000;
-        var stubborn = new ServiceLink(sid8b); int stubbornDone = 0; stubborn.Finished += delegate { stubbornDone++; }; stubborn.Start();
-        Thread.Sleep(800); stubborn.Stop(); stubborn.Flush(10000);
-        Assert(stubbornDone == 1 && stubborn.Lost && endedB >= 3, "The end goes out on the connection the window holds, again and again, and an unconfirmed end finishes as Lost: " + endedB);
-        ServiceLink.EndMs = 30000;
         // Pipe clients let the server identify them, never act as them.
         string me8 = Guid.NewGuid().ToString("N").Substring(0, 8); string secret = Path.Combine(dir, "only-me.txt"); File.WriteAllText(secret, "x"); Exception asClient = null;
         using (var server = Native.PipeServer("SupportMcpTest-" + me8, "D:P(A;;GA;;;" + me.Value + ")", 1, true)) {
@@ -732,7 +931,22 @@ public static class AppTests {
             Assert(Wire.Text(second, "error") == FullRequestGate.Waiting && asks == 2, "One prompt at a time");
             gate.Record(Elevation.Declined, t + 5);
             Assert(Wire.Text(gate.Request(ask, t + 6), "error") == FullRequestGate.Cooling && asks == 2, "A later decline starts the cooldown too");
+            gate = new FullRequestGate(); gate.Record(Elevation.NoAnswer, t);
+            Assert(Wire.Text(gate.Request(ask, t + 1), "error") == "asked" && asks == 3, "No answer starts no cooldown");
+            // A UAC prompt the app stopped waiting for: no new request while it is open; a No on it starts the cooldown.
+            // The No counts at once, at the time the prompt ended: a request right after it, with no wait, gets the cooldown.
+            var stale = new ManualResetEvent(false); int staleOutcome = Elevation.Declined; long staleEnded = t + 1000;
+            gate.Leave(stale, delegate { return staleOutcome; }, delegate { return staleEnded; });
+            Assert(Wire.Text(gate.Request(ask, t + 900), "error") == FullRequestGate.StillOpen && asks == 3, "No second prompt while an earlier one is open");
+            stale.Set();
+            Assert(Wire.Text(gate.Request(ask, t + 1001), "error") == FullRequestGate.Cooling && asks == 3, "A No on the earlier prompt starts the cooldown before the next request");
+            Assert(Wire.Text(gate.Request(ask, t + 1000 + FullRequestGate.CooldownMs), "error") == "asked" && asks == 4, "The minute counts from when the prompt ended");
+            gate = new FullRequestGate(); stale = new ManualResetEvent(false); staleOutcome = Elevation.NoAnswer;
+            gate.Leave(stale, delegate { return staleOutcome; }, delegate { return staleEnded; }); stale.Set();
+            Assert(Wire.Text(gate.Request(ask, t + 1001), "error") == "asked" && asks == 5, "A prompt Windows dropped (no answer) starts no cooldown");
         }
+        AttemptTests();
+        Console.WriteLine("PASS an elevation attempt: the drop time, a withdrawal while it stages, Discard and the sweep of staged copies");
         Console.WriteLine("PASS request_full_control: the full cap, a declined request, the silent handover, the cooldown after any decline");
     }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder text, int max);
@@ -852,6 +1066,8 @@ public static class AppTests {
             } finally { try { peer.Kill(); } catch (Exception) { } peer.Dispose(); }
         }
         Console.WriteLine("PASS the corner window does not take the focus, keeps its taskbar button, and Keep connected gives the focus back");
+        QuestionTests();
+        Console.WriteLine("PASS the full-control question stays open as the owner of the UAC prompt");
 
         // A key the app pressed whose up never arrived (a desktop switch) neither pauses support nor stays down:
         // Unstick sends the up. A key no one released and no input for 10 s is stuck and stops pausing. F23 and F22 are harmless.
@@ -874,6 +1090,16 @@ public static class AppTests {
         }
         Console.WriteLine("PASS a key the app left down is released, and a stuck key stops pausing after 10 s");
     }
+    static T Find<T>(System.Windows.DependencyObject root, Func<T, bool> match) where T : System.Windows.DependencyObject {
+        foreach (object child in System.Windows.LogicalTreeHelper.GetChildren(root)) {
+            var hit = child as T; if (hit != null && match(hit)) return hit;
+            var node = child as System.Windows.DependencyObject; if (node == null) continue;
+            var found = Find<T>(node, match); if (found != null) return found;
+        }
+        return null;
+    }
+    [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr h);
+    static void Press(System.Windows.Controls.Button button) { button.RaiseEvent(new System.Windows.RoutedEventArgs(System.Windows.Controls.Primitives.ButtonBase.ClickEvent)); }
     [DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(int pid);
     // A window of another process: the focus-return test starts this exe again with --peer <parent pid>. It lets the
     // parent take the foreground, and prints "ready" once its window is shown.
@@ -973,6 +1199,7 @@ public static class AppTests {
                 r = relay.Call(Run(ChildCommand(late, started), 1));
                 Assert(Wire.Flag(r, "timed_out") && r["exit_code"] == null, "Timeout result");
                 Thread.Sleep(3500); Assert(!File.Exists(late), "Timeout must kill descendants");
+                SettleTests(relay, dir);
                 late = Path.Combine(dir, "end-late"); started = Path.Combine(dir, "end-started");
                 relay.Queue(Run(ChildCommand(late, started), 20)); WaitFile(started); relay.End = true; relay.WaitExit();
                 Thread.Sleep(3500); Assert(!File.Exists(late), "Operator end must kill descendants");

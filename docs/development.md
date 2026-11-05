@@ -125,7 +125,8 @@ The native tests compile `test/app-native.cs` together with `src/agent-app.cs`
 on Windows, using the same references plus `/main:AppTests /target:exe`, and run
 the result. They start the real client against a fake relay and exercise HTTP
 operations, Unicode, chunking, retry deduplication, process-tree cancellation,
-timeout, local expiry and the reconnect rules. They need a Windows desktop
+the second a program the command did not wait for gets to finish, timeout,
+local expiry and the reconnect rules. They need a Windows desktop
 session, so they are not part of `node --test`; CI runs them in the `windows-app`
 job. Besides the client, they cover the pure parts of screen control: coordinate
 scaling, key parsing, the customer pause (hooks and the `GetLastInputInfo`
@@ -134,7 +135,9 @@ of display for `ui_tree`, the stop and pause checks of typing, the corner window
 a result the relay refuses, `as` in normal mode and the screen consent of a
 prepared reconnect. For full control they cover the parts that need no
 administrator: the consent path (UAC prompt, the app's own confirm, or
-unavailable), the folder and file ACLs (a real folder, read back with `icacls`),
+unavailable), the full-control question that stays open as the owner of the UAC
+prompt (modeless, with the corner window still enabled, and Allow dead for its
+first 500 ms), the named event that lets the elevated installer go ahead, the folder and file ACLs (a real folder, read back with `icacls`),
 the exclusive creation of the folder and the parent it goes in, the deadline
 state on disk and its expiry rules, the shared `SoftwareSASGeneration` record (in
 C# and in the backstop's PowerShell, and that neither changes it without the
@@ -160,7 +163,7 @@ Windows 11 PC or VM with UAC on, against `wrangler dev` (see below; raise
 `http://127.0.0.1` as its relay, so in a VM forward the port with `netsh interface
 portproxy add v4tov4 listenaddress=127.0.0.1 listenport=8787
 connectaddress=<host> connectport=8787`. Then check, with screenshots through the
-relay: UAC Yes gives `control: full`; with Notepad focused before the app starts, `type_text` right after the attach goes to Notepad; with the corner window deliberately in front, `type_text` is refused with `the support window has the keyboard focus`; End session then Keep connected returns the focus to Notepad; the corner window has a taskbar button, and Win+T then Alt+F4 asks "End the session?" and can be answered from the keyboard; clicking Tuck or Expand leaves the foreground window unchanged; a `click` on the corner window is refused; a UAC prompt in the user's session shows
+relay: started from Explorer, from Edge's download and with another window in front, a click on Allow brings the UAC prompt up on the secure desktop, not as a taskbar button, and so does `request_full_control` after a decline and the one-minute wait; UAC Yes gives `control: full`; with Notepad focused before the app starts, `type_text` right after the attach goes to Notepad; with the corner window deliberately in front, `type_text` is refused with `the support window has the keyboard focus`; End session then Keep connected returns the focus to Notepad; the corner window has a taskbar button, and Win+T then Alt+F4 asks "End the session?" and can be answered from the keyboard; clicking Tuck or Expand leaves the foreground window unchanged; a `click` on the corner window is refused; a UAC prompt in the user's session shows
 `desktop: secure` and can be clicked; the lock screen can be unlocked with
 `type_secret`; after a restart the session comes back within its deadline and the
 sign-in screen is reachable; `block_input` blocks the physical keyboard and
