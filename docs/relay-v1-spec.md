@@ -44,6 +44,10 @@ refuses the other mode's transport (`/ws` for an `app` session, `/agent` for a
 | `src/session.js` | `Session` Durable Object (SQLite-backed), one per session |
 | `src/screen.js` | the screen vocabulary: lanes, the normalized actions, their audit text, and the strict check of every app result field (pure, shared by `mcp.js` and `session.js`) |
 | `src/registry.js` | `Registry` Durable Object, single instance `idFromName("registry")`, lists sessions |
+| `src/permissions.js` | the permission keys, the built-in roles, and the permission each MCP tool needs (pure data) |
+| `src/workspace.js` | team data in D1: members, roles, recent callers, the chained team log and `authorize`. All team SQL is here, and every query filters by workspace |
+| `src/api.js` | the team API under `/api/v1/w/<slug>/` |
+| `migrations/0001_team.sql` | the D1 tables `members`, `roles`, `callers` and `audit`, each keyed by workspace first |
 | `src/agent.ps1` | PowerShell agent template (imported as text, placeholders substituted) |
 | `src/agent-app.cs`, `src/agent-app.manifest` | the Windows app: .NET Framework 4 source (WPF window) and an `asInvoker` manifest |
 | `src/app-bundle.json` | the compiled x86 app plus the SHA-256 of its source and manifest, built by `scripts/build-app.ps1` and checked by tests |
@@ -54,7 +58,10 @@ refuses the other mode's transport (`/ws` for an `app` session, `/agent` for a
 `[[migrations]] tag="v1" new_sqlite_classes=["Session","Registry"]` (free plan
 needs SQLite-backed DOs), `[[rules]] type="Text" globs=["**/*.ps1"]`, and
 `[vars] ACCESS_TEAM_DOMAIN="<team>.cloudflareaccess.com"`,
-`ACCESS_AUD="<Access app AUD tag>"`. Keep the custom-domain route. Free plan: 10 ms CPU per request, so no heavy
+`ACCESS_AUD="<Access app AUD tag>"`, `DEPLOYMENT_ADMINS=""` (comma-separated
+identities allowed to add the first member; empty allows any), and
+`[[d1_databases]] binding="DB" database_name="support-mcp" database_id="<id>"
+migrations_dir="migrations"`. There is no Durable Object migration for teams. Keep the custom-domain route. Free plan: 10 ms CPU per request, so no heavy
 work in the request path; use the WebSocket Hibernation API
 (`ctx.acceptWebSocket`) and a DO alarm for expiry.
 
@@ -67,7 +74,8 @@ work in the request path; use the WebSocket Hibernation API
 | `GET /j/<code>?client=app` | public | The downloaded app. `legacy` is an alias for `app`; any other `client` value → 404. **https only**: over plain `http:` on any host except `localhost` / `127.0.0.1` → 403 `text/plain`, code **not** consumed. `GET` serves the download page (200 `text/html`, `Cache-Control: no-store`, `Referrer-Policy: same-origin`, a CSP with `default-src 'none'` and `form-action 'self'`) and **never consumes the code**, however often the page is opened or refreshed. Only a `POST` from the page's button consumes it. If the request has an `Origin` header it must equal the relay's own origin exactly. If it has none (IE11 on Windows 7 can omit it on a same-origin form POST), its `Referer` must start with `<origin>/j/`, which the page's `Referrer-Policy: same-origin` keeps on the click. A foreign `Origin`, a foreign or missing `Referer` without an `Origin`, or neither header → 403, code unused. A first valid `POST` returns 200 `application/octet-stream` with `Content-Disposition: attachment; filename="remote-support-<sid8>.exe"`: the compiled app followed by the session configuration (below). The code is single use: a repeat after the download shows "Check your downloads" (409), an expired or ended one shows "This support link has expired" (410). A code made for a `powershell` session shows the expired page and stays unused. `HEAD` and every other method → 405 (`Allow: GET, POST`). |
 | `POST /agent?sid=<sid>` + `X-Attach-Key: <key>` | attach key | The app's transport, JSON in and out; below. 403 over plain `http:` on any host except `localhost` / `127.0.0.1`, 403 on any `Origin` header or a `key` query param, 405 on other methods, 415 on a non-JSON body, 413 over 750,000 characters (checked against `Content-Length` before the body is read, and again after it is read when there is no `Content-Length`), 401 on a bad sid, bad key, a `powershell` session or a session that is still `pending`, 409 on a stale generation, 410 when the session has ended. |
 | `GET /ws?sid=<sid>` + `X-Attach-Key: <key>` | attach key | WebSocket upgrade for the agent; 403 over plain `http:` on any host except `localhost` / `127.0.0.1`; 401 on bad/missing key, on a `key` query param, on a bad sid, or on an `app` session; 410 if session ended/expired |
-| `POST /mcp` | Access JWT | MCP JSON-RPC 2.0 |
+| `POST /mcp` | Access JWT | MCP JSON-RPC 2.0. `tools/call` checks the caller's role first (below) |
+| `/api/v1/w/default/...` | Access JWT | the team API (below) |
 | anything else | — | 404 |
 
 `<sid>` = the Session DO's hex id (`idFromName(code)`); the code is the DO name.
@@ -123,6 +131,151 @@ one per 60 s. Local bypass: only when `env.DEV_SKIP_ACCESS === "1"` (set from
 The caller identity — `email` (user), else `common_name` (service token), else
 `sub`, or `local-dev` under the bypass — is threaded to the DO and recorded in
 the audit log for `session_create`, `run`, `put_file`, `get_file`, `session_end`.
+The session's own log keeps it as sent, in the `[identity] detail` form.
+
+### Role check (`tools/call`)
+
+`initialize`, `ping`, `tools/list` and every refusal above never read team
+data. On `tools/call` for a listed tool, after the `session_id` check, the relay
+looks up the tool's permission in `src/permissions.js` and asks
+`authorize("default", identity, permission)` before the tool's backend runs.
+The identity is trimmed and lowercased. `authorize` gets only the permission
+key, never the tool's arguments.
+
+| Tool | Permission |
+|---|---|
+| `session_create` | `sessions.create` |
+| `session_list`, `session_status` | `sessions.view` |
+| `session_end` | `sessions.end` |
+| every other tool | `sessions.control` |
+
+- No members in the workspace (open): allowed, and the caller is recorded in
+  `callers` with the time.
+- Not a member: tool error `you are not a member of this team`.
+- A member whose role lacks the permission: tool error
+  `your role does not allow <permission>`.
+- No `DB` binding: tool error `the team database (DB) is not configured`.
+
+A refusal is a tool error (`isError`), and nothing reaches a Session.
+`session_create` sends `workspace: "default"` to `/create`, and the operator
+calls send it to `/command` and `/end` in the body and to `/status` as
+`?workspace=default`. The Session stores `workspace` at create (default
+`default`; anything but `[a-z0-9-]{1,40}` is a 400). When an operator call names
+a workspace other than the stored one (a session with none stored counts as
+`default`), the Session answers exactly as for a session that does not exist:
+`/status` gives `state: "unknown"` with every other field empty, `/command`
+gives `{ok:false, error:"session ended"}`, `/end` gives `{ended:true}`, and
+nothing changes. Calls that name no workspace (the download page's `/status`,
+`/consume`, `/agent`, `/ws`) skip the check. `session_list` still reads the
+Registry, unchanged.
+
+## Team API (`/api/v1/w/<slug>`)
+
+The same gate as `/mcp`, before any database access: an `Origin` header → 403
+`{"error":{"code":"forbidden",...}}` (also under the local bypass); `POST`,
+`PATCH` and `DELETE` need `Content-Type: application/json` → else 415
+`unsupported_media_type`; methods other than `GET`, `POST`, `PATCH`, `DELETE` →
+405; then the Access JWT, failure → 403 `forbidden`. Only the slug `default`
+exists; any other path is 404 `not_found`. Bodies are JSON objects of at most
+16,384 characters. Every answer is JSON with `Cache-Control: no-store`, and every
+error is `{"error":{"code","message"}}`.
+
+| Route | Needs | Body | Answer |
+|---|---|---|---|
+| `GET /api/v1/w/default` | any member, anyone while open | | `{workspace:{slug,open}, me:{identity,role_id,permissions}, recent_callers?}`; `recent_callers` (`[{identity,last_seen,kind}]`, newest first, at most 50) only while open; `role_id` is `null` while open |
+| `GET .../members` | `members.manage` | | `{members:[{identity,kind,name,role_id,added_at,added_by}]}` |
+| `POST .../members` | `members.manage` | `{identity, name?, role_id}` | 201 `{member}` |
+| `PATCH .../members/<identity>` | `members.manage` | `{name?, role_id?}` | `{member}` |
+| `DELETE .../members/<identity>` | `members.manage` | | `{removed:{identity}}` |
+| `GET .../roles` | `roles.manage` or `members.manage`, anyone while open | | `{roles:[{id,name,permissions,builtin,editable}]}` |
+| `POST .../roles` | `roles.manage` | `{id, name?, permissions}` | 201 `{role}` |
+| `PATCH .../roles/<id>` | `roles.manage` | `{name?, permissions?}` | `{role}` |
+| `DELETE .../roles/<id>` | `roles.manage` | | `{removed:{id}}` |
+| `GET .../audit?after=&limit=` | `audit.view` | | `{rows:[{seq,ts,actor,kind,detail,prev_hash,hash}], head:{seq,hash}, verified}`; rows with `seq > after` (default 0), at most `limit` (1 to 500, default 100) |
+
+`<identity>` is URL-encoded and compared trimmed and lowercased. A member's
+`kind` is `service` when the identity has no `@`, else `person`. Identities are
+at most 200 characters with no spaces; names at most 100 characters with no
+control characters. Role ids match `[a-z0-9-]{1,40}`. Permission keys are
+`members.manage`, `roles.manage`, `audit.view`, `sessions.create`,
+`sessions.view`, `sessions.control`, `sessions.end`. Built-in roles: `admin`
+(every key, fixed), `technician` (the four `sessions.*` keys), `viewer`
+(`sessions.view`, `audit.view`). They are not stored; a stored row overrides an
+edited `technician` or `viewer`, and a deleted one keeps a row with `deleted = 1`.
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `bad_request` | a body that is not a JSON object, a bad identity, name, role id, permission list (an unknown key) or query value, a `PATCH` with no field |
+| 400 | `unknown_role` | a member given a role that does not exist |
+| 403 | `forbidden` | `Origin` header, Access refused, or a team change that breaks the escalation rules below |
+| 403 | `not_member` | the workspace has members and the caller is not one |
+| 403 | `permission_denied` | the caller's role lacks the route's permission |
+| 404 | `not_found` | another slug, an unknown path, member or role |
+| 409 | `first_member` | the first member is not the caller as `admin`, or `DEPLOYMENT_ADMINS` is set and the caller is not in it; or any other team write while the workspace has no members |
+| 409 | `member_exists`, `role_exists` | already there |
+| 409 | `last_admin` | removing or demoting the last admin |
+| 409 | `role_fixed` | creating, editing or deleting `admin` |
+| 409 | `role_in_use` | deleting a role a member holds |
+| 503 | `busy` | six tries in a row lost the race to another change (`Retry-After: 1`) |
+
+While the workspace has no members, every caller holds only the four
+`sessions.*` permissions, so `authorize` for those is as before teams existed.
+`GET .../` and `GET .../roles` answer anyone; `GET .../members` and
+`GET .../audit` are 403. Every write except adding the first member is 409
+`first_member` ("add yourself as the first admin before changing the team"), so
+nothing written while open persists into the roles that turn on later. Adding
+the first member writes `member_added` and then `roles_turned_on`. Two callers
+racing to add it collide on the log number; the loser retries, finds a member
+and is refused `not_member`. The relay writes an open-mode caller's `last_seen`
+once when new and again only when it is over 60 seconds old.
+
+### Escalation rules
+
+Holding `members.manage` or `roles.manage` is not enough to reach admin. Each
+refusal is 403 `forbidden` with a plain `message`, and writes no log row.
+
+- Only an `admin` member can add a member as `admin`, change anyone to or from
+  `admin`, or remove an `admin`.
+- Anyone else can give a member only a role whose permissions are all held by
+  their own role.
+- Anyone else can create a role, or edit one, only so that the role ends up
+  holding no permission they lack. A rename counts: it leaves the role's
+  permissions as they are, so a role holding more than the editor does can't be
+  renamed by them.
+- Nobody can edit or delete the role they hold.
+- Nobody can change their own role. An `admin` is the exception: they can
+  demote themselves, and `last_admin` (409) refuses it unless another admin
+  remains.
+
+The planning step checks these rules, and the SQL guard on the log insert checks
+them again against the actor's role, and the role's permissions, as the plan
+read them. A change that lands between the read and the commit therefore fails
+the guard, and the retry gives the right 403.
+
+### The team log
+
+Each change writes one row (two for the first member) of kind `member_added`,
+`member_changed`, `member_removed`, `role_added`, `role_changed`,
+`role_removed` or `roles_turned_on`, with `actor` the caller's identity.
+`hash` = hex SHA-256 of `prev_hash`, `seq`, `ts`, `actor`, `kind` and `detail`
+joined by `\n`; the first row's `prev_hash` is 64 zeros. A change reads the log
+head, checks its rules, computes the next row, then runs one `DB.batch`: the
+log insert, whose `WHERE` holds the rules as SQL (for example that another
+admin remains), then the change itself, which runs only if that log row went in.
+A batch is atomic, so the change and its row commit together. Two writers that
+read the same head collide on `PRIMARY KEY(workspace, seq)`; the loser's batch
+rolls back and it starts again from a fresh read, up to five retries with a
+short random wait, then `busy`. A lost log number shows as a UNIQUE or
+`SQLITE_CONSTRAINT` error naming `audit`; for any other batch error the store
+reads the log head again and retries if it moved since the read, else it
+rethrows. A batch whose rules no longer hold also starts
+again, and the fresh read gives the right 403, 404 or 409. `verified` recomputes
+the whole chain: numbers 1, 2, 3 with no gap, each `prev_hash` equal to the row
+before, each `hash` matching its row. Verification covers the whole log on each
+read of `GET .../audit`, not only the returned page. An edit, removal or
+reordering of a row shows unless it is among the newest entries; deleting the
+newest rows still verifies, so note the `head` (`seq` and `hash`) outside the
+relay to catch that.
 
 ## Session state machine (Session DO)
 
@@ -694,7 +847,8 @@ window's two requests, and the Client's full-control path with a fake service.
 
 ## Acceptance (each names its check)
 
-1. `node --test` green; `npx wrangler deploy --dry-run` bundles without error.
+1. `node --test` green; `npx wrangler deploy --dry-run` bundles without error
+   and lists `env.DB` as a D1 database.
 2. Local stack (`wrangler dev`, `.dev.vars` with `DEV_SKIP_ACCESS=1`): MCP
    `initialize` → `tools/list` returns the 7 base tools plus the nine screen
    tools, `ui_tree`, `ui_act`, `block_input`, `send_sas`, `type_secret` and
@@ -741,4 +895,6 @@ window's two requests, and the Client's full-control path with a fake service.
 - A screenshot, typed text and a secret are never stored by the relay: not in
   the audit log, the Session storage, the registry or the Worker log.
 - `ended` is terminal; no path reopens a session or extends `expires_at`.
+- Every `tools/call` checks the caller's role before it reaches a session; team
+  management is never an MCP tool.
 - No secrets in the repo: `.dev.vars` gitignored; attach keys stored hashed.

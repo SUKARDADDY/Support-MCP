@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Session } from '../src/session.js';
+import { createHandler } from '../src/app.js';
 
 function fixture(t) {
   let now = 1_800_000_000_000;
@@ -409,4 +410,94 @@ test('hello logs truncated values and is accepted once per socket', async (t) =>
   await f.session.webSocketMessage(second, JSON.stringify({ type: 'hello', machine: 'AGAIN', user: 'u' }));
   assert.equal(f.values.get('machine'), 'NEW-PC');
   assert.equal(f.logs.filter((l) => l.kind === 'hello').length, 2);
+});
+
+// ---- the session's workspace ---------------------------------------------------
+const CODE = 'abcdefghijklmnop';
+const SID = 'a'.repeat(64);
+const createIn = (f, extra = {}) => f.fetch('/create', { method: 'POST', body: JSON.stringify({ code: CODE, sid: SID, actor: 'op@example.com', ...extra }) });
+const post = (f, path, body) => f.fetch(path, { method: 'POST', body: JSON.stringify(body) }).then((r) => r.json());
+// What a session that does not exist answers.
+async function missingAnswers(t) {
+  const m = fixture(t);
+  return {
+    status: await (await m.fetch('/status?log_tail=20&workspace=default')).json(),
+    command: await post(m, '/command', { op: 'run', command: 'whoami', actor: 'op@example.com', workspace: 'default' }),
+    end: await post(m, '/end', { actor: 'op@example.com', workspace: 'default' }),
+  };
+}
+
+test('a call from another workspace gets exactly the answer for a missing session', async (t) => {
+  const missing = await missingAnswers(t);
+  assert.equal(missing.status.state, 'unknown');
+  const f = fixture(t);
+  assert.equal((await createIn(f, { workspace: 'team-b' })).status, 200);
+  assert.equal(f.values.get('workspace'), 'team-b');
+  await f.fetch('/consume');
+  // Attached over the websocket, so a command would go out at once.
+  const ws = f.socket('g1');
+  f.values.set('state', 'attached');
+  f.values.set('ws_tag', 'g1');
+  f.values.set('expires_at', f.now() + 60_000);
+  const logRows = f.logs.length;
+
+  assert.deepEqual(await (await f.fetch('/status?log_tail=20&workspace=default')).json(), missing.status);
+  assert.deepEqual(await post(f, '/command', { op: 'run', command: 'whoami', actor: 'op@example.com', workspace: 'default' }), missing.command);
+  assert.deepEqual(await post(f, '/end', { actor: 'op@example.com', workspace: 'default' }), missing.end);
+  assert.deepEqual(ws.sent, [], 'no command reached the PC');
+  assert.equal(f.values.get('state'), 'attached', 'the session was not ended');
+  assert.equal(f.logs.length, logRows, 'nothing was logged');
+
+  // Its own workspace, and calls that name none, see the session.
+  assert.equal((await (await f.fetch('/status?workspace=team-b')).json()).state, 'attached');
+  assert.equal((await (await f.fetch('/status?log_tail=0')).json()).state, 'attached');
+  assert.deepEqual(await post(f, '/end', { actor: 'op@example.com', workspace: 'team-b' }), { ended: true });
+  assert.equal(f.values.get('state'), 'ended');
+  assert.equal(f.logs.at(-1).detail, '[op@example.com] ended_by_operator');
+});
+
+test('a session with no stored workspace counts as default', async (t) => {
+  const missing = await missingAnswers(t);
+  const f = fixture(t);
+  await createIn(f);
+  assert.equal(f.values.get('workspace'), 'default', 'create stores default when none is named');
+  // A session created before workspaces existed has no value at all.
+  f.values.delete('workspace');
+  assert.equal((await (await f.fetch('/status?workspace=default')).json()).state, 'pending');
+  const other = await (await f.fetch('/status?log_tail=20&workspace=team-b')).json();
+  assert.deepEqual(other, missing.status);
+  assert.deepEqual(await post(f, '/command', { op: 'run', command: 'x', workspace: 'team-b' }), missing.command);
+  assert.deepEqual(await post(f, '/end', { workspace: 'team-b' }), missing.end);
+  assert.equal(f.values.get('state'), 'pending');
+  assert.deepEqual(await post(f, '/command', { op: 'run', command: 'x', workspace: 'default' }), { ok: false, error: 'agent not attached' });
+});
+
+test('create refuses a workspace that is not a slug, and stores nothing', async (t) => {
+  for (const workspace of ['Team B', '', 'x'.repeat(41), 5, null]) {
+    const f = fixture(t);
+    const r = await createIn(f, { workspace });
+    if (workspace === null) {
+      assert.equal(r.status, 200, 'null means the default');
+      assert.equal(f.values.get('workspace'), 'default');
+      continue;
+    }
+    assert.equal(r.status, 400, JSON.stringify(workspace));
+    assert.equal(f.values.get('state'), undefined);
+  }
+});
+
+test('the download page still loads for a session in another workspace, without using the code', async (t) => {
+  const f = fixture(t);
+  await createIn(f, { workspace: 'team-b', windows_mode: 'app' });
+  const env = {
+    SESSION: {
+      idFromName: () => ({ toString: () => SID }),
+      get: () => ({ fetch: (u, init) => f.session.fetch(new Request(u, init)) }),
+    },
+  };
+  const handler = createHandler('powershell agent', { exe_b64: '', source_sha256: '', manifest_sha256: '' });
+  const page = await handler.fetch(new Request(`https://support.example.com/j/${CODE}?client=app`), env);
+  assert.equal(page.status, 200);
+  assert.match(await page.text(), /Download the support app/);
+  assert.equal(f.values.get('state'), 'pending');
 });

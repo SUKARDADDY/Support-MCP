@@ -16,6 +16,12 @@
 // An app client that reports the `lanes` cap runs two lanes at once: `cmd`
 // (run, put_file, get_file) and `screen` (screen and control frames). An older
 // client without it keeps one lane and cannot do screen work.
+//
+// A session belongs to the team workspace that created it (`workspace`, stored
+// at create; a session without one is in "default"). Operator calls to
+// /status, /command and /end name their workspace, and a call from another
+// workspace gets exactly the answer for a session that does not exist. Calls
+// that name none (the download page, consume, the app) skip the check.
 
 import {
   LANES, auditText, decodeCaps, decodeControl, decodeControlResult, decodePollReport,
@@ -43,6 +49,8 @@ const NO_SCREEN_CONSENT = 'the customer has not approved screen control for this
 // character takes about 31 ms. The relay waits 35 ms for each.
 const TYPE_MS_PER_CHAR = 35;
 const FULL_ONLY = ['block_input', 'send_sas'];
+const DEFAULT_WORKSPACE = 'default';
+const WORKSPACE_RE = /^[a-z0-9-]{1,40}$/;
 export const GET_FILE_MAX = 524288; // bytes per get_file chunk
 export const PUT_B64_MAX = 700000; // data_b64 chars per put_file chunk (~512 KiB)
 
@@ -168,6 +176,12 @@ export class Session {
     return this._ttlOverride;
   }
 
+  // True when an operator call names a workspace other than this session's.
+  async otherWorkspace(workspace) {
+    if (workspace === undefined || workspace === null) return false;
+    return workspace !== (await this.get('workspace', DEFAULT_WORKSPACE));
+  }
+
   async deadlineFor(state) {
     const d = DEADLINES[state];
     if (!d) return null;
@@ -217,6 +231,10 @@ export class Session {
     if ((await this.get('state')) !== undefined) {
       return Response.json({ ok: false, error: 'session already exists' }, { status: 409 });
     }
+    const workspace = b.workspace ?? DEFAULT_WORKSPACE;
+    if (typeof workspace !== 'string' || !WORKSPACE_RE.test(workspace)) {
+      return Response.json({ ok: false, error: 'bad workspace' }, { status: 400 });
+    }
     const now = Date.now();
     this._ttlOverride = Number(b.ttl_ms) > 0 ? Number(b.ttl_ms) : 0;
     const codeExpiry = now + this.ttlMs(CODE_TTL_MS);
@@ -227,6 +245,7 @@ export class Session {
       state: 'pending',
       created_at: now,
       created_by: b.actor ?? null,
+      workspace,
       code_expires_at: codeExpiry,
       ttl_ms: this._ttlOverride,
       machine: null,
@@ -334,6 +353,8 @@ export class Session {
   }
 
   async doStatus(url) {
+    // Another workspace sees what a session that does not exist shows.
+    if (await this.otherWorkspace(url.searchParams.get('workspace'))) return Response.json(statusBody(new Map(), [], false));
     await this.expireIfDue();
     const tail = Math.max(0, Math.min(500, Number(url.searchParams.get('log_tail') || 20) || 0));
     const s = await this.ctx.storage.get([
@@ -341,38 +362,18 @@ export class Session {
       'windows_mode', 'transport', 'http_seen_at', 'elevated', 'caps', 'control', 'agent', 'desktop',
       'paused_until', 'input_blocked_until',
     ]);
-    const app = s.get('windows_mode') === 'app';
     const rows = tail
       ? this.sql.exec(`SELECT ts,kind,detail FROM log ORDER BY ts DESC LIMIT ?`, tail).toArray().reverse()
       : [];
-    return Response.json({
-      state: s.get('state') ?? 'unknown',
-      machine: s.get('machine') ?? null,
-      user: s.get('user') ?? null,
-      ps: s.get('ps') ?? null,
-      windows_mode: s.get('windows_mode') ?? 'powershell',
-      ...(app ? {
-        elevated: s.get('elevated') ?? null,
-        control: s.get('control') ?? null,
-        caps: s.get('caps') ?? [],
-        desktop: s.get('desktop') ?? null,
-        // A deadline that has passed no longer says anything.
-        paused_until: future(s.get('paused_until')),
-        input_blocked_until: future(s.get('input_blocked_until')),
-      } : {}),
-      client_version: s.get('agent') ?? null,
-      expires_at: s.get('expires_at') ?? null,
-      startup_expires_at: s.get('state') === 'consumed' ? s.get('consumed_expires_at') ?? null : null,
-      ended_reason: s.get('ended_reason') ?? null,
-      attached: s.get('transport') === 'https-poll'
-        ? s.get('state') === 'attached' && Date.now() - (s.get('http_seen_at') || 0) < HTTP_SEEN_MS
-        : !!(await this.currentSocket()),
-      log: rows,
-    });
+    const attached = s.get('transport') === 'https-poll'
+      ? s.get('state') === 'attached' && Date.now() - (s.get('http_seen_at') || 0) < HTTP_SEEN_MS
+      : !!(await this.currentSocket());
+    return Response.json(statusBody(s, rows, attached));
   }
 
   async doCommand(request) {
     const b = await request.json();
+    if (await this.otherWorkspace(b.workspace)) return Response.json({ ok: false, error: 'session ended' });
     await this.expireIfDue();
     const state = await this.get('state');
     if (state === 'ended' || state === undefined) return Response.json({ ok: false, error: 'session ended' });
@@ -675,9 +676,11 @@ export class Session {
 
   async doEnd(request) {
     let actor = null;
+    let workspace;
     try {
-      actor = (await request.json()).actor ?? null;
+      ({ actor = null, workspace } = await request.json());
     } catch (_) {}
+    if (await this.otherWorkspace(workspace)) return Response.json({ ended: true });
     await this.expireIfDue();
     const state = await this.get('state');
     if (state === 'ended' || state === undefined) return Response.json({ ended: true });
@@ -783,6 +786,33 @@ export class Session {
 
 function truncate(s, n) {
   return s.length > n ? s.slice(0, n) + '…' : s;
+}
+
+// The /status answer. A session that does not exist is statusBody(new Map(), [], false).
+function statusBody(s, rows, attached) {
+  const app = s.get('windows_mode') === 'app';
+  return {
+    state: s.get('state') ?? 'unknown',
+    machine: s.get('machine') ?? null,
+    user: s.get('user') ?? null,
+    ps: s.get('ps') ?? null,
+    windows_mode: s.get('windows_mode') ?? 'powershell',
+    ...(app ? {
+      elevated: s.get('elevated') ?? null,
+      control: s.get('control') ?? null,
+      caps: s.get('caps') ?? [],
+      desktop: s.get('desktop') ?? null,
+      // A deadline that has passed no longer says anything.
+      paused_until: future(s.get('paused_until')),
+      input_blocked_until: future(s.get('input_blocked_until')),
+    } : {}),
+    client_version: s.get('agent') ?? null,
+    expires_at: s.get('expires_at') ?? null,
+    startup_expires_at: s.get('state') === 'consumed' ? s.get('consumed_expires_at') ?? null : null,
+    ended_reason: s.get('ended_reason') ?? null,
+    attached,
+    log: rows,
+  };
 }
 
 // A deadline in the future, or null. Status never reports one that has passed.

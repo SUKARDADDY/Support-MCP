@@ -1,9 +1,12 @@
-// support-mcp relay router: Access JWT gate + MCP JSON-RPC handler + the
-// public customer paths (/healthz, /j/<code>, /agent, /ws). Kept free of the .ps1
-// import and the DO classes so node --test can drive it route-level; index.js
-// wires it to the real agent template.
+// support-mcp relay router: Access JWT gate + MCP JSON-RPC handler + the team
+// API (/api/v1/...) + the public customer paths (/healthz, /j/<code>, /agent,
+// /ws). Kept free of the .ps1 import and the DO classes so node --test can drive
+// it route-level; index.js wires it to the real agent template.
 import { verifyAccessJwt, importRsaJwk, localBypassAllowed, callerIdentity } from './jwt.js';
 import { handleRpc, parseToolOptions } from './mcp.js';
+import { permissionForTool } from './permissions.js';
+import { DEFAULT_WORKSPACE, teamFromEnv } from './workspace.js';
+import { handleApi } from './api.js';
 import {
   buildAppDownload,
   buildBootstrap,
@@ -125,6 +128,10 @@ function appPage(url, state = 'pending', sid = '', expiredStatus = 410) {
 }
 
 // ---- MCP backend: each tool talks to the DOs -------------------------------
+// Every operator call names its workspace, and the Session answers a call from
+// another workspace as it answers for a session that does not exist.
+const WORKSPACE = DEFAULT_WORKSPACE;
+
 function makeBackend(env, origin, devTtlMs, actor) {
   const sessionStub = (sid) => {
     if (sid === undefined || sid === null || sid === '') throw new Error('session_id is required; call session_list to find it');
@@ -134,7 +141,7 @@ function makeBackend(env, origin, devTtlMs, actor) {
   async function cmd(sid, body) {
     const r = await sessionStub(sid).fetch('https://do/command', {
       method: 'POST',
-      body: JSON.stringify({ ...body, actor }),
+      body: JSON.stringify({ ...body, actor, workspace: WORKSPACE }),
     });
     return r.json();
   }
@@ -146,7 +153,7 @@ function makeBackend(env, origin, devTtlMs, actor) {
       const sid = id.toString();
       const r = await env.SESSION.get(id).fetch('https://do/create', {
         method: 'POST',
-        body: JSON.stringify({ code, sid, label: args.label ?? null, windows_mode: windowsMode, ttl_ms: devTtlMs, actor }),
+        body: JSON.stringify({ code, sid, label: args.label ?? null, windows_mode: windowsMode, ttl_ms: devTtlMs, actor, workspace: WORKSPACE }),
       });
       const out = await r.json();
       if (!out.ok) throw new Error(out.error || 'session_create failed');
@@ -173,7 +180,7 @@ function makeBackend(env, origin, devTtlMs, actor) {
     },
     async session_status(args) {
       const tail = args.log_tail == null ? 20 : args.log_tail;
-      const r = await sessionStub(args.session_id).fetch(`https://do/status?log_tail=${encodeURIComponent(tail)}`);
+      const r = await sessionStub(args.session_id).fetch(`https://do/status?log_tail=${encodeURIComponent(tail)}&workspace=${WORKSPACE}`);
       return r.json();
     },
     async run(args) {
@@ -212,11 +219,29 @@ function makeBackend(env, origin, devTtlMs, actor) {
     async session_end(args) {
       const r = await sessionStub(args.session_id).fetch('https://do/end', {
         method: 'POST',
-        body: JSON.stringify({ actor }),
+        body: JSON.stringify({ actor, workspace: WORKSPACE }),
       });
       return r.json();
     },
   };
+}
+
+// The role check in front of every tool. A tool call runs exactly one backend
+// method, and each method first checks that the caller's role holds the
+// permission the called tool needs. It is given only that permission key, never
+// the tool's arguments, and a refused call never reaches a Session.
+function authorizedBackend(backend, env, actor, toolName) {
+  const check = async () => {
+    const permission = permissionForTool(toolName);
+    if (!permission) throw new Error(`unknown tool: ${toolName}`);
+    const a = await teamFromEnv(env).authorize(WORKSPACE, actor, permission);
+    if (a.ok) return;
+    throw new Error(a.reason === 'not_member' ? 'you are not a member of this team' : `your role does not allow ${permission}`);
+  };
+  return Object.fromEntries(Object.entries(backend).map(([name, fn]) => [name, async (args) => {
+    await check();
+    return fn(args);
+  }]));
 }
 
 // ---- Access gate -----------------------------------------------------------
@@ -407,7 +432,10 @@ async function handleMcp(request, env, url, origin, devTtlMs) {
   } catch (_) {
     return json({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } }, 200);
   }
-  const backend = makeBackend(env, origin, devTtlMs, actor);
+  // Roles are checked on tools/call only. tools/list, initialize and ping never
+  // touch the team database.
+  const toolName = msg && msg.method === 'tools/call' && msg.params ? msg.params.name : undefined;
+  const backend = authorizedBackend(makeBackend(env, origin, devTtlMs, actor), env, actor, toolName);
   const { status, body } = await handleRpc(msg, backend, options);
   if (body === null) return new Response(null, { status });
   return json(body, status);
@@ -429,6 +457,7 @@ export function createHandler(agentText, appBundle = null) {
       if (p === '/agent') return handleAgent(request, env, url);
       if (p === '/ws') return handleWs(request, env, url);
       if (p === '/mcp') return handleMcp(request, env, url, origin, devTtlMs);
+      if (p === '/api' || p.startsWith('/api/')) return handleApi(request, env, url, { accessCaller, isJsonContentType });
       return new Response('not found', { status: 404 });
     },
   };

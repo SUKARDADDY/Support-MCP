@@ -43,6 +43,8 @@ AI agent does the diagnosis and the fix while a person watches.
   seconds.
 - Access ends 24 hours after the PC connects, or sooner if either side ends it.
 - The Worker is the MCP server, so there is nothing to run on your machine.
+- A support team can share one relay. Each tool call is checked against the
+  caller's role, so a Viewer can watch but not act.
 
 ## How it works
 
@@ -216,6 +218,73 @@ fails with `session_id is required; call session_list to find it`, and the relay
 never picks a session for you. `run`, `put_file` and `get_file` use their own
 lane, so a long command does not block the screen.
 
+## Teams
+
+The relay has one team workspace. Until you add its first member, it works as
+before: anyone Cloudflare Access lets in can use every tool. Once it has a
+member, only members can use the MCP endpoint, and each tool call is checked
+against the caller's role before it reaches a session. Until then, nobody can
+change the team except by adding themselves as the first admin: an attempt to
+edit or add a role, or to change or remove a member, gets a 409 `first_member`.
+
+- **Members** are identities from Cloudflare Access: a person by email, or an
+  MCP client signed in with a service token by the token's client ID (the
+  `CF_ACCESS_CLIENT_ID` value, which ends in `.access`). Identities ignore case
+  and surrounding spaces.
+- **Roles.** `admin` can do everything and can't be changed. `technician` can
+  create, view, control and end sessions. `viewer` can view sessions and read
+  the team log. Admins can edit `technician` and `viewer`, delete them while no
+  member holds them, and add roles of their own from these permissions:
+  `members.manage`, `roles.manage`, `audit.view`, `sessions.create`,
+  `sessions.view`, `sessions.control`, `sessions.end`.
+- **Who can give what.** Having `members.manage` or `roles.manage` does not let
+  a member reach admin. Only an admin can add a member as admin, move anyone to
+  or from admin, or remove an admin. Everyone else can give a member only a role
+  whose permissions they hold themselves, and can create or edit a role only so
+  that it holds permissions they hold. Nobody can change their own role or edit
+  or delete the role they hold. An admin can demote themselves only while
+  another admin remains. A refused change is a 403 with the code `forbidden`
+  and a plain reason.
+- **Which tool needs what.** `session_create` needs `sessions.create`,
+  `session_list` and `session_status` need `sessions.view`, `session_end` needs
+  `sessions.end`, and every other tool needs `sessions.control`. Controlling a
+  full-control session is administrator-level on the customer's PC, so give
+  `sessions.control` only to people you would trust with that.
+- **A refused call** is a tool error: `you are not a member of this team`, or
+  `your role does not allow sessions.control`. Removing a member takes effect on
+  their next call.
+- **The first member must be you, as admin.** If `DEPLOYMENT_ADMINS` is set,
+  you must be listed in it. Add your MCP client's service token as a member at
+  the same time, or it loses access. While the team has no members,
+  `GET /api/v1/w/default` lists who has been calling, service tokens included.
+- **The team log** records every change to members and roles. Each entry seals
+  the one before it, so an edit, removal or reordering of an entry shows, unless
+  it is among the newest entries: deleting the last few rows leaves a log that
+  still verifies. The log API returns the latest seal as `head` (number and
+  hash). Note it somewhere outside the relay now and then. That catches a
+  truncated log, and one rewritten from some point onward.
+
+Teams are managed through a small HTTP API, never through MCP tools, so text on
+a customer's screen can't make an agent add a member. It is behind the same
+Access app as `/mcp`. Send writes as JSON from a command-line client; the API
+refuses any request with an `Origin` header, which a browser adds. For example,
+with [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/applications/non-http/cloudflared-authentication/):
+
+```sh
+api=https://support.example.com/api/v1/w/default
+cloudflared access login "$api"
+cloudflared access curl "$api"                                  # you, your role, recent callers
+cloudflared access curl "$api/members" -X POST -H 'content-type: application/json' \
+  -d '{"identity":"you@example.com","role_id":"admin"}'          # the first member: you
+cloudflared access curl "$api/members" -X POST -H 'content-type: application/json' \
+  -d '{"identity":"<CF_ACCESS_CLIENT_ID>","name":"Claude Code","role_id":"technician"}'
+cloudflared access curl "$api/members/tech%40example.com" -X DELETE -H 'content-type: application/json'
+cloudflared access curl "$api/audit?limit=100"
+```
+
+The routes, bodies and errors are in
+[docs/relay-v1-spec.md](docs/relay-v1-spec.md#team-api-apiv1wslug).
+
 ## Architecture
 
 ```mermaid
@@ -236,17 +305,24 @@ flowchart LR
 | `GET /j/<code>` | public, single use, https only | serves the PowerShell agent script with the session values filled in, to PowerShell clients only |
 | `POST /agent?sid=` | attach key in a header, https only | the app's transport: hello, long poll, results and end, as JSON |
 | `GET /ws?sid=` | attach key in a header, https only | PowerShell agent WebSocket, using the hibernation API |
-| `POST /mcp` | Cloudflare Access | MCP JSON-RPC 2.0, stateless HTTP |
+| `POST /mcp` | Cloudflare Access, then the caller's role | MCP JSON-RPC 2.0, stateless HTTP |
+| `/api/v1/w/default/...` | Cloudflare Access, then the caller's role | the team API: members, roles and the team log |
 
 The Worker itself is the MCP server. There is no local bridge process. Each
 session is one Durable Object holding its state machine, its audit log and an
 alarm for expiry. A second Durable Object keeps the list for `session_list`.
+Team members, roles and the team log live in a D1 database, with every row
+keyed by workspace.
 
 | Source file | What it does |
 |---|---|
 | `src/app.js` | router, Access JWT gate, MCP handler, download page |
 | `src/session.js` | `Session` Durable Object: states, audit log, alarm, tagged sockets, the app's polling transport |
 | `src/registry.js` | `Registry` Durable Object for `session_list` |
+| `src/permissions.js` | the permission keys, the built-in roles, and the permission each MCP tool needs |
+| `src/workspace.js` | team data in D1: members, roles, recent callers, the chained team log, and the role check. All team SQL is here |
+| `src/api.js` | the team API under `/api/v1/w/default` |
+| `migrations/0001_team.sql` | the D1 tables, each keyed by workspace |
 | `src/mcp.js` | JSON-RPC dispatch, the tool schemas, and the mapping of each screen tool to one normalized action |
 | `src/screen.js` | the screen actions, their audit text, and the strict check of every field an app result may carry |
 | `src/jwt.js` | RS256 verification of the Access JWT with WebCrypto |
@@ -294,8 +370,9 @@ You need a Cloudflare account with a zone for the hostname, Node 22 and
 deploy without Windows. You need Windows only to change the app: see
 [Build the app](docs/development.md#build-the-app).
 
-1. **Create the Access guard for `/mcp`.** This makes a service token for the
-   MCP client and an Access app with two policies, your email and the token.
+1. **Create the Access guard for `/mcp` and `/api`.** This makes a service
+   token for the MCP client and an Access app with two policies, your email and
+   the token.
    ```sh
    CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... \
    SUPPORT_HOST=support.example.com SUPPORT_OPERATOR_EMAIL=you@example.com \
@@ -307,14 +384,27 @@ deploy without Windows. You need Windows only to change the app: see
    prints the app's AUD tag at the end. The service token lasts one year.
    Running the script again does not replace it, so rotate it in the Zero Trust
    dashboard and update `access.env`.
-2. **Fill in `wrangler.toml`.** Set the route hostname, `ACCESS_TEAM_DOMAIN`
-   and `ACCESS_AUD`, then run `npx wrangler deploy`.
-3. **Harden the zone.** Turn on **Always Use HTTPS** for the zone (SSL/TLS,
+   If you set up an earlier version, run the script again: it updates the app
+   to guard `/api` as well, and keeps the service token.
+2. **Create the team database.**
+   ```sh
+   npx wrangler d1 create support-mcp
+   ```
+   Put the `database_id` it prints in `wrangler.toml`, then create the tables:
+   ```sh
+   npx wrangler d1 migrations apply support-mcp --remote
+   ```
+   Run the migrations again after an update that adds one, before you deploy.
+3. **Fill in `wrangler.toml`.** Set the route hostname, `ACCESS_TEAM_DOMAIN`,
+   `ACCESS_AUD` and the D1 `database_id`. Set `DEPLOYMENT_ADMINS` to your own
+   email (comma-separate several), so only you can become the first admin.
+   Then run `npx wrangler deploy`.
+4. **Harden the zone.** Turn on **Always Use HTTPS** for the zone (SSL/TLS,
    Edge Certificates), so a link pasted without `https://` is redirected. The
    relay refuses `/j` and `/ws` over plain http either way. The relay does no
    rate limiting of its own, so add a Cloudflare rate-limiting rule on `/j` and
    `/ws`.
-4. **Connect your MCP client.** Every request to `/mcp` needs the headers
+5. **Connect your MCP client.** Every request to `/mcp` needs the headers
    `CF-Access-Client-Id` and `CF-Access-Client-Secret`. `cf/mcp-headers.sh`
    reads them from `~/.config/support-mcp/access.env` when the client connects,
    so the secret stays out of the client's config file.
@@ -336,6 +426,11 @@ deploy without Windows. You need Windows only to change the app: see
 
    Other clients need the same two headers. If a client can't run a helper,
    put the values in its config, and keep that file out of git.
+6. **Turn on roles.** Add yourself as the first member, as admin, and in the
+   same sitting add your MCP client's service token by its client ID
+   (`CF_ACCESS_CLIENT_ID` in `access.env`), or the client loses access. See
+   [Teams](#teams) for the commands. Until you do this, anyone Access admits can
+   use every tool.
 
 ## Develop
 
@@ -394,8 +489,9 @@ check are in [docs/development.md](docs/development.md).
 - An old app from before screen control keeps working for commands and files.
   Its screen calls return `this support app is too old for screen control`. The
   PowerShell fallback has no screen access either.
-- It is built for one operator, or a few people sharing one Access app. There
-  are no per-operator permissions.
+- It has one team workspace. Cloudflare Access decides who can reach the relay,
+  and the team's roles decide what each member can do. More workspaces and the
+  relay's own sign-in come later. `session_list` still lists every session.
 - Command output is capped at 262,144 characters per stream, and the whole
   result frame is trimmed to fit the WebSocket message limit. Files move in
   chunks of about 512 KiB.

@@ -253,12 +253,78 @@ apply to only one client say which.
   goes into a single-quoted literal. The script runs inside `& { ... }` so
   nothing leaks into the customer's console session. The values appended to the
   app are checked the same way before they are written as JSON.
-- **The operator endpoint sits behind Cloudflare Access.** The relay verifies
-  the Access JWT itself: RS256 signature, `aud`, `iss`, `exp` and `nbf` with 60
-  seconds of skew. It caches signing keys for an hour and allows at most one
-  forced refetch per minute when it sees an unknown `kid`. Requests carrying
-  an `Origin` header get a 403 and non-JSON bodies get a 415, which blocks
-  cross-site POSTs from a logged-in browser.
+- **The operator endpoints sit behind Cloudflare Access.** `/mcp` and the team
+  API under `/api/` both check the Access JWT in the relay itself: RS256
+  signature, `aud`, `iss`, `exp` and `nbf` with 60 seconds of skew. It caches
+  signing keys for an hour and allows at most one forced refetch per minute
+  when it sees an unknown `kid`. Requests carrying an `Origin` header get a 403
+  and non-JSON bodies (every team API write) get a 415, which blocks cross-site
+  requests from a logged-in browser. All of these refusals come before the relay
+  reads any session or team data.
+- **Each tool call is checked against the caller's role.** The relay keeps one
+  team workspace, `default`, with its members and their roles in a D1 database.
+  A member is an identity from the Access JWT: a person's email, or a service
+  token's client id. Identities are compared trimmed and lowercased. One table
+  in `src/permissions.js` maps every MCP tool to the permission it needs, and a
+  test fails if a listed tool is missing from it. The check runs on
+  `tools/call` only, before the call reaches a session, and it sees only that
+  permission key, never the tool's arguments. A non-member gets the tool error
+  `you are not a member of this team`, and a member whose role lacks the
+  permission gets `your role does not allow <permission>`. Removing a member or
+  changing a role takes effect on the next call. The roles are `admin` (every
+  permission, fixed), `technician` (create, view, control and end sessions) and
+  `viewer` (view sessions, read the team log), and admins can edit the last two
+  and add their own.
+- **Managing members or roles does not reach admin.** Only an admin can add a
+  member as admin, change anyone to or from admin, or remove an admin. Anyone
+  else can give a member only a role whose permissions are a subset of their
+  own. They can create or edit a role only so that it holds permissions they
+  hold, and they can't edit or delete the role they hold. Nobody can change
+  their own role. An admin may demote themselves, but only while another admin
+  remains. The relay checks these rules when it plans the change and again in
+  the SQL that commits it, against the actor's role and the role's permissions
+  as the plan read them, so a change that lands between the read and the commit
+  can't slip a grant through. A refusal is a 403 `forbidden` and writes no log
+  row. A member with `members.manage` can still remove or lower a non-admin
+  member who holds more than they do. That can lock someone out but can't raise
+  anyone's access.
+- **The team is open until its first member.** With no members, every caller
+  Access admits holds the session permissions (`sessions.create`,
+  `sessions.view`, `sessions.control`, `sessions.end`), as before teams existed,
+  and the relay records who called so an admin can add them. It writes a
+  caller's row at most once a minute. While the team is open nobody holds a
+  team permission: editing or adding a role, or changing or removing a member,
+  is refused with 409 `first_member`, so nothing a stranger writes can persist
+  into the roles that turn on later. Reading the workspace and the role list
+  still works. The first member must be the caller, as admin. Two callers racing
+  to add it get one winner, and the other is then refused as a non-member. When `DEPLOYMENT_ADMINS` is set, only an identity it lists
+  can be that first member, which stops any other Access user from racing to
+  claim the team. Once there is a member, a caller who is not one is refused,
+  and that includes an MCP client whose service token was not added. The last
+  admin can't be removed or demoted.
+- **Controlling a session is administrator-level.** On a full-control session,
+  `put_file` and `get_file` run as SYSTEM and screen control can click Yes on a
+  UAC prompt, so a separate SYSTEM permission would not hold. Give
+  `sessions.control` only to people you would trust as an administrator of the
+  customer's PC.
+- **Each session belongs to its workspace.** A session stores the workspace that
+  created it, and operator calls name their workspace. A call from another
+  workspace gets the same answer as a session that does not exist. A session
+  stored without one counts as `default`. The download page, the code and the
+  app's own connection name no workspace and are not checked.
+- **Team changes go in a chained log.** Every change to members and roles writes
+  one row with a number, the time, the actor, the kind and the detail. Each row's
+  hash is SHA-256 over the previous row's hash and its own fields, so an edit,
+  removal or reordering of a row makes verification fail and the log API report
+  `verified: false`, unless the change is among the newest entries. Deleting
+  the newest rows (truncating the tail) leaves a shorter chain that still
+  verifies. The change, its rule check and its row commit in one D1 batch, so a
+  change never happens without its row. The chain has two limits. Someone with
+  write access to the database could rewrite every row after the one they edit
+  and seal the new chain, and could cut off the newest rows. To catch both,
+  note the `head` (number and hash) the log API returns somewhere outside the
+  relay, and compare it later: a lower number, or a different hash at the same
+  number, means the log changed.
 - **Sessions only move forward.** The states run pending, consumed, attached,
   ended, and `ended` is final. The 24-hour limit starts at the first attach and
   a reattach does not extend it. Every handler checks the deadline inline, so a
