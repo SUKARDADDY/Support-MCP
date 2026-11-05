@@ -990,6 +990,14 @@ public static class AppTests {
                 r = relay.Call(Run(ChildCommand(late, started), 1));
                 Assert(Wire.Flag(r, "timed_out") && r["exit_code"] == null, "Timeout result");
                 Thread.Sleep(3500); Assert(!File.Exists(late), "Timeout must kill descendants");
+                // A program the command started without waiting (like rundll32 user32.dll,LockWorkStation) gets time to
+                // finish; one that keeps running is still stopped once the command has exited.
+                string quick = Path.Combine(dir, "settle-quick"); late = Path.Combine(dir, "settle-late");
+                string slowChild = "Start-Sleep -Seconds 3; Set-Content -LiteralPath '" + late.Replace("'", "''") + "' -Value late";
+                var settle = Stopwatch.StartNew();
+                r = relay.Call(Run("Start-Process cmd.exe -WindowStyle Hidden -ArgumentList '/c echo done> \"" + quick.Replace("'", "''") + "\"'; Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile -NonInteractive -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(slowChild)) + "'", 30));
+                Assert(Wire.Flag(r, "ok") && File.Exists(quick) && settle.ElapsedMilliseconds < 15000, "A program the command did not wait for finishes: " + settle.ElapsedMilliseconds + " ms");
+                Thread.Sleep(3500); Assert(!File.Exists(late), "A descendant that keeps running is stopped after the command exits");
                 late = Path.Combine(dir, "end-late"); started = Path.Combine(dir, "end-started");
                 relay.Queue(Run(ChildCommand(late, started), 20)); WaitFile(started); relay.End = true; relay.WaitExit();
                 Thread.Sleep(3500); Assert(!File.Exists(late), "Operator end must kill descendants");

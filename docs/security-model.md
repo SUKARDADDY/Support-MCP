@@ -246,7 +246,9 @@ apply to only one client say which.
 - **Normal mode leaves nothing behind.** It installs no service, scheduled task
   or logon entry, so restarting the PC ends access, and it deletes its temporary
   command folder on exit. A command runs inside a Windows Job Object, so a
-  timeout, an end or the app exiting kills the whole process tree. The
+  timeout, an end or the app exiting kills the whole process tree. A program
+  the command started without waiting for it gets up to a second after the
+  command exits to finish by itself, then it is stopped too. The
   optional restart-reconnect script is the one exception, and it needs the
   customer's approval for one reconnect. That approval covers screen, mouse and
   keyboard control only if the prompt that recorded it carried the text above.

@@ -125,7 +125,8 @@ The native tests compile `test/app-native.cs` together with `src/agent-app.cs`
 on Windows, using the same references plus `/main:AppTests /target:exe`, and run
 the result. They start the real client against a fake relay and exercise HTTP
 operations, Unicode, chunking, retry deduplication, process-tree cancellation,
-timeout, local expiry and the reconnect rules. They need a Windows desktop
+the second a program the command did not wait for gets to finish, timeout,
+local expiry and the reconnect rules. They need a Windows desktop
 session, so they are not part of `node --test`; CI runs them in the `windows-app`
 job. Besides the client, they cover the pure parts of screen control: coordinate
 scaling, key parsing, the customer pause (hooks and the `GetLastInputInfo`

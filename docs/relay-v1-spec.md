@@ -536,7 +536,10 @@ the access is administrator access, and the `hello` carries an `elevated`
 boolean. In normal mode commands inherit the app's consented token. The app
 requests elevation only through UAC, for full control. It runs each command in a fresh non-interactive
 `powershell.exe -NoProfile` inside a Windows Job Object, so cancellation,
-timeout or the app exiting kills the whole process tree. Output is capped at
+timeout or the app exiting kills the whole process tree. When the command exits,
+what it started without waiting (PowerShell does not wait for a GUI program,
+such as `rundll32.exe user32.dll,LockWorkStation`) gets up to a second to finish
+by itself, then the Job stops the rest. Output is capped at
 64 KiB per stream. The PowerShell agent rules below still apply to that agent.
 
 ## PowerShell agent (`src/agent.ps1`)

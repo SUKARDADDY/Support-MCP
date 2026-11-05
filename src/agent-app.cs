@@ -158,6 +158,9 @@ namespace SupportMcp {
         }
         [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr CreateJobObject(IntPtr a, string name);
         [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetInformationJobObject(IntPtr j, int c, ref ExtendedLimits limits, int size);
+        [StructLayout(LayoutKind.Sequential)] struct Accounting { public long User, Kernel, PeriodUser, PeriodKernel; public uint Faults, Total, Active, Terminated; }
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool QueryInformationJobObject(IntPtr j, int c, out Accounting info, int size, IntPtr returned);
+        public const int SettleMs = 1000;
         [DllImport("kernel32.dll", SetLastError = true)] internal static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p);
         [DllImport("kernel32.dll", SetLastError = true)] internal static extern bool TerminateProcess(IntPtr p, uint code);
         [DllImport("kernel32.dll", SetLastError = true)] internal static extern uint ResumeThread(IntPtr t);
@@ -227,7 +230,11 @@ namespace SupportMcp {
                     if (clock.ElapsedMilliseconds >= timeoutSeconds * 1000L) { timedOut = true; break; }
                 }
                 uint exit; Check(GetExitCodeProcess(process, out exit));
-                Close(ref job); // also stop descendants after their parent exits
+                // PowerShell does not wait for a GUI program it starts, such as rundll32.exe user32.dll,LockWorkStation. Give what
+                // is left in the Job up to SettleMs to finish by itself, so it is not stopped before it did its work.
+                Accounting info; var settle = Stopwatch.StartNew();
+                while (!timedOut && settle.ElapsedMilliseconds < SettleMs && QueryInformationJobObject(job, 1, out info, Marshal.SizeOf(typeof(Accounting)), IntPtr.Zero) && info.Active > 0 && !stop.WaitOne(20)) { }
+                Close(ref job); // then stop the descendants that are still running
                 WaitForSingleObject(process, 5000);
                 outReader.Join(5000); errReader.Join(5000);
                 return Wire.Map("ok", true, "exit_code", timedOut ? null : (object)unchecked((int)exit), "timed_out", timedOut,
