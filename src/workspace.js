@@ -141,6 +141,14 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
     return or(['NOT EXISTS (SELECT 1 FROM roles WHERE workspace = ? AND role_id = ?)', [slug, roleId]], stored);
   }
 
+  // The member's role, as the plan read it: with these permissions, or (perms
+  // null) still gone.
+  function memberRoleAsRead(slug, roleId, perms) {
+    if (perms) return roleIsAsRead(slug, roleId, perms);
+    if (isBuiltinRole(roleId)) return ['EXISTS (SELECT 1 FROM roles WHERE workspace = ? AND role_id = ? AND deleted = 1)', [slug, roleId]];
+    return ['NOT EXISTS (SELECT 1 FROM roles WHERE workspace = ? AND role_id = ? AND deleted = 0)', [slug, roleId]];
+  }
+
   function roleExists(slug, roleId) {
     if (roleId === ADMIN_ROLE) return ['1', []];
     if (isBuiltinRole(roleId)) return ['NOT EXISTS (SELECT 1 FROM roles WHERE workspace = ? AND role_id = ? AND deleted = 1)', [slug, roleId]];
@@ -276,12 +284,46 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
   }
 
   // ---- the log ---------------------------------------------------------------
-  async function readAudit(slug, { after = 0, limit = 100 } = {}) {
+  // A page read checks only the rows it returns: each row's hash, each prev_hash
+  // link, the first row against the row just before it (or the genesis hash when
+  // it is row 1), and the last row against the row just after it. It reads at
+  // most limit + 2 rows (that row before, the page, that row after), plus the
+  // head. Only the newest row of the log has no row after it, so a reseal of
+  // that row alone passes a page check; the head catches it. `full` returns the
+  // page rows only and runs verifyAudit over the whole chain instead.
+  async function readAudit(slug, { after = 0, limit = 100, full = false } = {}) {
     checkSlug(slug);
-    const { results } = await q(`SELECT seq, ts, actor, kind, detail, prev_hash, hash FROM audit
-      WHERE workspace = ? AND seq > ? ORDER BY seq LIMIT ?`, slug, after, limit).all();
-    const v = await verifyAudit(slug);
-    return { rows: results.map((r) => ({ ...r })), head: v.head, verified: v.ok };
+    const cols = 'seq, ts, actor, kind, detail, prev_hash, hash';
+    if (full) {
+      const { results } = await q(`SELECT ${cols} FROM audit WHERE workspace = ? AND seq > ? ORDER BY seq LIMIT ?`, slug, after, limit).all();
+      const v = await verifyAudit(slug);
+      return { rows: results.map((r) => ({ ...r })), head: v.head, verified: v.ok, verified_scope: 'full' };
+    }
+    // From the row numbered `after` (the anchor, when it exists) to one past the page.
+    const { results } = await q(`SELECT ${cols} FROM audit WHERE workspace = ? AND seq >= ? ORDER BY seq LIMIT ?`,
+      slug, after, limit + (after > 0 ? 2 : 1)).all();
+    const past = results.filter((r) => r.seq > after);
+    const rows = past.slice(0, limit).map((r) => ({ ...r }));
+    const anchor = rows.length ? results.find((r) => r.seq === rows[0].seq - 1) : undefined;
+    return { rows, head: await head(slug), verified: await verifyPage(rows, anchor, past[limit]), verified_scope: 'page' };
+  }
+
+  // Numbers run on with no gap, each row seals the one before it, each hash
+  // matches its row, and the row after the page (when there is one) seals the
+  // last row. An empty page has nothing to fail.
+  async function verifyPage(rows, anchor, next) {
+    if (!rows.length) return true;
+    let prev;
+    if (rows[0].seq === 1) prev = GENESIS_HASH;
+    else if (anchor) prev = anchor.hash;
+    else return false;
+    let seq = rows[0].seq - 1;
+    for (const r of rows) {
+      if (r.seq !== seq + 1 || r.prev_hash !== prev || (await chainHash(r)) !== r.hash) return false;
+      seq = r.seq;
+      prev = r.hash;
+    }
+    return !next || (next.seq === seq + 1 && next.prev_hash === prev);
   }
 
   // Recompute the whole chain: numbers 1, 2, 3 ... with no gap, each row sealing
@@ -362,6 +404,7 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
   // The escalation rules. Only an admin deals in the admin role. Anyone else
   // hands out only permissions they hold themselves.
   const forbidden = (message) => new TeamError(403, 'forbidden', message);
+  const roleMissing = () => new TeamError(409, 'role_missing', 'that member has a role that no longer exists; give them a role first');
   function requireAdmin(ctx, message) {
     if (!ctx.admin) throw forbidden(message);
   }
@@ -371,12 +414,28 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
     if (lacking.length) throw forbidden(`${message}: you do not hold ${lacking.join(', ')}`);
   }
 
+  // A non-admin acts on a member only if that member's role holds nothing the
+  // actor lacks. The admin role holds every permission, so it is an admin-only
+  // target even for a custom role that holds them all.
+  function requireMemberWithin(ctx, member, perms, verb) {
+    if (ctx.admin) return;
+    if (member.role_id === ADMIN_ROLE || perms.some((p) => !ctx.permissions.includes(p))) {
+      throw forbidden(`you can only ${verb} members whose role is within your own permissions`);
+    }
+  }
+
   // ---- members ---------------------------------------------------------------
   // Team-change rules, enforced here in the plan and again in each guard's SQL:
   //  - Only an admin adds a member as admin, moves anyone to or from admin, or
   //    removes an admin.
   //  - Anyone else gives only roles whose permissions they hold themselves, and
   //    can't create or edit a role to hold more than they do.
+  //  - Anyone else changes (any field), demotes or removes only members whose
+  //    role holds no permission they lack. That covers every admin.
+  //  - Anyone else edits (any field) or deletes only a role whose current
+  //    permissions they hold.
+  //  - A member whose role is gone can be given a role that exists, or removed
+  //    by an admin; any other change is 409 role_missing.
   //  - Nobody changes their own role or edits or deletes the role they hold. An
   //    admin may demote themselves, but only while another admin remains.
   async function addMember(slug, actorIdentity, body) {
@@ -451,9 +510,12 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
       if (!m) throw new TeamError(404, 'not_found', `${identity} is not a member`);
       const next = { ...m, ...(hasName ? { name } : {}), ...(hasRole ? { role_id: roleId } : {}) };
       if (next.name === m.name && next.role_id === m.role_id) return { noop: true, result: m };
+      const roleChanges = next.role_id !== m.role_id;
+      const current = await getRole(slug, m.role_id);
+      // A member whose role is gone can only be given a role that exists.
+      if (!current && !roleChanges) throw roleMissing();
       const nextRole = await getRole(slug, next.role_id);
       if (!nextRole) throw new TeamError(400, 'unknown_role', `no role ${next.role_id}`);
-      const roleChanges = next.role_id !== m.role_id;
       const demotes = m.role_id === ADMIN_ROLE && roleChanges;
       if (roleChanges) {
         if (identity === actor && !ctx.admin) throw forbidden('you cannot change your own role');
@@ -461,6 +523,8 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
         else if (next.role_id === ADMIN_ROLE) requireAdmin(ctx, 'only an admin can give the admin role');
         else requireWithin(ctx, nextRole.permissions, `you can only give a role whose permissions you hold (${next.role_id})`);
       }
+      const targetPerms = current ? current.permissions : [];
+      requireMemberWithin(ctx, m, targetPerms, 'change');
       if (demotes && (await adminCount(slug)) <= 1) throw new TeamError(409, 'last_admin', 'the team needs at least one admin');
       const changes = [];
       if (roleChanges) changes.push(`role ${m.role_id} to ${next.role_id}`);
@@ -471,7 +535,9 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
           actorHas(slug, actor, 'members.manage'),
           ['EXISTS (SELECT 1 FROM members WHERE workspace = ? AND identity = ? AND role_id = ? AND name IS ?)', [slug, identity, m.role_id, m.name]],
           roleExists(slug, next.role_id),
-          roleChanges ? actorUnchanged(slug, ctx) : lit(true),
+          actorUnchanged(slug, ctx),
+          // The member keeps the role, with the permissions, that the plan read.
+          ctx.admin ? lit(true) : memberRoleAsRead(slug, m.role_id, current && targetPerms),
           roleChanges && !ctx.admin ? roleIsAsRead(slug, next.role_id, nextRole.permissions) : lit(true),
           demotes ? anotherAdmin(slug, identity) : lit(true),
         ),
@@ -494,13 +560,20 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
       if (!m) throw new TeamError(404, 'not_found', `${identity} is not a member`);
       const admin = m.role_id === ADMIN_ROLE;
       if (admin) requireAdmin(ctx, 'only an admin can remove an admin');
+      const current = await getRole(slug, m.role_id);
+      // An admin can still remove a member whose role is gone; anyone else gives one a role first.
+      if (!current && !ctx.admin) throw roleMissing();
+      const targetPerms = current ? current.permissions : [];
+      requireMemberWithin(ctx, m, targetPerms, 'remove');
       if (admin && (await adminCount(slug)) <= 1) throw new TeamError(409, 'last_admin', 'the team needs at least one admin');
       return {
         entries: [{ kind: 'member_removed', detail: identity }],
         guard: and(
           actorHas(slug, actor, 'members.manage'),
           ['EXISTS (SELECT 1 FROM members WHERE workspace = ? AND identity = ? AND role_id = ?)', [slug, identity, m.role_id]],
-          admin ? and(actorUnchanged(slug, ctx), anotherAdmin(slug, identity)) : lit(true),
+          actorUnchanged(slug, ctx),
+          ctx.admin ? lit(true) : roleIsAsRead(slug, m.role_id, targetPerms),
+          admin ? anotherAdmin(slug, identity) : lit(true),
         ),
         change: ([cond, params]) => [q(`DELETE FROM members WHERE workspace = ? AND identity = ? AND ${cond}`, slug, identity, ...params)],
         result: { identity },
@@ -553,6 +626,9 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
       if (!cur) throw new TeamError(404, 'not_found', `no role ${roleId}`);
       // The actor's own role differs from this one, and the guard keeps it so.
       if (ctx.role_id === roleId) throw forbidden('you cannot edit the role you hold');
+      // The role as it is now must be within the actor's permissions: narrowing a
+      // stronger role would lower every member who holds it.
+      requireWithin(ctx, cur.permissions, 'you can only change a role whose permissions you hold');
       const role = { ...cur, ...(hasName ? { name: name || cur.name } : {}), ...(hasPerms ? { permissions } : {}) };
       requireWithin(ctx, role.permissions, 'you can only leave a role with permissions you hold');
       return {
@@ -561,8 +637,9 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
           actorHas(slug, actor, 'roles.manage'),
           actorUnchanged(slug, ctx),
           roleExists(slug, roleId),
-          // A rename keeps the stored permissions, so they must be the ones read.
-          hasPerms ? lit(true) : roleIsAsRead(slug, roleId, cur.permissions),
+          // The role is as the plan read it: a rename keeps the stored permissions,
+          // and anyone but an admin may touch only a role within their own.
+          ctx.admin && hasPerms ? lit(true) : roleIsAsRead(slug, roleId, cur.permissions),
         ),
         change: upsertRole(slug, role, false),
         result: role,
@@ -579,6 +656,7 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
       const cur = await getRole(slug, roleId);
       if (!cur) throw new TeamError(404, 'not_found', `no role ${roleId}`);
       if (ctx.role_id === roleId) throw forbidden('you cannot delete the role you hold');
+      requireWithin(ctx, cur.permissions, 'you can only delete a role whose permissions you hold');
       const inUse = await q('SELECT COUNT(*) AS n FROM members WHERE workspace = ? AND role_id = ?', slug, roleId).first('n');
       if (inUse) throw new TeamError(409, 'role_in_use', `${inUse} member(s) hold role ${roleId}`);
       return {
@@ -587,6 +665,7 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
           actorHas(slug, actor, 'roles.manage'),
           actorUnchanged(slug, ctx),
           roleExists(slug, roleId),
+          ctx.admin ? lit(true) : roleIsAsRead(slug, roleId, cur.permissions),
           ['NOT EXISTS (SELECT 1 FROM members WHERE workspace = ? AND role_id = ?)', [slug, roleId]],
         ),
         change: upsertRole(slug, { ...cur, permissions: [] }, true),

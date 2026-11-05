@@ -241,10 +241,16 @@ edit or add a role, or to change or remove a member, gets a 409 `first_member`.
   a member reach admin. Only an admin can add a member as admin, move anyone to
   or from admin, or remove an admin. Everyone else can give a member only a role
   whose permissions they hold themselves, and can create or edit a role only so
-  that it holds permissions they hold. Nobody can change their own role or edit
-  or delete the role they hold. An admin can demote themselves only while
-  another admin remains. A refused change is a 403 with the code `forbidden`
-  and a plain reason.
+  that it holds permissions they hold. Everyone else can also rename, demote or
+  remove only a member whose role holds nothing they lack, so a member manager
+  can't touch an admin or anyone stronger than themselves. They can also edit
+  (a rename counts) or delete only a role whose current permissions they hold,
+  so a role manager can't narrow or delete a stronger role. Nobody can change
+  their own role or edit or delete the role they hold. An admin can demote
+  themselves only while another admin remains. A refused change is a 403 with
+  the code `forbidden` and a plain reason. A member whose role no longer exists
+  can be given a role that does, and an admin can remove them. Any other change
+  to them is a 409 `role_missing`.
 - **Which tool needs what.** `session_create` needs `sessions.create`,
   `session_list` and `session_status` need `sessions.view`, `session_end` needs
   `sessions.end`, and every other tool needs `sessions.control`. Controlling a
@@ -262,7 +268,10 @@ edit or add a role, or to change or remove a member, gets a 409 `first_member`.
   it is among the newest entries: deleting the last few rows leaves a log that
   still verifies. The log API returns the latest seal as `head` (number and
   hash). Note it somewhere outside the relay now and then. That catches a
-  truncated log, and one rewritten from some point onward.
+  truncated log, and one rewritten from some point onward. A normal read of
+  `GET /api/v1/w/default/audit` checks only the rows it returns, and the row
+  just before and just after them, and says so with `verified_scope: "page"`.
+  Add `?verify=full` to check the whole chain.
 
 Teams are managed through a small HTTP API, never through MCP tools, so text on
 a customer's screen can't make an agent add a member. It is behind the same
@@ -279,7 +288,8 @@ cloudflared access curl "$api/members" -X POST -H 'content-type: application/jso
 cloudflared access curl "$api/members" -X POST -H 'content-type: application/json' \
   -d '{"identity":"<CF_ACCESS_CLIENT_ID>","name":"Claude Code","role_id":"technician"}'
 cloudflared access curl "$api/members/tech%40example.com" -X DELETE -H 'content-type: application/json'
-cloudflared access curl "$api/audit?limit=100"
+cloudflared access curl "$api/audit?limit=100"                 # checks the rows shown
+cloudflared access curl "$api/audit?limit=100&verify=full"      # checks the whole chain
 ```
 
 The routes, bodies and errors are in

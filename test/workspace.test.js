@@ -222,6 +222,114 @@ test('editing any log entry makes verification fail', async () => {
   assert.equal((await gap.team.verifyAudit(W)).ok, false);
 });
 
+// Count the rows each read statement returns.
+function countRows(db) {
+  const counter = { rows: 0 };
+  const prepare = db.prepare;
+  const wrap = (st) => ({
+    ...st,
+    bind: (...p) => wrap(st.bind(...p)),
+    all: async () => { const r = await st.all(); counter.rows += r.results.length; return r; },
+    first: async (col) => { const r = await st.first(col); if (r !== null && r !== undefined) counter.rows++; return r; },
+  });
+  db.prepare = (sql) => wrap(prepare(sql));
+  return counter;
+}
+
+async function longLog(n = 30) {
+  const db = openD1();
+  const team = teamStore(db);
+  await team.addMember(W, 'boss@example.com', { identity: 'boss@example.com', role_id: 'admin' });
+  for (let i = 0; i < n; i++) await team.addMember(W, 'boss@example.com', { identity: `u${i}@example.com`, role_id: 'viewer' });
+  return { db, team };
+}
+
+test('a page read checks only the rows it returns, and reads at most limit + 2 of them', async () => {
+  const { db, team } = await longLog();
+  const total = 32;
+  const counter = countRows(db);
+  const page = await team.readAudit(W, { after: 10, limit: 5 });
+  assert.deepEqual([page.rows.map((r) => r.seq), page.verified, page.verified_scope, page.head.seq], [[11, 12, 13, 14, 15], true, 'page', total]);
+  assert.equal(counter.rows, 1 + 5 + 1 + 1, 'the row before the page, the page, the row after it, and the head');
+  // The first page has no row before it, so it reads one row fewer.
+  counter.rows = 0;
+  assert.deepEqual([(await team.readAudit(W, { limit: 3 })).verified, counter.rows], [true, 3 + 1 + 1]);
+  // The newest rows have no row after them.
+  counter.rows = 0;
+  assert.deepEqual([(await team.readAudit(W, { after: 31, limit: 5 })).rows.length, counter.rows], [1, 1 + 1 + 1]);
+  // The full check reads the whole chain, and only the page rows besides: no anchor, no next row.
+  counter.rows = 0;
+  const full = await team.readAudit(W, { after: 10, limit: 5, full: true });
+  assert.deepEqual([full.rows.map((r) => r.seq), full.verified, full.verified_scope, counter.rows], [[11, 12, 13, 14, 15], true, 'full', 5 + total]);
+  // An empty page verifies, in page scope.
+  const empty = await team.readAudit(W, { after: 500 });
+  assert.deepEqual([empty.rows, empty.verified, empty.verified_scope, empty.head.seq], [[], true, 'page', total]);
+});
+
+test('tampering on the returned page fails the page check; tampering elsewhere fails only verify=full', async () => {
+  for (const [column, value] of [['detail', "'x@example.com as admin'"], ['actor', "'mallory@example.com'"], ['hash', "'" + 'f'.repeat(64) + "'"], ['prev_hash', "'" + 'e'.repeat(64) + "'"]]) {
+    for (const seq of [11, 13, 15]) {
+      const { db, team } = await longLog();
+      db.sqlite.exec(`UPDATE audit SET ${column} = ${value} WHERE workspace = 'default' AND seq = ${seq}`);
+      assert.equal((await team.readAudit(W, { after: 10, limit: 5 })).verified, false, `${column} of row ${seq}`);
+    }
+  }
+  // Rows outside the page 11 to 15, before and after it.
+  for (const seq of [2, 9, 20, 32]) {
+    const { db, team } = await longLog();
+    db.sqlite.exec(`UPDATE audit SET detail = 'x@example.com as admin' WHERE workspace = 'default' AND seq = ${seq}`);
+    const page = await team.readAudit(W, { after: 10, limit: 5 });
+    assert.deepEqual([page.verified, page.verified_scope], [true, 'page'], `row ${seq}`);
+    const full = await team.readAudit(W, { after: 10, limit: 5, full: true });
+    assert.deepEqual([full.verified, full.verified_scope], [false, 'full'], `row ${seq}`);
+  }
+  // The row just before the page is its anchor: a changed seal there breaks the first link.
+  const { db, team } = await longLog();
+  db.sqlite.exec(`UPDATE audit SET hash = '${'d'.repeat(64)}' WHERE workspace = 'default' AND seq = 10`);
+  assert.equal((await team.readAudit(W, { after: 10, limit: 5 })).verified, false);
+  // A deleted row leaves a gap: inside the page, or between the anchor and the page.
+  const gap = await longLog();
+  gap.db.sqlite.exec("DELETE FROM audit WHERE workspace = 'default' AND seq = 13");
+  assert.equal((await gap.team.readAudit(W, { after: 10, limit: 5 })).verified, false);
+  const before = await longLog();
+  before.db.sqlite.exec("DELETE FROM audit WHERE workspace = 'default' AND seq = 11");
+  assert.equal((await before.team.readAudit(W, { after: 10, limit: 5 })).verified, false);
+  // A first page whose row 1 is gone has no anchor.
+  const first = await longLog();
+  first.db.sqlite.exec("DELETE FROM audit WHERE workspace = 'default' AND seq = 1");
+  assert.equal((await first.team.readAudit(W, { limit: 5 })).verified, false);
+});
+
+test('a page check sees the last returned row edited and resealed, unless that row is the newest of the log', async () => {
+  const reseal = async (db, seq) => {
+    const row = { ...db.sqlite.prepare(`SELECT * FROM audit WHERE workspace = 'default' AND seq = ${seq}`).get() };
+    row.detail = 'x@example.com as admin';
+    db.sqlite.prepare("UPDATE audit SET detail = ?, hash = ? WHERE workspace = 'default' AND seq = ?").run(row.detail, await chainHash(row), seq);
+  };
+  // Row 15 ends the page and is not the newest: row 16 no longer links to it.
+  const { db, team } = await longLog();
+  assert.equal((await team.readAudit(W, { after: 10, limit: 5 })).verified, true);
+  await reseal(db, 15);
+  assert.equal((await team.readAudit(W, { after: 10, limit: 5 })).verified, false);
+  assert.equal((await team.readAudit(W, { after: 10, limit: 5, full: true })).verified, false);
+  // The same from the first page (no anchor to lean on), and for a page of one row.
+  const first = await longLog();
+  await reseal(first.db, 3);
+  assert.equal((await first.team.readAudit(W, { limit: 3 })).verified, false);
+  assert.equal((await first.team.readAudit(W, { after: 2, limit: 1 })).verified, false);
+  // The row after the page vanishing leaves a gap after the last row.
+  const gap = await longLog();
+  gap.db.sqlite.exec("DELETE FROM audit WHERE workspace = 'default' AND seq = 16");
+  assert.equal((await gap.team.readAudit(W, { after: 10, limit: 5 })).verified, false);
+  // Only the newest row has nothing after it: a page check cannot see it resealed. The head moves.
+  const newest = await longLog();
+  const before = (await newest.team.readAudit(W, { after: 30 })).head;
+  await reseal(newest.db, 32);
+  const page = await newest.team.readAudit(W, { after: 30 });
+  assert.deepEqual([page.verified, page.head.seq], [true, 32]);
+  assert.notEqual(page.head.hash, before.hash, 'the head changed, so a noted head catches it');
+});
+
 test('50 changes at once leave a gapless, valid chain', async () => {
   const db = openD1();
   const team = teamStore(db);
@@ -320,6 +428,7 @@ async function leadTeam() {
   await team.addMember(W, boss, { identity: 'lead@example.com', role_id: 'lead' });
   return { db, team, boss };
 }
+const within403 = { status: 403, code: 'forbidden', message: /within your own permissions/ };
 // Run `sneak` once, after the store has planned and before its batch commits.
 function sneakBeforeBatch(db, sneak) {
   const batch = db.batch;
@@ -355,6 +464,174 @@ test("the actor's own permissions are re-checked in SQL: a lead that lost permis
   sneakBeforeBatch(db, () => db.sqlite.exec(`UPDATE roles SET permissions = '["members.manage","sessions.view"]' WHERE workspace = 'default' AND role_id = 'wide'`));
   await assert.rejects(team.addMember(W, 'lead@example.com', { identity: 'new@example.com', role_id: 'both' }), { status: 403, code: 'forbidden' });
   assert.equal(await team.getMember(W, 'new@example.com'), null);
+});
+
+test('a member manager acts only on members whose role is within their own permissions', async () => {
+  const { team, boss } = await leadTeam();
+  await team.addRole(W, boss, { id: 'wide', permissions: ['sessions.view', 'sessions.control'] });
+  const lead = 'lead@example.com';
+  await team.addMember(W, boss, { identity: 'wide@example.com', role_id: 'wide' });
+  await team.addMember(W, boss, { identity: 'sv@example.com', role_id: 'sv' });
+  const within = { status: 403, code: 'forbidden', message: /within your own permissions/ };
+  await assert.rejects(team.updateMember(W, lead, 'second@example.com', { name: 'x' }), within);
+  await assert.rejects(team.updateMember(W, lead, 'wide@example.com', { name: 'x' }), within);
+  await assert.rejects(team.updateMember(W, lead, 'wide@example.com', { role_id: 'sv' }), within);
+  await assert.rejects(team.removeMember(W, lead, 'wide@example.com'), within);
+  await assert.rejects(team.removeMember(W, lead, 'second@example.com'), /only an admin can remove an admin/);
+  await team.updateMember(W, lead, 'sv@example.com', { name: 'Vee' });
+  await team.removeMember(W, lead, 'sv@example.com');
+  await team.updateMember(W, boss, 'wide@example.com', { name: 'Wide' });
+  await team.removeMember(W, boss, 'wide@example.com');
+  assert.equal((await team.readAudit(W)).verified, true);
+});
+
+test("the member's role is re-checked in SQL: the member moved to a stronger role after the read, a rename is refused", async () => {
+  const { db, team, boss } = await leadTeam();
+  await team.addMember(W, boss, { identity: 'sv@example.com', role_id: 'sv' });
+  sneakBeforeBatch(db, () => db.sqlite.exec("UPDATE members SET role_id = 'technician' WHERE workspace = 'default' AND identity = 'sv@example.com'"));
+  await assert.rejects(team.updateMember(W, 'lead@example.com', 'sv@example.com', { name: 'Vee' }), within403);
+  const m = await team.getMember(W, 'sv@example.com');
+  assert.deepEqual([m.role_id, m.name], ['technician', null]);
+  assert.equal((await team.readAudit(W)).verified, true);
+});
+
+test('the target is re-checked in SQL: promoted to a stronger role after the read, a removal is refused', async () => {
+  const { db, team, boss } = await leadTeam();
+  await team.addMember(W, boss, { identity: 'sv@example.com', role_id: 'sv' });
+  sneakBeforeBatch(db, () => db.sqlite.exec("UPDATE members SET role_id = 'admin' WHERE workspace = 'default' AND identity = 'sv@example.com'"));
+  await assert.rejects(team.removeMember(W, 'lead@example.com', 'sv@example.com'), { status: 403, code: 'forbidden' });
+  assert.equal((await team.getMember(W, 'sv@example.com')).role_id, 'admin');
+});
+
+test("the target's role is re-checked in SQL: it grew after the read, so a rename is refused", async () => {
+  const { db, team, boss } = await leadTeam();
+  await team.addMember(W, boss, { identity: 'sv@example.com', role_id: 'sv' });
+  sneakBeforeBatch(db, () => db.sqlite.exec(`UPDATE roles SET permissions = '["sessions.view","sessions.control"]' WHERE workspace = 'default' AND role_id = 'sv'`));
+  await assert.rejects(team.updateMember(W, 'lead@example.com', 'sv@example.com', { name: 'Vee' }), within403);
+  assert.equal((await team.getMember(W, 'sv@example.com')).name, null);
+  assert.equal((await team.readAudit(W)).verified, true);
+});
+
+test('the actor is re-checked in SQL on a rename: an admin demoted after the read cannot rename a stronger member', async () => {
+  const { db, team, boss } = await leadTeam();
+  await team.addMember(W, boss, { identity: 'tech@example.com', role_id: 'technician' });
+  // second@ is an admin when the plan reads, and only a lead after.
+  sneakBeforeBatch(db, () => db.sqlite.exec("UPDATE members SET role_id = 'lead' WHERE workspace = 'default' AND identity = 'second@example.com'"));
+  await assert.rejects(team.updateMember(W, 'second@example.com', 'tech@example.com', { name: 'Tech' }), within403);
+  assert.equal((await team.getMember(W, 'tech@example.com')).name, null);
+  assert.equal((await team.readAudit(W)).verified, true);
+});
+
+test("the target's role growing after the read is refused in SQL", async () => {
+  const { db, team, boss } = await leadTeam();
+  await team.addMember(W, boss, { identity: 'sv@example.com', role_id: 'sv' });
+  sneakBeforeBatch(db, () => db.sqlite.exec(`UPDATE roles SET permissions = '["sessions.view","sessions.control"]' WHERE workspace = 'default' AND role_id = 'sv'`));
+  await assert.rejects(team.removeMember(W, 'lead@example.com', 'sv@example.com'), { status: 403, code: 'forbidden' });
+  assert.notEqual(await team.getMember(W, 'sv@example.com'), null);
+});
+
+test('an admin demoted after the read cannot finish a removal that only an admin may do', async () => {
+  const { db, team, boss } = await leadTeam();
+  await team.addRole(W, boss, { id: 'strong', permissions: ['sessions.view', 'sessions.control'] });
+  await team.addMember(W, boss, { identity: 'strong@example.com', role_id: 'strong' });
+  // second@ is an admin when the plan reads, and holds members.manage and more after.
+  await team.addRole(W, boss, { id: 'mgr', permissions: ['members.manage', 'sessions.view'] });
+  sneakBeforeBatch(db, () => db.sqlite.exec("UPDATE members SET role_id = 'mgr' WHERE workspace = 'default' AND identity = 'second@example.com'"));
+  await assert.rejects(team.removeMember(W, 'second@example.com', 'strong@example.com'), { status: 403, code: 'forbidden' });
+  assert.notEqual(await team.getMember(W, 'strong@example.com'), null);
+});
+
+// ---- editing and deleting roles ---------------------------------------------------
+const roleWithin = { status: 403, code: 'forbidden', message: /you can only (change|delete) a role whose permissions you hold: you do not hold sessions\.control/ };
+async function rolemakerTeam() {
+  const t = await leadTeam();
+  await t.team.addRole(W, t.boss, { id: 'rolemaker', permissions: ['roles.manage', 'sessions.view'] });
+  await t.team.addMember(W, t.boss, { identity: 'rm@example.com', role_id: 'rolemaker' });
+  await t.team.addRole(W, t.boss, { id: 'strong', permissions: ['sessions.view', 'sessions.control'] });
+  return t;
+}
+const permsOf = async (team, id) => (await team.listRoles(W)).find((r) => r.id === id)?.permissions;
+
+test('a role manager cannot narrow, rename or delete a role that holds more than they do', async () => {
+  const { team } = await rolemakerTeam();
+  const rm = 'rm@example.com';
+  await assert.rejects(team.updateRole(W, rm, 'strong', { permissions: ['sessions.view'] }), roleWithin);
+  await assert.rejects(team.updateRole(W, rm, 'strong', { permissions: [] }), roleWithin);
+  await assert.rejects(team.updateRole(W, rm, 'strong', { name: 'Renamed' }), roleWithin);
+  await assert.rejects(team.removeRole(W, rm, 'strong'), roleWithin);
+  await assert.rejects(team.updateRole(W, rm, 'technician', { permissions: ['sessions.view'] }), /you do not hold sessions\.create/);
+  await assert.rejects(team.removeRole(W, rm, 'technician'), /you do not hold sessions\.create/);
+  assert.deepEqual(await permsOf(team, 'strong'), ['sessions.view', 'sessions.control']);
+  assert.ok(await permsOf(team, 'technician'));
+  assert.equal((await team.readAudit(W)).verified, true);
+});
+
+test('a role manager can still edit and delete a role within their own permissions; an admin can edit any role', async () => {
+  const { team, boss } = await rolemakerTeam();
+  const rm = 'rm@example.com';
+  await team.updateRole(W, rm, 'sv', { name: 'Viewer of sessions' });
+  await team.updateRole(W, rm, 'sv', { permissions: [] });
+  await team.updateRole(W, rm, 'sv', { permissions: ['sessions.view'] });
+  await team.addRole(W, rm, { id: 'tmp', permissions: ['sessions.view'] });
+  await team.removeRole(W, rm, 'tmp');
+  await team.updateRole(W, boss, 'strong', { permissions: ['sessions.view'] });
+  await team.updateRole(W, boss, 'technician', { name: 'Tech' });
+  await team.removeRole(W, boss, 'strong');
+  assert.equal(await permsOf(team, 'strong'), undefined);
+  assert.equal((await team.readAudit(W)).verified, true);
+});
+
+test('a role widened after the read is re-checked in SQL: narrowing it is refused', async () => {
+  const { db, team } = await rolemakerTeam();
+  sneakBeforeBatch(db, () => db.sqlite.exec(`UPDATE roles SET permissions = '["sessions.view","sessions.control"]' WHERE workspace = 'default' AND role_id = 'sv'`));
+  await assert.rejects(team.updateRole(W, 'rm@example.com', 'sv', { permissions: [] }), roleWithin);
+  assert.deepEqual(await permsOf(team, 'sv'), ['sessions.view', 'sessions.control']);
+  assert.equal((await team.readAudit(W)).verified, true);
+});
+
+test('a role widened after the read is re-checked in SQL: a rename is refused', async () => {
+  const { db, team } = await rolemakerTeam();
+  sneakBeforeBatch(db, () => db.sqlite.exec(`UPDATE roles SET permissions = '["sessions.view","sessions.control"]' WHERE workspace = 'default' AND role_id = 'sv'`));
+  await assert.rejects(team.updateRole(W, 'rm@example.com', 'sv', { name: 'Renamed' }), roleWithin);
+  assert.equal((await team.listRoles(W)).find((r) => r.id === 'sv').name, 'sv');
+});
+
+test('a role widened after the read is re-checked in SQL: deleting it is refused', async () => {
+  const { db, team, boss } = await rolemakerTeam();
+  await team.addRole(W, boss, { id: 'spare', permissions: ['sessions.view'] });
+  sneakBeforeBatch(db, () => db.sqlite.exec(`UPDATE roles SET permissions = '["sessions.view","sessions.control"]' WHERE workspace = 'default' AND role_id = 'spare'`));
+  await assert.rejects(team.removeRole(W, 'rm@example.com', 'spare'), roleWithin);
+  assert.deepEqual(await permsOf(team, 'spare'), ['sessions.view', 'sessions.control']);
+  assert.equal((await team.readAudit(W)).verified, true);
+});
+
+// ---- a member whose role no longer exists -----------------------------------------------
+test('a member whose role is gone can be given a role or removed by an admin; any other change is a clean 409', async () => {
+  const { db, team, boss } = await leadTeam();
+  const lead = 'lead@example.com';
+  const gone = { status: 409, code: 'role_missing', message: 'that member has a role that no longer exists; give them a role first' };
+  await team.addRole(W, boss, { id: 'ghost', permissions: ['sessions.view'] });
+  for (const id of ['g1', 'g2', 'g3', 'g4']) await team.addMember(W, boss, { identity: `${id}@example.com`, role_id: 'ghost' });
+  // A built-in role deleted behind the store's back is gone too.
+  await team.addMember(W, boss, { identity: 'bv@example.com', role_id: 'viewer' });
+  db.sqlite.exec("UPDATE roles SET deleted = 1 WHERE workspace = 'default' AND role_id = 'ghost'");
+  db.sqlite.exec("INSERT INTO roles(workspace, role_id, name, permissions, builtin, deleted) VALUES ('default', 'viewer', 'Viewer', '[]', 1, 1)");
+  const before = (await team.readAudit(W)).head.seq;
+  await assert.rejects(team.updateMember(W, lead, 'g1@example.com', { name: 'x' }), gone);
+  await assert.rejects(team.updateMember(W, boss, 'g1@example.com', { name: 'x' }), gone);
+  await assert.rejects(team.removeMember(W, lead, 'g1@example.com'), gone);
+  await assert.rejects(team.removeMember(W, lead, 'bv@example.com'), gone);
+  assert.equal((await team.readAudit(W)).head.seq, before, 'a refused change writes no log row');
+  // Giving a role that exists works, for an admin and for a lead within their permissions.
+  assert.equal((await team.updateMember(W, boss, 'g1@example.com', { role_id: 'technician' })).role_id, 'technician');
+  assert.equal((await team.updateMember(W, lead, 'g2@example.com', { role_id: 'sv' })).role_id, 'sv');
+  assert.equal((await team.updateMember(W, lead, 'bv@example.com', { name: 'Bee', role_id: 'sv' })).role_id, 'sv');
+  await assert.rejects(team.updateMember(W, lead, 'g3@example.com', { role_id: 'technician' }), { status: 403, code: 'forbidden' });
+  await assert.rejects(team.updateMember(W, lead, 'g3@example.com', { role_id: 'nonesuch' }), { status: 400, code: 'unknown_role' });
+  // An admin can still remove one.
+  await team.removeMember(W, boss, 'g4@example.com');
+  assert.equal(await team.getMember(W, 'g4@example.com'), null);
+  assert.equal((await team.readAudit(W)).verified, true);
 });
 
 // ---- open mode ---------------------------------------------------------------------

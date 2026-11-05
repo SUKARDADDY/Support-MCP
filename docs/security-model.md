@@ -279,15 +279,19 @@ apply to only one client say which.
   member as admin, change anyone to or from admin, or remove an admin. Anyone
   else can give a member only a role whose permissions are a subset of their
   own. They can create or edit a role only so that it holds permissions they
-  hold, and they can't edit or delete the role they hold. Nobody can change
-  their own role. An admin may demote themselves, but only while another admin
+  hold, and they can't edit or delete the role they hold. Anyone else can also
+  change (a rename counts), demote or remove only a member whose role holds no
+  permission they lack, which leaves every admin to admins. They can edit (a
+  rename counts) or delete only a role whose current permissions they hold, so
+  they can't narrow or delete a stronger role. Nobody can change their own
+  role. An admin may demote themselves, but only while another admin
   remains. The relay checks these rules when it plans the change and again in
-  the SQL that commits it, against the actor's role and the role's permissions
-  as the plan read them, so a change that lands between the read and the commit
-  can't slip a grant through. A refusal is a 403 `forbidden` and writes no log
-  row. A member with `members.manage` can still remove or lower a non-admin
-  member who holds more than they do. That can lock someone out but can't raise
-  anyone's access.
+  the SQL that commits it, against the actor's role, the target's role, the
+  edited role and the roles' permissions as the plan read them, so a change
+  that lands between the read and the commit (the target promoted, a role
+  widened, the actor demoted)
+  can't slip a change through. A refusal is a 403 `forbidden` and writes no log
+  row.
 - **The team is open until its first member.** With no members, every caller
   Access admits holds the session permissions (`sessions.create`,
   `sessions.view`, `sessions.control`, `sessions.end`), as before teams existed,
@@ -316,7 +320,13 @@ apply to only one client say which.
   one row with a number, the time, the actor, the kind and the detail. Each row's
   hash is SHA-256 over the previous row's hash and its own fields, so an edit,
   removal or reordering of a row makes verification fail and the log API report
-  `verified: false`, unless the change is among the newest entries. Deleting
+  `verified: false`, unless the change is among the newest entries. A normal
+  read of the log checks only the rows it returns (the hash of each, each link,
+  the first row against the row before it and the last against the row after
+  it) and reports `verified_scope: "page"`, so an edit further outside the page
+  goes unseen by that read. Only the newest row of the log has no row after it,
+  so a reseal of that row alone passes a page check, and a noted head catches
+  it. `verify=full` checks the whole chain and reports `"full"`. Deleting
   the newest rows (truncating the tail) leaves a shorter chain that still
   verifies. The change, its rule check and its row commit in one D1 batch, so a
   change never happens without its row. The chain has two limits. Someone with
