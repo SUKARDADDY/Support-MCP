@@ -409,15 +409,124 @@ public static class AppTests {
         try { using (var p = Process.GetProcessById(int.Parse(slow[0]))) if (p.StartTime.ToUniversalTime().Ticks == long.Parse(slow[1])) slowGone = p.WaitForExit(1000); }
         catch (ArgumentException) { } catch (InvalidOperationException) { }
         Assert(slowGone, "The program that keeps running is killed after that second");
-        // The stop comes 400 ms after the script's last line, so in the settle second unless PowerShell took longer to exit.
+        // The stop comes 50 ms after PowerShell itself exited (the script writes its pid), so it falls in the settle second.
         string marker = Path.Combine(dir, "settle-marker-" + tag), script = Path.Combine(dir, "settle-stop-" + tag + ".ps1");
-        File.WriteAllText(script, "Start-Process cmd.exe -WindowStyle Hidden -ArgumentList '/c ping -n 30 127.0.0.1 >nul'; Set-Content -LiteralPath '" + marker.Replace("'", "''") + "' -Value x");
+        File.WriteAllText(script, "Start-Process cmd.exe -WindowStyle Hidden -ArgumentList '/c ping -n 30 127.0.0.1 >nul'; Set-Content -LiteralPath '" + marker.Replace("'", "''") + "' -Value $PID");
         var stop = new ManualResetEvent(false); var clock = Stopwatch.StartNew(); long stoppedAt = long.MaxValue;
-        var stopper = new Thread(delegate() { while (!File.Exists(marker) && clock.ElapsedMilliseconds < 30000) Thread.Sleep(5); Thread.Sleep(400); stoppedAt = clock.ElapsedMilliseconds; stop.Set(); });
+        var stopper = new Thread(delegate() {
+            while (clock.ElapsedMilliseconds < 30000) { try { if (File.Exists(marker) && File.ReadAllText(marker).Trim().Length > 0) break; } catch (IOException) { } Thread.Sleep(5); }
+            try { using (var ps = Process.GetProcessById(int.Parse(File.ReadAllText(marker).Trim()))) ps.WaitForExit(30000); } catch (ArgumentException) { }
+            Thread.Sleep(50); stoppedAt = clock.ElapsedMilliseconds; stop.Set();
+        });
         stopper.Start();
         try { using (var job = new CommandJob()) job.Run(script, dir, 30, stop); } catch (OperationCanceledException) { }
         long ended = clock.ElapsedMilliseconds; stopper.Join();
         Assert(ended - stoppedAt < 300, "The client's stop ends the settle second at once: " + (ended - stoppedAt) + " ms after it");
+    }
+
+    // One elevation attempt with a stand-in for staging and UAC. The drop clock starts at the prompt, not at the staging; a
+    // withdrawal during the staging shows no prompt; Discard removes the staged copy of a prompt nobody answered; and the
+    // sweep at start removes only old staged folders directly in Temp, without following a junction inside.
+    static void AttemptTests() {
+        string a8 = Guid.NewGuid().ToString("N").Substring(0, 8), dir = Path.Combine(Path.GetTempPath(), "support-mcp-attempt-" + a8); Directory.CreateDirectory(dir);
+        Func<string> slowStage = delegate { Thread.Sleep(1200); string d = Path.Combine(dir, Elevation.StagePrefix + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(d); File.WriteAllText(Path.Combine(d, "app.exe"), "x"); return Path.Combine(d, "app.exe"); };
+        var no = new Elevation.Attempt(a8, slowStage, delegate(string copy, string nonce, Action answered) { Thread.Sleep(100); return -1223; }, 1000, delegate { });
+        Assert(no.Done.WaitOne(10000) && no.Outcome == Elevation.Declined, "A No 100 ms into the prompt is a No, however long the staging took: " + no.Outcome);
+        var drop = new Elevation.Attempt(a8, slowStage, delegate(string copy, string nonce, Action answered) { Thread.Sleep(1100); return -1223; }, 1000, delegate { });
+        Assert(drop.Done.WaitOne(10000) && drop.Outcome == Elevation.NoAnswer, "A No after the drop time is Windows dropping the prompt: " + drop.Outcome);
+        bool prompted = false; ManualResetEvent staging = new ManualResetEvent(false), go = new ManualResetEvent(false);
+        var early = new Elevation.Attempt(a8, delegate { staging.Set(); go.WaitOne(); return slowStage(); }, delegate(string copy, string nonce, Action answered) { prompted = true; return 0; }, 300, delegate { });
+        staging.WaitOne(); early.Withdraw(); go.Set();
+        Assert(early.Done.WaitOne(10000) && !prompted && early.Outcome == Elevation.NoAnswer, "A withdrawal during the staging shows no prompt");
+        string staged = null; ManualResetEvent asking = new ManualResetEvent(false), answer = new ManualResetEvent(false);
+        var open = new Elevation.Attempt(a8, delegate { staged = slowStage(); return staged; }, delegate(string copy, string nonce, Action answered) { asking.Set(); answer.WaitOne(); return -1223; }, 300, delegate { });
+        asking.WaitOne(); open.Discard();
+        Assert(!Directory.Exists(Path.GetDirectoryName(staged)), "Discard removes the staged copy of a prompt nobody answered");
+        answer.Set(); open.Done.WaitOne(10000);
+        var yes = new Elevation.Attempt(a8, delegate { staged = slowStage(); return staged; }, delegate(string copy, string nonce, Action answered) { answered(); asking.Set(); answer.WaitOne(); return 0; }, 300, delegate { });
+        asking.Reset(); answer.Reset(); asking.WaitOne(); yes.Discard();
+        Assert(Directory.Exists(Path.GetDirectoryName(staged)), "Discard leaves the copy of an answered prompt alone");
+        answer.Set(); Assert(yes.Done.WaitOne(10000) && yes.Outcome == Elevation.Installed && yes.EndedAt > 0, "The installer's exit code 0 is Installed");
+        // The sweep: an hour-old staged folder (with a junction to a folder outside), a young one, another name, and a staged
+        // name one level down.
+        string temp = Path.Combine(dir, "sweep-" + a8), victim = Path.Combine(dir, "victim-" + a8);
+        Directory.CreateDirectory(victim); File.WriteAllText(Path.Combine(victim, "keep.txt"), "x");
+        string old = Path.Combine(temp, Elevation.StagePrefix + "old"), young = Path.Combine(temp, Elevation.StagePrefix + "young"), other = Path.Combine(temp, "other-old"), deep = Path.Combine(other, Elevation.StagePrefix + "deep");
+        foreach (string d in new string[] { old, young, deep }) Directory.CreateDirectory(d);
+        using (var mk = Process.Start(new ProcessStartInfo("cmd.exe", "/c mklink /J \"" + Path.Combine(old, "link") + "\" \"" + victim + "\"") { UseShellExecute = false, CreateNoWindow = true })) mk.WaitForExit();
+        Assert(Directory.Exists(Path.Combine(old, "link")), "Test setup: the junction exists");
+        foreach (string d in new string[] { old, other, deep }) Directory.SetCreationTimeUtc(d, DateTime.UtcNow.AddHours(-2));
+        Elevation.SweepStaged(temp);
+        Assert(!Directory.Exists(old) && Directory.Exists(young) && Directory.Exists(deep) && File.Exists(Path.Combine(victim, "keep.txt")),
+            "The sweep removes only an old staged folder directly in Temp, and not what a junction inside points to: old " + Directory.Exists(old)
+            + " young " + Directory.Exists(young) + " deep " + Directory.Exists(deep) + " victim " + File.Exists(Path.Combine(victim, "keep.txt")));
+        try { Directory.Delete(dir, true); } catch (Exception) { }
+    }
+
+    static void QuestionTests() {
+        // Before UAC the full-control question stays open after Allow, as the owner of the UAC prompt (Windows shows the prompt in
+        // front only for an app in the foreground, and the click on Allow gives it that), says that Windows asks now, and cannot
+        // be closed until the app finishes it. It is modeless: the corner window, with End session, stays enabled throughout.
+        // Allow does nothing in its first 500 ms. Don't allow closes it at once. As the app's own confirm (no UAC), Allow closes it.
+        {
+            bool cornerOpen = false, cornerHeld = false, early = true, allowHeld = false, closeRefused = false, finished = false, denyClosed = false, confirmClosed = false;
+            var t = new Thread(delegate() {
+                Action pump = delegate { for (int i = 0; i < 10; i++) { Application.DoEvents(); System.Windows.Threading.Dispatcher.CurrentDispatcher.Invoke(System.Windows.Threading.DispatcherPriority.Background, new Action(delegate { })); Thread.Sleep(25); } };
+                Func<System.Windows.DependencyObject, string, System.Windows.Controls.Button> button = delegate(System.Windows.DependencyObject w, string text) { return Find<System.Windows.Controls.Button>(w, delegate(System.Windows.Controls.Button b) { return text.Equals(b.Content); }); };
+                var corner = new SupportWindow(Palette.Detect(), false, false, null); corner.Show(); pump();
+                IntPtr cornerHandle = new System.Windows.Interop.WindowInteropHelper(corner).Handle;
+                var d = ConsentDialog.Open(true);
+                // Loaded comes asynchronously: wait for it, so only the time guards Allow, and press at once after it.
+                for (int i = 0; i < 400 && !d.IsLoaded; i++) { System.Windows.Threading.Dispatcher.CurrentDispatcher.Invoke(System.Windows.Threading.DispatcherPriority.Background, new Action(delegate { })); Thread.Sleep(5); }
+                var allow = button(d, "Allow");
+                Press(allow); pump(); early = d.Allowed || d.Decided.WaitOne(0) || !allow.IsVisible;
+                cornerOpen = IsWindowEnabled(cornerHandle);
+                Thread.Sleep(ConsentDialog.ArmMs); pump();
+                Press(allow); pump();
+                allowHeld = d.IsVisible && d.Allowed && d.Decided.WaitOne(0) && !allow.IsVisible
+                    && Find<System.Windows.Controls.TextBlock>(d, delegate(System.Windows.Controls.TextBlock b) { return b.Text == SupportAccess.Asking && b.IsVisible; }) != null;
+                cornerHeld = IsWindowEnabled(cornerHandle);
+                d.Close(); pump(); closeRefused = d.IsVisible;
+                d.Finish(); pump(); finished = !d.IsVisible;
+                var n = ConsentDialog.Open(true); pump();
+                Press(button(n, "Don't allow")); pump();
+                denyClosed = !n.IsVisible && !n.Allowed && n.Decided.WaitOne(0); n.Finish();
+                var c = ConsentDialog.Open(false); pump(); Thread.Sleep(ConsentDialog.ArmMs);
+                Press(button(c, "Allow")); pump();
+                confirmClosed = !c.IsVisible && c.Allowed && c.Decided.WaitOne(0); c.Finish();
+                corner.CloseQuietly(); pump();
+            }); t.SetApartmentState(ApartmentState.STA); t.Start(); t.Join();
+            Assert(cornerOpen && cornerHeld, "The corner window stays enabled while the question is open and while it waits for UAC");
+            Assert(!early, "Allow does nothing right after the question appears");
+            Assert(allowHeld, "Allow before UAC keeps the question open and says that Windows asks now");
+            Assert(closeRefused && finished, "The question cannot be closed while UAC asks, only finished by the app");
+            Assert(denyClosed, "Don't allow closes the question");
+            Assert(confirmClosed, "Allow on the app's own confirm closes it");
+            // The installer goes ahead only while the event of its own attempt (a random nonce) exists and is not set, and it
+            // keeps the event: the app exiting afterwards withdraws nothing, setting it does. Nobody can make the event first.
+            string w8 = Guid.NewGuid().ToString("N").Substring(0, 8), n1 = Elevation.Nonce(), n2 = Elevation.Nonce();
+            Func<string, bool> wanted = delegate(string nonce) { using (var h = Elevation.Wanted(w8, nonce)) return h != null; };
+            Assert(n1 != n2 && System.Text.RegularExpressions.Regex.IsMatch(n1, "^[0-9a-f]{32}$"), "Each attempt has a nonce of its own");
+            Assert(!wanted(n1), "No attempt: the installer installs nothing");
+            EventWaitHandle held;
+            using (var want = Elevation.Want(w8, n1)) {
+                Assert(wanted(n1) && !wanted(n2), "Only the attempt with that nonce is wanted");
+                using (var other = Elevation.Want(w8, n2)) { other.Set(); Assert(wanted(n1) && !wanted(n2), "Withdrawing one attempt leaves another alone"); }
+                held = Elevation.Wanted(w8, n1);
+            }
+            Assert(held != null && !held.WaitOne(0), "The installer's open event outlives the app and stays unset");
+            held.Dispose();
+            Assert(!wanted(n1), "With no one holding it, an attempt whose app is gone is not wanted");
+            using (var want = Elevation.Want(w8, n1)) {
+                held = Elevation.Wanted(w8, n1); want.Set();
+                Assert(held.WaitOne(0) && !wanted(n1), "A withdrawal reaches an installer that already holds the event");
+                held.Dispose();
+            }
+            using (var squat = new EventWaitHandle(false, EventResetMode.ManualReset, Elevation.WantName(w8, n2))) {
+                bool refused = false; try { Elevation.Want(w8, n2).Dispose(); } catch (IOException) { refused = true; }
+                Assert(refused, "An event someone made first is refused");
+            }
+        }
     }
 
     static void FullControlTests(string dir) {
@@ -780,15 +889,19 @@ public static class AppTests {
             gate = new FullRequestGate(); gate.Record(Elevation.NoAnswer, t);
             Assert(Wire.Text(gate.Request(ask, t + 1), "error") == "asked" && asks == 3, "No answer starts no cooldown");
             // A UAC prompt the app stopped waiting for: no new request while it is open; a No on it starts the cooldown.
-            var stale = new ManualResetEvent(false); int staleOutcome = Elevation.Declined;
-            gate.Leave(stale, delegate { return staleOutcome; });
-            Assert(Wire.Text(gate.Request(ask, PauseClock.Now()), "error") == FullRequestGate.StillOpen && asks == 3, "No second prompt while an earlier one is open");
-            stale.Set(); Thread.Sleep(300);
-            Assert(Wire.Text(gate.Request(ask, PauseClock.Now()), "error") == FullRequestGate.Cooling && asks == 3, "A No on the earlier prompt starts the cooldown");
-            gate = new FullRequestGate(); stale = new ManualResetEvent(false); staleOutcome = Elevation.Failed;
-            gate.Leave(stale, delegate { return staleOutcome; }); stale.Set(); Thread.Sleep(300);
-            Assert(Wire.Text(gate.Request(ask, PauseClock.Now()), "error") == "asked" && asks == 4, "Once it is gone without a No, the next request asks");
+            // The No counts at once, at the time the prompt ended: a request right after it, with no wait, gets the cooldown.
+            var stale = new ManualResetEvent(false); int staleOutcome = Elevation.Declined; long staleEnded = t + 1000;
+            gate.Leave(stale, delegate { return staleOutcome; }, delegate { return staleEnded; });
+            Assert(Wire.Text(gate.Request(ask, t + 900), "error") == FullRequestGate.StillOpen && asks == 3, "No second prompt while an earlier one is open");
+            stale.Set();
+            Assert(Wire.Text(gate.Request(ask, t + 1001), "error") == FullRequestGate.Cooling && asks == 3, "A No on the earlier prompt starts the cooldown before the next request");
+            Assert(Wire.Text(gate.Request(ask, t + 1000 + FullRequestGate.CooldownMs), "error") == "asked" && asks == 4, "The minute counts from when the prompt ended");
+            gate = new FullRequestGate(); stale = new ManualResetEvent(false); staleOutcome = Elevation.NoAnswer;
+            gate.Leave(stale, delegate { return staleOutcome; }, delegate { return staleEnded; }); stale.Set();
+            Assert(Wire.Text(gate.Request(ask, t + 1001), "error") == "asked" && asks == 5, "A prompt Windows dropped (no answer) starts no cooldown");
         }
+        AttemptTests();
+        Console.WriteLine("PASS an elevation attempt: the drop time, a withdrawal while it stages, Discard and the sweep of staged copies");
         Console.WriteLine("PASS request_full_control: the full cap, a declined request, the silent handover, the cooldown after any decline");
     }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder text, int max);
@@ -908,67 +1021,7 @@ public static class AppTests {
             } finally { try { peer.Kill(); } catch (Exception) { } peer.Dispose(); }
         }
         Console.WriteLine("PASS the corner window does not take the focus, keeps its taskbar button, and Keep connected gives the focus back");
-        // Before UAC the full-control question stays open after Allow, as the owner of the UAC prompt (Windows shows the prompt in
-        // front only for an app in the foreground, and the click on Allow gives it that), says that Windows asks now, and cannot
-        // be closed until the app finishes it. It is modeless: the corner window, with End session, stays enabled throughout.
-        // Allow does nothing in its first 500 ms. Don't allow closes it at once. As the app's own confirm (no UAC), Allow closes it.
-        {
-            bool cornerOpen = false, cornerHeld = false, early = true, allowHeld = false, closeRefused = false, finished = false, denyClosed = false, confirmClosed = false;
-            var t = new Thread(delegate() {
-                Action pump = delegate { for (int i = 0; i < 10; i++) { Application.DoEvents(); System.Windows.Threading.Dispatcher.CurrentDispatcher.Invoke(System.Windows.Threading.DispatcherPriority.Background, new Action(delegate { })); Thread.Sleep(25); } };
-                Func<System.Windows.DependencyObject, string, System.Windows.Controls.Button> button = delegate(System.Windows.DependencyObject w, string text) { return Find<System.Windows.Controls.Button>(w, delegate(System.Windows.Controls.Button b) { return text.Equals(b.Content); }); };
-                var corner = new SupportWindow(Palette.Detect(), false, false, null); corner.Show(); pump();
-                IntPtr cornerHandle = new System.Windows.Interop.WindowInteropHelper(corner).Handle;
-                var d = ConsentDialog.Open(true); pump(); // Loaded comes asynchronously: let it run, so only the time guards Allow
-                var allow = button(d, "Allow");
-                Press(allow); pump(); early = d.Allowed || d.Decided.WaitOne(0) || !allow.IsVisible;
-                cornerOpen = IsWindowEnabled(cornerHandle);
-                Thread.Sleep(ConsentDialog.ArmMs); pump();
-                Press(allow); pump();
-                allowHeld = d.IsVisible && d.Allowed && d.Decided.WaitOne(0) && !allow.IsVisible
-                    && Find<System.Windows.Controls.TextBlock>(d, delegate(System.Windows.Controls.TextBlock b) { return b.Text == SupportAccess.Asking && b.IsVisible; }) != null;
-                cornerHeld = IsWindowEnabled(cornerHandle);
-                d.Close(); pump(); closeRefused = d.IsVisible;
-                d.Finish(); pump(); finished = !d.IsVisible;
-                var n = ConsentDialog.Open(true); pump();
-                Press(button(n, "Don't allow")); pump();
-                denyClosed = !n.IsVisible && !n.Allowed && n.Decided.WaitOne(0); n.Finish();
-                var c = ConsentDialog.Open(false); pump(); Thread.Sleep(ConsentDialog.ArmMs);
-                Press(button(c, "Allow")); pump();
-                confirmClosed = !c.IsVisible && c.Allowed && c.Decided.WaitOne(0); c.Finish();
-                corner.CloseQuietly(); pump();
-            }); t.SetApartmentState(ApartmentState.STA); t.Start(); t.Join();
-            Assert(cornerOpen && cornerHeld, "The corner window stays enabled while the question is open and while it waits for UAC");
-            Assert(!early, "Allow does nothing right after the question appears");
-            Assert(allowHeld, "Allow before UAC keeps the question open and says that Windows asks now");
-            Assert(closeRefused && finished, "The question cannot be closed while UAC asks, only finished by the app");
-            Assert(denyClosed, "Don't allow closes the question");
-            Assert(confirmClosed, "Allow on the app's own confirm closes it");
-            // The installer goes ahead only while the event of its own attempt (a random nonce) exists and is not set, and it
-            // keeps the event: the app exiting afterwards withdraws nothing, setting it does. Nobody can make the event first.
-            string w8 = Guid.NewGuid().ToString("N").Substring(0, 8), n1 = Elevation.Nonce(), n2 = Elevation.Nonce();
-            Func<string, bool> wanted = delegate(string nonce) { using (var h = Elevation.Wanted(w8, nonce)) return h != null; };
-            Assert(n1 != n2 && System.Text.RegularExpressions.Regex.IsMatch(n1, "^[0-9a-f]{32}$"), "Each attempt has a nonce of its own");
-            Assert(!wanted(n1), "No attempt: the installer installs nothing");
-            EventWaitHandle held;
-            using (var want = Elevation.Want(w8, n1)) {
-                Assert(wanted(n1) && !wanted(n2), "Only the attempt with that nonce is wanted");
-                using (var other = Elevation.Want(w8, n2)) { other.Set(); Assert(wanted(n1) && !wanted(n2), "Withdrawing one attempt leaves another alone"); }
-                held = Elevation.Wanted(w8, n1);
-            }
-            Assert(held != null && !held.WaitOne(0), "The installer's open event outlives the app and stays unset");
-            held.Dispose();
-            Assert(!wanted(n1), "With no one holding it, an attempt whose app is gone is not wanted");
-            using (var want = Elevation.Want(w8, n1)) {
-                held = Elevation.Wanted(w8, n1); want.Set();
-                Assert(held.WaitOne(0) && !wanted(n1), "A withdrawal reaches an installer that already holds the event");
-                held.Dispose();
-            }
-            using (var squat = new EventWaitHandle(false, EventResetMode.ManualReset, Elevation.WantName(w8, n2))) {
-                bool refused = false; try { Elevation.Want(w8, n2).Dispose(); } catch (IOException) { refused = true; }
-                Assert(refused, "An event someone made first is refused");
-            }
-        }
+        QuestionTests();
         Console.WriteLine("PASS the full-control question stays open as the owner of the UAC prompt");
 
         // A key the app pressed whose up never arrived (a desktop switch) neither pauses support nor stays down:

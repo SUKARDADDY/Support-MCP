@@ -46,7 +46,14 @@ apply to only one client say which.
   `session_end`: the relay refuses the new service's `hello` for a session that
   ended. Until a withdrawn prompt is gone (answered, or dropped by Windows),
   `request_full_control` asks no new one, so only one prompt exists, and a No
-  on it starts the cooldown. If the customer says No anywhere,
+  on it starts the cooldown. Windows drops an unanswered prompt after about
+  two minutes and reports that as a No; the app counts only a No given within
+  115 seconds of the prompt as a decline, so a dropped prompt starts no
+  cooldown, also at the first start, which then still offers limited support.
+  A prompt parked as a taskbar button is not dropped (measured for 8 minutes on
+  Windows 11 and 7 on Windows 7), so a refusal because an earlier prompt is
+  still open lasts until the customer answers that prompt.
+  If the customer says No anywhere,
   or elevation fails, the app asks "Continue with limited support? Support can
   see your screen and control your mouse and keyboard, but not Windows
   security prompts." Every dialog has **Don't allow** selected by default, and

@@ -2048,12 +2048,25 @@ namespace SupportMcp {
             string dir = Path.Combine(Path.GetTempPath(), StagePrefix + Guid.NewGuid().ToString("N")), copy = Path.Combine(dir, Path.GetFileName(exe));
             Directory.CreateDirectory(dir); File.Copy(exe, copy); return copy;
         }
-        // Staged copies an earlier run left behind (it exited while UAC still asked), older than an hour.
-        public static void SweepStaged() {
+        // Staged copies an earlier run left behind (it exited while UAC still asked), older than an hour: only folders named
+        // so directly in temp.
+        public static void SweepStaged() { SweepStaged(Path.GetTempPath()); }
+        internal static void SweepStaged(string temp) {
             try {
-                foreach (string dir in Directory.GetDirectories(Path.GetTempPath(), StagePrefix + "*"))
-                    try { if (Directory.GetCreationTimeUtc(dir) < DateTime.UtcNow.AddHours(-1)) Directory.Delete(dir, true); } catch (Exception) { }
+                foreach (string dir in Directory.GetDirectories(temp, StagePrefix + "*"))
+                    try { if (Directory.GetCreationTimeUtc(dir) < DateTime.UtcNow.AddHours(-1)) DeleteTree(dir); } catch (Exception) { }
             } catch (Exception) { }
+        }
+        // Deletes a folder and what is in it. A junction or link inside is removed itself, never followed (Directory.Delete
+        // with recursive refuses one with access denied).
+        internal static void DeleteTree(string dir) {
+            foreach (string entry in Directory.GetFileSystemEntries(dir)) {
+                var a = File.GetAttributes(entry);
+                if ((a & FileAttributes.ReparsePoint) != 0) { if ((a & FileAttributes.Directory) != 0) Directory.Delete(entry); else File.Delete(entry); }
+                else if ((a & FileAttributes.Directory) != 0) DeleteTree(entry);
+                else { File.SetAttributes(entry, FileAttributes.Normal); File.Delete(entry); }
+            }
+            Directory.Delete(dir);
         }
         // The app may stop waiting while UAC still asks: the customer ended, the session ended, the request timed out, or
         // the app exited. A Yes after that must install nothing. So each attempt creates a named event with a random nonce,
@@ -2087,32 +2100,38 @@ namespace SupportMcp {
         // said Yes and the installer runs. Withdraw: install nothing from now on (the installer removes what it made).
         public sealed class Attempt {
             readonly EventWaitHandle want; readonly ManualResetEvent done = new ManualResetEvent(false);
-            volatile int outcome = Failed; volatile bool answered, dropped;
+            volatile int outcome = Failed; volatile bool answered; long endedAt;
             public WaitHandle Done { get { return done; } }
+            // Declined is a No within DropMs of the prompt. Windows drops an unanswered prompt after about 120 s (measured
+            // on 7 and 11) and reports that as a No too; it counts as NoAnswer, which starts no cooldown.
             public int Outcome { get { return outcome; } }
-            // Windows drops an unanswered prompt after about 120 s (measured on 7 and 11) and reports it as a No.
             public const long DropMs = 115000;
-            public bool Dropped { get { return dropped; } }
+            public long EndedAt { get { return Interlocked.Read(ref endedAt); } } // PauseClock time, set before Done
             public bool Answered { get { return answered; } }
             public void Withdraw() { try { want.Set(); } catch (ObjectDisposedException) { } }
             volatile string staged;
             // The app exits while UAC still asks: remove the staged copy (a Yes then starts nothing), as the thread cannot.
-            public void Discard() { var s = staged; if (s != null && !answered) try { Directory.Delete(Path.GetDirectoryName(s), true); } catch (Exception) { } }
-            internal Attempt(string exe, string sid8, long deadline, bool connected, IntPtr owner, Action onAnswered) {
+            public void Discard() { var s = staged; if (s != null && !answered) try { DeleteTree(Path.GetDirectoryName(s)); } catch (Exception) { } }
+            // The app pid: the corner window until the service starts one, which the helper must not click.
+            internal Attempt(string exe, string sid8, long deadline, bool connected, IntPtr owner, Action onAnswered) : this(sid8, delegate { return Stage(exe); },
+                delegate(string copy, string nonce, Action answered) {
+                    return Native.RunElevated(copy, "--elevate-install " + deadline.ToString(System.Globalization.CultureInfo.InvariantCulture) + (connected ? " 1 " : " 0 ")
+                        + Process.GetCurrentProcess().Id.ToString(System.Globalization.CultureInfo.InvariantCulture) + " " + nonce, owner, answered);
+                }, DropMs, onAnswered) { }
+            // stage, run and dropMs: the tests' own.
+            internal Attempt(string sid8, Func<string> stage, Func<string, string, Action, int> run, long dropMs, Action onAnswered) {
                 string nonce = Nonce(); want = Want(sid8, nonce);
                 var t = new Thread(delegate() {
-                    var asked = Stopwatch.StartNew();
                     try {
-                        staged = Stage(exe);
-                        // The app pid: the corner window until the service starts one, which the helper must not click.
-                        int code = Native.RunElevated(staged, "--elevate-install " + deadline.ToString(System.Globalization.CultureInfo.InvariantCulture) + (connected ? " 1 " : " 0 ")
-                            + Process.GetCurrentProcess().Id.ToString(System.Globalization.CultureInfo.InvariantCulture) + " " + nonce, owner, delegate { answered = true; onAnswered(); });
-                        outcome = code == 0 ? Installed : code == -1223 ? Declined : Failed;
-                        dropped = code == -1223 && asked.ElapsedMilliseconds >= DropMs;
+                        staged = stage();
+                        if (want.WaitOne(0)) { outcome = NoAnswer; return; } // withdrawn while it staged: no prompt at all
+                        var asked = Stopwatch.StartNew(); // the prompt's own time, without the staging
+                        int code = run(staged, nonce, delegate { answered = true; onAnswered(); });
+                        outcome = code == 0 ? Installed : code != -1223 ? Failed : asked.ElapsedMilliseconds >= dropMs ? NoAnswer : Declined;
                     } catch (Exception) { outcome = Failed; }
                     finally {
-                        var s = staged; if (s != null) try { Directory.Delete(Path.GetDirectoryName(s), true); } catch (Exception) { }
-                        done.Set(); want.Dispose();
+                        var s = staged; if (s != null) try { DeleteTree(Path.GetDirectoryName(s)); } catch (Exception) { }
+                        Interlocked.Exchange(ref endedAt, PauseClock.Now()); done.Set(); want.Dispose();
                     }
                 });
                 t.SetApartmentState(ApartmentState.STA); t.IsBackground = true; t.Start();
@@ -2596,18 +2615,22 @@ namespace SupportMcp {
         public const string Cooling = "the customer declined full control less than a minute ago; ask them first, then try again";
         public const string Waiting = "a request for full control is already waiting for the customer";
         public const string StillOpen = "the Windows permission prompt of an earlier request is still open; ask the customer to answer it, then try again";
-        long declinedAt = long.MinValue / 2; int requesting; volatile WaitHandle open;
+        long declinedAt = long.MinValue / 2; int requesting;
+        sealed class Open { public WaitHandle Done; public Func<int> Outcome; public Func<long> EndedAt; }
+        volatile Open open;
         // Every elevation outcome goes through here, so a decline at the first start counts as much as a later one.
         public void Record(int outcome, long now) { if (outcome == Elevation.Declined) Interlocked.Exchange(ref declinedAt, now); }
         // A UAC prompt the app stopped waiting for stays on screen until the customer answers it or Windows drops it. Until
-        // then no new prompt, so there is only ever one; and when it ends, its outcome counts (a No starts the cooldown).
-        public void Leave(WaitHandle done, Func<int> outcome) {
-            open = done;
-            ThreadPool.RegisterWaitForSingleObject(done, delegate { Record(outcome(), PauseClock.Now()); }, null, Timeout.Infinite, true);
-        }
+        // then no new prompt, so there is only ever one; once it ended, its outcome counts first, at the time it ended
+        // (endedAt is set before done), so a No on it starts the cooldown before the next request can ask.
+        public void Leave(WaitHandle done, Func<int> outcome, Func<long> endedAt) { open = new Open { Done = done, Outcome = outcome, EndedAt = endedAt }; }
         public Dictionary<string, object> Request(Func<Dictionary<string, object>> ask, long now) {
+            var left = open;
+            if (left != null) {
+                if (!left.Done.WaitOne(0)) return Wire.Map("ok", false, "error", StillOpen);
+                Record(left.Outcome(), left.EndedAt()); open = null;
+            }
             if (now - Interlocked.Read(ref declinedAt) < CooldownMs) return Wire.Map("ok", false, "error", Cooling);
-            var left = open; if (left != null && !left.WaitOne(0)) return Wire.Map("ok", false, "error", StillOpen);
             if (Interlocked.CompareExchange(ref requesting, 1, 0) != 0) return Wire.Map("ok", false, "error", Waiting);
             try { return ask(); } finally { Interlocked.Exchange(ref requesting, 0); }
         }
@@ -2648,9 +2671,10 @@ namespace SupportMcp {
                 int outcome = path == Consent.Unavailable ? Elevation.Declined : Elevate(path, connectBy, false, delegate { return false; });
                 if (path != Consent.Unavailable) gate.Record(outcome, PauseClock.Now()); // no request_full_control when Unavailable
                 if (window.EndedByCustomer) { if (outcome == Elevation.Installed) EndOrWarn(); return; }
-                if (outcome == Elevation.NoAnswer || window.Dispatcher.HasShutdownStarted) return; // the window closed (Windows signs out)
+                if (window.Dispatcher.HasShutdownStarted) return; // the window closed (Windows signs out)
                 if (outcome == Elevation.Installed) { Ui(BecomeWindow); return; }
-                // UAC No, a failure, or Don't allow: limited support, if the customer wants it. Don't allow is the default.
+                // UAC No, a failure, Don't allow, or a prompt Windows dropped after two minutes (NoAnswer, no cooldown):
+                // limited support, if the customer wants it. Don't allow is the default.
                 bool admin = SupportAccess.IsAdministrator();
                 if (!Ask(SupportAccess.LimitedHeading, SupportAccess.LimitedText + (admin ? SupportAccess.LimitedAdmin : ""), admin)) { Ui(window.CloseQuietly); return; }
                 Ui(delegate { StartNormal(admin, path != Consent.Unavailable); });
@@ -2687,7 +2711,7 @@ namespace SupportMcp {
                     // the installer already holds the event.
                     if (withdrew || !(attempt.Answered ? window.EndedByCustomer : over())) continue;
                     attempt.Withdraw(); withdrew = true;
-                    if (!attempt.Answered) { stale = attempt; var a = attempt; gate.Leave(a.Done, delegate { return a.Dropped ? Elevation.NoAnswer : a.Outcome; }); return Elevation.NoAnswer; }
+                    if (!attempt.Answered) { stale = attempt; var a = attempt; gate.Leave(a.Done, delegate { return a.Outcome; }, delegate { return a.EndedAt; }); return Elevation.NoAnswer; }
                 }
                 return attempt.Outcome;
             } finally { close(); }
