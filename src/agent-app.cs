@@ -1161,6 +1161,8 @@ namespace SupportMcp {
         public void Stop() {
             stop.Set(); lock (gate) { if (request != null) request.Abort(); }
         }
+        // Stop was called, or the run ended (the relay ended the session, or it expired).
+        public bool Stopped { get { return stop.WaitOne(0); } }
         // A poll that Wake ended early returns null.
         Dictionary<string, object> Send(Dictionary<string, object> body, bool ending, bool poll) {
             if (!ending && stop.WaitOne(0)) throw new OperationCanceledException();
@@ -1542,12 +1544,13 @@ namespace SupportMcp {
                 return new NamedPipeServerStream(PipeDirection.InOut, overlapped, false, h);
             } finally { LocalFree(sd); }
         }
-        // UAC: runs exe elevated and waits for it. Returns its exit code, or -1223 when the customer said No.
-        public static int RunElevated(string exe, string args, IntPtr owner) {
+        // UAC: runs exe elevated and waits for it. Returns its exit code, or -1223 when the customer said No. answered runs
+        // once the customer said Yes and the elevated process exists.
+        public static int RunElevated(string exe, string args, IntPtr owner, Action answered) {
             var info = new ShellInfo { Size = Marshal.SizeOf(typeof(ShellInfo)), Mask = 0x40 | 0x100 | 0x400, Window = owner, Verb = "runas", File = exe, Parameters = args, Show = 1 };
             if (!ShellExecuteEx(ref info)) { int e = Marshal.GetLastWin32Error(); if (e == 1223) return -1223; throw new Win32Exception(e); }
             if (info.Process == IntPtr.Zero) throw new Win32Exception(5);
-            try { CommandJob.WaitForSingleObject(info.Process, 0xFFFFFFFF); uint code; return GetExitCodeProcess(info.Process, out code) ? (int)code : -1; }
+            try { answered(); CommandJob.WaitForSingleObject(info.Process, 0xFFFFFFFF); uint code; return GetExitCodeProcess(info.Process, out code) ? (int)code : -1; }
             finally { CloseHandle(info.Process); }
         }
         public static string SendSas() {
@@ -1970,6 +1973,7 @@ namespace SupportMcp {
                 || !int.TryParse(args[3], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out appPid)) return 2;
             string sid = Wire.Text(cfg, "sid"), sid8 = Sid8(cfg), name = Backstop.Name(sid8), folder = Folder(sid8);
             if (!System.Text.RegularExpressions.Regex.IsMatch(folder, @"^[A-Za-z]:\\[^%&|<>^""]+$")) return 2; // it goes into cmd lines
+            if (!Elevation.Wanted(sid8, appPid)) return 1; // the app stopped waiting (or exited) before this Yes
             var status = Scm.Status(name);
             if (status != null || Directory.Exists(folder) || File.Exists(folder) || Backstop.Tasks(sid8).Count > 0) {
                 // A leftover (a crash in the middle of an install) or a running service. Only this session's is touched:
@@ -1994,6 +1998,7 @@ namespace SupportMcp {
                 // False when the mutex stayed busy: full control still works, and send_sas says that Windows refuses it.
                 using (var hklm = SasShare.Machine()) SasShare.Acquire(hklm, name);
                 Scm.Create(name, "\"" + Path.Combine(folder, "agent.exe") + "\" --service");
+                if (!Elevation.Wanted(sid8, appPid)) { Remove(sid8); return 1; }
                 Scm.Start(name);
                 return 0;
             } catch (Exception) { Remove(sid8); return 1; }
@@ -2027,30 +2032,62 @@ namespace SupportMcp {
 
     // The customer's side of --elevate-install.
     public static class Elevation {
-        public const int Installed = 0, Declined = 1, Failed = 2;
+        public const int Installed = 0, Declined = 1, Failed = 2, NoAnswer = 3;
         // The elevated child runs from a copy in a new folder of its own under the user's Temp, so nothing that sits
         // next to the download (an .exe.config, a DLL) is loaded by the elevated process. The caller deletes the folder.
         public static string Stage(string exe) {
             string dir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N")), copy = Path.Combine(dir, Path.GetFileName(exe));
             Directory.CreateDirectory(dir); File.Copy(exe, copy); return copy;
         }
-        // UAC, then wait for the install. On a fresh STA thread, as ShellExecuteEx wants.
-        public static int Install(string exe, long deadline, bool connected, IntPtr owner) {
-            int outcome = Failed;
-            var t = new Thread(delegate() {
-                string staged = null;
-                try {
-                    staged = Stage(exe);
-                    // The last argument is this process: the corner window until the service starts one, which the helper must not click.
-                    int code = Native.RunElevated(staged, "--elevate-install " + deadline.ToString(System.Globalization.CultureInfo.InvariantCulture) + (connected ? " 1 " : " 0 ")
-                        + Process.GetCurrentProcess().Id.ToString(System.Globalization.CultureInfo.InvariantCulture), owner);
-                    outcome = code == 0 ? Installed : code == -1223 ? Declined : Failed;
-                } catch (Exception) { outcome = Failed; }
-                finally { if (staged != null) try { Directory.Delete(Path.GetDirectoryName(staged), true); } catch (Exception) { } }
-            });
-            t.SetApartmentState(ApartmentState.STA); t.Start(); t.Join();
-            return outcome;
+        // The app may stop waiting while UAC still asks: the customer ended, the session ended, the request timed out, or
+        // the app exited. A Yes after that must install nothing. So each attempt holds a named event of this process, and
+        // the elevated installer goes ahead only while the event exists and is not set (Wanted), checked before it installs
+        // and again before it starts the service. The event is gone when this process is.
+        public static string WantName(string sid8, int appPid) { return "Local\\SupportMcpElevate-" + sid8 + "-" + appPid.ToString(System.Globalization.CultureInfo.InvariantCulture); }
+        // An installer that runs as another administrator (the credential prompt of a standard user) may only wait on it.
+        public static EventWaitHandle Want(string sid8, int appPid) {
+            var sec = new EventWaitHandleSecurity(); bool created;
+            sec.AddAccessRule(new EventWaitHandleAccessRule(WindowsIdentity.GetCurrent().User, EventWaitHandleRights.FullControl, AccessControlType.Allow));
+            foreach (var sid in new SecurityIdentifier[] { FullAcl.SystemSid, FullAcl.AdminsSid })
+                sec.AddAccessRule(new EventWaitHandleAccessRule(sid, EventWaitHandleRights.Synchronize, AccessControlType.Allow));
+            var e = new EventWaitHandle(false, EventResetMode.ManualReset, WantName(sid8, appPid), out created, sec);
+            e.Reset(); return e;
         }
+        public static bool Wanted(string sid8, int appPid) {
+            EventWaitHandle e;
+            if (!EventWaitHandle.TryOpenExisting(WantName(sid8, appPid), EventWaitHandleRights.Synchronize, out e)) return false;
+            using (e) return !e.WaitOne(0);
+        }
+        // One UAC request and the install after it, on a fresh STA thread, as ShellExecuteEx wants. Answered: the customer
+        // said Yes and the installer runs. Withdraw: install nothing from now on (the installer removes what it made).
+        public sealed class Attempt {
+            readonly EventWaitHandle want; readonly ManualResetEvent done = new ManualResetEvent(false);
+            volatile int outcome = Failed; volatile bool answered;
+            public WaitHandle Done { get { return done; } }
+            public int Outcome { get { return outcome; } }
+            public bool Answered { get { return answered; } }
+            public void Withdraw() { try { want.Set(); } catch (ObjectDisposedException) { } }
+            internal Attempt(string exe, string sid8, long deadline, bool connected, IntPtr owner, Action onAnswered) {
+                int pid = Process.GetCurrentProcess().Id; want = Want(sid8, pid);
+                var t = new Thread(delegate() {
+                    string staged = null;
+                    try {
+                        staged = Stage(exe);
+                        // The last argument is this process: the corner window until the service starts one, which the helper must
+                        // not click, and the owner of the event the installer checks.
+                        int code = Native.RunElevated(staged, "--elevate-install " + deadline.ToString(System.Globalization.CultureInfo.InvariantCulture) + (connected ? " 1 " : " 0 ")
+                            + pid.ToString(System.Globalization.CultureInfo.InvariantCulture), owner, delegate { answered = true; onAnswered(); });
+                        outcome = code == 0 ? Installed : code == -1223 ? Declined : Failed;
+                    } catch (Exception) { outcome = Failed; }
+                    finally {
+                        if (staged != null) try { Directory.Delete(Path.GetDirectoryName(staged), true); } catch (Exception) { }
+                        done.Set(); want.Dispose();
+                    }
+                });
+                t.SetApartmentState(ApartmentState.STA); t.IsBackground = true; t.Start();
+            }
+        }
+        public static Attempt Start(string exe, string sid8, long deadline, bool connected, IntPtr owner, Action onAnswered) { return new Attempt(exe, sid8, deadline, connected, owner, onAnswered); }
     }
 
     // The service's side of the SYSTEM helper on the console session. It starts the helper again when the console
@@ -2554,8 +2591,10 @@ namespace SupportMcp {
             if (client != null) { client.Stop(); if (clientThread != null) clientThread.Join(20000); }
             if (link != null) link.Flush(3000);
         }
-        T Ui<T>(Func<T> f) { return window.Dispatcher.Invoke(f); }
-        void Ui(Action a) { window.Dispatcher.Invoke(a); }
+        // After the window closed these do nothing. Invoke on a dispatcher that shut down throws TaskCanceledException, which
+        // would end this thread before it ends a service the customer no longer wants (EndOrWarn).
+        T Ui<T>(Func<T> f) { try { return window.Dispatcher.HasShutdownStarted ? default(T) : window.Dispatcher.Invoke(f); } catch (OperationCanceledException) { return default(T); } }
+        void Ui(Action a) { try { if (!window.Dispatcher.HasShutdownStarted) window.Dispatcher.Invoke(a); } catch (OperationCanceledException) { } }
         bool Ask(string heading, string text, bool warning) { return !window.EndedByCustomer && Ui(delegate { return ConsentDialog.Ask(heading, text, warning); }); }
         // The customer ended the session while the install ran: end the new service, and say so if that cannot be confirmed.
         void EndOrWarn() {
@@ -2566,9 +2605,10 @@ namespace SupportMcp {
                 // Opened again while this session has full control: be its window.
                 if (ServiceLink.Running(sid8)) { Ui(BecomeWindow); return; }
                 Consent path = ConsentPath.Detect();
-                int outcome = path == Consent.Unavailable ? Elevation.Declined : Elevate(path, connectBy, false);
+                int outcome = path == Consent.Unavailable ? Elevation.Declined : Elevate(path, connectBy, false, delegate { return false; });
                 if (path != Consent.Unavailable) gate.Record(outcome, PauseClock.Now()); // no request_full_control when Unavailable
                 if (window.EndedByCustomer) { if (outcome == Elevation.Installed) EndOrWarn(); return; }
+                if (outcome == Elevation.NoAnswer || window.Dispatcher.HasShutdownStarted) return; // the window closed (Windows signs out)
                 if (outcome == Elevation.Installed) { Ui(BecomeWindow); return; }
                 // UAC No, a failure, or Don't allow: limited support, if the customer wants it. Don't allow is the default.
                 bool admin = SupportAccess.IsAdministrator();
@@ -2581,14 +2621,34 @@ namespace SupportMcp {
         // the background cannot take the foreground (request_full_control, or a start from Explorer or a download), but the
         // customer's click on Allow gives it to the dialog. So before UAC the dialog stays open as the prompt's owner, saying
         // that Windows asks now, until UAC is answered. When no prompt will appear, the dialog is the consent and closes.
-        int Elevate(Consent path, long deadline, bool connected) {
+        // The dialog is modeless, so End session in the corner window works throughout. The wait ends when the customer
+        // ended, the window closed or giveUp says so; an unanswered UAC prompt is then withdrawn (NoAnswer). After Yes only
+        // End session withdraws, and the install that already runs is waited for, so the caller can end what it made.
+        int Elevate(Consent path, long deadline, bool connected, Func<bool> giveUp) { bool withdrew; return Elevate(path, deadline, connected, giveUp, out withdrew); }
+        // withdrew: the wait ended early (see above); an install that finished anyway is then not wanted.
+        int Elevate(Consent path, long deadline, bool connected, Func<bool> giveUp, out bool withdrew) {
+            withdrew = false;
             if (window.EndedByCustomer) return Elevation.Declined;
-            var dialog = Ui(delegate { return ConsentDialog.Full(path == Consent.Prompt); });
-            window.Dispatcher.BeginInvoke(new Action(delegate { dialog.ShowDialog(); }));
-            while (!dialog.Decided.WaitOne(500)) if (window.Dispatcher.HasShutdownStarted) return Elevation.Declined;
-            if (!dialog.Allowed) return Elevation.Declined;
-            try { return Elevation.Install(exe, deadline, connected, Ui(delegate { return path == Consent.Prompt ? new WindowInteropHelper(dialog).Handle : new WindowInteropHelper(window).Handle; })); }
-            finally { Ui(dialog.Finish); }
+            var dialog = Ui(delegate { return ConsentDialog.Open(path == Consent.Prompt); });
+            if (dialog == null) return Elevation.NoAnswer;
+            Func<bool> over = delegate { return window.EndedByCustomer || window.Dispatcher.HasShutdownStarted || giveUp(); };
+            Action close = delegate { if (!dialog.Dispatcher.HasShutdownStarted) dialog.Dispatcher.BeginInvoke(new Action(dialog.Finish)); };
+            try {
+                while (!dialog.Decided.WaitOne(250)) if (over()) return Elevation.NoAnswer;
+                if (!dialog.Allowed) return Elevation.Declined;
+                if (over()) return Elevation.NoAnswer;
+                IntPtr owner = Ui(delegate { return path == Consent.Prompt ? new WindowInteropHelper(dialog).Handle : new WindowInteropHelper(window).Handle; });
+                // Once UAC is answered the question has done its work: it goes, and the corner window shows the install.
+                var attempt = Elevation.Start(exe, sid8, deadline, connected, owner, close);
+                while (!attempt.Done.WaitOne(250)) {
+                    // After Yes only the customer's End session withdraws: the old client stops by itself when the new
+                    // service says hello, and a sign-out keeps full control, as a restart does.
+                    if (withdrew || !(attempt.Answered ? window.EndedByCustomer : over())) continue;
+                    attempt.Withdraw(); withdrew = true;
+                    if (!attempt.Answered) return Elevation.NoAnswer;
+                }
+                return attempt.Outcome;
+            } finally { close(); }
         }
         void StartNormal(bool admin, bool canElevate) {
             window.SetAccess(admin, admin ? null : SupportAccess.NoAdminNote);
@@ -2600,19 +2660,27 @@ namespace SupportMcp {
         // request_full_control, on the client's screen lane. On success the service has said hello, which answers the
         // operator; this client then stops without sending anything and the window shows the service.
         Dictionary<string, object> RequestFull() { return gate.Request(AskFull, PauseClock.Now()); }
+        // The relay answers the operator after 120 s; the question goes a little before, so a new request finds it gone.
+        public const long AnswerMs = 110000;
         Dictionary<string, object> AskFull() {
             Consent path = ConsentPath.Detect();
             if (path == Consent.Unavailable) return Wire.Map("ok", false, "error", "this Windows account cannot get administrator rights, so full control is not possible");
             Ui(delegate { window.Hold(true); });
-            int outcome = Elevation.Failed;
-            try { outcome = Elevate(path, client.ExpiresAtMs, true); }
+            int outcome = Elevation.Failed; bool withdrew = false; var asked = Stopwatch.StartNew();
+            try { outcome = Elevate(path, client.ExpiresAtMs, true, delegate { return client.Stopped || asked.ElapsedMilliseconds > AnswerMs; }, out withdrew); }
             finally {
-                if (outcome == Elevation.Installed) { client.EndRemote = false; client.Stop(); Ui(BecomeWindow); }
+                if (outcome == Elevation.Installed) {
+                    // The service takes over from this client (whose run ends when the service says hello), unless this app had
+                    // already stopped waiting (the session ended, the customer ended, no answer in time): then it is ended again.
+                    if (withdrew || window.EndedByCustomer) EndOrWarn();
+                    else { client.EndRemote = false; client.Stop(); Ui(BecomeWindow); }
+                }
                 Ui(delegate { window.Hold(false); });
             }
             if (outcome == Elevation.Installed) return null;
-            gate.Record(outcome, PauseClock.Now());
-            return Wire.Map("ok", false, "error", outcome == Elevation.Declined ? "the customer declined full control" : "full control could not be set up on this PC");
+            gate.Record(outcome, PauseClock.Now()); // a decline starts the cooldown, no answer does not
+            return Wire.Map("ok", false, "error", outcome == Elevation.Declined ? "the customer declined full control"
+                : outcome == Elevation.NoAnswer ? "the customer did not answer the request for full control" : "full control could not be set up on this PC");
         }
         void BecomeWindow() {
             if (window.EndedByCustomer) { ender = new Thread(EndOrWarn); ender.Start(); return; }
@@ -3129,9 +3197,16 @@ namespace SupportMcp {
             dialog.ShowDialog();
             return dialog.allowed;
         }
-        // The full-control question. beforeUac: Allow keeps it open and says that Windows asks now; Finish closes it.
-        public static ConsentDialog Full(bool beforeUac) { return new ConsentDialog(Palette.Detect(), SupportAccess.FullHeading, SupportAccess.FullText, true, beforeUac); }
+        // The full-control question, shown modeless so the corner window (End session) stays usable. beforeUac: Allow keeps
+        // it open and says that Windows asks now; Finish closes it.
+        public static ConsentDialog Open(bool beforeUac) {
+            var d = new ConsentDialog(Palette.Detect(), SupportAccess.FullHeading, SupportAccess.FullText, true, beforeUac); d.Show(); return d;
+        }
         public void Finish() { finished = true; if (!closed) Close(); }
+        // Allow does nothing for this long after the question appears, so keys or a click meant for another window cannot
+        // answer it. Don't allow works at once.
+        public const int ArmMs = 500;
+        readonly Stopwatch shown = new Stopwatch();
         ConsentDialog(Palette p, string headingText, string message, bool administrator, bool holds) {
             this.holds = holds;
             const double CardWidth = 440, Pad = 20;
@@ -3180,6 +3255,7 @@ namespace SupportMcp {
 
             deny.Click += delegate { allowed = false; Close(); };
             allow.Click += delegate {
+                if (!shown.IsRunning || shown.ElapsedMilliseconds < ArmMs) return;
                 allowed = true;
                 if (!holds) { Close(); return; }
                 held = true; copy.Text = SupportAccess.Asking; foot.Visibility = Visibility.Collapsed; Decided.Set();
@@ -3187,7 +3263,7 @@ namespace SupportMcp {
             PreviewKeyDown += delegate(object sender, KeyEventArgs e) { if (e.Key == Key.Escape && !held) { e.Handled = true; allowed = false; Close(); } };
             Closing += delegate(object sender, System.ComponentModel.CancelEventArgs e) { if (held && !finished) e.Cancel = true; }; // UAC's owner stays until UAC is answered
             Closed += delegate { closed = true; Decided.Set(); };
-            Loaded += delegate { Activate(); deny.Focus(); Keyboard.Focus(deny); };
+            Loaded += delegate { shown.Start(); Activate(); deny.Focus(); Keyboard.Focus(deny); };
         }
     }
 

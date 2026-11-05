@@ -19,14 +19,26 @@ apply to only one client say which.
   flashing taskbar button the customer may miss, and an app in the background
   (a start from a download or Explorer, or `request_full_control`) cannot take
   the foreground by itself. The customer's click on Allow gives it to the app.
-  The app never answers UAC. When no UAC prompt would appear (the app already
+  Allow does nothing for its first half second, so typing meant for another
+  window cannot answer it. The app never answers UAC. The question is not a
+  barrier against the operator: in normal mode the operator's `run` and screen
+  tools work as the customer and can press Allow through UI Automation. UAC
+  **Yes**, which only the customer can click on the secure desktop, is the
+  consent to full control. When no UAC prompt would appear (the app already
   runs as administrator, UAC is off, or an administrator elevates without a
-  prompt), the question is the consent. If the customer says No anywhere, or elevation fails,
-  the app asks "Continue with limited support? Support can see your screen and
-  control your mouse and keyboard, but not Windows security prompts." Every
-  dialog has **Don't allow** selected by default, and only a click on Allow
-  grants access. Don't allow on the last one ends the app with nothing
-  installed.
+  prompt), the question is the only consent, and an operator in normal mode
+  already has the customer's administrator rights. The question is modeless,
+  so End session in the corner window works while it waits and while UAC asks.
+  If the app stops waiting before the customer answers UAC (End session, the
+  session ended, `request_full_control` unanswered for 110 s, the app closed),
+  it withdraws the request: the elevated installer checks a named event of the
+  app before it installs and again before it starts the service, and installs
+  nothing once the app withdrew or exited. If the customer says No anywhere,
+  or elevation fails, the app asks "Continue with limited support? Support can
+  see your screen and control your mouse and keyboard, but not Windows
+  security prompts." Every dialog has **Don't allow** selected by default, and
+  the customer decides with a click. Don't allow on the last one ends the app
+  with nothing installed.
 - **The window shows that access exists.** The app's window stays on top in the
   bottom-right corner while support is connected. It shows a running timer and
   when the session ends by itself, turns blue while a command, file or screen
@@ -97,9 +109,11 @@ apply to only one client say which.
   task, which tries again at the deadline and then every hour. The own-window
   guard of the helper covers the corner window the service started and the app
   that installed it, not every process that talks to the window pipe. UIPI no longer limits input, so support can work
-  in windows that run as administrator. Commands keep the Job Object and the
-  output caps. `request_full_control` asks one prompt at a time, and not again
-  within a minute after the customer declined.
+  in windows that run as administrator. Commands keep the Job Object, its one
+  second for a program the command did not wait for (as SYSTEM and as the
+  user), and the output caps. `request_full_control` asks one prompt at a time,
+  and not again within a minute after the customer declined. One that gets no
+  answer in 110 s returns `the customer did not answer`, without the minute.
 - **Normal mode.** Without full control, screen capture, mouse, keyboard and UI
   Automation run inside the customer's own process and desktop session, with the
   customer's token. It cannot see or operate the secure desktop, it cannot run as

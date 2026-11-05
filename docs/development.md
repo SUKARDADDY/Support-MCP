@@ -136,7 +136,8 @@ a result the relay refuses, `as` in normal mode and the screen consent of a
 prepared reconnect. For full control they cover the parts that need no
 administrator: the consent path (UAC prompt, the app's own confirm, or
 unavailable), the full-control question that stays open as the owner of the UAC
-prompt, the folder and file ACLs (a real folder, read back with `icacls`),
+prompt (modeless, with the corner window still enabled, and Allow dead for its
+first 500 ms), the named event that lets the elevated installer go ahead, the folder and file ACLs (a real folder, read back with `icacls`),
 the exclusive creation of the folder and the parent it goes in, the deadline
 state on disk and its expiry rules, the shared `SoftwareSASGeneration` record (in
 C# and in the backstop's PowerShell, and that neither changes it without the

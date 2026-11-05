@@ -871,29 +871,49 @@ public static class AppTests {
         Console.WriteLine("PASS the corner window does not take the focus, keeps its taskbar button, and Keep connected gives the focus back");
         // Before UAC the full-control question stays open after Allow, as the owner of the UAC prompt (Windows shows the prompt in
         // front only for an app in the foreground, and the click on Allow gives it that), says that Windows asks now, and cannot
-        // be closed until the app finishes it. Don't allow closes it. As the app's own confirm (no UAC prompt), Allow closes it.
+        // be closed until the app finishes it. It is modeless: the corner window, with End session, stays enabled throughout.
+        // Allow does nothing in its first 500 ms. Don't allow closes it at once. As the app's own confirm (no UAC), Allow closes it.
         {
-            bool allowHeld = false, closeRefused = false, finished = false, denyClosed = false, confirmClosed = false;
+            bool cornerOpen = false, cornerHeld = false, early = true, allowHeld = false, closeRefused = false, finished = false, denyClosed = false, confirmClosed = false;
             var t = new Thread(delegate() {
                 Action pump = delegate { for (int i = 0; i < 10; i++) { Application.DoEvents(); System.Windows.Threading.Dispatcher.CurrentDispatcher.Invoke(System.Windows.Threading.DispatcherPriority.Background, new Action(delegate { })); Thread.Sleep(25); } };
-                var d = ConsentDialog.Full(true); d.Show(); pump();
-                var allow = Find<System.Windows.Controls.Button>(d, delegate(System.Windows.Controls.Button b) { return "Allow".Equals(b.Content); });
+                Func<System.Windows.DependencyObject, string, System.Windows.Controls.Button> button = delegate(System.Windows.DependencyObject w, string text) { return Find<System.Windows.Controls.Button>(w, delegate(System.Windows.Controls.Button b) { return text.Equals(b.Content); }); };
+                var corner = new SupportWindow(Palette.Detect(), false, false, null); corner.Show(); pump();
+                IntPtr cornerHandle = new System.Windows.Interop.WindowInteropHelper(corner).Handle;
+                var d = ConsentDialog.Open(true);
+                var allow = button(d, "Allow");
+                Press(allow); early = d.Allowed || d.Decided.WaitOne(0);
+                pump(); cornerOpen = IsWindowEnabled(cornerHandle);
+                Thread.Sleep(ConsentDialog.ArmMs); pump();
                 Press(allow); pump();
                 allowHeld = d.IsVisible && d.Allowed && d.Decided.WaitOne(0) && !allow.IsVisible
                     && Find<System.Windows.Controls.TextBlock>(d, delegate(System.Windows.Controls.TextBlock b) { return b.Text == SupportAccess.Asking && b.IsVisible; }) != null;
+                cornerHeld = IsWindowEnabled(cornerHandle);
                 d.Close(); pump(); closeRefused = d.IsVisible;
                 d.Finish(); pump(); finished = !d.IsVisible;
-                var n = ConsentDialog.Full(true); n.Show(); pump();
-                Press(Find<System.Windows.Controls.Button>(n, delegate(System.Windows.Controls.Button b) { return "Don't allow".Equals(b.Content); })); pump();
+                var n = ConsentDialog.Open(true); pump();
+                Press(button(n, "Don't allow")); pump();
                 denyClosed = !n.IsVisible && !n.Allowed && n.Decided.WaitOne(0); n.Finish();
-                var c = ConsentDialog.Full(false); c.Show(); pump();
-                Press(Find<System.Windows.Controls.Button>(c, delegate(System.Windows.Controls.Button b) { return "Allow".Equals(b.Content); })); pump();
+                var c = ConsentDialog.Open(false); pump(); Thread.Sleep(ConsentDialog.ArmMs);
+                Press(button(c, "Allow")); pump();
                 confirmClosed = !c.IsVisible && c.Allowed && c.Decided.WaitOne(0); c.Finish();
+                corner.CloseQuietly(); pump();
             }); t.SetApartmentState(ApartmentState.STA); t.Start(); t.Join();
+            Assert(cornerOpen && cornerHeld, "The corner window stays enabled while the question is open and while it waits for UAC");
+            Assert(!early, "Allow does nothing right after the question appears");
             Assert(allowHeld, "Allow before UAC keeps the question open and says that Windows asks now");
             Assert(closeRefused && finished, "The question cannot be closed while UAC asks, only finished by the app");
             Assert(denyClosed, "Don't allow closes the question");
             Assert(confirmClosed, "Allow on the app's own confirm closes it");
+            // The installer goes ahead only while the app's event for this attempt exists and is not set.
+            string w8 = Guid.NewGuid().ToString("N").Substring(0, 8); int pid = Process.GetCurrentProcess().Id;
+            Assert(!Elevation.Wanted(w8, pid), "No attempt: the installer installs nothing");
+            using (var want = Elevation.Want(w8, pid)) {
+                Assert(Elevation.Wanted(w8, pid) && !Elevation.Wanted(w8, pid + 1), "The attempt of this process is wanted");
+                want.Set();
+                Assert(!Elevation.Wanted(w8, pid), "A withdrawn attempt is not");
+            }
+            Assert(!Elevation.Wanted(w8, pid), "Nor one whose app is gone");
         }
         Console.WriteLine("PASS the full-control question stays open as the owner of the UAC prompt");
 
@@ -926,6 +946,7 @@ public static class AppTests {
         }
         return null;
     }
+    [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr h);
     static void Press(System.Windows.Controls.Button button) { button.RaiseEvent(new System.Windows.RoutedEventArgs(System.Windows.Controls.Primitives.ButtonBase.ClickEvent)); }
     [DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(int pid);
     // A window of another process: the focus-return test starts this exe again with --peer <parent pid>. It lets the
@@ -1026,14 +1047,20 @@ public static class AppTests {
                 r = relay.Call(Run(ChildCommand(late, started), 1));
                 Assert(Wire.Flag(r, "timed_out") && r["exit_code"] == null, "Timeout result");
                 Thread.Sleep(3500); Assert(!File.Exists(late), "Timeout must kill descendants");
-                // A program the command started without waiting (like rundll32 user32.dll,LockWorkStation) gets time to
-                // finish; one that keeps running is still stopped once the command has exited.
-                string quick = Path.Combine(dir, "settle-quick"); late = Path.Combine(dir, "settle-late");
-                string slowChild = "Start-Sleep -Seconds 3; Set-Content -LiteralPath '" + late.Replace("'", "''") + "' -Value late";
-                var settle = Stopwatch.StartNew();
-                r = relay.Call(Run("Start-Process cmd.exe -WindowStyle Hidden -ArgumentList '/c echo done> \"" + quick.Replace("'", "''") + "\"'; Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile -NonInteractive -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(slowChild)) + "'", 30));
-                Assert(Wire.Flag(r, "ok") && File.Exists(quick) && settle.ElapsedMilliseconds < 15000, "A program the command did not wait for finishes: " + settle.ElapsedMilliseconds + " ms");
-                Thread.Sleep(3500); Assert(!File.Exists(late), "A descendant that keeps running is stopped after the command exits");
+                // A program the command started without waiting (like rundll32 user32.dll,LockWorkStation) gets up to a second to
+                // finish: here a script that needs 400 ms, started last. One that keeps running is killed once that second is over.
+                string quick = Path.Combine(dir, "settle-quick"), slowPid = Path.Combine(dir, "settle-pid"), js = Path.Combine(dir, "settle.js");
+                late = Path.Combine(dir, "settle-late");
+                File.WriteAllText(js, "WScript.Sleep(400); var f = new ActiveXObject('Scripting.FileSystemObject').CreateTextFile('" + quick.Replace("\\", "\\\\") + "', true); f.Write('done'); f.Close();");
+                r = relay.Call(Run("$s = Start-Process cmd.exe -WindowStyle Hidden -PassThru -ArgumentList '/c ping -n 30 127.0.0.1 >nul & echo late> \"" + late.Replace("'", "''") + "\"'; Set-Content -LiteralPath '" + slowPid.Replace("'", "''")
+                    + "' -Value $s.Id; Start-Process cscript.exe -WindowStyle Hidden -ArgumentList '//nologo //e:jscript \"" + js.Replace("'", "''") + "\"'; [Console]::Write([DateTime]::UtcNow.Ticks)", 30));
+                long settledMs = (DateTime.UtcNow.Ticks - long.Parse(Decode(r, "stdout_b64"))) / 10000;
+                Assert(Wire.Flag(r, "ok") && File.Exists(quick), "A program the command did not wait for finishes");
+                Assert(settledMs >= CommandJob.SettleMs - 100 && settledMs < 10000, "The result waits about a second for a program that keeps running: " + settledMs + " ms");
+                int slow = int.Parse(File.ReadAllText(slowPid).Trim()); bool slowGone = true;
+                try { using (var p = Process.GetProcessById(slow)) slowGone = p.WaitForExit(1000); } catch (ArgumentException) { }
+                Assert(slowGone, "The program that keeps running is killed after that second");
+                Thread.Sleep(1500); Assert(!File.Exists(late), "It never finishes");
                 late = Path.Combine(dir, "end-late"); started = Path.Combine(dir, "end-started");
                 relay.Queue(Run(ChildCommand(late, started), 20)); WaitFile(started); relay.End = true; relay.WaitExit();
                 Thread.Sleep(3500); Assert(!File.Exists(late), "Operator end must kill descendants");

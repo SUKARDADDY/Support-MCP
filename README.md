@@ -29,8 +29,9 @@ AI agent does the diagnosis and the fix while a person watches.
 
 ## At a glance
 
-- The customer opens a link, runs the app it downloads, and clicks **Yes** when
-  Windows asks for permission. That gives support full control: the app installs
+- The customer opens a link, runs the app it downloads, clicks **Allow** when it
+  asks "Give support full control of this PC?", and **Yes** when Windows asks for
+  permission. That gives support full control: the app installs
   a temporary service that reaches UAC prompts, the lock screen and the sign-in
   screen, runs commands as the signed-in user or as SYSTEM, and keeps working
   after a restart.
