@@ -1,5 +1,5 @@
 # Support-MCP relay Worker.
-# Before the first deploy, replace the three REPLACE_ME values (see README,
+# Before the first deploy, replace the four REPLACE_ME values (see README,
 # "Deploy your own"). The account comes from `wrangler login` or
 # CLOUDFLARE_ACCOUNT_ID, so it is not pinned here.
 name = "support-mcp"
@@ -15,6 +15,18 @@ enabled = true
 # Your Zero Trust team domain and the AUD tag of the Access app guarding /mcp.
 ACCESS_TEAM_DOMAIN = "REPLACE_ME.cloudflareaccess.com"
 ACCESS_AUD = "REPLACE_ME"
+# Comma-separated identities (emails or service token client ids) allowed to
+# add the team's first member. Empty: any caller Access admits may, as admin.
+DEPLOYMENT_ADMINS = ""
+
+# Team data: members, roles and the team log, one shared database with every
+# row keyed by workspace. Create it with `wrangler d1 create support-mcp`, put
+# its id here, then `wrangler d1 migrations apply support-mcp --remote`.
+[[d1_databases]]
+binding = "DB"
+database_name = "support-mcp"
+database_id = "REPLACE_ME"
+migrations_dir = "migrations"
 
 # Durable Objects: one Session per pairing code, one shared Registry.
 [[durable_objects.bindings]]

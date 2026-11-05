@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Provision the Cloudflare Access guard for the relay's MCP endpoint.
+# Provision the Cloudflare Access guard for the relay's MCP endpoint and team API.
 #
 # Creates (idempotently, by name):
 #   - Access service token  "support-mcp-client"  -> credentials for the MCP client
-#   - Access application    "support-mcp"         -> <host>/mcp  (self-hosted)
+#   - Access application    "support-mcp"         -> <host>/mcp and <host>/api  (self-hosted)
 #       policy 1 "operator"       allow   email == $SUPPORT_OPERATOR_EMAIL  (browser / OTP)
 #       policy 2 "mcp-client"     service_auth  the service token above
 # Customer paths (/j/<code>, /ws, /healthz) are NOT under the app and stay public.
@@ -58,7 +58,7 @@ fi
 # 2. application
 APP_ID=$(cf "$API/apps" | python3 -c "import sys,json; print(next((a['id'] for a in json.load(sys.stdin)['result'] or [] if a.get('name')=='$APP_NAME'),''))")
 BODY=$(cat <<JSON
-{"name":"$APP_NAME","type":"self_hosted","domain":"$HOST/mcp","self_hosted_domains":["$HOST/mcp"],
+{"name":"$APP_NAME","type":"self_hosted","domain":"$HOST/mcp","self_hosted_domains":["$HOST/mcp","$HOST/api"],
  "session_duration":"24h","app_launcher_visible":false,"allowed_idps":[],"auto_redirect_to_identity":false,
  "http_only_cookie_attribute":true,"same_site_cookie_attribute":"lax",
  "policies":[
@@ -75,7 +75,8 @@ else
 fi
 printf 'ACCESS_AUD for wrangler.toml: %s\n' "$(cf "$API/apps/$APP_ID" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["aud"])')"
 
-# 3. prove it: unauthenticated /mcp must be redirected/denied by Access, /healthz must stay open
+# 3. prove it: unauthenticated /mcp and /api must be redirected/denied by Access, /healthz must stay open
 sleep 3
 printf 'unauth /mcp -> %s (expect 302/401/403)\n' "$(curl -s -o /dev/null -w '%{http_code}' https://$HOST/mcp)"
+printf 'unauth /api -> %s (expect 302/401/403)\n' "$(curl -s -o /dev/null -w '%{http_code}' https://$HOST/api/v1/w/default)"
 printf '/healthz     -> %s (expect 200)\n' "$(curl -s -o /dev/null -w '%{http_code}' https://$HOST/healthz)"

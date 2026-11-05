@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Session } from '../src/session.js';
 import { createHandler } from '../src/app.js';
+import { openD1 } from './d1-fake.js';
 
 const SID = 'a'.repeat(64);
 const JPEG = '/9j/4AAQ';
@@ -21,7 +22,7 @@ function fixture() {
   const registry = { idFromName: (n) => n, get: () => ({ fetch: async (url, init) => { if (init?.body) registryBodies.push(init.body); return Response.json({ sessions: [] }); } }) };
   const session = new Session(ctx, { REGISTRY: registry });
   const req = (path, body, key = '') => session.fetch(new Request(`https://do${path}`, { method: 'POST', headers: { 'X-Attach-Key': key }, body: JSON.stringify(body) }));
-  const env = { DEV_SKIP_ACCESS: '1', REGISTRY: registry, SESSION: { idFromName: () => SID, idFromString: () => SID, get: () => ({ fetch: (r, opts) => session.fetch(typeof r === 'string' ? new Request(r, opts) : r) }) } };
+  const env = { DEV_SKIP_ACCESS: '1', DB: openD1(), REGISTRY: registry, SESSION: { idFromName: () => SID, idFromString: () => SID, get: () => ({ fetch: (r, opts) => session.fetch(typeof r === 'string' ? new Request(r, opts) : r) }) } };
   return { session, values, logs, registryBodies, req, env };
 }
 
@@ -439,6 +440,8 @@ test('audit rows: typed text is a length, type_secret is bare, screenshots log t
     '[op@example.com] send_sas', '[op@example.com] type_secret', '[op@example.com] screenshot 800x600 display 1',
   ]);
   // Neither the typed text, the secret, the value nor any image is in a log row, storage, or the registry.
+  // The registry check means something only if the session pushed to it.
+  assert.ok(f.registryBodies.length > 0, 'the session pushed to the registry');
   const everything = JSON.stringify([f.logs, [...f.values], f.registryBodies, await f.status()]);
   for (const needle of ['hunter2', 'TOPSECRET', 'VALUE-NOT-LOGGED', JPEG, PNG]) assert.ok(!everything.includes(needle), `${needle} was stored`);
 });
@@ -488,6 +491,7 @@ test('type_secret is never returned, even if the app echoes it in text or in an 
   const tooLong = await f.op(screen('type_secret', { text: `${secret}`.repeat(200) }));
   assert.equal(tooLong.ok, false);
   assert.ok(!JSON.stringify(tooLong).includes(secret));
+  assert.ok(f.registryBodies.length > 0, 'the session pushed to the registry');
   assert.ok(!JSON.stringify([f.logs, f.registryBodies]).includes(secret));
 });
 
@@ -601,6 +605,28 @@ test('/mcp run passes as to the app', async () => {
   assert.equal(frame.as, 'system');
   await f.result(frame, { stdout_b64: btoa('nt authority\\system'), stderr_b64: '', exit_code: 0 });
   assert.equal(JSON.parse((await call).body.result.content[0].text).stdout, 'nt authority\\system');
+});
+
+test('/mcp checks the role with the permission key only: no tool argument reaches the team database', async () => {
+  for (const member of [false, true]) {
+    const f = await attach({ control: 'full' });
+    // As a member the check reads the role too, not just the open-mode shortcut.
+    if (member) {
+      f.env.DB.sqlite.exec(`INSERT INTO members VALUES ('default', 'local-dev', 'service', NULL, 'technician', 1, 'local-dev')`);
+    }
+    f.env.DB.seen.length = 0;
+    const secret = 'pw-TOPSECRET-42';
+    const call = mcp(f, '', 'tools/call', { name: 'type_secret', arguments: { session_id: SID, text: secret } });
+    await until(() => f.session.httpCommands.screen);
+    await f.result(await f.poll({ busy_lanes: [] }), shotResult());
+    const { body } = await call;
+    assert.ok(!body.result.isError, body.result.content.at(-1).text);
+    assert.ok(f.env.DB.seen.length > 0, 'the role was checked');
+    const bound = f.env.DB.seen.flatMap((s) => s.params);
+    for (const v of bound) assert.ok(typeof v === 'number' || ['default', 'local-dev'].includes(v), `bound ${JSON.stringify(v)}`);
+    assert.ok(!JSON.stringify(f.env.DB.seen).includes(secret));
+    assert.ok(!JSON.stringify(f.env.DB.seen).includes(SID));
+  }
 });
 
 test('/mcp session_status reports control, caps and client_version', async () => {

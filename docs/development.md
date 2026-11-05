@@ -205,6 +205,7 @@ operator ending the session cancels it.
 ```sh
 node --test                          # unit and route tests, no network
 npx wrangler deploy --dry-run --outdir /tmp/support-mcp-dry
+npx wrangler d1 migrations apply support-mcp --local   # the team tables, once
 cp .dev.vars.example .dev.vars && npx wrangler dev --port 8787
 ```
 
@@ -218,6 +219,38 @@ interface could send `Host: localhost` and skip Access.
 exercise `/mcp`, `/j` or `/ws` locally, run it against a copy of the config
 with the `routes` line removed. Over plain http the relay serves only
 `localhost` and `127.0.0.1`.
+
+### Teams locally
+
+`wrangler dev` gives the Worker a local D1 database for the `DB` binding. Apply
+the migration to it once with
+`npx wrangler d1 migrations apply support-mcp --local`, and again after any
+change to `migrations/`. Without the tables, every MCP tool call fails with a
+D1 error and the team API answers 500.
+
+Under the local bypass every caller is the identity `local-dev`, for `/mcp` and
+the team API alike. A new local database has no members, so every tool works.
+To try roles, add `local-dev` as the first admin:
+
+```sh
+curl -s localhost:8787/api/v1/w/default/members -H 'content-type: application/json' \
+  -d '{"identity":"local-dev","role_id":"admin"}'
+```
+
+Because every local request is `local-dev`, you can't sign in as a second
+member. To see a refusal, change `local-dev`'s role instead: add a second admin
+(any identity), then demote `local-dev` to `viewer` with
+`PATCH /api/v1/w/default/members/local-dev` and `{"role_id":"viewer"}`. A `run`
+over MCP then returns `your role does not allow sessions.control`. The download
+page at `/j/<code>?client=app` loads whatever the roles, because it never
+checks them. To start over, delete `.wrangler/state` and apply the migration
+again.
+
+`test/workspace.test.js` and `test/api.test.js` run the team code on a D1
+stand-in built on `node:sqlite` (`test/d1-fake.js`), with the migration applied.
+It yields before every statement like a network round trip, and its `batch()`
+is one transaction, so the concurrency tests race the way Workers do.
+`node:sqlite` prints an ExperimentalWarning on Node 22; that is expected.
 
 The route tests import the real router. Most give it Durable Object bindings
 that throw if touched. That proves the Access gate, the `Origin` check, the

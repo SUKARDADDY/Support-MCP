@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import { Session } from '../src/session.js';
 import { createHandler } from '../src/app.js';
 import { buildAppDownload, normalizeWindowsMode, clientMode } from '../src/template.js';
+import { openD1 } from './d1-fake.js';
 
 const SID = 'a'.repeat(64), KEY = 'b'.repeat(64), ORIGIN = 'https://support.example.com';
 const bundle = JSON.parse(await readFile(new URL('../src/app-bundle.json', import.meta.url)));
@@ -22,7 +23,7 @@ function fixture() {
   const registry = { idFromName: n => n, get: () => ({ fetch: async () => Response.json({ sessions: [] }) }) };
   const session = new Session(ctx, { REGISTRY: registry });
   const req = (path, body, key = '') => session.fetch(new Request(`https://do${path}`, { method: 'POST', headers: { 'X-Attach-Key': key }, body: JSON.stringify(body) }));
-  const env = { DEV_SKIP_ACCESS: '1', REGISTRY: registry, SESSION: { idFromName: () => SID, idFromString: () => SID, get: () => ({ fetch: (r, opts) => session.fetch(typeof r === 'string' ? new Request(r, opts) : r) }) } };
+  const env = { DEV_SKIP_ACCESS: '1', DB: openD1(), REGISTRY: registry, SESSION: { idFromName: () => SID, idFromString: () => SID, get: () => ({ fetch: (r, opts) => session.fetch(typeof r === 'string' ? new Request(r, opts) : r) }) } };
   return { session, values, logs, req, env };
 }
 
