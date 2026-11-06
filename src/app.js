@@ -6,6 +6,7 @@ import { verifyAccessJwt, importRsaJwk, localBypassAllowed, callerIdentity } fro
 import { handleRpc, parseToolOptions } from './mcp.js';
 import { permissionForTool } from './permissions.js';
 import { DEFAULT_WORKSPACE, teamFromEnv } from './workspace.js';
+import { registryName } from './registry.js';
 import { handleApi } from './api.js';
 import {
   buildAppDownload,
@@ -128,11 +129,11 @@ function appPage(url, state = 'pending', sid = '', expiredStatus = 410) {
 }
 
 // ---- MCP backend: each tool talks to the DOs -------------------------------
-// Every operator call names its workspace, and the Session answers a call from
-// another workspace as it answers for a session that does not exist.
-const WORKSPACE = DEFAULT_WORKSPACE;
-
-function makeBackend(env, origin, devTtlMs, actor) {
+// Every operator call names its workspace, which comes from the address the
+// request arrived on (/mcp is default, /w/<slug>/mcp is that workspace). The
+// Session answers a call from another workspace as it answers for a session
+// that does not exist.
+function makeBackend(env, origin, devTtlMs, actor, workspace) {
   const sessionStub = (sid) => {
     if (sid === undefined || sid === null || sid === '') throw new Error('session_id is required; call session_list to find it');
     if (!/^[0-9a-f]{64}$/.test(String(sid))) throw new Error('session_id must be the 64 hex characters from session_create or session_list');
@@ -141,7 +142,7 @@ function makeBackend(env, origin, devTtlMs, actor) {
   async function cmd(sid, body) {
     const r = await sessionStub(sid).fetch('https://do/command', {
       method: 'POST',
-      body: JSON.stringify({ ...body, actor, workspace: WORKSPACE }),
+      body: JSON.stringify({ ...body, actor, workspace }),
     });
     return r.json();
   }
@@ -153,7 +154,7 @@ function makeBackend(env, origin, devTtlMs, actor) {
       const sid = id.toString();
       const r = await env.SESSION.get(id).fetch('https://do/create', {
         method: 'POST',
-        body: JSON.stringify({ code, sid, label: args.label ?? null, windows_mode: windowsMode, ttl_ms: devTtlMs, actor, workspace: WORKSPACE }),
+        body: JSON.stringify({ code, sid, label: args.label ?? null, windows_mode: windowsMode, ttl_ms: devTtlMs, actor, workspace }),
       });
       const out = await r.json();
       if (!out.ok) throw new Error(out.error || 'session_create failed');
@@ -174,13 +175,13 @@ function makeBackend(env, origin, devTtlMs, actor) {
           };
     },
     async session_list() {
-      const r = await env.REGISTRY.get(env.REGISTRY.idFromName('registry')).fetch('https://do/list');
+      const r = await env.REGISTRY.get(env.REGISTRY.idFromName(registryName(workspace))).fetch('https://do/list');
       const { sessions } = await r.json();
       return { sessions };
     },
     async session_status(args) {
       const tail = args.log_tail == null ? 20 : args.log_tail;
-      const r = await sessionStub(args.session_id).fetch(`https://do/status?log_tail=${encodeURIComponent(tail)}&workspace=${WORKSPACE}`);
+      const r = await sessionStub(args.session_id).fetch(`https://do/status?log_tail=${encodeURIComponent(tail)}&workspace=${workspace}`);
       return r.json();
     },
     async run(args) {
@@ -219,7 +220,7 @@ function makeBackend(env, origin, devTtlMs, actor) {
     async session_end(args) {
       const r = await sessionStub(args.session_id).fetch('https://do/end', {
         method: 'POST',
-        body: JSON.stringify({ actor, workspace: WORKSPACE }),
+        body: JSON.stringify({ actor, workspace }),
       });
       return r.json();
     },
@@ -230,11 +231,15 @@ function makeBackend(env, origin, devTtlMs, actor) {
 // method, and each method first checks that the caller's role holds the
 // permission the called tool needs. It is given only that permission key, never
 // the tool's arguments, and a refused call never reaches a Session.
-function authorizedBackend(backend, env, actor, toolName) {
+function authorizedBackend(backend, env, actor, toolName, workspace) {
   const check = async () => {
     const permission = permissionForTool(toolName);
     if (!permission) throw new Error(`unknown tool: ${toolName}`);
-    const a = await teamFromEnv(env).authorize(WORKSPACE, actor, permission);
+    const team = teamFromEnv(env);
+    // A workspace that was never created answers every tool call the same way,
+    // whoever asks. tools/list never gets here.
+    if (!(await team.workspaceExists(workspace))) throw new Error('workspace not found');
+    const a = await team.authorize(workspace, actor, permission);
     if (a.ok) return;
     throw new Error(a.reason === 'not_member' ? 'you are not a member of this team' : `your role does not allow ${permission}`);
   };
@@ -269,6 +274,7 @@ function isJsonContentType(request) {
 }
 
 // ---- routes ----------------------------------------------------------------
+const WORKSPACE_MCP = /^\/w\/([a-z0-9-]{1,40})\/mcp$/;
 const isLoopback = (hostname) => hostname === 'localhost' || hostname === '127.0.0.1';
 
 // `irm` sends WindowsPowerShell/5.1.x (Windows PowerShell) or PowerShell/7.x.
@@ -410,7 +416,7 @@ function handleWs(request, env, url) {
   return env.SESSION.get(id).fetch(new Request(`https://do/ws?sid=${sid}`, request));
 }
 
-async function handleMcp(request, env, url, origin, devTtlMs) {
+async function handleMcp(request, env, url, origin, devTtlMs, workspace = DEFAULT_WORKSPACE) {
   // CSRF: the Access app also admits a browser identity (cookie). MCP clients
   // never send Origin; browsers always do on cross-origin POST. Refuse it, and
   // require a JSON content type (a form post cannot set one without CORS).
@@ -435,7 +441,7 @@ async function handleMcp(request, env, url, origin, devTtlMs) {
   // Roles are checked on tools/call only. tools/list, initialize and ping never
   // touch the team database.
   const toolName = msg && msg.method === 'tools/call' && msg.params ? msg.params.name : undefined;
-  const backend = authorizedBackend(makeBackend(env, origin, devTtlMs, actor), env, actor, toolName);
+  const backend = authorizedBackend(makeBackend(env, origin, devTtlMs, actor, workspace), env, actor, toolName, workspace);
   const { status, body } = await handleRpc(msg, backend, options);
   if (body === null) return new Response(null, { status });
   return json(body, status);
@@ -457,6 +463,12 @@ export function createHandler(agentText, appBundle = null) {
       if (p === '/agent') return handleAgent(request, env, url);
       if (p === '/ws') return handleWs(request, env, url);
       if (p === '/mcp') return handleMcp(request, env, url, origin, devTtlMs);
+      // /w/<slug>/mcp is the same endpoint for another workspace. A slug that is
+      // not well formed is an unknown route; a well-formed one that was never
+      // created is answered per tool call, so tools/list stays static.
+      // default has one address, /mcp, so /w/default/mcp is unknown too.
+      const wm = WORKSPACE_MCP.exec(p);
+      if (wm && wm[1] !== DEFAULT_WORKSPACE) return handleMcp(request, env, url, origin, devTtlMs, wm[1]);
       if (p === '/api' || p.startsWith('/api/')) return handleApi(request, env, url, { accessCaller, isJsonContentType });
       return new Response('not found', { status: 404 });
     },

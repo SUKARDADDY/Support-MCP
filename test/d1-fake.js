@@ -7,9 +7,12 @@
 // one, like a second Worker instance. Every handle records the SQL and the
 // bound values it ran in `seen`, and counts its failed batches in `failedBatches`.
 import { DatabaseSync } from 'node:sqlite';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 
-const MIGRATION = readFileSync(new URL('../migrations/0001_team.sql', import.meta.url), 'utf8');
+// Every .sql file in migrations/, in name order, as `wrangler d1 migrations apply` runs them.
+const MIGRATIONS_DIR = new URL('../migrations/', import.meta.url);
+const MIGRATIONS = readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith('.sql')).sort()
+  .map((f) => readFileSync(new URL(f, MIGRATIONS_DIR), 'utf8'));
 const tick = () => new Promise((r) => setImmediate(r));
 const plain = (row) => (row ? { ...row } : row);
 
@@ -66,6 +69,6 @@ export function handle(sqlite, seen = []) {
 
 export function openD1() {
   const sqlite = new DatabaseSync(':memory:');
-  sqlite.exec(MIGRATION);
+  for (const sql of MIGRATIONS) sqlite.exec(sql);
   return handle(sqlite);
 }

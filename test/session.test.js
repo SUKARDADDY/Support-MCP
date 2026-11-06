@@ -35,8 +35,10 @@ function fixture(t) {
   };
   // The next registry push waits for registryHold.release(), if one is armed.
   let registryHold = null;
+  // The Registry object name of every push, in order.
+  const registryNames = [];
   const env = { REGISTRY: {
-    idFromName: (name) => name,
+    idFromName: (name) => { registryNames.push(name); return name; },
     get: () => ({ fetch: async () => {
       const hold = registryHold;
       registryHold = null;
@@ -58,6 +60,7 @@ function fixture(t) {
     values,
     logs,
     sockets,
+    registryNames,
     fakeSocket,
     holdRegistry: () => {
       let release;
@@ -500,4 +503,42 @@ test('the download page still loads for a session in another workspace, without 
   assert.equal(page.status, 200);
   assert.match(await page.text(), /Download the support app/);
   assert.equal(f.values.get('state'), 'pending');
+});
+
+// ---- one Registry object per workspace ------------------------------------------
+test('a session pushes to its own workspace\'s Registry object on every change', async (t) => {
+  stubUpgrade(t);
+  const f = fixture(t);
+  assert.equal((await createIn(f, { workspace: 'team-b' })).status, 200);
+  const key = (await (await f.fetch('/consume')).json()).key;
+  assert.equal((await f.fetch('/ws', upgrade(key))).status, 101);
+  assert.equal((await f.fetch('/end', { method: 'POST', body: JSON.stringify({ workspace: 'team-b' }) })).status, 200);
+  // Create, consume, first attach and end each push, and every push goes to the same object.
+  assert.ok(f.registryNames.length >= 3);
+  assert.deepEqual([...new Set(f.registryNames)], ['registry:team-b']);
+  assert.equal(f.values.get('state'), 'ended');
+});
+
+test('default and a session with no stored workspace push to the original Registry object', async (t) => {
+  const f = fixture(t);
+  assert.equal((await createIn(f)).status, 200);
+  assert.deepEqual(f.registryNames, ['registry'], 'no workspace named is default');
+  // A session made before workspaces has no workspace value at all.
+  const g = fixture(t);
+  assert.equal((await createIn(g, { workspace: 'default' })).status, 200);
+  g.values.delete('workspace');
+  await g.session.pushRegistry();
+  assert.deepEqual(g.registryNames, ['registry', 'registry']);
+  const h = fixture(t);
+  await createIn(h, { workspace: 'team-b' });
+  await h.session.setMany({ workspace: 'default' });
+  await h.session.pushRegistry();
+  assert.deepEqual(h.registryNames, ['registry:team-b', 'registry']);
+});
+
+test('the Registry name: default and nothing keep the old object, any other workspace gets its own', async () => {
+  const { registryName } = await import('../src/registry.js');
+  assert.deepEqual([undefined, null, '', 'default'].map(registryName), ['registry', 'registry', 'registry', 'registry']);
+  assert.equal(registryName('team-b'), 'registry:team-b');
+  assert.notEqual(registryName('team-b'), registryName('team-c'));
 });

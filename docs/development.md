@@ -223,7 +223,7 @@ with the `routes` line removed. Over plain http the relay serves only
 ### Teams locally
 
 `wrangler dev` gives the Worker a local D1 database for the `DB` binding. Apply
-the migration to it once with
+the migrations to it once with
 `npx wrangler d1 migrations apply support-mcp --local`, and again after any
 change to `migrations/`. Without the tables, every MCP tool call fails with a
 D1 error and the team API answers 500.
@@ -243,11 +243,16 @@ member. To see a refusal, change `local-dev`'s role instead: add a second admin
 `PATCH /api/v1/w/default/members/local-dev` and `{"role_id":"viewer"}`. A `run`
 over MCP then returns `your role does not allow sessions.control`. The download
 page at `/j/<code>?client=app` loads whatever the roles, because it never
-checks them. To start over, delete `.wrangler/state` and apply the migration
+checks them. To start over, delete `.wrangler/state` and apply the migrations
 again.
 
+To try a second workspace, set `DEPLOYMENT_ADMINS=local-dev` in `.dev.vars`,
+create it with `POST /api/v1/w` and `{"slug":"acme","name":"Acme"}`, and point
+the MCP client at `/w/acme/mcp`. `local-dev` is its admin.
+
 `test/workspace.test.js` and `test/api.test.js` run the team code on a D1
-stand-in built on `node:sqlite` (`test/d1-fake.js`), with the migration applied.
+stand-in built on `node:sqlite` (`test/d1-fake.js`), with every file in
+`migrations/` applied in name order.
 It yields before every statement like a network round trip, and its `batch()`
 is one transaction, so the concurrency tests race the way Workers do.
 `node:sqlite` prints an ExperimentalWarning on Node 22; that is expected.

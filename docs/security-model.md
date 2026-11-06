@@ -253,16 +253,24 @@ apply to only one client say which.
   goes into a single-quoted literal. The script runs inside `& { ... }` so
   nothing leaks into the customer's console session. The values appended to the
   app are checked the same way before they are written as JSON.
-- **The operator endpoints sit behind Cloudflare Access.** `/mcp` and the team
-  API under `/api/` both check the Access JWT in the relay itself: RS256
+- **The operator endpoints sit behind Cloudflare Access.** `/mcp`, `/w/<slug>/mcp`
+  and the team API under `/api/` all check the Access JWT in the relay itself: RS256
   signature, `aud`, `iss`, `exp` and `nbf` with 60 seconds of skew. It caches
   signing keys for an hour and allows at most one forced refetch per minute
   when it sees an unknown `kid`. Requests carrying an `Origin` header get a 403
   and non-JSON bodies (every team API write) get a 415, which blocks cross-site
   requests from a logged-in browser. All of these refusals come before the relay
   reads any session or team data.
-- **Each tool call is checked against the caller's role.** The relay keeps one
-  team workspace, `default`, with its members and their roles in a D1 database.
+- **Each tool call is checked against the caller's role.** The relay keeps the
+  `default` workspace and any number of created ones, each with its own members
+  and roles in a D1 database. The workspace is the address the call arrived on:
+  `/mcp` is `default` and `/w/<slug>/mcp` is that workspace. A slug that was
+  never created answers every tool call with `workspace not found`, whoever
+  asks, and a malformed one is a 404, as is `/w/default/mcp`. A caller Access
+  admits can tell a created slug from one that was never created: the first
+  answers "you are not a member of this team" (403 `not_member` on the API),
+  the second "workspace not found" (404). A slug's name is not treated as a
+  secret.
   A member is an identity from the Access JWT: a person's email, or a service
   token's client id. Identities are compared trimmed and lowercased. One table
   in `src/permissions.js` maps every MCP tool to the permission it needs, and a
@@ -292,7 +300,17 @@ apply to only one client say which.
   widened, the actor demoted)
   can't slip a change through. A refusal is a 403 `forbidden` and writes no log
   row.
-- **The team is open until its first member.** With no members, every caller
+- **Only deployment admins create workspaces, and each starts with its admin.**
+  `POST /api/v1/w` is refused with 409 `no_deployment_admins` while
+  `DEPLOYMENT_ADMINS` is empty, and with 403 for an identity not listed in it.
+  One batch writes the workspace, its first admin (the caller) and the first two
+  log rows, so a created workspace never exists without an admin. Its slug is the
+  table's primary key, so two creations of one slug cannot both land.
+- **Only `default` is ever open.** The next bullet describes open mode. It
+  applies to `default` alone. A created workspace that somehow has no members is
+  closed: nobody holds any permission, and nobody can add themselves as its first
+  admin.
+- **The `default` team is open until its first member.** With no members, every caller
   Access admits holds the session permissions (`sessions.create`,
   `sessions.view`, `sessions.control`, `sessions.end`), as before teams existed,
   and the relay records who called so an admin can add them. It writes a
@@ -315,7 +333,10 @@ apply to only one client say which.
   created it, and operator calls name their workspace. A call from another
   workspace gets the same answer as a session that does not exist. A session
   stored without one counts as `default`. The download page, the code and the
-  app's own connection name no workspace and are not checked.
+  app's own connection name no workspace and are not checked. Each workspace
+  also has its own Registry object, so `session_list` shows only the caller's
+  sessions. `default` keeps the original object, so sessions made before
+  workspaces existed stay in its list.
 - **Team changes go in a chained log.** Every change to members and roles writes
   one row with a number, the time, the actor, the kind and the detail. Each row's
   hash is SHA-256 over the previous row's hash and its own fields, so an edit,

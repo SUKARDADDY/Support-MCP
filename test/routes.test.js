@@ -81,6 +81,60 @@ test('GET /mcp => 405', async () => {
   assert.equal(r.status, 405);
 });
 
+// ---- /w/<slug>/mcp -----------------------------------------------------------------
+// The same endpoint as /mcp for another workspace. The env here has no database
+// and traps every Durable Object, so each answer below came before any of them.
+const WORKSPACE_MCP = ['/w/acme/mcp', '/w/a/mcp', `/w/${'a'.repeat(40)}/mcp`, '/w/0-9/mcp'];
+
+test('/w/<slug>/mcp refuses Origin, then non-POST, then non-JSON, before any credential check', async () => {
+  for (const path of WORKSPACE_MCP) {
+    const send = (init, e = env, base = PROD) => handler.fetch(new Request(`${base}${path}`, init), e);
+    const json = { 'content-type': 'application/json' };
+    // Origin comes first, whatever else is wrong, and under the localhost bypass too.
+    for (const init of [{ method: 'POST', headers: { ...json, origin: 'https://evil.example' }, body: rpc }, { method: 'GET', headers: { origin: 'https://evil.example' } },
+      { method: 'POST', headers: { origin: 'https://evil.example', 'content-type': 'text/plain' }, body: rpc }]) {
+      assert.equal((await send(init)).status, 403, `${path} ${init.method}`);
+      assert.equal((await send(init, { ...env, DEV_SKIP_ACCESS: '1' }, 'http://127.0.0.1:8787')).status, 403, `${path} bypass`);
+    }
+    // Then the method, even with the wrong content type.
+    for (const method of ['GET', 'PUT', 'DELETE', 'PATCH']) {
+      const r = await send({ method, headers: { 'content-type': 'text/plain' } });
+      assert.equal(r.status, 405, `${path} ${method}`);
+      assert.equal(r.headers.get('allow'), 'POST');
+    }
+    // Then the content type, with no credential sent at all.
+    for (const ct of ['text/plain', 'application/x-www-form-urlencoded', 'multipart/form-data; boundary=x', null]) {
+      const r = await send({ method: 'POST', headers: ct ? { 'content-type': ct } : {}, body: rpc });
+      assert.equal(r.status, 415, `${path} ${ct}`);
+    }
+    // Only then the credential: none, and a malformed one, are 403.
+    assert.equal((await send({ method: 'POST', headers: json, body: rpc })).status, 403);
+    assert.equal((await send({ method: 'POST', headers: { ...json, 'cf-access-jwt-assertion': 'not.a.jwt' }, body: rpc })).status, 403);
+  }
+});
+
+test('/w/<slug>/mcp lists the same 22 tools as /mcp for any well-formed slug, with no database or Durable Object', async () => {
+  const local = { ...env, DEV_SKIP_ACCESS: '1' };
+  const list = async (path) => (await (await handler.fetch(new Request(`http://127.0.0.1:8787${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: rpc }), local)).json()).result.tools;
+  const base = await list('/mcp');
+  assert.equal(base.length, 22);
+  for (const path of WORKSPACE_MCP) assert.deepEqual(await list(path), base, path);
+});
+
+test('a malformed workspace address is an unknown route, and the other paths are unchanged', async () => {
+  const bad = ['/w/Acme/mcp', '/w//mcp', '/w/a_b/mcp', '/w/a%20b/mcp', `/w/${'a'.repeat(41)}/mcp`, '/w/acme/mcp/', '/w/acme/mcp/x', '/w/acme', '/w/acme/', '/w', '/w/', '/w/a/b/mcp', '/ww/acme/mcp', '/mcp/', '/W/acme/mcp', '/w/default/mcp'];
+  for (const path of bad) {
+    for (const init of [{ method: 'POST', headers: { 'content-type': 'application/json' }, body: rpc }, { method: 'GET' }]) {
+      const r = await handler.fetch(new Request(`${PROD}${path}`, init), env);
+      assert.equal(r.status, 404, `${init.method} ${path}`);
+    }
+  }
+  // /ws and /j still answer as before, and neither is a workspace route.
+  assert.equal((await handler.fetch(new Request(`${PROD}/ws?sid=nope`), env)).status, 401);
+  assert.equal((await handler.fetch(new Request(`${PROD}/j/abcdefghijklmnop`, { method: 'PUT' }), env)).status, 405);
+  assert.equal((await handler.fetch(new Request(`${PROD}/healthz`), env)).status, 200);
+});
+
 test('/j with a non-GET method => 405 and the code is not consumed', async () => {
   for (const method of ['HEAD', 'POST', 'PUT', 'DELETE']) {
     const r = await handler.fetch(new Request(`${PROD}/j/abcdefghijklmnop`, { method }), env);

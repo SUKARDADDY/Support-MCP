@@ -1,6 +1,12 @@
-// Registry Durable Object: single instance idFromName("registry").
-// Holds one row per session so session_list is a single read (Session DOs push
-// snapshots on every state change).
+// Registry Durable Object: one instance per workspace. Holds one row per
+// session so session_list is a single read (Session DOs push snapshots on every
+// state change). The default workspace keeps idFromName("registry"), so sessions
+// made before workspaces existed stay in its list. Any other workspace uses
+// idFromName("registry:<slug>").
+
+// The Registry object name for a workspace. A session with no workspace stored
+// (made before workspaces) counts as default.
+export const registryName = (workspace) => (workspace && workspace !== 'default' ? `registry:${workspace}` : 'registry');
 
 export class Registry {
   constructor(ctx, env) {

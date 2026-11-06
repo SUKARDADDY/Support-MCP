@@ -23,6 +23,7 @@
 // workspace gets exactly the answer for a session that does not exist. Calls
 // that name none (the download page, consume, the app) skip the check.
 
+import { registryName } from './registry.js';
 import {
   LANES, auditText, decodeCaps, decodeControl, decodeControlResult, decodePollReport,
   decodeScreenResult, normalizeAction,
@@ -99,10 +100,12 @@ export class Session {
 
   async pushRegistry() {
     const s = await this.ctx.storage.get([
-      'code', 'sid', 'label', 'state', 'machine', 'user', 'expires_at', 'created_at',
+      'code', 'sid', 'label', 'state', 'machine', 'user', 'expires_at', 'created_at', 'workspace',
     ]);
     try {
-      await this.env.REGISTRY.get(this.env.REGISTRY.idFromName('registry')).fetch(
+      // The session reports to its own workspace's Registry object.
+      const registry = this.env.REGISTRY.idFromName(registryName(s.get('workspace') ?? DEFAULT_WORKSPACE));
+      await this.env.REGISTRY.get(registry).fetch(
         'https://do/update',
         {
           method: 'POST',
