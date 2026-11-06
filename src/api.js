@@ -1,11 +1,15 @@
 // The team API: members, roles and the team log of a workspace, under
-// /api/v1/w/<slug>/... PR 1 has one workspace, "default". The gate is the same
+// /api/v1/w/<slug>/..., plus POST and GET /api/v1/w to create a workspace and
+// list the caller's. "default" always exists; any other slug exists once it has
+// been created, and anything else is 404 before a permission is looked at. The
+// gate is the same
 // as /mcp and runs before any database access: an Origin header is refused, a
 // write must be JSON, and Cloudflare Access must admit the caller. Team
 // management is never an MCP tool, so text on a customer's screen can't make an
 // agent add a member.
-import { DEFAULT_WORKSPACE, TeamError, teamFromEnv } from './workspace.js';
+import { TeamError, teamFromEnv } from './workspace.js';
 
+const ROOT = '/api/v1/w';
 const PREFIX = '/api/v1/w/';
 const BODY_MAX = 16384;
 const AUDIT_LIMIT_MAX = 500;
@@ -68,11 +72,17 @@ export async function handleApi(request, env, url, { accessCaller, isJsonContent
   if (!caller) return fail(403, 'forbidden', 'Cloudflare Access did not admit this request');
 
   try {
+    if (url.pathname === ROOT) {
+      if (method === 'GET') return json({ workspaces: await teamFromEnv(env).listWorkspaces(caller) });
+      if (method === 'POST') return json({ workspace: await teamFromEnv(env).createWorkspace(caller, await readBody(request)) }, 201);
+      return notAllowed('GET, POST');
+    }
     if (!url.pathname.startsWith(PREFIX)) throw new TeamError(404, 'not_found', 'not found');
     const [slug, collection, item, ...extra] = url.pathname.slice(PREFIX.length).split('/');
-    if (slug !== DEFAULT_WORKSPACE) throw new TeamError(404, 'not_found', 'no such workspace');
-    if (extra.length || item === '') throw new TeamError(404, 'not_found', 'not found');
     const team = teamFromEnv(env);
+    // A slug that was never created, or is malformed, is 404 for everyone.
+    if (!(await team.workspaceExists(slug))) throw new TeamError(404, 'not_found', 'no such workspace');
+    if (extra.length || item === '') throw new TeamError(404, 'not_found', 'not found');
 
     if (collection === undefined) {
       if (method !== 'GET') return notAllowed('GET');

@@ -15,20 +15,23 @@ enabled = true
 # Your Zero Trust team domain and the AUD tag of the Access app guarding /mcp.
 ACCESS_TEAM_DOMAIN = "REPLACE_ME.cloudflareaccess.com"
 ACCESS_AUD = "REPLACE_ME"
-# Comma-separated identities (emails or service token client ids) allowed to
-# add the team's first member. Empty: any caller Access admits may, as admin.
+# Comma-separated identities (emails or service token client ids). They alone
+# may create workspaces (POST /api/v1/w), and with this empty nobody can. They
+# are also the only ones who may add the default workspace's first member; if
+# empty, any caller Access admits may, as admin.
 DEPLOYMENT_ADMINS = ""
 
 # Team data: members, roles and the team log, one shared database with every
 # row keyed by workspace. Create it with `wrangler d1 create support-mcp`, put
-# its id here, then `wrangler d1 migrations apply support-mcp --remote`.
+# its id here, then `wrangler d1 migrations apply support-mcp --remote`. That
+# runs every file in migrations/ in name order.
 [[d1_databases]]
 binding = "DB"
 database_name = "support-mcp"
 database_id = "REPLACE_ME"
 migrations_dir = "migrations"
 
-# Durable Objects: one Session per pairing code, one shared Registry.
+# Durable Objects: one Session per pairing code, one Registry per workspace.
 [[durable_objects.bindings]]
 name = "SESSION"
 class_name = "Session"

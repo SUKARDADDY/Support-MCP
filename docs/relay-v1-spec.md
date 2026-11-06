@@ -33,7 +33,8 @@ refuses the other mode's transport (`/ws` for an `app` session, `/agent` for a
   removes brute force. Still single use, 10 min TTL.
 - **The MCP server is the Worker itself** (`POST /mcp`, streamable-HTTP JSON
   responses). No local wrapper process. Claude Code connects with the Access
-  service-token headers.
+  service-token headers. `/mcp` serves the `default` workspace, and
+  `/w/<slug>/mcp` serves any other, through the same handler.
 
 ## Components
 
@@ -43,11 +44,11 @@ refuses the other mode's transport (`/ws` for an `app` session, `/agent` for a
 | `src/app.js` | router, Access gate, MCP JSON-RPC handler, download page (pure: no `.ps1` import or DO classes, so `node --test` can drive routes) |
 | `src/session.js` | `Session` Durable Object (SQLite-backed), one per session |
 | `src/screen.js` | the screen vocabulary: lanes, the normalized actions, their audit text, and the strict check of every app result field (pure, shared by `mcp.js` and `session.js`) |
-| `src/registry.js` | `Registry` Durable Object, single instance `idFromName("registry")`, lists sessions |
+| `src/registry.js` | `Registry` Durable Object, one instance per workspace: `idFromName("registry")` for `default` and `idFromName("registry:<slug>")` for any other. Lists that workspace's sessions |
 | `src/permissions.js` | the permission keys, the built-in roles, and the permission each MCP tool needs (pure data) |
 | `src/workspace.js` | team data in D1: members, roles, recent callers, the chained team log and `authorize`. All team SQL is here, and every query filters by workspace |
-| `src/api.js` | the team API under `/api/v1/w/<slug>/` |
-| `migrations/0001_team.sql` | the D1 tables `members`, `roles`, `callers` and `audit`, each keyed by workspace first |
+| `src/api.js` | the team API under `/api/v1/w/<slug>/`, plus `POST` and `GET /api/v1/w` |
+| `migrations/0001_team.sql`, `migrations/0002_workspaces.sql` | the D1 tables `members`, `roles`, `callers` and `audit`, each keyed by workspace first; then `workspaces` (one row per workspace other than `default`) and the index `members_by_identity`. `wrangler d1 migrations apply` runs them in name order, and so does `test/d1-fake.js` |
 | `src/agent.ps1` | PowerShell agent template (imported as text, placeholders substituted) |
 | `src/agent-app.cs`, `src/agent-app.manifest` | the Windows app: .NET Framework 4 source (WPF window) and an `asInvoker` manifest |
 | `src/app-bundle.json` | the compiled x86 app plus the SHA-256 of its source and manifest, built by `scripts/build-app.ps1` and checked by tests |
@@ -59,7 +60,9 @@ refuses the other mode's transport (`/ws` for an `app` session, `/agent` for a
 needs SQLite-backed DOs), `[[rules]] type="Text" globs=["**/*.ps1"]`, and
 `[vars] ACCESS_TEAM_DOMAIN="<team>.cloudflareaccess.com"`,
 `ACCESS_AUD="<Access app AUD tag>"`, `DEPLOYMENT_ADMINS=""` (comma-separated
-identities allowed to add the first member; empty allows any), and
+identities allowed to add `default`'s first member and to create workspaces;
+empty lets any caller add `default`'s first member and lets nobody create a
+workspace), and
 `[[d1_databases]] binding="DB" database_name="support-mcp" database_id="<id>"
 migrations_dir="migrations"`. There is no Durable Object migration for teams. Keep the custom-domain route. Free plan: 10 ms CPU per request, so no heavy
 work in the request path; use the WebSocket Hibernation API
@@ -74,8 +77,10 @@ work in the request path; use the WebSocket Hibernation API
 | `GET /j/<code>?client=app` | public | The downloaded app. `legacy` is an alias for `app`; any other `client` value → 404. **https only**: over plain `http:` on any host except `localhost` / `127.0.0.1` → 403 `text/plain`, code **not** consumed. `GET` serves the download page (200 `text/html`, `Cache-Control: no-store`, `Referrer-Policy: same-origin`, a CSP with `default-src 'none'` and `form-action 'self'`) and **never consumes the code**, however often the page is opened or refreshed. Only a `POST` from the page's button consumes it. If the request has an `Origin` header it must equal the relay's own origin exactly. If it has none (IE11 on Windows 7 can omit it on a same-origin form POST), its `Referer` must start with `<origin>/j/`, which the page's `Referrer-Policy: same-origin` keeps on the click. A foreign `Origin`, a foreign or missing `Referer` without an `Origin`, or neither header → 403, code unused. A first valid `POST` returns 200 `application/octet-stream` with `Content-Disposition: attachment; filename="remote-support-<sid8>.exe"`: the compiled app followed by the session configuration (below). The code is single use: a repeat after the download shows "Check your downloads" (409), an expired or ended one shows "This support link has expired" (410). A code made for a `powershell` session shows the expired page and stays unused. `HEAD` and every other method → 405 (`Allow: GET, POST`). |
 | `POST /agent?sid=<sid>` + `X-Attach-Key: <key>` | attach key | The app's transport, JSON in and out; below. 403 over plain `http:` on any host except `localhost` / `127.0.0.1`, 403 on any `Origin` header or a `key` query param, 405 on other methods, 415 on a non-JSON body, 413 over 750,000 characters (checked against `Content-Length` before the body is read, and again after it is read when there is no `Content-Length`), 401 on a bad sid, bad key, a `powershell` session or a session that is still `pending`, 409 on a stale generation, 410 when the session has ended. |
 | `GET /ws?sid=<sid>` + `X-Attach-Key: <key>` | attach key | WebSocket upgrade for the agent; 403 over plain `http:` on any host except `localhost` / `127.0.0.1`; 401 on bad/missing key, on a `key` query param, on a bad sid, or on an `app` session; 410 if session ended/expired |
-| `POST /mcp` | Access JWT | MCP JSON-RPC 2.0. `tools/call` checks the caller's role first (below) |
-| `/api/v1/w/default/...` | Access JWT | the team API (below) |
+| `POST /mcp` | Access JWT | MCP JSON-RPC 2.0 for the `default` workspace. `tools/call` checks the caller's role first (below) |
+| `POST /w/<slug>/mcp` | Access JWT | the same endpoint for workspace `<slug>` (`[a-z0-9-]{1,40}`). Any other shape of path is 404 |
+| `/api/v1/w/<slug>/...` | Access JWT | the team API (below) |
+| `POST /api/v1/w`, `GET /api/v1/w` | Access JWT | create a workspace, list yours (below) |
 | anything else | — | 404 |
 
 `<sid>` = the Session DO's hex id (`idFromName(code)`); the code is the DO name.
@@ -107,9 +112,9 @@ missing. The relay enforces the 2 h limit itself, whatever the app does. The
 reply. The app uses their difference, counted on its own clock, and shows "Ends
 by itself" as the PC's own clock plus that remaining time.
 
-## Access check (`/mcp`)
+## Access check (`/mcp` and `/w/<slug>/mcp`)
 
-`/mcp` accepts **POST only** (else 405, `Allow: POST`). Because the Access app
+Both addresses run one handler, in this order, so the checks below are the same on both. Each accepts **POST only** (else 405, `Allow: POST`). Because the Access app
 also admits a browser (cookie) identity, guard against CSRF first, before the
 Access check:
 
@@ -136,11 +141,16 @@ The session's own log keeps it as sent, in the `[identity] detail` form.
 ### Role check (`tools/call`)
 
 `initialize`, `ping`, `tools/list` and every refusal above never read team
-data. On `tools/call` for a listed tool, after the `session_id` check, the relay
+data, so `tools/list` answers the same 22 tools on any well-formed
+`/w/<slug>/mcp`, created or not, without touching D1 or a Durable Object. On
+`tools/call` for a listed tool, after the `session_id` check, the relay checks
+that the workspace exists (`default` always does; any other slug needs a row in
+`workspaces`, else the tool error `workspace not found`, whoever asks). It then
 looks up the tool's permission in `src/permissions.js` and asks
-`authorize("default", identity, permission)` before the tool's backend runs.
-The identity is trimmed and lowercased. `authorize` gets only the permission
-key, never the tool's arguments.
+`authorize(<workspace>, identity, permission)` before the tool's backend runs.
+The workspace comes from the address the request arrived on. The identity is
+trimmed and lowercased. `authorize` gets only the permission key, never the
+tool's arguments.
 
 | Tool | Permission |
 |---|---|
@@ -149,25 +159,33 @@ key, never the tool's arguments.
 | `session_end` | `sessions.end` |
 | every other tool | `sessions.control` |
 
-- No members in the workspace (open): allowed, and the caller is recorded in
-  `callers` with the time.
+- No members in `default` (open): allowed, and the caller is recorded in
+  `callers` with the time. Open mode is `default`'s alone. A created workspace
+  with no members, which the rules never produce, is closed: every caller gets
+  `you are not a member of this team`.
 - Not a member: tool error `you are not a member of this team`.
 - A member whose role lacks the permission: tool error
   `your role does not allow <permission>`.
 - No `DB` binding: tool error `the team database (DB) is not configured`.
 
 A refusal is a tool error (`isError`), and nothing reaches a Session.
-`session_create` sends `workspace: "default"` to `/create`, and the operator
+`session_create` sends `workspace: "<slug>"` to `/create`, and the operator
 calls send it to `/command` and `/end` in the body and to `/status` as
-`?workspace=default`. The Session stores `workspace` at create (default
+`?workspace=<slug>`. The Session stores `workspace` at create (default
 `default`; anything but `[a-z0-9-]{1,40}` is a 400). When an operator call names
 a workspace other than the stored one (a session with none stored counts as
 `default`), the Session answers exactly as for a session that does not exist:
 `/status` gives `state: "unknown"` with every other field empty, `/command`
 gives `{ok:false, error:"session ended"}`, `/end` gives `{ended:true}`, and
 nothing changes. Calls that name no workspace (the download page's `/status`,
-`/consume`, `/agent`, `/ws`) skip the check. `session_list` still reads the
-Registry, unchanged.
+`/consume`, `/agent`, `/ws`) skip the check.
+
+`session_list` reads the Registry object of the caller's workspace:
+`idFromName("registry")` for `default` and `idFromName("registry:<slug>")` for
+any other. A Session reads its stored workspace in `pushRegistry` and pushes to
+that object, so sessions made before workspaces existed (no workspace stored)
+stay in `default`'s list. The push order, and accepting the socket before the
+first-attach push, are unchanged.
 
 ## Team API (`/api/v1/w/<slug>`)
 
@@ -175,14 +193,18 @@ The same gate as `/mcp`, before any database access: an `Origin` header → 403
 `{"error":{"code":"forbidden",...}}` (also under the local bypass); `POST`,
 `PATCH` and `DELETE` need `Content-Type: application/json` → else 415
 `unsupported_media_type`; methods other than `GET`, `POST`, `PATCH`, `DELETE` →
-405; then the Access JWT, failure → 403 `forbidden`. Only the slug `default`
-exists; any other path is 404 `not_found`. Bodies are JSON objects of at most
+405; then the Access JWT, failure → 403 `forbidden`. The slug `default`
+always exists. Any other slug exists once it has a row in `workspaces`. A slug
+that does not, or is malformed, is 404 `not_found` before any permission is
+looked at, and so is any other unknown path. Bodies are JSON objects of at most
 16,384 characters. Every answer is JSON with `Cache-Control: no-store`, and every
 error is `{"error":{"code","message"}}`.
 
 | Route | Needs | Body | Answer |
 |---|---|---|---|
-| `GET /api/v1/w/default` | any member, anyone while open | | `{workspace:{slug,open}, me:{identity,role_id,permissions}, recent_callers?}`; `recent_callers` (`[{identity,last_seen,kind}]`, newest first, at most 50) only while open; `role_id` is `null` while open |
+| `POST /api/v1/w` | a deployment admin | `{slug, name}` | 201 `{workspace:{slug,name,role_id:"admin",created_by,created_at}}`. One batch writes the `workspaces` row, the caller as an admin member, and the log rows `workspace_created` then `member_added`. `slug` matches `[a-z0-9-]{1,40}` and is not `default`; `name` is 1 to 100 characters. With `DEPLOYMENT_ADMINS` empty: 409 `no_deployment_admins`. A caller not listed: 403 `forbidden`. A taken slug, and `default`: 409 `workspace_exists` |
+| `GET /api/v1/w` | any caller | | `{workspaces:[{slug,name,role_id}]}`: `default` first when it is open (`role_id` is `null`, as in `me`) or the caller is a member of it, then the other workspaces the caller is a member of, by slug. `default`'s name is `Default` |
+| `GET /api/v1/w/<slug>` | any member, anyone while open | | `{workspace:{slug,open}, me:{identity,role_id,permissions}, recent_callers?}`; `recent_callers` (`[{identity,last_seen,kind}]`, newest first, at most 50) only while open; `role_id` is `null` while open |
 | `GET .../members` | `members.manage` | | `{members:[{identity,kind,name,role_id,added_at,added_by}]}` |
 | `POST .../members` | `members.manage` | `{identity, name?, role_id}` | 201 `{member}` |
 | `PATCH .../members/<identity>` | `members.manage` | `{name?, role_id?}` | `{member}` |
@@ -208,10 +230,12 @@ edited `technician` or `viewer`, and a deleted one keeps a row with `deleted = 1
 | 400 | `bad_request` | a body that is not a JSON object, a bad identity, name, role id, permission list (an unknown key) or query value, a `PATCH` with no field |
 | 400 | `unknown_role` | a member given a role that does not exist |
 | 403 | `forbidden` | `Origin` header, Access refused, or a team change that breaks the escalation rules below |
-| 403 | `not_member` | the workspace has members and the caller is not one |
+| 403 | `not_member` | the workspace has members and the caller is not one, or a created workspace has none |
 | 403 | `permission_denied` | the caller's role lacks the route's permission |
-| 404 | `not_found` | another slug, an unknown path, member or role |
-| 409 | `first_member` | the first member is not the caller as `admin`, or `DEPLOYMENT_ADMINS` is set and the caller is not in it; or any other team write while the workspace has no members |
+| 404 | `not_found` | a slug that was not created or is malformed, an unknown path, member or role |
+| 409 | `no_deployment_admins` | `POST /api/v1/w` while `DEPLOYMENT_ADMINS` is empty |
+| 409 | `workspace_exists` | `POST /api/v1/w` with a slug that is taken, or `default` |
+| 409 | `first_member` | in `default`: the first member is not the caller as `admin`, or `DEPLOYMENT_ADMINS` is set and the caller is not in it; or any other team write while it has no members |
 | 409 | `member_exists`, `role_exists` | already there |
 | 409 | `last_admin` | removing or demoting the last admin |
 | 409 | `role_fixed` | creating, editing or deleting `admin` |
@@ -219,7 +243,11 @@ edited `technician` or `viewer`, and a deleted one keeps a row with `deleted = 1
 | 409 | `role_missing` | changing a member whose role no longer exists, other than giving them a role that exists (an admin can also remove them) |
 | 503 | `busy` | six tries in a row lost the race to another change (`Retry-After: 1`) |
 
-While the workspace has no members, every caller holds only the four
+Open mode and the first-member rule below apply to `default` only. A created
+workspace starts with its admin. If it ever has no members, it is closed: no
+caller holds any permission, and every route that needs one is 403 `not_member`.
+
+While `default` has no members, every caller holds only the four
 `sessions.*` permissions, so `authorize` for those is as before teams existed.
 `GET .../` and `GET .../roles` answer anyone; `GET .../members` and
 `GET .../audit` are 403. Every write except adding the first member is 409
@@ -670,7 +698,7 @@ text content item, not JSON-RPC errors.
 | Tool | Args | Returns (text content, JSON) |
 |---|---|---|
 | `session_create` | `label?` string, `windows_mode?` (`app` default, `powershell`; deprecated aliases `legacy`, `standard`) | `app`: `{session_id, windows_mode, download_url, one_liner, code_expires_at}` with `download_url` = `<origin>/j/<code>?client=app` and one-liner = `Start-Process '<download_url>'`. `powershell`: `{session_id, windows_mode, one_liner, code_expires_at}` with one-liner = `irm <origin>/j/<code> \| iex`. An unknown mode is a tool error and creates nothing. |
-| `session_list` | — | sessions from Registry with state + expires_at + machine |
+| `session_list` | — | sessions from the caller's workspace's Registry with state + expires_at + machine |
 | `session_status` | `session_id`, `log_tail?` (default 20) | state, `windows_mode` (`app` or `powershell`), machine, user, expires_at, startup_expires_at, attached now?, `client_version` (the `agent` string of the last hello), last log rows; `app` sessions add `elevated` (`true`, `false`, or `null` when the app did not report it), `control` (`full`, `normal` or `null`), `caps` (array), `desktop` (`default`, `secure`, `unknown` or `null`), `paused_until` and `input_blocked_until` (Unix ms while in the future, else `null`) |
 | `run` | `session_id`, `command`, `timeout_s?`, `as?` (`user` default; `system` needs full control and is refused otherwise) | exit_code (null if timed out), stdout, stderr, timed_out |
 | `put_file` | `session_id`, `path`, `data_b64`, `append?` | bytes |

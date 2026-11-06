@@ -70,7 +70,22 @@ function relay(extra = {}) {
     }), env);
     return (await r.json()).result;
   };
-  return { env, calls, handler, api, tool };
+  // The same calls for any workspace: the team API under /api/v1/w/<slug>, the
+  // workspace list and creation at /api/v1/w, and an MCP tool on /w/<slug>/mcp.
+  const apiAt = async (slug, who, method, path, body) => {
+    const headers = { 'cf-access-jwt-assertion': await as(who) };
+    if (method !== 'GET') headers['content-type'] = 'application/json';
+    const r = await handler.fetch(new Request(`${HOST}/api/v1/w${slug === null ? '' : `/${slug}`}${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) }), env);
+    return { status: r.status, body: await r.json() };
+  };
+  const toolAt = async (slug, who, name, args = {}) => {
+    const r = await handler.fetch(new Request(`${HOST}/w/${slug}/mcp`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'cf-access-jwt-assertion': await as(who) },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }),
+    }), env);
+    return (await r.json()).result;
+  };
+  return { env, calls, handler, api, tool, apiAt, toolAt };
 }
 
 const BOSS = 'boss@example.com';
@@ -114,7 +129,7 @@ test('the API gate refuses Origin, non-JSON writes and a failed Access check bef
   assert.equal(res.status, 405);
 });
 
-test('only the default workspace exists, and unknown routes are 404', async () => {
+test('unknown routes are 404, and so is a workspace that was not created', async () => {
   const r = relay();
   for (const path of ['/api/v1/w/other', '/api/v1/w/other/members', '/api/v1/w/Default', '/api/v1/w/', '/api/v2/w/default', '/api', '/api/v1/w/default/nope', '/api/v1/w/default/members/a/b', '/api/v1/w/default/audit/1']) {
     const res = await r.handler.fetch(new Request(`${HOST}${path}`, { headers: { 'cf-access-jwt-assertion': await as(BOSS) } }), r.env);
@@ -570,4 +585,190 @@ test('with DEPLOYMENT_ADMINS set, another caller cannot edit the roles before th
   const roles = (await r.api('owner@example.com', 'GET', '/roles')).body.roles;
   assert.deepEqual(roles.map((x) => x.id), ['admin', 'technician', 'viewer']);
   assert.deepEqual(roles.find((x) => x.id === 'viewer').permissions, ['sessions.view', 'audit.view']);
+});
+
+// ---- more workspaces ----------------------------------------------------------------
+const OWNER = 'owner@example.com';
+const created = async (extra = {}) => {
+  const r = relay({ DEPLOYMENT_ADMINS: `${OWNER}, ${BOT}`, ...extra });
+  const made = await r.apiAt(null, OWNER, 'POST', '', { slug: 'acme', name: 'Acme Support' });
+  assert.equal(made.status, 201, JSON.stringify(made.body));
+  return r;
+};
+
+test('POST /api/v1/w creates a workspace and makes the caller its admin, with two log rows', async () => {
+  const r = relay({ DEPLOYMENT_ADMINS: ` ${OWNER.toUpperCase()} ` });
+  const made = await r.apiAt(null, OWNER, 'POST', '', { slug: 'acme', name: 'Acme Support' });
+  assert.equal(made.status, 201);
+  assert.deepEqual({ ...made.body.workspace, created_at: 0 }, { slug: 'acme', name: 'Acme Support', role_id: 'admin', created_by: OWNER, created_at: 0 });
+  const page = await r.apiAt('acme', OWNER, 'GET', '');
+  assert.deepEqual(page.body, { workspace: { slug: 'acme', open: false }, me: { identity: OWNER, role_id: 'admin', permissions: PERMISSIONS } });
+  const log = await r.apiAt('acme', OWNER, 'GET', '/audit?verify=full');
+  assert.deepEqual([log.body.rows.map((x) => [x.seq, x.kind, x.actor, x.detail]), log.body.verified], [
+    [[1, 'workspace_created', OWNER, 'named "Acme Support"'], [2, 'member_added', OWNER, `${OWNER} as admin`]], true]);
+  assert.deepEqual((await r.apiAt('acme', OWNER, 'GET', '/members')).body.members.map((m) => [m.identity, m.role_id]), [[OWNER, 'admin']]);
+  // Default is not touched: still open, with an empty log.
+  assert.equal((await r.api(OWNER, 'GET', '')).body.workspace.open, true);
+});
+
+test('creating a workspace is refused without deployment admins, for anyone not listed, and for bad input', async () => {
+  const none = relay({ DEPLOYMENT_ADMINS: '' });
+  for (const who of [OWNER, BOT]) {
+    const res = await none.apiAt(null, who, 'POST', '', { slug: 'acme', name: 'Acme' });
+    assert.deepEqual([res.status, res.body.error.code], [409, 'no_deployment_admins']);
+  }
+  const r = relay({ DEPLOYMENT_ADMINS: OWNER });
+  const denied = await r.apiAt(null, 'mallory@example.com', 'POST', '', { slug: 'acme', name: 'Acme' });
+  assert.deepEqual([denied.status, denied.body.error.code], [403, 'forbidden']);
+  // Not even an admin of default may, unless listed.
+  await r.api(OWNER, 'POST', '/members', { identity: OWNER, role_id: 'admin' });
+  await r.api(OWNER, 'POST', '/members', { identity: BOSS, role_id: 'admin' });
+  assert.equal((await r.apiAt(null, BOSS, 'POST', '', { slug: 'acme', name: 'Acme' })).status, 403);
+  for (const body of [{}, { slug: 'acme' }, { name: 'Acme' }, { slug: 'Acme', name: 'A' }, { slug: 'a b', name: 'A' }, { slug: 'x'.repeat(41), name: 'A' }, { slug: 'acme', name: '' }, { slug: 'acme', name: 5 }, { slug: 5, name: 'A' }]) {
+    const res = await r.apiAt(null, OWNER, 'POST', '', body);
+    assert.deepEqual([res.status, res.body.error.code], [400, 'bad_request'], JSON.stringify(body));
+  }
+  assert.equal((await r.apiAt('acme', OWNER, 'GET', '')).status, 404, 'nothing was created');
+  // Writes to the collection need JSON, like every other write.
+  const headers = { 'cf-access-jwt-assertion': await as(OWNER), 'content-type': 'text/plain' };
+  assert.equal((await r.handler.fetch(new Request(`${HOST}/api/v1/w`, { method: 'POST', headers, body: '{}' }), r.env)).status, 415);
+  const put = await r.apiAt(null, OWNER, 'PUT', '', {});
+  assert.equal(put.status, 405);
+});
+
+test('default cannot be created and an existing slug is 409 workspace_exists', async () => {
+  const r = await created();
+  for (const slug of ['default', 'acme']) {
+    const res = await r.apiAt(null, OWNER, 'POST', '', { slug, name: 'Again' });
+    assert.deepEqual([res.status, res.body.error.code], [409, 'workspace_exists'], slug);
+  }
+  // Another deployment admin can't take it over either, and the owner stays admin.
+  const takeover = await r.apiAt(null, BOT, 'POST', '', { slug: 'acme', name: 'Mine' });
+  assert.deepEqual([takeover.status, takeover.body.error.code], [409, 'workspace_exists']);
+  assert.deepEqual((await r.apiAt('acme', OWNER, 'GET', '/members')).body.members.map((m) => m.identity), [OWNER]);
+  assert.equal((await r.apiAt('acme', BOT, 'GET', '')).status, 403, 'a would-be taker is no member');
+  assert.equal((await r.api(OWNER, 'GET', '')).body.workspace.open, true, 'default was not created or closed');
+});
+
+test('GET /api/v1/w lists the caller\'s workspaces, and default while it is open', async () => {
+  const r = await created();
+  await r.apiAt(null, OWNER, 'POST', '', { slug: 'beta', name: 'Beta' });
+  await r.apiAt('acme', OWNER, 'POST', '/members', { identity: 'tech@example.com', role_id: 'technician' });
+  const listOf = async (who) => (await r.apiAt(null, who, 'GET', '')).body;
+  assert.deepEqual(await listOf(OWNER), { workspaces: [
+    { slug: 'default', name: 'Default', role_id: null }, { slug: 'acme', name: 'Acme Support', role_id: 'admin' }, { slug: 'beta', name: 'Beta', role_id: 'admin' }] });
+  assert.deepEqual((await listOf('tech@example.com')).workspaces.map((w) => [w.slug, w.role_id]), [['default', null], ['acme', 'technician']]);
+  assert.equal((await r.apiAt(null, OWNER, 'GET', '')).status, 200);
+  // Once default has members, a stranger sees none of them and a member sees default with their role.
+  await r.api(OWNER, 'POST', '/members', { identity: OWNER, role_id: 'admin' });
+  await r.api(OWNER, 'POST', '/members', { identity: BOSS, role_id: 'viewer' });
+  assert.deepEqual(await listOf('tech@example.com'), { workspaces: [{ slug: 'acme', name: 'Acme Support', role_id: 'technician' }] });
+  assert.deepEqual((await listOf(BOSS)).workspaces, [{ slug: 'default', name: 'Default', role_id: 'viewer' }]);
+  assert.deepEqual((await listOf(OWNER)).workspaces.map((w) => [w.slug, w.role_id]), [['default', 'admin'], ['acme', 'admin'], ['beta', 'admin']]);
+  assert.deepEqual(await listOf('stranger@example.com'), { workspaces: [] });
+  // Same gate as the rest of the API: no Access, no list.
+  const res = await r.handler.fetch(new Request(`${HOST}/api/v1/w`), r.env);
+  assert.equal(res.status, 403);
+});
+
+test('a workspace that was not created is 404 on every API route, for everyone, before any permission is looked at', async () => {
+  const r = await created();
+  const trapped = { ...r.env, DB: new Proxy(r.env.DB, { get: (t, k) => (k === 'prepare' ? (sql) => { if (/FROM (members|roles|audit|callers)/.test(sql)) throw new Error(`team table read: ${sql}`); return t.prepare(sql); } : t[k]) }) };
+  const stranger = 'stranger@example.com';
+  const slugs = ['ghost', 'acme2', 'Acme', 'a_b', 'x'.repeat(41), '%20', 'a%2Fb', 'acme%00', '__proto__'];
+  for (const slug of slugs) {
+    for (const who of [OWNER, stranger]) {
+      for (const [method, path, body] of [['GET', ''], ['GET', '/members'], ['GET', '/roles'], ['GET', '/audit'], ['POST', '/members', { identity: who, role_id: 'admin' }], ['POST', '/roles', { id: 'x', permissions: [] }], ['PATCH', `/members/${who}`, { name: 'x' }], ['DELETE', `/members/${who}`]]) {
+        const headers = { 'cf-access-jwt-assertion': await as(who), ...(method === 'GET' ? {} : { 'content-type': 'application/json' }) };
+        const res = await r.handler.fetch(new Request(`${HOST}/api/v1/w/${slug}${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) }), trapped);
+        assert.equal(res.status, 404, `${method} ${slug}${path} as ${who}`);
+        assert.deepEqual((await res.json()).error, { code: 'not_found', message: 'no such workspace' });
+      }
+    }
+  }
+  // A stranger in a created workspace is told they are not a member, which a missing one never says.
+  assert.equal((await r.apiAt('acme', stranger, 'GET', '')).status, 403);
+});
+
+test('every team route works in a created workspace, apart from default', async () => {
+  const r = await created();
+  const put = (method, path, body, who = OWNER) => r.apiAt('acme', who, method, path, body);
+  const added = await put('POST', '/members', { identity: 'tech@example.com', name: 'Tess', role_id: 'technician' });
+  assert.equal(added.status, 201);
+  assert.equal((await put('POST', '/roles', { id: 'lead', name: 'Lead', permissions: ['sessions.view'] })).status, 201);
+  assert.equal((await put('PATCH', '/members/tech@example.com', { role_id: 'lead' })).body.member.role_id, 'lead');
+  assert.deepEqual((await put('GET', '/roles')).body.roles.map((x) => x.id), ['admin', 'technician', 'viewer', 'lead']);
+  assert.equal((await put('PATCH', '/roles/lead', { name: 'Leader' })).body.role.name, 'Leader');
+  assert.equal((await put('GET', '/members', undefined, 'tech@example.com')).status, 403, 'a lead holds no members.manage');
+  assert.equal((await put('DELETE', '/members/tech@example.com')).status, 200);
+  assert.equal((await put('DELETE', '/roles/lead')).status, 200);
+  const last = await put('DELETE', `/members/${OWNER}`);
+  assert.deepEqual([last.status, last.body.error.code], [409, 'last_admin']);
+  const log = await put('GET', '/audit?verify=full');
+  assert.equal(log.body.verified, true);
+  assert.deepEqual(log.body.rows.map((x) => x.kind), ['workspace_created', 'member_added', 'member_added', 'role_added', 'member_changed', 'role_changed', 'member_removed', 'role_removed']);
+  // None of it reached default.
+  assert.equal((await r.api(OWNER, 'GET', '')).body.workspace.open, true);
+});
+
+test('open mode and the first-admin rule are default\'s alone', async () => {
+  const r = await created();
+  // A stranger cannot make themselves the first admin of a created workspace, nor read it.
+  const grab = await r.apiAt('acme', BOSS, 'POST', '/members', { identity: BOSS, role_id: 'admin' });
+  assert.deepEqual([grab.status, grab.body.error.code], [403, 'not_member']);
+  assert.equal((await r.apiAt('acme', BOSS, 'GET', '')).status, 403);
+  assert.equal((await r.apiAt('acme', BOSS, 'GET', '/roles')).status, 403, 'the role list is not open to anyone');
+  refused(await r.toolAt('acme', BOSS, 'session_list'), 'you are not a member of this team');
+  assert.deepEqual(r.calls, []);
+  // Even with every member gone, the workspace stays closed instead of opening.
+  r.env.DB.sqlite.exec("DELETE FROM members WHERE workspace = 'acme'");
+  for (const [method, path, body] of [['GET', ''], ['GET', '/roles'], ['GET', '/members'], ['POST', '/members', { identity: OWNER, role_id: 'admin' }], ['POST', '/roles', { id: 'x', permissions: [] }], ['DELETE', '/members/a@example.com']]) {
+    const res = await r.apiAt('acme', OWNER, method, path, body);
+    assert.deepEqual([res.status, res.body.error.code], [403, 'not_member'], `${method} ${path}`);
+  }
+  refused(await r.toolAt('acme', OWNER, 'run', { session_id: SID, command: 'whoami' }), 'you are not a member of this team');
+  refused(await r.toolAt('acme', OWNER, 'session_create'), 'you are not a member of this team');
+  assert.deepEqual(r.calls, [], 'nothing reached a session');
+  assert.equal(await r.env.DB.prepare("SELECT COUNT(*) AS n FROM callers WHERE workspace = 'acme'").first('n'), 0);
+  // Default is still open, and still wants its first admin to add themselves.
+  const page = await r.api(BOSS, 'GET', '');
+  assert.equal(page.body.workspace.open, true);
+  assert.equal((await r.api(BOSS, 'POST', '/members', { identity: OWNER, role_id: 'admin' })).body.error.code, 'first_member');
+});
+
+test('Access logins and service tokens work as members on /w/<slug>/mcp, and not as strangers', async () => {
+  const r = await created();
+  await r.apiAt('acme', OWNER, 'POST', '/members', { identity: BOT, name: 'Claude Code', role_id: 'technician' });
+  await r.apiAt('acme', OWNER, 'POST', '/members', { identity: 'viewer@example.com', role_id: 'viewer' });
+  // A person on an Access login, and a service token, each run a command as members.
+  for (const who of [OWNER, BOT]) {
+    const out = await r.toolAt('acme', who, 'run', { session_id: SID, command: 'whoami' });
+    assert.ok(!out.isError, out.content[0].text);
+    assert.equal(JSON.parse(out.content[0].text).stdout, 'done');
+  }
+  const actors = r.calls.filter((c) => c.path === '/command').map((c) => [c.body.actor, c.body.workspace]);
+  assert.deepEqual(actors, [[OWNER, 'acme'], [BOT, 'acme']], 'the audit actor is the member, and the Session is told the workspace');
+  refused(await r.toolAt('acme', 'viewer@example.com', 'run', { session_id: SID, command: 'x' }), 'your role does not allow sessions.control');
+  refused(await r.toolAt('acme', 'stranger@example.com', 'session_list'), 'you are not a member of this team');
+  refused(await r.toolAt('acme', 'ffff9999.access', 'session_list'), 'you are not a member of this team');
+  // The same members are strangers to a workspace they were not added to.
+  await r.apiAt(null, OWNER, 'POST', '', { slug: 'beta', name: 'Beta' });
+  refused(await r.toolAt('beta', BOT, 'session_list'), 'you are not a member of this team');
+  // A workspace that was not created: a tool error, even for a deployment admin.
+  refused(await r.toolAt('ghost', OWNER, 'session_list'), 'workspace not found');
+  // And /mcp is still default: open, so the stranger holds the sessions permissions there.
+  assert.ok(!(await r.tool('stranger@example.com', 'session_list')).isError);
+});
+
+test('session_create in a workspace tells the Session its workspace, and session_list reads that workspace\'s Registry', async () => {
+  const names = [];
+  const r = await created();
+  r.env.REGISTRY = { idFromName: (n) => { names.push(n); return n; }, get: () => ({ fetch: async () => Response.json({ sessions: [] }) }) };
+  await r.apiAt(null, OWNER, 'POST', '', { slug: 'beta', name: 'Beta' });
+  assert.ok(!(await r.toolAt('acme', OWNER, 'session_create')).isError);
+  assert.equal(r.calls.find((c) => c.path === '/create').body.workspace, 'acme');
+  await r.toolAt('acme', OWNER, 'session_list');
+  await r.toolAt('beta', OWNER, 'session_list');
+  await r.tool(OWNER, 'session_list');
+  assert.deepEqual(names, ['registry:acme', 'registry:beta', 'registry']);
 });

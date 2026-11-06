@@ -3,6 +3,12 @@
 // Every store method takes the workspace slug first, and every query filters by
 // it, so one workspace never reads another's rows.
 //
+// "default" always exists and is never a row in `workspaces`. It is the only
+// workspace with an open mode (no members yet: any caller admitted holds the
+// sessions.* permissions, and the first admin adds themselves). Any other
+// workspace is created with its first admin in one batch, and if it ever has
+// no members it is closed: nobody holds any permission.
+//
 // A change is: read the log head, check the rules, compute the next log row,
 // then one DB.batch([log insert, change]). The log insert carries the rule
 // check in its WHERE clause, and the change runs only if that log row went in,
@@ -16,6 +22,7 @@ import {
 export const DEFAULT_WORKSPACE = 'default';
 export const GENESIS_HASH = '0'.repeat(64);
 const SLUG_RE = /^[a-z0-9-]{1,40}$/;
+const DEFAULT_NAME = 'Default';
 const MAX_RETRIES = 5;
 const RECENT_CALLERS = 50;
 // An open-mode caller's last_seen is written at most this often.
@@ -102,7 +109,8 @@ function validPermissions(v) {
 }
 
 // The store for one D1 database. opts.deploymentAdmins is DEPLOYMENT_ADMINS:
-// when set, only those identities may add a workspace's first member.
+// when set, only those identities may add the default workspace's first member.
+// Only those identities may create a workspace, and with none named nobody may.
 export function teamStore(db, { deploymentAdmins = '' } = {}) {
   if (!db || typeof db.prepare !== 'function') throw new TeamError(503, 'no_database', 'the team database (DB) is not configured');
   const admins = parseDeploymentAdmins(deploymentAdmins);
@@ -249,7 +257,7 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
   }
 
   // Is `identity` allowed `permission` in this workspace? Given only the
-  // permission key, never a tool's arguments. While the workspace is open, a
+  // permission key, never a tool's arguments. While default is open, a
   // caller holds the sessions.* permissions and nothing that changes the team
   // (reason 'open').
   async function authorize(slug, identity, permission) {
@@ -259,6 +267,8 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
     const row = await q(`SELECT (SELECT role_id FROM members WHERE workspace = ? AND identity = ?) AS role_id,
       EXISTS (SELECT 1 FROM members WHERE workspace = ?) AS any_member`, slug, id, slug).first();
     if (!row.any_member) {
+      // Only default is ever open. Any other workspace with no members is closed.
+      if (slug !== DEFAULT_WORKSPACE) return { ok: false, open: false, role_id: null, reason: 'not_member' };
       if (!OPEN_PERMISSIONS.includes(permission)) return { ok: false, open: true, role_id: null, reason: 'open' };
       await recordCaller(slug, id);
       return { ok: true, open: true, role_id: null };
@@ -268,19 +278,42 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
     return ok ? { ok, open: false, role_id: row.role_id } : { ok, open: false, role_id: row.role_id, reason: 'permission' };
   }
 
-  // The caller's place in the workspace: open (no members yet, the sessions.*
-  // permissions only), or a member's role and permissions, or not a member
-  // (role_id null, no permissions).
+  // The caller's place in the workspace: open (default with no members yet, the
+  // sessions.* permissions only), or a member's role and permissions, or not a
+  // member (role_id null, no permissions). A created workspace is never open.
   async function whoami(slug, identity) {
     checkSlug(slug);
     const id = normalizeIdentity(identity);
     if ((await memberCount(slug)) === 0) {
+      if (slug !== DEFAULT_WORKSPACE) return { identity: id, open: false, member: false, role_id: null, permissions: [] };
       await recordCaller(slug, id);
       return { identity: id, open: true, member: false, role_id: null, permissions: [...OPEN_PERMISSIONS] };
     }
     const m = await getMember(slug, id);
     if (!m) return { identity: id, open: false, member: false, role_id: null, permissions: [] };
     return { identity: id, open: false, member: true, role_id: m.role_id, permissions: await permissionsOf(slug, m.role_id) };
+  }
+
+  // ---- workspaces ------------------------------------------------------------
+  // default always exists. Any other slug exists once it has been created.
+  async function workspaceExists(slug) {
+    if (slug === DEFAULT_WORKSPACE) return true;
+    if (typeof slug !== 'string' || !SLUG_RE.test(slug)) return false;
+    return (await q('SELECT 1 AS found FROM workspaces WHERE slug = ?', slug).first('found')) === 1;
+  }
+
+  // The workspaces this identity is a member of, by slug, and default first
+  // when it is open (role_id null, as in whoami) or the caller is a member of it.
+  async function listWorkspaces(identity) {
+    const id = normalizeIdentity(identity);
+    const { results } = await q(`SELECT w.slug, w.name, m.role_id FROM members m JOIN workspaces w ON w.slug = m.workspace
+      WHERE m.identity = ? ORDER BY w.slug`, id).all();
+    const out = results.map((r) => ({ slug: r.slug, name: r.name, role_id: r.role_id }));
+    const d = await q(`SELECT (SELECT role_id FROM members WHERE workspace = ? AND identity = ?) AS role_id,
+      EXISTS (SELECT 1 FROM members WHERE workspace = ?) AS any_member`, DEFAULT_WORKSPACE, id, DEFAULT_WORKSPACE).first();
+    if (!d.any_member) out.unshift({ slug: DEFAULT_WORKSPACE, name: DEFAULT_NAME, role_id: null });
+    else if (d.role_id !== null && d.role_id !== undefined) out.unshift({ slug: DEFAULT_WORKSPACE, name: DEFAULT_NAME, role_id: d.role_id });
+    return out;
   }
 
   // ---- the log ---------------------------------------------------------------
@@ -387,11 +420,12 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
   }
 
   // The actor's role, read for a team change. Throws unless the actor is a
-  // member whose role holds `permission`. While the workspace is open nothing
+  // member whose role holds `permission`. While default is open nothing
   // that changes the team is allowed except adding the first member, which
-  // does not come through here.
+  // does not come through here. A created workspace with no members is closed.
   async function actorContext(slug, actor, permission) {
     if ((await memberCount(slug)) === 0) {
+      if (slug !== DEFAULT_WORKSPACE) throw new TeamError(403, 'not_member', 'you are not a member of this team');
       throw new TeamError(409, 'first_member', 'add yourself as the first admin before changing the team');
     }
     const m = await getMember(slug, actor);
@@ -446,6 +480,9 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
     const roleId = validRoleId(body?.role_id);
     return mutate(slug, actor, async () => {
       const count = await memberCount(slug);
+      // Only default is ever open. A created workspace starts with its admin,
+      // so one with no members is closed and nobody can add to it.
+      if (count === 0 && slug !== DEFAULT_WORKSPACE) throw new TeamError(403, 'not_member', 'you are not a member of this team');
       // The first member turns roles on: it must be the caller, as admin, and
       // a deployment admin when DEPLOYMENT_ADMINS is set.
       const firstOk = count === 0 && identity === actor && roleId === ADMIN_ROLE && (admins.size === 0 || admins.has(actor));
@@ -581,6 +618,51 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
     });
   }
 
+  // ---- workspaces: create ----------------------------------------------------
+  // Only an identity in DEPLOYMENT_ADMINS may create a workspace, and with none
+  // named nobody may. One batch writes the workspace row, the caller as its
+  // admin, and the first two rows of its log: workspace_created, member_added.
+  // Creating default is refused as "already exists": it always does.
+  async function createWorkspace(actorIdentity, body) {
+    const actor = normalizeIdentity(actorIdentity);
+    if (admins.size === 0) {
+      throw new TeamError(409, 'no_deployment_admins', 'name who may create workspaces in DEPLOYMENT_ADMINS first');
+    }
+    if (!admins.has(actor)) throw forbidden('only an identity in DEPLOYMENT_ADMINS can create a workspace');
+    const slug = body?.slug;
+    if (typeof slug !== 'string' || !SLUG_RE.test(slug)) {
+      throw new TeamError(400, 'bad_request', 'slug must be 1 to 40 characters of a-z, 0-9 and -');
+    }
+    const name = validName(body?.name);
+    if (!name) throw new TeamError(400, 'bad_request', 'name is required');
+    return mutate(slug, actor, async () => {
+      // The members check is read time only. That is safe because nothing else
+      // writes members for a slug that was never created, and the log's unique
+      // key serialises two creations. Don't rely on the guard for it.
+      if ((await workspaceExists(slug)) || (await memberCount(slug)) > 0) {
+        throw new TeamError(409, 'workspace_exists', `workspace ${slug} already exists`);
+      }
+      const now = Date.now();
+      const member = { identity: actor, kind: identityKind(actor), name: null, role_id: ADMIN_ROLE, added_at: now, added_by: actor };
+      return {
+        entries: [
+          { kind: 'workspace_created', detail: `named ${JSON.stringify(name)}` },
+          { kind: 'member_added', detail: `${actor} as ${ADMIN_ROLE}` },
+        ],
+        // The slug is the table's primary key, so two creations of one slug can't
+        // both land. The member goes in first: the guard reads only `workspaces`,
+        // which the member insert leaves alone, and the row insert comes last.
+        guard: ['NOT EXISTS (SELECT 1 FROM workspaces WHERE slug = ?)', [slug]],
+        change: ([cond, params]) => [
+          q(`INSERT INTO members(workspace, identity, kind, name, role_id, added_at, added_by) SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${cond}`,
+            slug, member.identity, member.kind, member.name, member.role_id, member.added_at, member.added_by, ...params),
+          q(`INSERT INTO workspaces(slug, name, created_by, created_at) SELECT ?, ?, ?, ? WHERE ${cond}`, slug, name, actor, now, ...params),
+        ],
+        result: { slug, name, role_id: ADMIN_ROLE, created_by: actor, created_at: now },
+      };
+    });
+  }
+
   // ---- roles -----------------------------------------------------------------
   // Writes the role's row: an edit, a new role, or (deleted = 1) a removal.
   const upsertRole = (slug, role, deleted) => ([cond, params]) => [q(
@@ -676,6 +758,7 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
 
   return {
     authorize, whoami, recentCallers,
+    workspaceExists, listWorkspaces, createWorkspace,
     listMembers, getMember, addMember, updateMember, removeMember,
     listRoles, addRole, updateRole, removeRole,
     readAudit, verifyAudit,

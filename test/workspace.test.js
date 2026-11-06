@@ -1,11 +1,14 @@
 // Team data: the permission table, open mode, role checks on MCP tool calls,
 // the chained team log, and workspace separation. Runs on the node:sqlite D1
-// stand-in in test/d1-fake.js with migrations/0001_team.sql applied.
+// stand-in in test/d1-fake.js with every migration in migrations/ applied.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
 import { openD1, handle } from './d1-fake.js';
 import { listTools } from '../src/mcp.js';
 import { createHandler } from '../src/app.js';
+import { Session } from '../src/session.js';
+import { Registry } from '../src/registry.js';
 import { BUILTIN_ROLES, OPEN_PERMISSIONS, PERMISSIONS, normalizePermissions, permissionForTool } from '../src/permissions.js';
 import { GENESIS_HASH, TeamError, chainHash, teamStore } from '../src/workspace.js';
 
@@ -389,7 +392,7 @@ test('the rule check sits inside the changing SQL, so a change that lands after 
 test("another workspace's rows never appear in the default workspace", async () => {
   const db = openD1();
   const team = teamStore(db);
-  await team.addMember('other', 'eve@example.com', { identity: 'eve@example.com', role_id: 'admin' });
+  await teamStore(db, { deploymentAdmins: 'eve@example.com' }).createWorkspace('eve@example.com', { slug: 'other', name: 'Other' });
   await team.addMember('other', 'eve@example.com', { identity: 'mallory@example.com', role_id: 'technician' });
   await team.addRole('other', 'eve@example.com', { id: 'spy', permissions: ['sessions.view'] });
   await team.removeRole('other', 'eve@example.com', 'viewer');
@@ -747,4 +750,362 @@ test('retries stay bounded: a log number that is always lost ends as busy', asyn
   const team = teamStore(db);
   db.batch = async () => { throw new Error('D1_ERROR: UNIQUE constraint failed: audit.workspace, audit.seq: SQLITE_CONSTRAINT'); };
   await assert.rejects(team.addMember(W, 'boss@example.com', { identity: 'boss@example.com', role_id: 'admin' }), { status: 503, code: 'busy' });
+});
+
+// ---- creating workspaces --------------------------------------------------------
+const OWNER = 'owner@example.com';
+const ownerTeam = (db) => teamStore(db, { deploymentAdmins: OWNER });
+const workspaceRows = (db) => db.sqlite.prepare('SELECT slug, name, created_by FROM workspaces ORDER BY slug').all().map((r) => ({ ...r }));
+
+test('creating a workspace writes the row, the creator as admin and two log rows in one batch', async () => {
+  const db = openD1();
+  const team = ownerTeam(db);
+  const out = await team.createWorkspace(' Owner@Example.com ', { slug: 'acme', name: ' Acme Support ' });
+  assert.deepEqual({ ...out, created_at: 0 }, { slug: 'acme', name: 'Acme Support', role_id: 'admin', created_by: OWNER, created_at: 0 });
+  assert.deepEqual(workspaceRows(db), [{ slug: 'acme', name: 'Acme Support', created_by: OWNER }]);
+  assert.equal(db.failedBatches, 0);
+  const members = await team.listMembers('acme');
+  assert.deepEqual(members.map((m) => [m.identity, m.kind, m.role_id, m.added_by]), [[OWNER, 'person', 'admin', OWNER]]);
+  const log = await team.readAudit('acme', { full: true });
+  assert.deepEqual(log.rows.map((r) => [r.seq, r.kind, r.actor]), [[1, 'workspace_created', OWNER], [2, 'member_added', OWNER]]);
+  assert.equal(log.rows[1].detail, `${OWNER} as admin`);
+  assert.deepEqual([log.rows[0].prev_hash, log.rows[1].prev_hash], [GENESIS_HASH, log.rows[0].hash]);
+  assert.equal(log.verified, true);
+  // The creator holds every permission at once, and default's log is untouched.
+  for (const p of PERMISSIONS) assert.equal((await team.authorize('acme', OWNER, p)).ok, true, p);
+  assert.deepEqual((await team.readAudit(W)).rows, []);
+  // A service token can create one too.
+  const bot = teamStore(db, { deploymentAdmins: '0123abcd.access' });
+  assert.equal((await bot.createWorkspace('0123abcd.access', { slug: 'bots', name: 'Bots' })).role_id, 'admin');
+  assert.equal((await bot.getMember('bots', '0123abcd.access')).kind, 'service');
+});
+
+test('only a deployment admin can create a workspace, and with none named nobody can', async () => {
+  const db = openD1();
+  const body = { slug: 'acme', name: 'Acme' };
+  for (const named of ['', '  ', undefined]) {
+    await assert.rejects(teamStore(db, { deploymentAdmins: named }).createWorkspace(OWNER, body), { status: 409, code: 'no_deployment_admins' });
+  }
+  await assert.rejects(ownerTeam(db).createWorkspace('mallory@example.com', body), { status: 403, code: 'forbidden' });
+  // Being an admin of another workspace is not enough.
+  await ownerTeam(db).createWorkspace(OWNER, { slug: 'beta', name: 'Beta' });
+  await ownerTeam(db).addMember('beta', OWNER, { identity: 'lead@example.com', role_id: 'admin' });
+  await assert.rejects(ownerTeam(db).createWorkspace('lead@example.com', body), { status: 403, code: 'forbidden' });
+  assert.deepEqual(workspaceRows(db).map((r) => r.slug), ['beta'], 'a refusal writes nothing');
+  assert.equal(await db.prepare("SELECT COUNT(*) AS n FROM audit WHERE workspace = 'acme'").first('n'), 0);
+});
+
+test('a workspace needs a good slug and name; default is reserved; an existing slug is refused', async () => {
+  const db = openD1();
+  const team = ownerTeam(db);
+  for (const slug of [undefined, null, 5, '', 'Acme', 'a b', 'a_b', 'a/b', '..', 'x'.repeat(41), 'é']) {
+    await assert.rejects(team.createWorkspace(OWNER, { slug, name: 'N' }), { status: 400, code: 'bad_request' }, String(slug));
+  }
+  for (const name of [undefined, null, '', '   ', 5, 'x'.repeat(101), 'a\nb']) {
+    await assert.rejects(team.createWorkspace(OWNER, { slug: 'acme', name }), { status: 400, code: 'bad_request' }, String(name));
+  }
+  await assert.rejects(team.createWorkspace(OWNER, undefined), { status: 400, code: 'bad_request' });
+  await assert.rejects(team.createWorkspace(OWNER, { slug: 'default', name: 'Mine' }), { status: 409, code: 'workspace_exists' });
+  assert.deepEqual(workspaceRows(db), []);
+  assert.equal(await db.prepare('SELECT COUNT(*) AS n FROM members').first('n'), 0);
+  await team.createWorkspace(OWNER, { slug: 'a'.repeat(40), name: 'Longest slug' });
+  await team.createWorkspace(OWNER, { slug: '0-9', name: 'Digits and a hyphen' });
+  await team.createWorkspace(OWNER, { slug: 'acme', name: 'Acme' });
+  await assert.rejects(team.createWorkspace(OWNER, { slug: 'acme', name: 'Again' }), { status: 409, code: 'workspace_exists' });
+  assert.equal(workspaceRows(db).find((r) => r.slug === 'acme').name, 'Acme', 'the first creation stands');
+  assert.equal((await team.readAudit('acme')).rows.length, 2, 'the refused creation wrote no log row');
+});
+
+test('two creators racing for one slug: exactly one wins, and its log stays valid', async () => {
+  const first = openD1();
+  const a = ownerTeam(first);
+  const b = teamStore(handle(first.sqlite), { deploymentAdmins: 'other@example.com' });
+  const results = await Promise.allSettled([
+    a.createWorkspace(OWNER, { slug: 'acme', name: 'From owner' }),
+    b.createWorkspace('other@example.com', { slug: 'acme', name: 'From other' }),
+  ]);
+  assert.deepEqual(results.map((r) => r.status).sort(), ['fulfilled', 'rejected']);
+  assert.deepEqual(results.find((r) => r.status === 'rejected').reason.code, 'workspace_exists');
+  assert.equal(workspaceRows(first).length, 1);
+  assert.equal((await a.listMembers('acme')).length, 1, 'one admin, the winner');
+  const log = await a.readAudit('acme', { full: true });
+  assert.deepEqual([log.rows.map((r) => r.kind), log.verified], [['workspace_created', 'member_added'], true]);
+});
+
+test('a slug that was not created does not exist; default always does', async () => {
+  const db = openD1();
+  const team = ownerTeam(db);
+  await team.createWorkspace(OWNER, { slug: 'acme', name: 'Acme' });
+  assert.equal(await team.workspaceExists('default'), true);
+  assert.equal(await team.workspaceExists('acme'), true);
+  for (const slug of ['beta', 'Acme', '', 'a b', undefined, null, 5, 'x'.repeat(41), '__proto__']) {
+    assert.equal(await team.workspaceExists(slug), false, String(slug));
+  }
+});
+
+test('open mode is only for default: a created workspace with no members is closed', async () => {
+  const db = openD1();
+  const team = ownerTeam(db);
+  await team.createWorkspace(OWNER, { slug: 'acme', name: 'Acme' });
+  // Remove its members behind the store's back: the rules refuse that, so this is the "somehow" case.
+  db.sqlite.exec("DELETE FROM members WHERE workspace = 'acme'");
+  for (const p of PERMISSIONS) {
+    assert.deepEqual(await team.authorize('acme', 'anyone@example.com', p), { ok: false, open: false, role_id: null, reason: 'not_member' }, p);
+  }
+  assert.deepEqual(await team.whoami('acme', 'anyone@example.com'), { identity: 'anyone@example.com', open: false, member: false, role_id: null, permissions: [] });
+  // Nobody can claim the first admin seat, themselves or anyone else, and no caller is recorded.
+  for (const body of [{ identity: 'anyone@example.com', role_id: 'admin' }, { identity: 'anyone@example.com', role_id: 'viewer' }]) {
+    await assert.rejects(team.addMember('acme', 'anyone@example.com', body), { status: 403, code: 'not_member' });
+    await assert.rejects(ownerTeam(db).addMember('acme', OWNER, { identity: OWNER, role_id: 'admin' }), { status: 403, code: 'not_member' });
+  }
+  await assert.rejects(team.addRole('acme', 'anyone@example.com', { id: 'x', permissions: [] }), { status: 403, code: 'not_member' });
+  assert.deepEqual(await team.recentCallers('acme'), []);
+  assert.deepEqual(await team.listMembers('acme'), []);
+  // Default is still open.
+  assert.deepEqual(await team.authorize(W, 'anyone@example.com', 'sessions.view'), { ok: true, open: true, role_id: null });
+  // A slug that was never created is closed too.
+  assert.equal((await team.authorize('ghost', 'anyone@example.com', 'sessions.view')).reason, 'not_member');
+});
+
+test('listWorkspaces: the ones I am a member of, by role, and default while open or when I am in it', async () => {
+  const db = openD1();
+  const team = ownerTeam(db);
+  await team.createWorkspace(OWNER, { slug: 'beta', name: 'Beta' });
+  await team.createWorkspace(OWNER, { slug: 'acme', name: 'Acme' });
+  await team.addMember('acme', OWNER, { identity: 'Tech@Example.com', role_id: 'technician' });
+  // Default is open: everyone sees it, with no role.
+  assert.deepEqual(await team.listWorkspaces(' TECH@example.com '), [
+    { slug: 'default', name: 'Default', role_id: null }, { slug: 'acme', name: 'Acme', role_id: 'technician' },
+  ]);
+  assert.deepEqual(await team.listWorkspaces(OWNER), [
+    { slug: 'default', name: 'Default', role_id: null }, { slug: 'acme', name: 'Acme', role_id: 'admin' }, { slug: 'beta', name: 'Beta', role_id: 'admin' },
+  ]);
+  assert.deepEqual(await team.listWorkspaces('stranger@example.com'), [{ slug: 'default', name: 'Default', role_id: null }]);
+  // Once default has members, only its members see it, with their role.
+  await team.addMember(W, OWNER, { identity: OWNER, role_id: 'admin' });
+  assert.deepEqual(await team.listWorkspaces('stranger@example.com'), []);
+  assert.deepEqual(await team.listWorkspaces('tech@example.com'), [{ slug: 'acme', name: 'Acme', role_id: 'technician' }]);
+  assert.deepEqual((await team.listWorkspaces(OWNER)).map((w) => [w.slug, w.role_id]), [['default', 'admin'], ['acme', 'admin'], ['beta', 'admin']]);
+  // It reads members through the identity index, and writes nothing.
+  const read = db.seen.findLast((x) => x.sql.includes('JOIN workspaces'));
+  const plan = db.sqlite.prepare(`EXPLAIN QUERY PLAN ${read.sql}`).all(...read.params).map((r) => r.detail).join('\n');
+  assert.match(plan, /members_by_identity/);
+  assert.deepEqual(await team.recentCallers(W), []);
+});
+
+// ---- two workspaces, real Sessions and Registries ----------------------------------
+// One Durable Object namespace in memory: a real Session per id and a real
+// Registry per name, so what crosses between workspaces is what the code does.
+function registryObject() {
+  const sqlite = new DatabaseSync(':memory:');
+  const ctx = { storage: { sql: { exec(query, ...args) {
+    const st = sqlite.prepare(query);
+    if (/^\s*SELECT/i.test(query)) return { toArray: () => st.all(...args).map((r) => ({ ...r })) };
+    st.run(...args);
+    return { toArray: () => [] };
+  } } } };
+  return new Registry(ctx, {});
+}
+function sessionObject(registries) {
+  const values = new Map();
+  const logs = [];
+  const ctx = { getWebSockets: () => [], storage: {
+    get: async (k) => (Array.isArray(k) ? new Map(k.map((x) => [x, values.get(x)])) : values.get(k)),
+    put: async (o) => { for (const [k, v] of Object.entries(o)) values.set(k, v); },
+    setAlarm: async () => {}, deleteAlarm: async () => {},
+    sql: { exec(query, ...a) {
+      if (query.startsWith('INSERT INTO log')) logs.push({ ts: a[0], kind: a[1], detail: a[2] });
+      return { toArray: () => logs.slice().reverse() };
+    } },
+  } };
+  const env = { REGISTRY: registries.binding };
+  return { session: new Session(ctx, env), values };
+}
+function world() {
+  const registryByName = new Map();
+  const sessions = new Map();
+  const touched = [];
+  const registries = { binding: {
+    idFromName: (name) => ({ name }),
+    get: (id) => {
+      if (!registryByName.has(id.name)) registryByName.set(id.name, registryObject());
+      const reg = registryByName.get(id.name);
+      return { fetch: (u, init) => { touched.push(`${id.name} ${new URL(u).pathname}`); return reg.fetch(new Request(u, init)); } };
+    },
+  } };
+  const SESSION = {
+    idFromName: (code) => ({ toString: () => Buffer.from(code).toString('hex').padEnd(64, '0') }),
+    idFromString: (sid) => ({ toString: () => sid }),
+    get: (id) => {
+      const sid = id.toString();
+      if (!sessions.has(sid)) sessions.set(sid, sessionObject(registries));
+      return { fetch: (u, init) => sessions.get(sid).session.fetch(typeof u === 'string' ? new Request(u, init) : u) };
+    },
+  };
+  const db = openD1();
+  const env = { DEV_SKIP_ACCESS: '1', DEPLOYMENT_ADMINS: 'local-dev', DB: db, SESSION, REGISTRY: registries.binding };
+  return { env, db, sessions, registryByName, touched };
+}
+async function toolAt(env, path, name, args = {}) {
+  const r = await handler.fetch(new Request(`http://127.0.0.1:8787${path}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }),
+  }), env);
+  assert.equal(r.status, 200);
+  return (await r.json()).result;
+}
+const payload = (out) => JSON.parse(out.content[0].text);
+const WS_PATHS = { default: '/mcp', acme: '/w/acme/mcp', beta: '/w/beta/mcp' };
+
+// Every tool that takes a session, with arguments that pass its schema.
+const SESSION_TOOLS = {
+  session_status: {}, session_end: {}, run: { command: 'whoami' },
+  put_file: { path: 'C:\\x.txt', data_b64: 'eA==' }, get_file: { path: 'C:\\x.txt' },
+  screenshot: {}, click: { x: 1, y: 1 }, move_mouse: { x: 1, y: 1 }, drag: { x1: 1, y1: 1, x2: 2, y2: 2 },
+  scroll: { x: 1, y: 1, direction: 'down' }, type_text: { text: 'hi' }, press_key: { keys: 'enter' }, wait: {},
+  zoom: { x1: 0, y1: 0, x2: 10, y2: 10 }, ui_tree: {}, ui_act: { ref: 1, verb: 'invoke' },
+  block_input: { on: true }, send_sas: {}, type_secret: { text: 'hunter2-secret' }, request_full_control: {},
+};
+
+async function twoWorkspaces() {
+  const w = world();
+  const team = teamStore(w.db, { deploymentAdmins: 'local-dev' });
+  await team.createWorkspace('local-dev', { slug: 'acme', name: 'Acme' });
+  await team.createWorkspace('local-dev', { slug: 'beta', name: 'Beta' });
+  const sid = {};
+  for (const ws of Object.keys(WS_PATHS)) {
+    const out = await toolAt(w.env, WS_PATHS[ws], 'session_create', { label: ws });
+    assert.ok(!out.isError, out.content[0].text);
+    sid[ws] = payload(out).session_id;
+  }
+  // A session made before workspaces existed: no workspace stored, listed in the old Registry.
+  const code = 'legacycodelegacy';
+  const legacy = w.env.SESSION.idFromName(code).toString();
+  const made = await w.env.SESSION.get(w.env.SESSION.idFromName(code)).fetch('https://do/create', {
+    method: 'POST', body: JSON.stringify({ code, sid: legacy, label: 'legacy', windows_mode: 'app' }),
+  });
+  assert.equal(made.status, 200);
+  w.sessions.get(legacy).values.delete('workspace');
+  sid.legacy = legacy;
+  return { w, sid, team };
+}
+
+test('every tool that takes a session is separate per workspace; a session from another one answers as a missing session', async () => {
+  const { w, sid } = await twoWorkspaces();
+  const tools = listTools({ ui: true }).filter((t) => Object.hasOwn(t.inputSchema.properties, 'session_id')).map((t) => t.name);
+  assert.deepEqual([...tools].sort(), Object.keys(SESSION_TOOLS).sort(), 'a new session tool needs a line in SESSION_TOOLS');
+  const missing = 'f'.repeat(64);
+  // A session that does not exist answers the same way from any workspace.
+  const missingAnswer = async (ws, name, args) => toolAt(w.env, WS_PATHS[ws], name, { session_id: missing, ...args });
+  const owners = { default: [sid.default, sid.legacy], acme: [sid.acme], beta: [sid.beta] };
+  for (const [name, args] of Object.entries(SESSION_TOOLS)) {
+    if (name === 'session_end') continue; // last, because it ends the session
+    for (const ws of Object.keys(WS_PATHS)) {
+      const reference = await missingAnswer(ws === 'default' ? 'acme' : 'default', name, args);
+      for (const [owner, sids] of Object.entries(owners)) {
+        for (const s of sids) {
+          const out = await toolAt(w.env, WS_PATHS[ws], name, { session_id: s, ...args });
+          if (owner === ws) {
+            // Its own workspace sees the session. A pending one has no agent yet.
+            assert.notDeepEqual(out, reference, `${name} from ${ws} sees its own session`);
+          } else {
+            assert.deepEqual(out, reference, `${name} from ${ws} on a session of ${owner}`);
+          }
+        }
+      }
+    }
+  }
+});
+
+test('session_status shows a session only to its own workspace', async () => {
+  const { w, sid } = await twoWorkspaces();
+  for (const ws of Object.keys(WS_PATHS)) {
+    const st = payload(await toolAt(w.env, WS_PATHS[ws], 'session_status', { session_id: sid[ws] }));
+    assert.equal(st.state, 'pending', ws);
+    for (const other of Object.keys(WS_PATHS).filter((x) => x !== ws)) {
+      const seen = payload(await toolAt(w.env, WS_PATHS[other], 'session_status', { session_id: sid[ws] }));
+      assert.deepEqual(seen, payload(await toolAt(w.env, WS_PATHS[other], 'session_status', { session_id: 'e'.repeat(64) })), `${other} looking at ${ws}`);
+      assert.notEqual(seen.state, 'pending');
+    }
+  }
+  // The pre-2a session belongs to default, and only to default.
+  assert.equal(payload(await toolAt(w.env, '/mcp', 'session_status', { session_id: sid.legacy })).state, 'pending');
+  for (const ws of ['acme', 'beta']) {
+    assert.notEqual(payload(await toolAt(w.env, WS_PATHS[ws], 'session_status', { session_id: sid.legacy })).state, 'pending');
+  }
+});
+
+test('session_end from another workspace ends nothing, and from its own workspace ends the session', async () => {
+  const { w, sid } = await twoWorkspaces();
+  const state = async (ws, s) => payload(await toolAt(w.env, WS_PATHS[ws], 'session_status', { session_id: s })).state;
+  for (const [caller, target] of [['acme', 'beta'], ['beta', 'acme'], ['default', 'acme'], ['acme', 'default'], ['acme', 'legacy'], ['beta', 'legacy']]) {
+    assert.deepEqual(payload(await toolAt(w.env, WS_PATHS[caller], 'session_end', { session_id: sid[target] })), { ended: true });
+    assert.equal(await state(target === 'legacy' ? 'default' : target, sid[target]), 'pending', `${caller} ended nothing in ${target}`);
+  }
+  assert.deepEqual(payload(await toolAt(w.env, '/w/acme/mcp', 'session_end', { session_id: sid.acme })), { ended: true });
+  assert.equal(await state('acme', sid.acme), 'ended');
+  assert.equal(await state('beta', sid.beta), 'pending');
+});
+
+test('session_list reads only the caller\'s workspace; sessions from before workspaces are in default only', async () => {
+  const { w, sid } = await twoWorkspaces();
+  const listed = async (ws) => payload(await toolAt(w.env, WS_PATHS[ws], 'session_list')).sessions.map((x) => x.sid).sort();
+  assert.deepEqual(await listed('acme'), [sid.acme]);
+  assert.deepEqual(await listed('beta'), [sid.beta]);
+  assert.deepEqual(await listed('default'), [sid.default, sid.legacy].sort());
+  assert.deepEqual([...w.registryByName.keys()].sort(), ['registry', 'registry:acme', 'registry:beta']);
+  // A workspace with no sessions lists nothing, and does not make the others' rows appear.
+  await teamStore(w.db, { deploymentAdmins: 'local-dev' }).createWorkspace('local-dev', { slug: 'empty', name: 'Empty' });
+  assert.deepEqual(payload(await toolAt(w.env, '/w/empty/mcp', 'session_list')), { sessions: [] });
+  // Ending a session updates its own workspace's list only.
+  await toolAt(w.env, '/w/acme/mcp', 'session_end', { session_id: sid.acme });
+  const acme = payload(await toolAt(w.env, '/w/acme/mcp', 'session_list')).sessions;
+  assert.deepEqual(acme.map((x) => [x.sid, x.state]), [[sid.acme, 'ended']]);
+  assert.deepEqual(payload(await toolAt(w.env, '/w/beta/mcp', 'session_list')).sessions.map((x) => x.state), ['pending']);
+});
+
+test('a workspace that was not created answers tool calls with a tool error and touches nothing', async () => {
+  const { w, sid } = await twoWorkspaces();
+  w.touched.length = 0;
+  const seenDo = [];
+  const env = { ...w.env, SESSION: new Proxy(w.env.SESSION, { get: (t, k) => { seenDo.push(String(k)); return t[k]; } }) };
+  for (const path of ['/w/ghost/mcp', '/w/x/mcp', `/w/${'a'.repeat(40)}/mcp`]) {
+    for (const [name, args] of [['session_list', {}], ['session_create', {}], ['session_status', { session_id: sid.acme }], ['run', { session_id: sid.acme, command: 'whoami' }], ['session_end', { session_id: sid.acme }]]) {
+      const out = await toolAt(env, path, name, args);
+      assert.deepEqual(out, { content: [{ type: 'text', text: 'workspace not found' }], isError: true }, `${path} ${name}`);
+    }
+  }
+  assert.deepEqual([seenDo, w.touched], [[], []], 'no Session or Registry was touched');
+  assert.equal((await w.db.prepare('SELECT COUNT(*) AS n FROM members WHERE workspace = ?').bind('ghost').first('n')), 0);
+  assert.equal((await w.db.prepare('SELECT COUNT(*) AS n FROM callers WHERE workspace = ?').bind('ghost').first('n')), 0, 'the unknown workspace is not opened or recorded');
+});
+
+test('tools/list on any well-formed workspace address never touches the database or a Durable Object', async () => {
+  const trap = () => { throw new Error('touched'); };
+  const env = { DEV_SKIP_ACCESS: '1', DB: { prepare: trap, batch: trap }, SESSION: { idFromName: trap, idFromString: trap, get: trap }, REGISTRY: { idFromName: trap, get: trap } };
+  for (const path of ['/mcp', '/w/acme/mcp', '/w/never-created/mcp']) {
+    const r = await handler.fetch(new Request(`http://127.0.0.1:8787${path}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    }), env);
+    assert.equal((await r.json()).result.tools.length, 22, path);
+  }
+});
+
+test('roles are per workspace: a viewer in one can hold another role in the next, and a stranger holds nothing', async () => {
+  const { w, sid } = await twoWorkspaces();
+  const team = teamStore(w.db, { deploymentAdmins: 'local-dev' });
+  // local-dev is a viewer in acme (boss holds the admin seat) and an admin in beta.
+  await team.addMember('acme', 'local-dev', { identity: 'boss@example.com', role_id: 'admin' });
+  await team.updateMember('acme', 'local-dev', 'local-dev', { role_id: 'viewer' });
+  const text = (out) => out.content[0].text;
+  assert.ok(!(await toolAt(w.env, '/w/acme/mcp', 'session_list')).isError);
+  assert.equal(text(await toolAt(w.env, '/w/acme/mcp', 'run', { session_id: sid.acme, command: 'whoami' })), 'your role does not allow sessions.control');
+  assert.equal(text(await toolAt(w.env, '/w/beta/mcp', 'run', { session_id: sid.beta, command: 'whoami' })), 'agent not attached');
+  // Open mode is default's alone: local-dev holds the sessions permissions there, and nothing else.
+  assert.equal(text(await toolAt(w.env, '/mcp', 'run', { session_id: sid.default, command: 'whoami' })), 'agent not attached');
+  // Move beta's only seat to someone else: local-dev is then a stranger there.
+  await team.addMember('beta', 'local-dev', { identity: 'boss@example.com', role_id: 'admin' });
+  await team.removeMember('beta', 'boss@example.com', 'local-dev');
+  const stranger = await toolAt(w.env, '/w/beta/mcp', 'session_list');
+  assert.deepEqual(stranger, { content: [{ type: 'text', text: 'you are not a member of this team' }], isError: true });
 });

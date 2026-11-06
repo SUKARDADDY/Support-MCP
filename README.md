@@ -220,13 +220,32 @@ lane, so a long command does not block the screen.
 
 ## Teams
 
-The relay has one team workspace. Until you add its first member, it works as
-before: anyone Cloudflare Access lets in can use every tool. Once it has a
-member, only members can use the MCP endpoint, and each tool call is checked
-against the caller's role before it reaches a session. Until then, nobody can
-change the team except by adding themselves as the first admin: an attempt to
-edit or add a role, or to change or remove a member, gets a 409 `first_member`.
+The relay holds one or more workspaces, and each has its own members, roles,
+team log and sessions. The `default` workspace always exists. Until you add its
+first member, it works as before: anyone Cloudflare Access lets in can use every
+tool. Once it has a member, only members can use the MCP endpoint, and each tool
+call is checked against the caller's role before it reaches a session. Until
+then, nobody can change the team except by adding themselves as the first admin:
+an attempt to edit or add a role, or to change or remove a member, gets a 409
+`first_member`. This open mode is `default`'s alone.
 
+- **More workspaces.** A deployment admin creates one with
+  `POST /api/v1/w` and a body of `{"slug":"acme","name":"Acme Support"}`. The
+  slug is 1 to 40 characters of `a-z`, `0-9` and `-`, and `default` is
+  reserved. The caller becomes its admin in the same step, so a workspace never
+  exists without one and is never open. With `DEPLOYMENT_ADMINS` empty,
+  creation is refused with a 409 `no_deployment_admins`. An identity not listed
+  there gets a 403 `forbidden`, and a slug already taken gets a 409
+  `workspace_exists`. `GET /api/v1/w` lists the workspaces you belong to as
+  `{slug, name, role_id}`, and `default` while it is open (with `role_id`
+  `null`) or when you are a member of it.
+- **Where a workspace lives.** Its MCP address is `/w/<slug>/mcp` (`/mcp` is
+  `default`) and its team API is `/api/v1/w/<slug>/...`. A slug that was never
+  created is a 404 on the API and a tool error, `workspace not found`, on its
+  MCP address. `tools/list` still answers without looking anything up. Each
+  workspace has its own session list, and a session answers an operator call
+  from another workspace as if it did not exist. `/w/default/mcp` is a 404:
+  `default` has one address.
 - **Members** are identities from Cloudflare Access: a person by email, or an
   MCP client signed in with a service token by the token's client ID (the
   `CF_ACCESS_CLIENT_ID` value, which ends in `.access`). Identities ignore case
@@ -259,7 +278,7 @@ edit or add a role, or to change or remove a member, gets a 409 `first_member`.
 - **A refused call** is a tool error: `you are not a member of this team`, or
   `your role does not allow sessions.control`. Removing a member takes effect on
   their next call.
-- **The first member must be you, as admin.** If `DEPLOYMENT_ADMINS` is set,
+- **The first member of `default` must be you, as admin.** If `DEPLOYMENT_ADMINS` is set,
   you must be listed in it. Add your MCP client's service token as a member at
   the same time, or it loses access. While the team has no members,
   `GET /api/v1/w/default` lists who has been calling, service tokens included.
@@ -290,6 +309,9 @@ cloudflared access curl "$api/members" -X POST -H 'content-type: application/jso
 cloudflared access curl "$api/members/tech%40example.com" -X DELETE -H 'content-type: application/json'
 cloudflared access curl "$api/audit?limit=100"                 # checks the rows shown
 cloudflared access curl "$api/audit?limit=100&verify=full"      # checks the whole chain
+cloudflared access curl https://support.example.com/api/v1/w -X POST -H 'content-type: application/json' \
+  -d '{"slug":"acme","name":"Acme Support"}'                     # a new workspace, you as its admin
+cloudflared access curl https://support.example.com/api/v1/w     # the workspaces you belong to
 ```
 
 The routes, bodies and errors are in
@@ -302,7 +324,7 @@ flowchart LR
   Op["MCP client<br/>(Claude Code)"] -- "POST /mcp<br/>Cloudflare Access" --> W[Worker]
   Cust["Customer browser or PowerShell"] -- "GET /j/&lt;code&gt;<br/>download page or script" --> W
   W --> S[("Session DO<br/>SQLite, alarm")]
-  W --> R[("Registry DO")]
+  W --> R[("Registry DO<br/>one per workspace")]
   App["Windows app<br/>WPF window"] -- "POST /agent<br/>X-Attach-Key, long poll" --> S
   A["agent.ps1<br/>WinForms window"] -- "WebSocket /ws<br/>X-Attach-Key" --> S
 ```
@@ -315,12 +337,15 @@ flowchart LR
 | `GET /j/<code>` | public, single use, https only | serves the PowerShell agent script with the session values filled in, to PowerShell clients only |
 | `POST /agent?sid=` | attach key in a header, https only | the app's transport: hello, long poll, results and end, as JSON |
 | `GET /ws?sid=` | attach key in a header, https only | PowerShell agent WebSocket, using the hibernation API |
-| `POST /mcp` | Cloudflare Access, then the caller's role | MCP JSON-RPC 2.0, stateless HTTP |
-| `/api/v1/w/default/...` | Cloudflare Access, then the caller's role | the team API: members, roles and the team log |
+| `POST /mcp` | Cloudflare Access, then the caller's role | MCP JSON-RPC 2.0, stateless HTTP, for the `default` workspace |
+| `POST /w/<slug>/mcp` | Cloudflare Access, then the caller's role | the same endpoint for another workspace |
+| `/api/v1/w/<slug>/...` | Cloudflare Access, then the caller's role | the team API: members, roles and the team log |
+| `POST /api/v1/w`, `GET /api/v1/w` | Cloudflare Access, a deployment admin to create | create a workspace, list yours |
 
 The Worker itself is the MCP server. There is no local bridge process. Each
 session is one Durable Object holding its state machine, its audit log and an
-alarm for expiry. A second Durable Object keeps the list for `session_list`.
+alarm for expiry. One Registry Durable Object per workspace keeps the list for
+`session_list`.
 Team members, roles and the team log live in a D1 database, with every row
 keyed by workspace.
 
@@ -328,11 +353,11 @@ keyed by workspace.
 |---|---|
 | `src/app.js` | router, Access JWT gate, MCP handler, download page |
 | `src/session.js` | `Session` Durable Object: states, audit log, alarm, tagged sockets, the app's polling transport |
-| `src/registry.js` | `Registry` Durable Object for `session_list` |
+| `src/registry.js` | `Registry` Durable Object for `session_list`, one per workspace |
 | `src/permissions.js` | the permission keys, the built-in roles, and the permission each MCP tool needs |
 | `src/workspace.js` | team data in D1: members, roles, recent callers, the chained team log, and the role check. All team SQL is here |
-| `src/api.js` | the team API under `/api/v1/w/default` |
-| `migrations/0001_team.sql` | the D1 tables, each keyed by workspace |
+| `src/api.js` | the team API under `/api/v1/w/<slug>`, and workspace creation and listing |
+| `migrations/` | the D1 tables, applied in name order: `0001_team.sql` (members, roles, callers, the team log, each keyed by workspace) and `0002_workspaces.sql` (the workspaces table and an index on members by identity) |
 | `src/mcp.js` | JSON-RPC dispatch, the tool schemas, and the mapping of each screen tool to one normalized action |
 | `src/screen.js` | the screen actions, their audit text, and the strict check of every field an app result may carry |
 | `src/jwt.js` | RS256 verification of the Access JWT with WebCrypto |
@@ -380,7 +405,7 @@ You need a Cloudflare account with a zone for the hostname, Node 22 and
 deploy without Windows. You need Windows only to change the app: see
 [Build the app](docs/development.md#build-the-app).
 
-1. **Create the Access guard for `/mcp` and `/api`.** This makes a service
+1. **Create the Access guard for `/mcp`, `/w/` and `/api`.** This makes a service
    token for the MCP client and an Access app with two policies, your email and
    the token.
    ```sh
@@ -395,7 +420,7 @@ deploy without Windows. You need Windows only to change the app: see
    Running the script again does not replace it, so rotate it in the Zero Trust
    dashboard and update `access.env`.
    If you set up an earlier version, run the script again: it updates the app
-   to guard `/api` as well, and keeps the service token.
+   to guard `/api` and `/w/` as well, and keeps the service token.
 2. **Create the team database.**
    ```sh
    npx wrangler d1 create support-mcp
@@ -407,7 +432,8 @@ deploy without Windows. You need Windows only to change the app: see
    Run the migrations again after an update that adds one, before you deploy.
 3. **Fill in `wrangler.toml`.** Set the route hostname, `ACCESS_TEAM_DOMAIN`,
    `ACCESS_AUD` and the D1 `database_id`. Set `DEPLOYMENT_ADMINS` to your own
-   email (comma-separate several), so only you can become the first admin.
+   email (comma-separate several). Only they can become default's first admin, and
+   only they can create more workspaces. With it empty, nobody can create one.
    Then run `npx wrangler deploy`.
 4. **Harden the zone.** Turn on **Always Use HTTPS** for the zone (SSL/TLS,
    Edge Certificates), so a link pasted without `https://` is redirected. The
@@ -433,6 +459,9 @@ deploy without Windows. You need Windows only to change the app: see
    http_headers_helper = "/path/to/Support-MCP/cf/mcp-headers.sh"
    tool_timeout_sec = 630
    ```
+
+   For another workspace, use `https://support.example.com/w/<slug>/mcp` with
+   the same headers.
 
    Other clients need the same two headers. If a client can't run a helper,
    put the values in its config, and keep that file out of git.
@@ -499,9 +528,10 @@ check are in [docs/development.md](docs/development.md).
 - An old app from before screen control keeps working for commands and files.
   Its screen calls return `this support app is too old for screen control`. The
   PowerShell fallback has no screen access either.
-- It has one team workspace. Cloudflare Access decides who can reach the relay,
-  and the team's roles decide what each member can do. More workspaces and the
-  relay's own sign-in come later. `session_list` still lists every session.
+- Cloudflare Access decides who can reach the relay, and each workspace's roles
+  decide what its members can do. The relay's own sign-in comes later.
+  `session_list` lists the sessions of the workspace you called it on. A session
+  made before workspaces existed is in `default`.
 - Command output is capped at 262,144 characters per stream, and the whole
   result frame is trimmed to fit the WebSocket message limit. Files move in
   chunks of about 512 KiB.
