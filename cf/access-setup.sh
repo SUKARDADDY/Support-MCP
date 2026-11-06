@@ -46,6 +46,9 @@
 # and never prints it. The AUD tag of each application is printed; put it in
 # wrangler.toml as ACCESS_AUD (and ACCESS_MCP_AUD with OAUTH=1).
 set -euo pipefail
+# A failure inside $(...) must stop the script too. Bash drops errexit there
+# unless this is set, and upsert_app and aud_of run inside $(...).
+shopt -s inherit_errexit
 : "${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN}"
 : "${CLOUDFLARE_ACCOUNT_ID:?set CLOUDFLARE_ACCOUNT_ID}"
 : "${SUPPORT_HOST:?set SUPPORT_HOST, e.g. support.example.com}"
@@ -96,11 +99,13 @@ upsert_app() {
   local id resp
   id=$(app_id "$1")
   if [ -z "$id" ]; then
-    resp=$(cf -X POST "$API/apps" --data "$2"); echo "$resp" | ok
-    id=$(echo "$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["id"])'); echo "app created: $1 $id" >&2
+    resp=$(cf -X POST "$API/apps" --data "$2"); echo "$resp" | ok || exit 1
+    id=$(echo "$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["id"])') || exit 1
+    echo "app created: $1 $id" >&2
   else
-    cf -X PUT "$API/apps/$id" --data "$2" | ok; echo "app updated: $1 $id" >&2
+    cf -X PUT "$API/apps/$id" --data "$2" | ok || exit 1; echo "app updated: $1 $id" >&2
   fi
+  [ -n "$id" ] || { echo "no id for application $1" >&2; exit 1; }
   echo "$id"
 }
 aud_of() { cf "$API/apps/$1" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["aud"])'; }
@@ -115,7 +120,8 @@ BODY=$(cat <<JSON
 JSON
 )
 APP_ID=$(upsert_app "$APP_NAME" "$BODY")
-printf 'ACCESS_AUD for wrangler.toml: %s\n' "$(aud_of "$APP_ID")"
+APP_AUD=$(aud_of "$APP_ID")
+printf 'ACCESS_AUD for wrangler.toml: %s\n' "$APP_AUD"
 MCP_APP_ID=$(app_id "$MCP_APP_NAME")
 if [ "$OAUTH" = 1 ]; then
   # The MCP addresses: the service token gets a JWT, everyone else passes through.
@@ -130,7 +136,8 @@ if [ "$OAUTH" = 1 ]; then
 JSON
 )
   MCP_APP_ID=$(upsert_app "$MCP_APP_NAME" "$MCP_BODY")
-  printf 'ACCESS_MCP_AUD for wrangler.toml: %s\n' "$(aud_of "$MCP_APP_ID")"
+  MCP_AUD=$(aud_of "$MCP_APP_ID")
+  printf 'ACCESS_MCP_AUD for wrangler.toml: %s\n' "$MCP_AUD"
 elif [ -n "$MCP_APP_ID" ]; then
   # Back to one application: the second would claim the same addresses.
   cf -X DELETE "$API/apps/$MCP_APP_ID" | ok; echo "app removed: $MCP_APP_NAME $MCP_APP_ID"
