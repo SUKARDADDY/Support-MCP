@@ -11,6 +11,10 @@ to run on unattended customer PCs.
 
 ### Added
 
+- Computer use: screen capture, mouse and keyboard input and UI Automation, with
+  two lanes so a screen operation does not wait for a running command (#10).
+- Full control through a UAC-approved SYSTEM service that reaches the secure
+  desktop and survives a restart (#11, #12).
 - Team members and roles. Every MCP tool call is checked against the caller's
   role (#13).
 - Workspaces. Each team gets its own MCP address, team API and session list (#15).
@@ -34,7 +38,7 @@ to run on unattended customer PCs.
 
 ## [0.1.0]
 
-The first public release.
+The first public release, and the version production runs until 0.2.0 is deployed.
 
 - Consent-based, self-expiring Windows remote support sessions, run by an AI
   agent over MCP.
@@ -42,8 +46,5 @@ The first public release.
   the customer closes it, when the operator ends it, or after 24 hours.
 - A downloadable Windows app, with a PowerShell agent as the alternative. The
   customer approves the session before anything runs.
-- Computer use: screen capture, mouse and keyboard input and UI Automation, with
-  two lanes so a screen operation does not wait for a running command (#10).
-- Full control through a UAC-approved SYSTEM service that reaches the secure
-  desktop and survives a restart (#11, #12).
-- A reproducible app build, checked against the committed exe in CI (#6, #7).
+- A reproducible app build, checked against the committed exe in CI (#6).
+- The app runs on .NET Framework 4.5.2 without crashing (#7).
