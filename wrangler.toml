@@ -21,6 +21,25 @@ ACCESS_AUD = "REPLACE_ME"
 # empty, any caller Access admits may, as admin.
 DEPLOYMENT_ADMINS = ""
 
+# Sign-in for people (docs/sign-in-setup.md). Nothing here is secret. Leave a
+# method's id empty to hide it. People can sign in only if a team has added
+# them (or they are in DEPLOYMENT_ADMINS).
+# Your public address, with no path (https://support.example.com). Required.
+PUBLIC_ORIGIN = ""
+GOOGLE_CLIENT_ID = ""
+MICROSOFT_CLIENT_ID = ""
+# Comma-separated Microsoft tenant ids that may sign in. Empty allows any.
+MICROSOFT_TENANTS = ""
+# How emailed sign-in links are sent: "resend", or empty for no email option.
+MAIL_PROVIDER = ""
+# The verified sender address, such as "Support <login@support.example.com>".
+MAIL_FROM = ""
+SIGNIN_IDLE_HOURS = "12"
+SIGNIN_MAX_DAYS = "14"
+# Secrets, set with `wrangler secret put <NAME>`, never here: AUTH_SECRET
+# (32 or more random characters), GOOGLE_CLIENT_SECRET, MICROSOFT_CLIENT_SECRET
+# and RESEND_API_KEY.
+
 # Team data: members, roles and the team log, one shared database with every
 # row keyed by workspace. Create it with `wrangler d1 create support-mcp`, put
 # its id here, then `wrangler d1 migrations apply support-mcp --remote`. That

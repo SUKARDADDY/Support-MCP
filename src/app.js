@@ -2,12 +2,13 @@
 // API (/api/v1/...) + the public customer paths (/healthz, /j/<code>, /agent,
 // /ws). Kept free of the .ps1 import and the DO classes so node --test can drive
 // it route-level; index.js wires it to the real agent template.
-import { verifyAccessJwt, importRsaJwk, localBypassAllowed, callerIdentity } from './jwt.js';
+import { verifyAccessJwt, jwksKeyResolver, localBypassAllowed, callerIdentity } from './jwt.js';
 import { handleRpc, parseToolOptions } from './mcp.js';
 import { permissionForTool } from './permissions.js';
 import { DEFAULT_WORKSPACE, teamFromEnv } from './workspace.js';
 import { registryName } from './registry.js';
 import { handleApi } from './api.js';
+import { handleAuth } from './auth.js';
 import {
   buildAppDownload,
   buildBootstrap,
@@ -27,43 +28,6 @@ function newCode() {
   let s = '';
   for (let i = 0; i < 16; i++) s += CODE_ALPHABET[u[i] & 31];
   return s; // 16 chars * 5 bits = 80 bits
-}
-
-// ---- JWKS cache (module scope, ~1h) ----------------------------------------
-// Normal refresh may use the edge cache. A refetch forced by an unknown `kid`
-// (key rotation) bypasses every cache and is limited to one per 60 s so a
-// stream of junk tokens cannot turn into a stream of certs fetches.
-const JWKS_TTL_MS = 3600_000;
-const JWKS_FORCED_MIN_GAP_MS = 60_000;
-let jwksCache = { at: 0, keys: new Map(), domain: '' };
-let jwksForcedAt = 0;
-
-async function fetchJwks(domain, forced) {
-  const url = `https://${domain}/cdn-cgi/access/certs`;
-  const init = forced ? { cache: 'no-store' } : { cf: { cacheTtl: 3600 } };
-  const r = await fetch(url, init);
-  if (!r.ok) throw new Error('jwks fetch failed');
-  const { keys } = await r.json();
-  const map = new Map();
-  for (const jwk of keys || []) {
-    if (jwk.kid) map.set(jwk.kid, await importRsaJwk(jwk, crypto.subtle));
-  }
-  jwksCache = { at: Date.now(), keys: map, domain };
-}
-
-// Lazy: nothing is fetched until a well-formed token asks for a kid.
-function keyResolverFor(env) {
-  const domain = env.ACCESS_TEAM_DOMAIN;
-  return async (kid) => {
-    const fresh = jwksCache.domain === domain && Date.now() - jwksCache.at < JWKS_TTL_MS;
-    if (!fresh) await fetchJwks(domain, false);
-    if (jwksCache.keys.has(kid)) return jwksCache.keys.get(kid);
-    const now = Date.now();
-    if (now - jwksForcedAt < JWKS_FORCED_MIN_GAP_MS) return null;
-    jwksForcedAt = now;
-    await fetchJwks(domain, true);
-    return jwksCache.keys.get(kid) || null;
-  };
 }
 
 function json(obj, status = 200, extra = {}) {
@@ -259,7 +223,7 @@ async function accessCaller(request, env, url) {
     const payload = await verifyAccessJwt(token, {
       aud: env.ACCESS_AUD,
       iss: `https://${env.ACCESS_TEAM_DOMAIN}`,
-      keyResolver: keyResolverFor(env),
+      keyResolver: jwksKeyResolver(`https://${env.ACCESS_TEAM_DOMAIN}/cdn-cgi/access/certs`),
       subtle: crypto.subtle,
     });
     return callerIdentity(payload);
@@ -447,9 +411,11 @@ async function handleMcp(request, env, url, origin, devTtlMs, workspace = DEFAUL
   return json(body, status);
 }
 
-export function createHandler(agentText, appBundle = null) {
+// options (for tests): fetch replaces the network for the sign-in providers and
+// the mail provider; mailer replaces the one chosen by MAIL_PROVIDER (null = none).
+export function createHandler(agentText, appBundle = null, options = {}) {
   return {
-    async fetch(request, env) {
+    async fetch(request, env, ctx) {
       const url = new URL(request.url);
       const p = url.pathname;
       // The agent derives its ws:// or wss:// URL from this origin, so any real
@@ -469,6 +435,15 @@ export function createHandler(agentText, appBundle = null) {
       // default has one address, /mcp, so /w/default/mcp is unknown too.
       const wm = WORKSPACE_MCP.exec(p);
       if (wm && wm[1] !== DEFAULT_WORKSPACE) return handleMcp(request, env, url, origin, devTtlMs, wm[1]);
+      // Sign-in and the account page are for browsers, so they have their own
+      // origin and form-token checks (src/auth.js). /mcp and /api stay as above.
+      if (p === '/auth' || p.startsWith('/auth/') || p === '/account' || p.startsWith('/account/')) {
+        return handleAuth(request, env, url, {
+          fetchFn: options.fetch,
+          mailer: options.mailer,
+          waitUntil: ctx && typeof ctx.waitUntil === 'function' ? (promise) => ctx.waitUntil(promise) : undefined,
+        });
+      }
       if (p === '/api' || p.startsWith('/api/')) return handleApi(request, env, url, { accessCaller, isJsonContentType });
       return new Response('not found', { status: 404 });
     },

@@ -7,6 +7,7 @@ import { openD1 } from './d1-fake.js';
 import { createHandler } from '../src/app.js';
 import { importRsaJwk } from '../src/jwt.js';
 import { OPEN_PERMISSIONS, PERMISSIONS } from '../src/permissions.js';
+import { accountStore } from '../src/accounts.js';
 
 const TEAM = 'api-test.cloudflareaccess.com';
 const AUD = 'api-test-aud';
@@ -771,4 +772,35 @@ test('session_create in a workspace tells the Session its workspace, and session
   await r.toolAt('beta', OWNER, 'session_list');
   await r.tool(OWNER, 'session_list');
   assert.deepEqual(names, ['registry:acme', 'registry:beta', 'registry']);
+});
+
+// ---- a browser sign-in is not a credential here ---------------------------------------
+// PR 2b lets a person sign in with a cookie. That cookie opens the account page
+// only. The team API and every MCP address still admit Access logins and service
+// tokens, so a signed-in person from another team can't claim the open default
+// workspace's first admin, or read who has been calling it.
+test('a sign-in cookie is ignored on the team API and MCP, so default\'s first admin still needs Access', async () => {
+  const secret = 'api-test-auth-secret-0123456789abcdef-xyz';
+  const r = relay({ AUTH_SECRET: secret, PUBLIC_ORIGIN: HOST });
+  // A member of another team, signed in by cookie.
+  await r.api(BOSS, 'POST', '/members', { identity: BOSS, role_id: 'admin' }); // makes default closed...
+  r.env.DB.sqlite.exec('DELETE FROM members'); // ...then reopen it: no member in default
+  r.env.DB.sqlite.exec("INSERT INTO workspaces(slug, name, created_by, created_at) VALUES ('acme', 'Acme', 'x', 1)");
+  r.env.DB.sqlite.exec("INSERT INTO members(workspace, identity, kind, name, role_id, added_at, added_by) VALUES ('acme', 'tech@example.com', 'person', NULL, 'admin', 1, 'x')");
+  const store = accountStore(r.env.DB, { secret });
+  const found = await store.userForEmail('tech@example.com', async () => true);
+  const cookie = `__Host-smcp=${await store.createSession(found.user.id, { maxMs: 86400_000 })}`;
+  const send = (path, init = {}) => r.handler.fetch(new Request(`${HOST}${path}`, { ...init, headers: { cookie, ...(init.headers || {}) } }), r.env);
+
+  assert.equal((await send('/api/v1/w/default')).status, 403, 'recent_callers stay behind Access');
+  const claim = await send('/api/v1/w/default/members', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ identity: 'tech@example.com', role_id: 'admin' }) });
+  assert.equal(claim.status, 403);
+  assert.equal((await send('/api/v1/w')).status, 403);
+  assert.equal((await send('/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'session_list', arguments: {} } }) })).status, 403);
+  assert.equal(r.env.DB.sqlite.prepare("SELECT COUNT(*) AS n FROM members WHERE workspace = 'default'").get().n, 0);
+
+  // The account page does accept it, and the same Access login claims default as before.
+  assert.equal((await send('/account')).status, 200);
+  const access = await r.api('tech@example.com', 'POST', '/members', { identity: 'tech@example.com', role_id: 'admin' });
+  assert.equal(access.status, 201, JSON.stringify(access.body));
 });

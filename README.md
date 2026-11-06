@@ -317,6 +317,33 @@ cloudflared access curl https://support.example.com/api/v1/w     # the workspace
 The routes, bodies and errors are in
 [docs/relay-v1-spec.md](docs/relay-v1-spec.md#team-api-apiv1wslug).
 
+## Sign-in
+
+People sign in as themselves at `/auth/signin`, with Google, Microsoft or an
+emailed link, and manage their account at `/account`. Sign-in is by invitation:
+only a person who is a member of a workspace, or listed in `DEPLOYMENT_ADMINS`,
+can sign in. Anyone whose role can control sessions or manage the team must also
+set up an authenticator app (6-digit codes, with ten recovery codes), and enters
+a code at each sign-in. Removing someone from the team, or their choosing
+**Sign out everywhere**, ends their browser sign-ins on the next request.
+
+In this release a sign-in opens the account page: your email, your workspaces
+and roles, your second factor, and sign out. The team API and the MCP addresses
+still admit only Cloudflare Access logins and service tokens, so signing in
+changes nothing there. Letting MCP clients act as a signed-in person comes next.
+
+| Route | What it does |
+|---|---|
+| `GET /auth/signin` | the sign-in page; shows only the methods you configured |
+| `GET /auth/google`, `/auth/microsoft` | start the provider sign-in; the provider returns to `.../callback` |
+| `POST /auth/email`, `GET` and `POST /auth/email/confirm` | ask for an emailed link; open it; press the button to use it |
+| `GET` and `POST /auth/factor` | set up, verify or replace the authenticator |
+| `GET /account` | your account; `POST /auth/signout` and `POST /account/signout-everywhere` |
+
+Setup for Google, Microsoft, email and the settings are in
+[docs/sign-in-setup.md](docs/sign-in-setup.md). Without `AUTH_SECRET`, or with no
+`PUBLIC_ORIGIN` on a real host, the sign-in pages answer 503.
+
 ## Architecture
 
 ```mermaid
@@ -465,7 +492,12 @@ deploy without Windows. You need Windows only to change the app: see
 
    Other clients need the same two headers. If a client can't run a helper,
    put the values in its config, and keep that file out of git.
-6. **Turn on roles.** Add yourself as the first member, as admin, and in the
+6. **Optional: turn on sign-in.** Set `PUBLIC_ORIGIN`, store `AUTH_SECRET`, and
+   configure Google, Microsoft or email links. See
+   [docs/sign-in-setup.md](docs/sign-in-setup.md). The `/auth/` and `/account`
+   paths need to be reachable without Cloudflare Access, so keep them outside
+   the Access app (it guards `/mcp`, `/w/` and `/api/`).
+7. **Turn on roles.** Add yourself as the first member, as admin, and in the
    same sitting add your MCP client's service token by its client ID
    (`CF_ACCESS_CLIENT_ID` in `access.env`), or the client loses access. See
    [Teams](#teams) for the commands. Until you do this, anyone Access admits can

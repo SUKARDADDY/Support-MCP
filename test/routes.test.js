@@ -280,3 +280,23 @@ test('/healthz stays public', async () => {
   assert.equal(r.status, 200);
   assert.deepEqual(await r.json(), { ok: true, service: 'support-mcp', stage: 'relay-v1' });
 });
+
+// ---- sign-in and account routes ----------------------------------------------------
+// Browser routes, so unlike /mcp they accept a cookie and a form. This env has no
+// database and traps every Durable Object: the answers below came first.
+test('/auth and /account answer 503 without AUTH_SECRET, and never touch a Durable Object', async () => {
+  for (const [method, path] of [['GET', '/auth/signin'], ['GET', '/account'], ['POST', '/auth/signout'], ['GET', '/auth/google'], ['POST', '/account/signout-everywhere']]) {
+    const r = await handler.fetch(new Request(`${PROD}${path}`, { method }), env);
+    assert.equal(r.status, 503, path);
+    assert.equal(r.headers.get('cache-control'), 'no-store');
+    assert.match(r.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+  }
+});
+
+test('the Origin refusal on /mcp and /api still holds when the sign-in routes exist', async () => {
+  const withSecret = { ...env, AUTH_SECRET: 'routes-test-secret-0123456789abcdef-xyz', PUBLIC_ORIGIN: PROD };
+  for (const path of ['/mcp', '/w/acme/mcp', '/api/v1/w']) {
+    const r = await handler.fetch(new Request(`${PROD}${path}`, { method: 'POST', headers: { 'content-type': 'application/json', origin: PROD, cookie: '__Host-smcp=abc' }, body: rpc }), withSecret);
+    assert.equal(r.status, 403, path);
+  }
+});

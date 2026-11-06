@@ -81,6 +81,7 @@ work in the request path; use the WebSocket Hibernation API
 | `POST /w/<slug>/mcp` | Access JWT | the same endpoint for workspace `<slug>` (`[a-z0-9-]{1,40}`). Any other shape of path is 404 |
 | `/api/v1/w/<slug>/...` | Access JWT | the team API (below) |
 | `POST /api/v1/w`, `GET /api/v1/w` | Access JWT | create a workspace, list yours (below) |
+| `GET /auth/signin`, `GET /auth/google`, `GET /auth/microsoft`, `GET /auth/<provider>/callback`, `POST /auth/email`, `GET` and `POST /auth/email/confirm`, `GET` and `POST /auth/factor`, `POST /auth/signout`, `GET /account`, `POST /account/signout-everywhere` | none, then a browser sign-in | people sign in; see [Sign-in](#sign-in-auth-and-account) |
 | anything else | — | 404 |
 
 `<sid>` = the Session DO's hex id (`idFromName(code)`); the code is the DO name.
@@ -126,10 +127,11 @@ Then require header `Cf-Access-Jwt-Assertion`. Verify RS256 against
 `https://<ACCESS_TEAM_DOMAIN>/cdn-cgi/access/certs`, `aud` contains `ACCESS_AUD`,
 `exp` in the future, `nbf` (if present) not in the future beyond 60 s of skew,
 `iss` = `https://<ACCESS_TEAM_DOMAIN>`. Failure → 403 JSON `{"error":"forbidden"}`.
-The signing keys are cached in module scope for 1 h and fetched lazily (only once
+The signing keys are cached in module scope for 1 h, one entry per key address
+(`src/jwt.js`, shared with Google and Microsoft sign-in), and fetched lazily (only once
 a well-formed token names a `kid`); an unknown `kid` forces one refetch that
 **bypasses the edge cache** (`cache:'no-store'`) and is rate-limited to at most
-one per 60 s. Local bypass: only when `env.DEV_SKIP_ACCESS === "1"` (set from
+one per 60 s per address. Local bypass: only when `env.DEV_SKIP_ACCESS === "1"` (set from
 `.dev.vars`, never committed) **and** the request URL hostname is `localhost` or
 `127.0.0.1`. The deployed hostname can never satisfy it.
 
@@ -334,6 +336,56 @@ each `hash` matching its row). An edit, removal or reordering of a row shows in
 a full check unless it is among the newest entries; deleting the newest rows
 still verifies, so note the `head` (`seq` and `hash`) outside the relay to catch
 that.
+
+## Sign-in (`/auth/*` and `/account`)
+
+Browser routes for people. They are outside Access and outside the `/mcp` and
+`/api` gate: instead of refusing every `Origin`, each POST accepts only an
+`Origin`, if sent, equal to the relay's own, and a form token. A browser sign-in
+is not accepted on `/mcp`, `/w/<slug>/mcp` or `/api/`, so nothing a signed-in
+person can do reaches a session or the team. Code: `src/auth.js` (routes),
+`src/accounts.js` (the tables in `migrations/0003_signin.sql`), `src/oidc.js`,
+`src/totp.js`, `src/crypto.js`, `src/pages.js` and `src/mail/`.
+
+Settings: `PUBLIC_ORIGIN`, `GOOGLE_CLIENT_ID`, `MICROSOFT_CLIENT_ID`,
+`MICROSOFT_TENANTS`, `MAIL_PROVIDER`, `MAIL_FROM`, `SIGNIN_IDLE_HOURS`,
+`SIGNIN_MAX_DAYS` (vars) and `AUTH_SECRET`, `GOOGLE_CLIENT_SECRET`,
+`MICROSOFT_CLIENT_SECRET`, `RESEND_API_KEY` (Wrangler secrets), plus
+`DEV_SHOW_EMAIL_LINKS` (`.dev.vars` only, loopback only). Setup is in
+[sign-in-setup.md](sign-in-setup.md).
+
+Every route answers **503** with a plain page when `AUTH_SECRET` is missing or
+under 32 characters, when `PUBLIC_ORIGIN` is unset on a host other than
+`localhost` / `127.0.0.1`, is not an https address with no path, or names another
+host than the request's, or when the database is not bound. Every response
+carries `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline';
+form-action 'self'` (plus `https://accounts.google.com` and
+`https://login.microsoftonline.com` on `/auth/signin`) `; frame-ancestors 'none';
+base-uri 'none'`, `Referrer-Policy: same-origin`, `X-Content-Type-Options:
+nosniff` and `Cache-Control: no-store`. Pages contain no script.
+
+| Route | Behaviour |
+|---|---|
+| `GET /auth/signin?next=<path>` | The sign-in page. Buttons for each configured provider, and the email form when a mail provider is configured (or `DEV_SHOW_EMAIL_LINKS=1` on loopback). Sets a one-hour cookie that its email form's token is tied to. Redirects (303) to `next` if already signed in. |
+| `GET /auth/google`, `GET /auth/microsoft` | 404 when not configured. Else sets the sealed round-trip cookie (`__Host-smcp-oidc`, 10 minutes) and answers 302 to the provider with `response_type=code`, `scope`, `state`, `nonce`, `code_challenge` (S256) and `redirect_uri=<PUBLIC_ORIGIN>/auth/<provider>/callback`. Microsoft's authority is `common`, one listed tenant, or `organizations`. |
+| `GET /auth/<provider>/callback?code&state` | Opens the cookie (any tamper, expiry, mismatch of provider or state → 400, cookie cleared), exchanges the code at the provider with the client secret and verifier, verifies the id_token (see the security model), resolves the person, and signs them in: 303 to the return path, or to `/auth/factor` first when they have an authenticator. A person nobody invited gets 403 and the same "you can't sign in here" page whatever the reason. |
+| `POST /auth/email` | 404 without a mail provider. Needs `email`, `csrf` (HMAC of the sign-in page's cookie) and optional `next`. Answers 200 "check your email" for every well-formed address and sets the binding cookie (`__Host-smcp-bind`, 10 minutes). For an invited address under the limit of 5 links an hour it stores the link and mails it (after the answer, via `waitUntil`, or shows it in dev mode). A malformed address is 400. |
+| `GET /auth/email/confirm?t=` | Shows a confirmation page with a button, or "open this link in the same browser" without the binding cookie. Never changes state. |
+| `POST /auth/email/confirm` | Needs `t`, `csrf` (HMAC of the binding cookie) and the binding cookie. Redeems the link once if it is unused, unexpired and bound to that cookie, else 400 (a link from another browser is not used up). Then signs in as for a provider. |
+| `GET /auth/factor?next=&reset=1` | A signed-in person with no authenticator gets the setup page (a key and an `otpauth://` link; the key travels as an AES-GCM sealed value tied to this sign-in, nothing is stored yet). With one but not yet verified in this sign-in: the code page. With one verified: redirect, or the replace page for `reset=1`. Signed out: redirect to sign-in. |
+| `POST /auth/factor` | `action=verify` with `code` (six digits or a recovery code): success marks the sign-in `factor_at` and redirects (a recovery code instead shows a page saying every other sign-in was ended, 200); wrong is 400; locked is 429 (every fifth wrong try in a row locks, for 15 minutes, doubling each time up to 24 hours; only a right code resets). `action=enrol` with `sealed` and `code`: a matching code stores the authenticator and ten recovery codes (shown once, 200), marks the sign-in and revokes the person's other sign-ins. Replacing needs a verified sign-in. |
+| `GET /account` | Your email, your workspaces and roles, your second factor (required or optional), sign out. Redirects to sign-in when signed out, and to `/auth/factor` when an enrolled person has not passed a code. |
+| `POST /auth/signout`, `POST /account/signout-everywhere` | Need `csrf` (HMAC of the sign-in's id hash). Revoke this sign-in, or every sign-in of the person. 303 to `/auth/signin`. The second one, for a person with an authenticator, needs a sign-in that has passed a code, else 303 to `/auth/factor` and nothing is revoked. |
+
+A sign-in is the cookie `__Host-smcp` (`smcp` on loopback http): 32 random
+bytes, stored as `login_sessions.id_hash` (SHA-256). It is valid while it is
+not revoked, was used within `SIGNIN_IDLE_HOURS`, began within
+`SIGNIN_MAX_DAYS`, its person is not disabled, and the person is still invited
+(a member of a workspace or in `DEPLOYMENT_ADMINS`), all read live per request.
+`authorizeSignIn(team, session, workspace, permission)` in `src/auth.js` is the
+check for acting on a sign-in: the role must hold the permission, and
+`sessions.control`, `members.manage` and `roles.manage` also need the sign-in's
+`factor_at`, else "a second factor is required".
 
 ## Session state machine (Session DO)
 

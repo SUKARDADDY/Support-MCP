@@ -316,6 +316,40 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
     return out;
   }
 
+  // ---- sign-in -----------------------------------------------------------------
+  // Who may sign in as themselves in a browser: a deployment admin, or a person
+  // who is a member of any workspace. Read live on every check, so removing the
+  // last membership ends a sign-in on its next request. Open mode does not
+  // count: nobody is invited to a workspace that has no members.
+  const isDeploymentAdmin = (identity) => admins.has(normalizeIdentity(identity));
+
+  async function isInvited(identity) {
+    const id = normalizeIdentity(identity);
+    if (!id) return false;
+    if (admins.has(id)) return true;
+    return (await q("SELECT 1 AS found FROM members WHERE identity = ? AND kind = 'person' LIMIT 1", id).first('found')) === 1;
+  }
+
+  // The workspaces this person is really a member of (never the open default),
+  // each with the role's name and current permissions.
+  async function memberships(identity) {
+    const id = normalizeIdentity(identity);
+    const { results } = await q(`SELECT m.workspace AS slug, w.name AS name, m.role_id AS role_id
+      FROM members m LEFT JOIN workspaces w ON w.slug = m.workspace WHERE m.identity = ? ORDER BY m.workspace`, id).all();
+    const out = [];
+    for (const r of results) {
+      const role = await getRole(r.slug, r.role_id);
+      out.push({
+        slug: r.slug,
+        name: r.slug === DEFAULT_WORKSPACE ? DEFAULT_NAME : r.name,
+        role_id: r.role_id,
+        role_name: role ? role.name : null,
+        permissions: role ? role.permissions : [],
+      });
+    }
+    return out;
+  }
+
   // ---- the log ---------------------------------------------------------------
   // A page read checks only the rows it returns: each row's hash, each prev_hash
   // link, the first row against the row just before it (or the genesis hash when
@@ -759,6 +793,7 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
   return {
     authorize, whoami, recentCallers,
     workspaceExists, listWorkspaces, createWorkspace,
+    isInvited, isDeploymentAdmin, memberships,
     listMembers, getMember, addMember, updateMember, removeMember,
     listRoles, addRole, updateRole, removeRole,
     readAudit, verifyAudit,
