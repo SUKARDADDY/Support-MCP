@@ -415,6 +415,24 @@ test('hello logs truncated values and is accepted once per socket', async (t) =>
   assert.equal(f.logs.filter((l) => l.kind === 'hello').length, 2);
 });
 
+test('a PowerShell hello stores a valid version, ignores a bad one, and a later hello clears it', async (t) => {
+  const f = fixture(t);
+  await attachAs(f, 'g1');
+  await f.session.webSocketMessage(f.socket('g1'), JSON.stringify({ type: 'hello', machine: 'PC', agent: '1', version: '0.2.0' }));
+  assert.equal(f.values.get('version'), '0.2.0');
+  const second = f.socket('g2');
+  f.values.set('ws_tag', 'g2');
+  await f.session.webSocketMessage(second, JSON.stringify({ type: 'hello', machine: 'PC', agent: '1', version: 'x'.repeat(40) }));
+  assert.equal(f.values.get('version'), null);
+  const third = f.socket('g3');
+  f.values.set('ws_tag', 'g3');
+  await f.session.webSocketMessage(third, JSON.stringify({ type: 'hello', machine: 'PC', agent: '1', version: '0.2.1' }));
+  const fourth = f.socket('g4');
+  f.values.set('ws_tag', 'g4');
+  await f.session.webSocketMessage(fourth, JSON.stringify({ type: 'hello', machine: 'PC', agent: '1' }));
+  assert.equal(f.values.get('version'), null);
+});
+
 // ---- the session's workspace ---------------------------------------------------
 const CODE = 'abcdefghijklmnop';
 const SID = 'a'.repeat(64);

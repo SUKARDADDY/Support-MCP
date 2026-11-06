@@ -362,7 +362,7 @@ export class Session {
     const tail = Math.max(0, Math.min(500, Number(url.searchParams.get('log_tail') || 20) || 0));
     const s = await this.ctx.storage.get([
       'state', 'machine', 'user', 'expires_at', 'ps', 'code', 'ended_reason', 'consumed_expires_at',
-      'windows_mode', 'transport', 'http_seen_at', 'elevated', 'caps', 'control', 'agent', 'desktop',
+      'windows_mode', 'transport', 'http_seen_at', 'elevated', 'caps', 'control', 'agent', 'version', 'desktop',
       'paused_until', 'input_blocked_until',
     ]);
     const rows = tail
@@ -600,11 +600,12 @@ export class Session {
       const user = truncate(String(b.user ?? ''), 100) || null;
       const ps = truncate(String(b.ps ?? ''), 40) || null;
       const agent = truncate(String(b.agent ?? ''), 40) || null;
+      const version = decodeVersion(b.version);
       const elevated = typeof b.elevated === 'boolean' ? b.elevated : null;
       const caps = decodeCaps(b.caps);
       await this.setMany({
         state: 'attached', transport: 'https-poll', http_generation: generation, http_seen_at: now,
-        expires_at: expiresAt, machine, user, ps, elevated, agent, caps, control,
+        expires_at: expiresAt, machine, user, ps, elevated, agent, version, caps, control,
         desktop: null, paused_until: null, input_blocked_until: null,
         ...(firstAttach ? { attached_first_at: now } : {}),
       });
@@ -745,7 +746,8 @@ export class Session {
       const user = truncate(String(msg.user ?? ''), 100) || null;
       const ps = truncate(String(msg.ps ?? ''), 40) || null;
       const agent = truncate(String(msg.agent ?? ''), 40) || null;
-      await this.setMany({ machine, user, ps, agent, hello_tag: this.socketTag(ws) });
+      const version = decodeVersion(msg.version);
+      await this.setMany({ machine, user, ps, agent, version, hello_tag: this.socketTag(ws) });
       this.logRow('hello', `${machine ?? '?'}\\${user ?? '?'} ps=${ps ?? '?'} agent=${agent ?? '?'}`);
       await this.pushRegistry();
       return;
@@ -791,6 +793,12 @@ function truncate(s, n) {
   return s.length > n ? s.slice(0, n) + '…' : s;
 }
 
+// The release version a hello may carry: SemVer, 32 characters at most. Anything else is dropped.
+const VERSION_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$/;
+function decodeVersion(v) {
+  return typeof v === 'string' && v.length <= 32 && VERSION_RE.test(v) ? v : null;
+}
+
 // The /status answer. A session that does not exist is statusBody(new Map(), [], false).
 function statusBody(s, rows, attached) {
   const app = s.get('windows_mode') === 'app';
@@ -809,7 +817,8 @@ function statusBody(s, rows, attached) {
       paused_until: future(s.get('paused_until')),
       input_blocked_until: future(s.get('input_blocked_until')),
     } : {}),
-    client_version: s.get('agent') ?? null,
+    client_version: s.get('version') ?? s.get('agent') ?? null,
+    client_agent: s.get('agent') ?? null,
     expires_at: s.get('expires_at') ?? null,
     startup_expires_at: s.get('state') === 'consumed' ? s.get('consumed_expires_at') ?? null : null,
     ended_reason: s.get('ended_reason') ?? null,

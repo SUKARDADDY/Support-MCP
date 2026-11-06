@@ -73,7 +73,7 @@ work in the request path; use the WebSocket Hibernation API
 
 | Route | Auth | Behaviour |
 |---|---|---|
-| `GET /healthz` | public | `{"ok":true,"service":"support-mcp","stage":"relay-v1"}` |
+| `GET /healthz` | public | `{"ok":true,"service":"support-mcp","stage":"relay-v1","version":"<release>"}` (`stage` names this API generation, `version` the release, see [Versions](development.md#versions-and-releases)) |
 | `GET /j/<code>` | public | **GET only, https only.** The code is consumed only for a request whose `User-Agent` contains `PowerShell/` (`irm` sends `WindowsPowerShell/5.1.x` or `PowerShell/7.x`). Code valid+unused → 200 `text/plain` agent script with placeholders filled, code consumed; else 404 `text/plain` `Write-Host 'This support link is invalid or expired.'` (runnable, harmless). Any other `User-Agent` (a chat link preview, a browser) → 200 `text/plain`, `Cache-Control: no-store`, a one-line `Write-Host` telling the reader to paste the command into PowerShell, and the Durable Object is **not** touched. Over plain `http:` on any host except `localhost` / `127.0.0.1` → 200 `text/plain` `Write-Host` line asking for the https link, code **not** consumed. Any other method → 405 `text/plain` (harmless one-liner, `Allow: GET`) and the code is **not** consumed. Malformed percent-encoding → the same harmless 404 script, never 500. The `User-Agent` test keeps previews from burning the code. It is not a security control, since any client can send the header. |
 | `GET /j/<code>?client=app` | public | The downloaded app. `legacy` is an alias for `app`; any other `client` value → 404. **https only**: over plain `http:` on any host except `localhost` / `127.0.0.1` → 403 `text/plain`, code **not** consumed. `GET` serves the download page (200 `text/html`, `Cache-Control: no-store`, `Referrer-Policy: same-origin`, a CSP with `default-src 'none'` and `form-action 'self'`) and **never consumes the code**, however often the page is opened or refreshed. Only a `POST` from the page's button consumes it. If the request has an `Origin` header it must equal the relay's own origin exactly. If it has none (IE11 on Windows 7 can omit it on a same-origin form POST), its `Referer` must start with `<origin>/j/`, which the page's `Referrer-Policy: same-origin` keeps on the click. A foreign `Origin`, a foreign or missing `Referer` without an `Origin`, or neither header → 403, code unused. A first valid `POST` returns 200 `application/octet-stream` with `Content-Disposition: attachment; filename="remote-support-<sid8>.exe"`: the compiled app followed by the session configuration (below). The code is single use: a repeat after the download shows "Check your downloads" (409), an expired or ended one shows "This support link has expired" (410). A code made for a `powershell` session shows the expired page and stays unused. `HEAD` and every other method → 405 (`Allow: GET, POST`). |
 | `POST /agent?sid=<sid>` + `X-Attach-Key: <key>` | attach key | The app's transport, JSON in and out; below. 403 over plain `http:` on any host except `localhost` / `127.0.0.1`, 403 on any `Origin` header or a `key` query param, 405 on other methods, 415 on a non-JSON body, 413 over 750,000 characters (checked against `Content-Length` before the body is read, and again after it is read when there is no `Content-Length`), 401 on a bad sid, bad key, a `powershell` session or a session that is still `pending`, 409 on a stale generation, 410 when the session has ended. |
@@ -528,7 +528,7 @@ with the key in `X-Attach-Key`, and the relay answers in JSON with
 `hello` can never resurrect an ended session. Messages from the app:
 
 ```
-{"type":"hello","machine":"..","user":"..","ps":"..","agent":"windows-app-2","elevated":<bool>,
+{"type":"hello","machine":"..","user":"..","ps":"..","agent":"windows-app-2","version":"x.y.z","elevated":<bool>,
  "caps":["screen","uia","lanes","full"],"control":"full"|"normal"}
 {"type":"poll","generation":<n>,"busy_lanes":["cmd","screen"],"busy":<bool>,
  "desktop":"default"|"secure"|"unknown","paused_until":<ms>,"input_blocked_until":<ms>}
@@ -545,6 +545,9 @@ of them and keeps working: see [Lanes](#lanes-screen-and-control-frames).
   The first `hello` from a `consumed` session sets `expires_at` to now + 24 h. Any
   later `hello` (a reconnect) gets a new generation and the same `expires_at`.
   Machine, user and `ps` are cut to 100, 100 and 40 characters, `agent` to 40.
+  `version` is the app's release version. It is stored only when it is a string of
+  at most 32 characters like `1.2.3` or `1.2.3-rc.1` (digits, then an optional
+  prerelease or build part), else `null`; every hello replaces the stored value.
   `elevated` is stored only when it is a boolean, else `null`. `caps` keeps the
   names the relay knows (`screen`, `uia`, `lanes`, `full`) and drops the rest;
   no `caps` means `[]`. `control` is stored only when it is `full` or `normal`,
@@ -801,7 +804,7 @@ Relay → agent:
 ```
 Agent → relay:
 ```
-{"type":"hello","machine":"<COMPUTERNAME>","user":"<USERNAME>","ps":"<PSVersion>","agent":"1"}
+{"type":"hello","machine":"<COMPUTERNAME>","user":"<USERNAME>","ps":"<PSVersion>","agent":"1","version":"x.y.z"}
 {"type":"result","id":"<uuid>","ok":true,"exit_code":<int|null>,"stdout":"...","stderr":"...","timed_out":<bool>}
 {"type":"result","id":"<uuid>","ok":true,"bytes":<int>}                       (put_file)
 {"type":"result","id":"<uuid>","ok":true,"data_b64":"...","size":<total int64>,"eof":<bool>}  (get_file)
@@ -847,7 +850,7 @@ text content item, not JSON-RPC errors.
 |---|---|---|
 | `session_create` | `label?` string, `windows_mode?` (`app` default, `powershell`; deprecated aliases `legacy`, `standard`) | `app`: `{session_id, windows_mode, download_url, one_liner, code_expires_at}` with `download_url` = `<origin>/j/<code>?client=app` and one-liner = `Start-Process '<download_url>'`. `powershell`: `{session_id, windows_mode, one_liner, code_expires_at}` with one-liner = `irm <origin>/j/<code> \| iex`. An unknown mode is a tool error and creates nothing. |
 | `session_list` | — | sessions from the caller's workspace's Registry with state + expires_at + machine |
-| `session_status` | `session_id`, `log_tail?` (default 20) | state, `windows_mode` (`app` or `powershell`), machine, user, expires_at, startup_expires_at, attached now?, `client_version` (the `agent` string of the last hello), last log rows; `app` sessions add `elevated` (`true`, `false`, or `null` when the app did not report it), `control` (`full`, `normal` or `null`), `caps` (array), `desktop` (`default`, `secure`, `unknown` or `null`), `paused_until` and `input_blocked_until` (Unix ms while in the future, else `null`) |
+| `session_status` | `session_id`, `log_tail?` (default 20) | state, `windows_mode` (`app` or `powershell`), machine, user, expires_at, startup_expires_at, attached now?, `client_version` (the `version` of the last hello when it sent a valid one, else its `agent` string), `client_agent` (the `agent` string of the last hello, or `null`; it names the protocol generation), last log rows; `app` sessions add `elevated` (`true`, `false`, or `null` when the app did not report it), `control` (`full`, `normal` or `null`), `caps` (array), `desktop` (`default`, `secure`, `unknown` or `null`), `paused_until` and `input_blocked_until` (Unix ms while in the future, else `null`) |
 | `run` | `session_id`, `command`, `timeout_s?`, `as?` (`user` default; `system` needs full control and is refused otherwise) | exit_code (null if timed out), stdout, stderr, timed_out |
 | `put_file` | `session_id`, `path`, `data_b64`, `append?` | bytes |
 | `get_file` | `session_id`, `path`, `offset?`, `length?` | data_b64, size, eof |
@@ -986,7 +989,7 @@ expiry or the fixed 24-hour limit shows "Support is disconnected." and closes
 the window after four seconds. In normal mode the app installs no service,
 scheduled task or logon entry, so restarting the PC stops it, and it removes its
 private temporary command directory on normal exit. Its hello says `agent:
-"windows-app-2"`, `caps: ["screen","uia","lanes"]` plus `"full"` when this
+"windows-app-2"`, `version` (the release), `caps: ["screen","uia","lanes"]` plus `"full"` when this
 account can elevate, and `control: "normal"`. The window adds "Running without
 administrator access." Screen control runs in the app's own process on the
 user's desktop: capture is a BitBlt of a display scaled down to fit 1280 x 800 and sent

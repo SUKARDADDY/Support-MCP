@@ -38,6 +38,14 @@ using Img = System.Drawing.Imaging;
 using WF = System.Windows.Forms;
 using Shapes = System.Windows.Shapes;
 
+// The release version. scripts/bump-version.mjs rewrites these lines and Wire.Version; test/version.test.js checks them.
+// Fully qualified, so no System.Reflection using brings new type names into scope.
+[assembly: System.Reflection.AssemblyTitle("Support-MCP")]
+[assembly: System.Reflection.AssemblyProduct("Support-MCP")]
+[assembly: System.Reflection.AssemblyVersion("0.2.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("0.2.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("0.2.0")]
+
 namespace SupportMcp {
     public static class SupportAccess {
         public static bool IsAdministrator() {
@@ -95,6 +103,8 @@ namespace SupportMcp {
 
     public static class Wire {
         public const string Footer = "SUPPORTMCPCFG1";
+        // The release version, sent in the hello. The hello's "agent" field stays the protocol generation.
+        public const string Version = "0.2.0";
         public static Dictionary<string, object> Map(params object[] pairs) {
             var d = new Dictionary<string, object>();
             for (int i = 0; i < pairs.Length; i += 2) d[(string)pairs[i]] = pairs[i + 1];
@@ -1309,7 +1319,7 @@ namespace SupportMcp {
                             // "full" in caps: this app can ask for full control (or has it); control: what it has now.
                             bool full = Full != null, canFull = full || (CanElevate && ScreenAllowed);
                             var welcome = Send(Wire.Map("type", "hello", "machine", Environment.MachineName, "user", full ? Full.UserName : Environment.UserName,
-                                "ps", PowerShellVersion(), "agent", "windows-app-2", "elevated", full || SupportAccess.IsAdministrator(),
+                                "ps", PowerShellVersion(), "agent", "windows-app-2", "version", Wire.Version, "elevated", full || SupportAccess.IsAdministrator(),
                                 "caps", canFull ? new string[] { "screen", "uia", "lanes", "full" } : ScreenAllowed ? new string[] { "screen", "uia", "lanes" } : new string[] { "lanes" },
                                 "control", full ? "full" : "normal"), false, false);
                             if (Wire.Text(welcome, "type") != "welcome") throw new InvalidDataException("Invalid support handshake.");

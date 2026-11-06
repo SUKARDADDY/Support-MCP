@@ -343,7 +343,7 @@ function On-Connected {
     $script:backoff = 5
     $hello = New-Object psobject -Property @{
         type = 'hello'; machine = $env:COMPUTERNAME; user = $env:USERNAME;
-        ps = $PSVersionTable.PSVersion.ToString(); agent = '1'
+        ps = $PSVersionTable.PSVersion.ToString(); agent = '1'; version = '0.2.0'
     }
     Send-Frame $hello
     Start-Receive

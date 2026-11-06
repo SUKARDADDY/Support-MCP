@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleRpc, listTools, parseToolOptions, negotiateProtocol, DEFAULT_PROTOCOL } from '../src/mcp.js';
+import { VERSION } from '../src/version.js';
 
 const backend = {
   session_create: async (a) => ({ session_id: 'sid', one_liner: 'irm x | iex', code_expires_at: 1, label: a.label ?? null }),
@@ -105,7 +106,7 @@ test('descriptions carry the safety guidance and mark the aliases deprecated', (
   assert.match(by.ui_tree, /reports it as display/);
   assert.equal('display' in listTools().find((t) => t.name === 'ui_act').inputSchema.properties, false);
   const status = by.session_status;
-  for (const word of ['control', 'caps', 'desktop', 'input_blocked_until', 'paused_until', 'client_version']) assert.match(status, new RegExp(word));
+  for (const word of ['control', 'caps', 'desktop', 'input_blocked_until', 'paused_until', 'client_version', 'client_agent']) assert.match(status, new RegExp(word));
 });
 
 test('initialize negotiates protocol', async () => {
@@ -115,6 +116,7 @@ test('initialize negotiates protocol', async () => {
   const r = await handleRpc({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26' } }, backend);
   assert.equal(r.body.result.protocolVersion, '2025-03-26');
   assert.equal(r.body.result.serverInfo.name, 'support-mcp');
+  assert.equal(r.body.result.serverInfo.version, VERSION);
 });
 
 test('notifications/initialized => 202 no body', async () => {

@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHandler } from '../src/app.js';
+import { VERSION } from '../src/version.js';
 
 const handler = createHandler("$Sid = '{{SID}}'\n$Key = '{{KEY}}'\n$Origin = '{{ORIGIN}}'\n$AgentB64 = '{{AGENT_B64}}'\n");
 
@@ -280,7 +281,7 @@ test('/ws with the key in the query string => 401', async () => {
 test('/healthz stays public', async () => {
   const r = await handler.fetch(new Request(`${PROD}/healthz`), env);
   assert.equal(r.status, 200);
-  assert.deepEqual(await r.json(), { ok: true, service: 'support-mcp', stage: 'relay-v1' });
+  assert.deepEqual(await r.json(), { ok: true, service: 'support-mcp', stage: 'relay-v1', version: VERSION });
 });
 
 // ---- sign-in and account routes ----------------------------------------------------

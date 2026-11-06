@@ -200,6 +200,44 @@ without that record starts with commands and files only. The reconnect
 cannot extend the session's original 24-hour deadline, and End session or the
 operator ending the session cancels it.
 
+## Versions and releases
+
+The project has one release version, written as `MAJOR.MINOR.PATCH`
+([SemVer](https://semver.org)). The relay (`/healthz` and the MCP `serverInfo`),
+the Windows app (its hello and the exe's file version) and the PowerShell agent
+(its hello) all carry it. The version stays at `0.x` until Stage 1 is safe to run
+on unattended customer PCs. Each roadmap feature PR raises the minor number, and
+a fix raises the patch number. `CHANGELOG.md` lists what each version contains.
+
+Two strings look alike and mean different things. The hello's `agent` field
+(`windows-app-2`, `1`) names the wire protocol generation. The relay and its
+tests branch on it, so an app only changes it when the protocol changes. The
+hello's `version` field is the release. `session_status` reports the release as
+`client_version` when the client sent one, and the `agent` string as
+`client_agent`.
+
+To cut a release:
+
+1. Run `node scripts/bump-version.mjs 0.3.0`. It rewrites `package.json`,
+   `package-lock.json`, `src/version.js`, `src/agent.ps1` and `src/agent-app.cs`,
+   and refuses to write anything when a pattern does not match exactly once.
+2. Rebuild `src/app-bundle.json` on Windows, as in
+   [Build the app](#build-the-app). The version is part of the app source, so the
+   bundle hash test fails until you do.
+3. Add the `## [0.3.0]` entry to `CHANGELOG.md`.
+4. Open the PR. `test/version.test.js` fails when any copy of the version differs
+   from `package.json`.
+
+After the PR merges, tag the merge commit `v0.3.0` and create a GitHub release
+from the CHANGELOG entry. Deploy with
+
+```sh
+npx wrangler deploy --tag v0.3.0 --message "<one-line summary>"
+```
+
+(add `--config` if you deploy from a separate config file) so the version list
+in the Cloudflare dashboard shows which release each deployment is.
+
 ## Develop and test
 
 ```sh

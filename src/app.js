@@ -4,6 +4,7 @@
 // it route-level; index.js wires it to the real agent template.
 import { verifyAccessJwt, jwksKeyResolver, localBypassAllowed, callerIdentity } from './jwt.js';
 import { handleRpc, parseToolOptions } from './mcp.js';
+import { VERSION } from './version.js';
 import { permissionForTool } from './permissions.js';
 import { DEFAULT_WORKSPACE, teamFromEnv } from './workspace.js';
 import { registryName } from './registry.js';
@@ -483,7 +484,7 @@ export function createHandler(agentText, appBundle = null, options = {}) {
       const devTtlMs =
         localBypassAllowed(env, url.hostname) && env.SESSION_TTL_MS ? Number(env.SESSION_TTL_MS) : 0;
 
-      if (p === '/healthz') return json({ ok: true, service: 'support-mcp', stage: 'relay-v1' });
+      if (p === '/healthz') return json({ ok: true, service: 'support-mcp', stage: 'relay-v1', version: VERSION });
       if (p.startsWith('/j/')) return handleJ(request, env, url, origin, agentText, appBundle);
       if (p === '/agent') return handleAgent(request, env, url);
       if (p === '/ws') return handleWs(request, env, url);

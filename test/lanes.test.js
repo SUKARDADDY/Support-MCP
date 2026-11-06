@@ -67,6 +67,33 @@ test('hello stores caps, control and the agent, and status reports them', async 
   assert.deepEqual([o.caps, o.control, o.client_version], [[], null, 'windows-app-1']);
 });
 
+test('a hello version is reported as client_version, and the agent string stays in client_agent', async () => {
+  const f = await attach({ version: '0.2.0' });
+  const s = await f.status();
+  assert.deepEqual([s.client_version, s.client_agent], ['0.2.0', 'windows-app-2']);
+  // A prerelease and build part are valid too.
+  const pre = await attach({ version: '1.10.3-rc.1+build.5' });
+  assert.equal((await pre.status()).client_version, '1.10.3-rc.1+build.5');
+});
+
+test('a hello version that is not a short SemVer string is ignored', async () => {
+  for (const version of ['latest', '1.2', 'v1.2.3', '1.2.3 ', `1.2.3-${'a'.repeat(30)}`, 123, ['1.2.3'], { v: '1.2.3' }, null, '']) {
+    const f = await attach({ version });
+    const s = await f.status();
+    assert.deepEqual([s.client_version, s.client_agent], ['windows-app-2', 'windows-app-2'], JSON.stringify(version));
+  }
+});
+
+test('an old hello without a version still reports the agent string, and a reconnect hello clears the old version', async () => {
+  const f = await attach({ version: '0.2.0' });
+  assert.equal((await f.status()).client_version, '0.2.0');
+  await f.req('/agent', { type: 'hello', machine: 'POS', user: 'pos', agent: 'windows-app-2', caps: NEW_CAPS, control: 'normal' }, f.key);
+  const s = await f.status();
+  assert.deepEqual([s.client_version, s.client_agent], ['windows-app-2', 'windows-app-2']);
+  const old = await attach({ agent: 'windows-app-1', caps: undefined });
+  assert.deepEqual([(await old.status()).client_version, (await old.status()).client_agent], ['windows-app-1', 'windows-app-1']);
+});
+
 test('a poll may report desktop and the two deadlines; status drops a deadline that has passed', async () => {
   const f = await attach();
   const future = Date.now() + 60000;
