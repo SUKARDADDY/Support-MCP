@@ -7,13 +7,16 @@
 // src/agent.ps1, and src/agent-app.cs (Wire.Version and the four assembly attributes). The
 // assembly and file versions are x.y.z.0: a prerelease or build part is dropped from them.
 // A pattern that matches zero times or more than once is an error, and then no file is written.
+// Every new file is computed before the first write. The writes themselves are not atomic: an I/O
+// error midway can leave some files rewritten, and `git status` shows which.
 // It does not write the CHANGELOG entry or rebuild src/app-bundle.json (see docs/development.md).
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { VERSION_PATTERN } from '../src/version.js';
 
-// The same rule the relay applies to a version in a hello (src/session.js).
-const SEMVER = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$/;
+// The assembly attributes take four parts of 0 to 65534 each.
+const MAX_PART = 65534;
 
 const fail = (message) => {
   console.error(`bump-version: ${message}`);
@@ -30,8 +33,10 @@ if (rootAt >= 0) {
 }
 if (args.length !== 1) fail('usage: node scripts/bump-version.mjs <x.y.z> [--root <folder>]');
 const version = args[0];
-if (version.length > 32 || !SEMVER.test(version)) fail(`"${version}" is not a version like 1.2.3 or 1.2.3-rc.1`);
-const assemblyVersion = `${version.split(/[-+]/)[0]}.0`;
+if (version.length > 32 || !VERSION_PATTERN.test(version)) fail(`"${version}" is not a version like 1.2.3 or 1.2.3-rc.1`);
+const core = version.split(/[-+]/)[0];
+if (core.split('.').some((part) => Number(part) > MAX_PART)) fail(`"${version}": each of x, y and z must be ${MAX_PART} or less`);
+const assemblyVersion = `${core}.0`;
 
 // One edit: `pattern` must match exactly once and `$1` / `$2` keep the text around the number.
 const edit = (pattern, value) => ({ pattern, value });

@@ -396,7 +396,7 @@ test('hello logs truncated values and is accepted once per socket', async (t) =>
     type: 'hello', machine: long, user: long, ps: long, agent: long,
   }));
   const row = f.logs.find((l) => l.kind === 'hello');
-  assert.ok(row.detail.length < 300, `hello log row is ${row.detail.length} chars`);
+  assert.ok(row.detail.length < 320, `hello log row is ${row.detail.length} chars`);
   assert.equal(f.values.get('machine'), `${'x'.repeat(100)}…`);
   assert.equal(f.values.get('ps'), `${'x'.repeat(40)}…`);
 
@@ -427,6 +427,7 @@ test('a PowerShell hello stores a valid version, ignores a bad one, and a later 
   const third = f.socket('g3');
   f.values.set('ws_tag', 'g3');
   await f.session.webSocketMessage(third, JSON.stringify({ type: 'hello', machine: 'PC', agent: '1', version: '0.2.1' }));
+  assert.equal(f.values.get('version'), '0.2.1');
   const fourth = f.socket('g4');
   f.values.set('ws_tag', 'g4');
   await f.session.webSocketMessage(fourth, JSON.stringify({ type: 'hello', machine: 'PC', agent: '1' }));

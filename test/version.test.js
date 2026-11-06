@@ -79,13 +79,19 @@ test('bump-version.mjs refuses a bad version and touches no file', () => {
   const dir = copyTree();
   try {
     const before = snapshot(dir);
-    for (const bad of ['nope', '1.2', 'v1.2.3', '1.2.3 ', '1.2.3-', `1.2.3-${'a'.repeat(40)}`]) {
+    const refused = [
+      'nope', '1.2', 'v1.2.3', '1.2.3 ', '1.2.3-', `1.2.3-${'a'.repeat(40)}`,
+      '65535.0.0', '0.65535.0', '0.0.65535', '01.2.3', '1.02.3', '1.2.03', '1.2.3-..', '1.2.3-a..b', '1.2.3+a+b', '1.2.3+',
+    ];
+    for (const bad of refused) {
       const run = bump(dir, bad);
       assert.notEqual(run.status, 0, `${bad} is refused`);
       assert.match(run.stderr, /bump-version/);
     }
     assert.notEqual(bump(dir).status, 0, 'no version');
     assert.deepEqual(snapshot(dir), before);
+    assert.equal(bump(dir, '65534.65534.65534').status, 0, 'the largest assembly version is accepted');
+    assert.equal(versions(dir).cs_assembly, '65534.65534.65534.0');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -24,6 +24,7 @@
 // that name none (the download page, consume, the app) skip the check.
 
 import { registryName } from './registry.js';
+import { VERSION_PATTERN } from './version.js';
 import {
   LANES, auditText, decodeCaps, decodeControl, decodeControlResult, decodePollReport,
   decodeScreenResult, normalizeAction,
@@ -610,7 +611,7 @@ export class Session {
         ...(firstAttach ? { attached_first_at: now } : {}),
       });
       this.logRow('attached', `${firstAttach ? '' : 'reattach '}http${generation} elevated=${elevated ?? 'unknown'}`);
-      this.logRow('hello', `${machine ?? '?'}\\${user ?? '?'} ps=${ps ?? '?'} agent=${agent ?? '?'} control=${control ?? '?'} caps=${caps.join(',')}`);
+      this.logRow('hello', `${machine ?? '?'}\\${user ?? '?'} ps=${ps ?? '?'} agent=${agent ?? '?'} version=${version ?? '?'} control=${control ?? '?'} caps=${caps.join(',')}`);
       await this.ctx.storage.setAlarm(expiresAt);
       await this.pushRegistry();
       return Response.json({ type: 'welcome', generation, expires_at: expiresAt, server_time: now });
@@ -748,7 +749,7 @@ export class Session {
       const agent = truncate(String(msg.agent ?? ''), 40) || null;
       const version = decodeVersion(msg.version);
       await this.setMany({ machine, user, ps, agent, version, hello_tag: this.socketTag(ws) });
-      this.logRow('hello', `${machine ?? '?'}\\${user ?? '?'} ps=${ps ?? '?'} agent=${agent ?? '?'}`);
+      this.logRow('hello', `${machine ?? '?'}\\${user ?? '?'} ps=${ps ?? '?'} agent=${agent ?? '?'} version=${version ?? '?'}`);
       await this.pushRegistry();
       return;
     }
@@ -794,9 +795,8 @@ function truncate(s, n) {
 }
 
 // The release version a hello may carry: SemVer, 32 characters at most. Anything else is dropped.
-const VERSION_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$/;
 function decodeVersion(v) {
-  return typeof v === 'string' && v.length <= 32 && VERSION_RE.test(v) ? v : null;
+  return typeof v === 'string' && v.length <= 32 && VERSION_PATTERN.test(v) ? v : null;
 }
 
 // The /status answer. A session that does not exist is statusBody(new Map(), [], false).

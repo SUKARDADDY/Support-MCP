@@ -76,8 +76,17 @@ test('a hello version is reported as client_version, and the agent string stays 
   assert.equal((await pre.status()).client_version, '1.10.3-rc.1+build.5');
 });
 
+test('a hello version of exactly 32 characters is kept, and one of 33 is ignored', async () => {
+  const fits = `1.2.3-${'a'.repeat(26)}`;
+  assert.equal(fits.length, 32);
+  assert.equal((await (await attach({ version: fits })).status()).client_version, fits);
+  const tooLong = `${fits}a`;
+  assert.equal(tooLong.length, 33);
+  assert.equal((await (await attach({ version: tooLong })).status()).client_version, 'windows-app-2');
+});
+
 test('a hello version that is not a short SemVer string is ignored', async () => {
-  for (const version of ['latest', '1.2', 'v1.2.3', '1.2.3 ', `1.2.3-${'a'.repeat(30)}`, 123, ['1.2.3'], { v: '1.2.3' }, null, '']) {
+  for (const version of ['latest', '1.2', 'v1.2.3', '1.2.3 ', '01.2.3', '1.2.3+a+b', `1.2.3-${'a'.repeat(30)}`, 123, ['1.2.3'], { v: '1.2.3' }, null, '']) {
     const f = await attach({ version });
     const s = await f.status();
     assert.deepEqual([s.client_version, s.client_agent], ['windows-app-2', 'windows-app-2'], JSON.stringify(version));

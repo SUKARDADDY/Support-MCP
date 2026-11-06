@@ -210,8 +210,8 @@ on unattended customer PCs. Each roadmap feature PR raises the minor number, and
 a fix raises the patch number. `CHANGELOG.md` lists what each version contains.
 
 Two strings look alike and mean different things. The hello's `agent` field
-(`windows-app-2`, `1`) names the wire protocol generation. The relay and its
-tests branch on it, so an app only changes it when the protocol changes. The
+(`windows-app-2`, `1`) names the wire protocol generation. The relay stores and
+reports it, and an app changes it only when the protocol changes. The
 hello's `version` field is the release. `session_status` reports the release as
 `client_version` when the client sent one, and the `agent` string as
 `client_agent`.

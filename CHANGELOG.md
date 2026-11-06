@@ -16,7 +16,8 @@ to run on unattended customer PCs.
 - Full control through a UAC-approved SYSTEM service that reaches the secure
   desktop and survives a restart (#11, #12).
 - Team members and roles. Every MCP tool call is checked against the caller's
-  role (#13).
+  role (#13). Team managers cannot edit members or roles stronger than their own,
+  and checking a log page is cheaper (#14).
 - Workspaces. Each team gets its own MCP address, team API and session list (#15).
 - Technician sign-in with Google, Microsoft or an email link, followed by an
   authenticator code (#16).
@@ -31,14 +32,13 @@ to run on unattended customer PCs.
 
 ### Changed
 
-- Checking a log page is cheaper, and team managers can no longer edit members or
-  roles stronger than their own (#14).
 - `session_status` `client_version` is the release version when the client sends
   one. Older clients still show their `agent` string.
 
 ## [0.1.0]
 
-The first public release, and the version production runs until 0.2.0 is deployed.
+The first public release. It is the state of `main` at #7 (commit 99f242b), deployed
+to production on 2 November 2026, and production runs it until 0.2.0 is deployed.
 
 - Consent-based, self-expiring Windows remote support sessions, run by an AI
   agent over MCP.
