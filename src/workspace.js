@@ -22,6 +22,9 @@ import {
 export const DEFAULT_WORKSPACE = 'default';
 export const GENESIS_HASH = '0'.repeat(64);
 const SLUG_RE = /^[a-z0-9-]{1,40}$/;
+// The most workspaces (besides default) one server holds. OAuth lists every
+// workspace address pairwise, so the count is capped at creation.
+export const MAX_WORKSPACES = 500;
 const DEFAULT_NAME = 'Default';
 const MAX_RETRIES = 5;
 const RECENT_CALLERS = 50;
@@ -260,7 +263,11 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
   // permission key, never a tool's arguments. While default is open, a
   // caller holds the sessions.* permissions and nothing that changes the team
   // (reason 'open').
-  async function authorize(slug, identity, permission) {
+  //
+  // `membersOnly` is for a caller that must never use open mode (an OAuth
+  // token): while default has no members it answers not_member, and it does not
+  // record the caller.
+  async function authorize(slug, identity, permission, { membersOnly = false } = {}) {
     checkSlug(slug);
     if (!isPermission(permission)) throw new TypeError('authorize takes a permission key');
     const id = normalizeIdentity(identity);
@@ -268,7 +275,7 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
       EXISTS (SELECT 1 FROM members WHERE workspace = ?) AS any_member`, slug, id, slug).first();
     if (!row.any_member) {
       // Only default is ever open. Any other workspace with no members is closed.
-      if (slug !== DEFAULT_WORKSPACE) return { ok: false, open: false, role_id: null, reason: 'not_member' };
+      if (slug !== DEFAULT_WORKSPACE || membersOnly) return { ok: false, open: false, role_id: null, reason: 'not_member' };
       if (!OPEN_PERMISSIONS.includes(permission)) return { ok: false, open: true, role_id: null, reason: 'open' };
       await recordCaller(slug, id);
       return { ok: true, open: true, role_id: null };
@@ -300,6 +307,15 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
     if (slug === DEFAULT_WORKSPACE) return true;
     if (typeof slug !== 'string' || !SLUG_RE.test(slug)) return false;
     return (await q('SELECT 1 AS found FROM workspaces WHERE slug = ?', slug).first('found')) === 1;
+  }
+
+  // Every created workspace's slug (never default, which is not a row). The
+  // OAuth server builds its list of MCP addresses from this, and the library
+  // checks that list pairwise, so creation stops at MAX_WORKSPACES and this
+  // list is never cut short.
+  async function workspaceSlugs() {
+    const { results } = await q('SELECT slug FROM workspaces ORDER BY slug LIMIT ?', MAX_WORKSPACES).all();
+    return results.map((r) => r.slug);
   }
 
   // The workspaces this identity is a member of, by slug, and default first
@@ -676,6 +692,9 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
       if ((await workspaceExists(slug)) || (await memberCount(slug)) > 0) {
         throw new TeamError(409, 'workspace_exists', `workspace ${slug} already exists`);
       }
+      if ((await q('SELECT COUNT(*) AS n FROM workspaces').first('n')) >= MAX_WORKSPACES) {
+        throw new TeamError(409, 'workspace_limit', `this server holds at most ${MAX_WORKSPACES} workspaces besides default`);
+      }
       const now = Date.now();
       const member = { identity: actor, kind: identityKind(actor), name: null, role_id: ADMIN_ROLE, added_at: now, added_by: actor };
       return {
@@ -686,7 +705,7 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
         // The slug is the table's primary key, so two creations of one slug can't
         // both land. The member goes in first: the guard reads only `workspaces`,
         // which the member insert leaves alone, and the row insert comes last.
-        guard: ['NOT EXISTS (SELECT 1 FROM workspaces WHERE slug = ?)', [slug]],
+        guard: ['NOT EXISTS (SELECT 1 FROM workspaces WHERE slug = ?) AND (SELECT COUNT(*) FROM workspaces) < ?', [slug, MAX_WORKSPACES]],
         change: ([cond, params]) => [
           q(`INSERT INTO members(workspace, identity, kind, name, role_id, added_at, added_by) SELECT ?, ?, ?, ?, ?, ?, ? WHERE ${cond}`,
             slug, member.identity, member.kind, member.name, member.role_id, member.added_at, member.added_by, ...params),
@@ -792,7 +811,7 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
 
   return {
     authorize, whoami, recentCallers,
-    workspaceExists, listWorkspaces, createWorkspace,
+    workspaceExists, workspaceSlugs, listWorkspaces, createWorkspace,
     isInvited, isDeploymentAdmin, memberships,
     listMembers, getMember, addMember, updateMember, removeMember,
     listRoles, addRole, updateRole, removeRole,

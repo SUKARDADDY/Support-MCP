@@ -261,7 +261,17 @@ apply to only one client say which.
   on these addresses. Requests carrying an `Origin` header get a 403
   and non-JSON bodies (every team API write) get a 415, which blocks cross-site
   requests from a logged-in browser. All of these refusals come before the relay
-  reads any session or team data.
+  reads any session or team data. The MCP addresses also take an OAuth bearer
+  token (below), and answer a missing or failed credential with 401. The team
+  API does not take bearer tokens. With OAuth, the MCP addresses may sit under a
+  second Access app (`support-mcp-mcp`) that gives a service token an Access
+  login and bypasses everyone else. `ACCESS_MCP_AUD` names that app. On the MCP
+  addresses only, an Access login for either `ACCESS_AUD` or `ACCESS_MCP_AUD` is
+  accepted, with the same signature, issuer and expiry checks. The team API
+  accepts `ACCESS_AUD` only, and an empty `ACCESS_MCP_AUD` changes nothing.
+  Access session revocation does not apply on a bypassed path. There the relay's
+  own checks are the gate: the JWT or the OAuth token, and the role check on
+  every tool call.
 - **Each tool call is checked against the caller's role.** The relay keeps the
   `default` workspace and any number of created ones, each with its own members
   and roles in a D1 database. The workspace is the address the call arrived on:
@@ -364,12 +374,14 @@ apply to only one client say which.
   and nothing is stored. The check is read live on every request, so removing
   the last membership ends a sign-in on its next request, and "sign out
   everywhere" revokes every sign-in the person has (and, for a person with an
-  authenticator, needs a sign-in that has passed a code). A sign-in is for the account
-  page. It is not accepted on `/mcp`, `/w/<slug>/mcp` or the team API, which
-  still admit only Cloudflare Access logins and service tokens, so a signed-in
-  person from one team cannot claim the open `default` workspace's first admin
-  or read its recent callers. Until PR 2c, a sign-in cannot start or control a
-  session.
+  authenticator, needs a sign-in that has passed a code, and also ends the
+  person's OAuth grants). A sign-in cookie is for the account page and the
+  consent page. It is not accepted on `/mcp`, `/w/<slug>/mcp` or the team API,
+  so a signed-in person from one team cannot claim the open `default`
+  workspace's first admin or read its recent callers. A sign-in counts its
+  second factor only while the person still has the authenticator it used: if
+  an operator resets the authenticator, or the person replaces it, an open
+  sign-in loses its factor.
 - **Google and Microsoft sign-in checks the whole token.** It uses the
   authorization code flow with PKCE (S256), a `state` and a `nonce`. The state,
   nonce, PKCE verifier and return path live in one cookie sealed with AES-GCM
@@ -447,7 +459,7 @@ apply to only one client say which.
 - **Browser forms are checked for cross-site posting.** `/mcp` and `/api` refuse
   any `Origin` header outright. The sign-in and account pages are for browsers,
   so each POST instead needs an `Origin`, when the browser sends one, equal to
-  the relay's own (otherwise 403), a form token, and a urlencoded body under 4 KB.
+  the relay's own (otherwise 403), a form token, and a urlencoded body under 8 KB.
   The token is an HMAC (key derived from `AUTH_SECRET`) of the sign-in's id hash
   or, before sign-in, of the page's own cookie. Cookies are `SameSite=Lax` as a
   third layer. A return path after sign-in must start with one `/`, never `//` or
@@ -456,7 +468,7 @@ apply to only one client say which.
   `//evil.example`) and refused if it then points off the site. Every redirect
   and every link or form field that carries a return path goes through that
   check, so none can be an open redirect. Form bodies are read with a byte cap
-  and cut off at 4 KB even when they declare no length, and so are the
+  and cut off at 8 KB even when they declare no length, and so are the
   provider's token and key responses. Every page sends a
   Content-Security-Policy of `default-src 'none'` (so no script, font or image
   can load, and the pages contain none), `frame-ancestors 'none'`,
@@ -464,6 +476,129 @@ apply to only one client say which.
   hosts on the sign-in page only. They also send `Referrer-Policy: same-origin` (so no address leaves the site;
   `no-referrer` would make Chrome send `Origin: null` on every form post),
   `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`.
+- **MCP clients sign in through the relay's own OAuth server.** The relay uses
+  the maintained `@cloudflare/workers-oauth-provider` library (pinned to an
+  exact version) in its split roles: the authorization server for the
+  discovery document, `/oauth/token` and `/oauth/register`, and its token check
+  for each MCP address. The relay's own code serves the protected resource
+  documents, the consent page and the 401 challenge, so the library never
+  answers on an MCP address before the relay's `Origin`, method and content-type
+  refusals. The library stores grants, tokens and registered clients in the
+  `OAUTH_KV` namespace: tokens, codes and secrets only as hashes, and each
+  grant's props (the person, the workspace) encrypted with a key that only the
+  token holder can unwrap. The relay adds these rules:
+  - **One address per token.** Every grant and access token is bound to exactly
+    one MCP address (RFC 8707). A token for `/w/acme/mcp` is a 401 on `/mcp`, and
+    the reverse. An authorization request must name exactly one address, or
+    the library refuses it with `invalid_target`.
+  - **PKCE S256 for every client, exact redirect addresses.** Registration is
+    open and does not require a public client: a client that names no
+    authentication method gets the library's default, a client secret, and the
+    library requires PKCE only of clients without one. So the relay requires a
+    PKCE S256 challenge (43 characters of base64url) on every authorization
+    request, from every client, and refuses the request on the authorize page
+    when it is missing, is `plain`, or has no method. It checks again when the
+    person presses Allow, where the code is made. Redirect addresses must match
+    the registration exactly, and may be `https`, `http` on loopback, or an
+    RFC 8252 app link such as `cursor://` (`allowPrivateUseRedirectUris`; safe
+    only because PKCE is mandatory). Access tokens last one hour. Refresh tokens
+    last 30 days from approval, as one fixed limit. The library accepts the
+    current refresh token and the one before it, and has no reuse detection:
+    using the older one issues a new pair and makes the client's newer token
+    stop working, and nothing ends the grant or raises an alert. Presenting a
+    used authorization code again ends the grant. The authorization response
+    carries `iss` (RFC 9207).
+  - **Errors before a choice are never redirected.** Any error found while
+    reading an authorization request is shown on the relay's own page. The
+    library would redirect to the client's registered address, but a client
+    registers itself, so that would let an attacker's client send a signed-in
+    person to its own site with no click (RFC 9700 4.11.2). The page may carry a
+    plain link back, named by the client's host, which the person must click.
+    The client is redirected only after the person presses Allow or Deny.
+  - **The consent page is the relay's.** It needs a browser sign-in, then reads
+    the person's membership in the workspace the address names and refuses a
+    non-member. A role that holds `sessions.control`, `members.manage` or
+    `roles.manage` needs a second factor passed in this sign-in, so the person is
+    sent to `/auth/factor` first, as for the account page. The page shows the
+    client's name (escaped), where the client returns to (the host for a web
+    address, the scheme and host for an app link, with a warning that it opens
+    an app on the device), a warning for `localhost`, the workspace and what the
+    role allows. Allow and Deny are
+    separate form posts with the sign-in's form token, an `Origin` check and the
+    library's browser-bound, single-use, ten-minute handle. The page lists the
+    client's redirect origin in `form-action`, because Chrome applies
+    `form-action` to the redirect that answers a form post. That source is
+    built only from a plain host and port or a plain `scheme:` token that matches a
+    strict pattern and is not a known dangerous scheme, never from raw text, and
+    the address was matched exactly against the client's registration first. A
+    return address the builder cannot write is refused on the authorize page.
+    Membership and the second factor are read again when Allow is pressed.
+  - **Every tool call checks the person live.** The token proves who connected.
+    Each `tools/call` also reads the person, their membership and their role
+    from D1, as for an Access caller, and refuses a person who was removed,
+    disabled or never invited. An OAuth caller never reaches open mode: the role
+    check is told to admit members only, so an empty `default` neither admits
+    the caller nor records it among the recent callers. A permission that needs a second factor needs the
+    authenticator the grant was made with: the grant records when that
+    authenticator was set up, and a reset or replacement ends the use of control
+    permissions until the client is approved again. The audit identity is the
+    person's email. `tools/list`, `initialize` and `ping` with a token read the
+    person in D1 and KV once, and nothing else.
+  - **A junk token costs no KV read.** The free KV plan allows 100,000 reads a
+    day, so a flood of made-up bearer tokens could otherwise turn every OAuth
+    caller into a 503. Before KV is read, the token must have the issued shape
+    (`<uuid>:<16 characters>:<32 characters>`) and its first part must be a
+    person who exists and is not disabled in D1, whose free read limit is far
+    higher. Anything else is a 401 `invalid_token` with no KV read. If D1 cannot
+    answer, the answer is 503. A flood still costs a request and a D1 read each,
+    so add a rate-limiting rule on `/mcp` and `/w/*`, as on `/oauth/`.
+  - **Sign out everywhere ends the person's grants.** It lists and revokes every
+    grant for the person. If KV cannot be reached it says so instead of
+    claiming success. A plain sign out leaves the clients connected.
+  - **Failures are 401, outages are 503.** A token that is missing, expired,
+    revoked, for another address or malformed is a 401 with the discovery header,
+    so the client signs in again. A KV failure (its daily limit, an outage) is a
+    503, so a client does not throw away a good sign-in.
+  - **The discovery document does not list the workspaces, but slugs are not
+    secret.** The library would publish every address in `protected_resources`,
+    which would publish every team's name, so the relay removes that field. The
+    protected resource document `/.well-known/oauth-protected-resource/w/<slug>/mcp`
+    is public and answers 200 for a workspace that exists and 404 for one that
+    does not. So an unauthenticated visitor can learn which slugs exist by
+    trying them. Treat a slug as public. It leaks no member, session or name.
+  - **Dynamic registration is open.** Anyone can register a client, which writes
+    to KV. The library rejects an http address that is not loopback, a
+    dangerous scheme (`javascript:`, `data:`, `file:` and similar) and a
+    redirect with userinfo or a fragment, and the consent page labels a client
+    that registered itself as unverified. The risk is a flood of registrations
+    using up the free KV write limit. Add a rate-limiting rule on `/oauth/`.
+    The writes of honest use are small but real: a connected client writes two
+    keys each time its access token is refreshed, once an hour, about 48 writes
+    a day if it is active around the clock. About 20 such clients use the 1,000
+    free writes a day.
+  - **The workspace list is capped and refreshed on a miss.** The OAuth server
+    lists every workspace address, and the library checks that list pairwise, so
+    creating a workspace past 500 is refused with `409 workspace_limit`. The list
+    is read every ten seconds and at once when the authorize page or a refused
+    `/oauth/token` request meets an address it lacks, at most once every two
+    seconds, so a burst of unknown addresses is not a burst of D1 reads.
+  - **Client metadata documents.** The library fetches the document of an https
+    `client_id` with a 5 KB cap, a 10 second timeout and checks that the
+    document names the same address. The fetch needs the
+    `global_fetch_strictly_public` compatibility flag so it cannot reach private
+    addresses or this Worker's own zone. The consent page then shows the
+    client's domain.
+  - **KV is eventually consistent.** A used code might work twice at two
+    locations within about a minute, and a revoked token can be accepted for
+    about a minute at a location that has a copy. Membership removal has no such
+    delay. See [mcp-clients.md](mcp-clients.md).
+  - **Access Managed OAuth conflicts.** Turn it off for the MCP and discovery
+    addresses, or the Access authorization server answers instead of this one.
+    `cf/access-setup.sh` with `OAUTH=1` leaves `/oauth/`, `/.well-known/`,
+    `/auth/` and `/account` outside Access, and puts `/mcp` and `/w/*` under a
+    second app whose policies are Service Auth for the service token, then
+    Bypass for everyone. Service tokens keep working on the MCP addresses in
+    both modes.
 - **What sign-in stores.** `users` (email), `user_identities` (provider, the
   provider's id, the email seen at link time), `login_sessions` (hash of the
   cookie, times, when the second factor passed), `email_links` (hashes, address,
@@ -471,8 +606,11 @@ apply to only one client say which.
   count, hashed recovery codes). Never a cookie value, link token, plain
   recovery code or plain authenticator secret. Provider client secrets, the
   mail API key and `AUTH_SECRET` are Wrangler secrets. The sign-in code writes
-  nothing to the Worker log. Old `login_sessions` rows are not pruned yet, and
-  `email_links` rows are deleted after two hours.
+  nothing to the Worker log. `login_sessions` rows that expired or were revoked
+  more than 30 days ago are deleted when a new sign-in is made, and `email_links`
+  rows are deleted after two hours. The idle limit is never shorter than ten
+  minutes, so a very small `SIGNIN_IDLE_HOURS` cannot sign out someone who is
+  using the site (the last-seen time is written every five minutes).
 - **Sessions only move forward.** The states run pending, consumed, attached,
   ended, and `ended` is final. The 24-hour limit starts at the first attach and
   a reattach does not extend it. Every handler checks the deadline inline, so a

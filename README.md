@@ -45,6 +45,9 @@ AI agent does the diagnosis and the fix while a person watches.
 - The Worker is the MCP server, so there is nothing to run on your machine.
 - A support team can share one relay. Each tool call is checked against the
   caller's role, so a Viewer can watch but not act.
+- MCP clients (Claude Code, Codex, Cursor, VS Code) can sign in as a person
+  through the relay's own OAuth, or keep using an Access service token. Service
+  tokens work on the MCP addresses either way.
 
 ## How it works
 
@@ -327,10 +330,12 @@ set up an authenticator app (6-digit codes, with ten recovery codes), and enters
 a code at each sign-in. Removing someone from the team, or their choosing
 **Sign out everywhere**, ends their browser sign-ins on the next request.
 
-In this release a sign-in opens the account page: your email, your workspaces
-and roles, your second factor, and sign out. The team API and the MCP addresses
-still admit only Cloudflare Access logins and service tokens, so signing in
-changes nothing there. Letting MCP clients act as a signed-in person comes next.
+A sign-in opens the account page: your email, your workspaces and roles, your
+second factor, and sign out. It is also what lets an MCP client act as you: the
+client sends you to the consent page at `/oauth/authorize`, which needs this
+sign-in (see [MCP clients](#mcp-clients)). The team API still admits only
+Cloudflare Access logins and service tokens, and a sign-in cookie alone is not
+accepted there or on the MCP addresses.
 
 | Route | What it does |
 |---|---|
@@ -338,11 +343,31 @@ changes nothing there. Letting MCP clients act as a signed-in person comes next.
 | `GET /auth/google`, `/auth/microsoft` | start the provider sign-in; the provider returns to `.../callback` |
 | `POST /auth/email`, `GET` and `POST /auth/email/confirm` | ask for an emailed link; open it; press the button to use it |
 | `GET` and `POST /auth/factor` | set up, verify or replace the authenticator |
-| `GET /account` | your account; `POST /auth/signout` and `POST /account/signout-everywhere` |
+| `GET /account` | your account; `POST /auth/signout` and `POST /account/signout-everywhere` (which also ends every MCP client you approved) |
 
 Setup for Google, Microsoft, email and the settings are in
 [docs/sign-in-setup.md](docs/sign-in-setup.md). Without `AUTH_SECRET`, or with no
 `PUBLIC_ORIGIN` on a real host, the sign-in pages answer 503.
+
+## MCP clients
+
+An MCP client signs in through the relay's own OAuth server. The person signs
+in once in a browser (with the second factor their role needs), approves the
+client on a consent page that shows the client, where it returns to, the
+workspace and their role, and the client's token then acts as them in that
+workspace. Access tokens last an hour, refresh tokens 30 days, and both are
+bound to one MCP address: `/mcp` for `default`, `/w/<slug>/mcp` for another.
+
+```sh
+claude mcp add --transport http support-mcp https://support.example.com/mcp
+```
+
+Every tool call still checks the person's role live, so removing someone, or
+their choosing **Sign out everywhere**, ends their clients at once. An Access
+login or service token works on the same addresses as before. A request with no
+credential, or a failed token, gets 401 with a `WWW-Authenticate` header that
+leads the client to sign in. Setup, the other clients, the free-plan KV limits
+and local testing are in [docs/mcp-clients.md](docs/mcp-clients.md).
 
 ## Architecture
 
@@ -458,7 +483,7 @@ deploy without Windows. You need Windows only to change the app: see
    ```
    Run the migrations again after an update that adds one, before you deploy.
 3. **Fill in `wrangler.toml`.** Set the route hostname, `ACCESS_TEAM_DOMAIN`,
-   `ACCESS_AUD` and the D1 `database_id`. Set `DEPLOYMENT_ADMINS` to your own
+   `ACCESS_AUD` (and `ACCESS_MCP_AUD` if you use OAuth, below) and the D1 `database_id`. Set `DEPLOYMENT_ADMINS` to your own
    email (comma-separate several). Only they can become default's first admin, and
    only they can create more workspaces. With it empty, nobody can create one.
    Then run `npx wrangler deploy`.
@@ -466,7 +491,7 @@ deploy without Windows. You need Windows only to change the app: see
    Edge Certificates), so a link pasted without `https://` is redirected. The
    relay refuses `/j` and `/ws` over plain http either way. The relay does no
    rate limiting of its own, so add a Cloudflare rate-limiting rule on `/j` and
-   `/ws`.
+   `/ws` (and on `/oauth/`, `/mcp` and `/w/` if you turn on OAuth).
 5. **Connect your MCP client.** Every request to `/mcp` needs the headers
    `CF-Access-Client-Id` and `CF-Access-Client-Secret`. `cf/mcp-headers.sh`
    reads them from `~/.config/support-mcp/access.env` when the client connects,
@@ -497,6 +522,20 @@ deploy without Windows. You need Windows only to change the app: see
    [docs/sign-in-setup.md](docs/sign-in-setup.md). The `/auth/` and `/account`
    paths need to be reachable without Cloudflare Access, so keep them outside
    the Access app (it guards `/mcp`, `/w/` and `/api/`).
+   **Optional: let MCP clients sign in with OAuth.** Create the KV namespace
+   with `npx wrangler kv namespace create OAUTH_KV`, put its id in
+   `wrangler.toml`, and run the Access script again with `OAUTH=1`. The script
+   keeps the first Access app on `/api` and adds a second one on `/mcp` and
+   `/w/*`. The second app passes a service token through with an Access login
+   and lets every other request go on to the relay, which checks it. It prints
+   the second app's AUD: put it in `wrangler.toml` as `ACCESS_MCP_AUD`. `/oauth/`,
+   `/.well-known/`, `/auth/` and `/account` stay outside Access. Then clients can
+   connect with just the address, and service tokens keep working on the MCP
+   addresses. Access session revocation does not apply on the paths the second
+   app bypasses; there the relay's own checks are the gate. See
+   [docs/mcp-clients.md](docs/mcp-clients.md). Add a rate-limiting rule on `/mcp`
+   and `/w/` too: a flood of junk tokens there is stopped before KV, but each one
+   still costs a database read.
 7. **Turn on roles.** Add yourself as the first member, as admin, and in the
    same sitting add your MCP client's service token by its client ID
    (`CF_ACCESS_CLIENT_ID` in `access.env`), or the client loses access. See
@@ -506,8 +545,13 @@ deploy without Windows. You need Windows only to change the app: see
 ## Develop
 
 ```sh
-node --test    # unit and route tests, no network
+npm ci --ignore-scripts
+npm test       # unit and route tests, no network
 ```
+
+`npm test` runs `node --test` with a small loader that stands in for the
+`cloudflare:workers` module, which only the Workers runtime has, so the OAuth
+library can load under Node. Without the loader the OAuth tests skip.
 
 Building the Windows app, running a local dev server, and what the tests and CI
 check are in [docs/development.md](docs/development.md).
@@ -560,8 +604,8 @@ check are in [docs/development.md](docs/development.md).
 - An old app from before screen control keeps working for commands and files.
   Its screen calls return `this support app is too old for screen control`. The
   PowerShell fallback has no screen access either.
-- Cloudflare Access decides who can reach the relay, and each workspace's roles
-  decide what its members can do. The relay's own sign-in comes later.
+- Cloudflare Access, or the relay's OAuth for MCP clients, decides who can reach
+  the relay, and each workspace's roles decide what its members can do.
   `session_list` lists the sessions of the workspace you called it on. A session
   made before workspaces existed is in `default`.
 - Command output is capped at 262,144 characters per stream, and the whole

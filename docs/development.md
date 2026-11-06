@@ -203,11 +203,23 @@ operator ending the session cancels it.
 ## Develop and test
 
 ```sh
-node --test                          # unit and route tests, no network
+npm ci --ignore-scripts              # once: the OAuth library is the one dependency
+npm test                             # unit and route tests, no network
 npx wrangler deploy --dry-run --outdir /tmp/support-mcp-dry
 npx wrangler d1 migrations apply support-mcp --local   # the team tables, once
 cp .dev.vars.example .dev.vars && npx wrangler dev --port 8787
 ```
+
+`npm test` is `node --import ./test/stubs/register.mjs --test`. The OAuth library
+imports `cloudflare:workers`, which only the Workers runtime has, so
+`test/stubs/register.mjs` installs a resolve hook that maps it to
+`test/stubs/cloudflare-workers.mjs`, an empty `WorkerEntrypoint` plus the global
+that turns on client metadata documents. The library is imported only by
+`src/index.js` and handed to `createHandler`, so `src/app.js` and every test
+that does not need OAuth load without the hook. `test/oauth.test.js` needs it:
+under a bare `node --test` its tests skip with a message, and CI runs `npm ci --ignore-scripts`
+then `npm test`, so there they all run. (`node --test` also runs the helper files
+under `test/` as one empty test each, so the totals include them.)
 
 `.dev.vars` skips Access and shortens the session TTL, but only when the
 request host is `localhost` or `127.0.0.1`. The deployed hostname can never
@@ -265,6 +277,25 @@ binding that records every call.
 
 `test/app.test.js` covers the app: the bundle's hashes, the download flow and
 its security headers, the polling transport, and the default mode and aliases.
+
+### OAuth locally
+
+`test/oauth.test.js` drives the real router and the real library with an
+in-memory KV (`test/kv-fake.js`: get as text or json, put with `expirationTtl`
+and metadata, delete, list with prefix and cursor, a 60 second TTL floor like the
+real one, and read and write counters) on top of the D1 stand-in. A scripted
+client registers, a cookie-jar browser signs in and consents, and the tokens are
+used on the MCP addresses. Tests move the clock by replacing `Date.now`, which the
+library, the KV fake and the D1 fake all read. Access logins are signed with a
+local key, as in `test/api.test.js`.
+
+To try it with a real client under `wrangler dev`, follow [Sign-in
+locally](#sign-in-locally) and leave `DEV_SKIP_ACCESS` unset: with it set every
+local caller is accepted without a token and no client is asked to sign in.
+`wrangler dev` simulates the `OAUTH_KV` binding locally, so no namespace id is
+needed. Then `claude mcp add --transport http local-support
+http://localhost:8787/mcp` and run `/mcp` in Claude Code. Details are in
+[mcp-clients.md](mcp-clients.md#try-it-locally).
 
 ### Sign-in locally
 

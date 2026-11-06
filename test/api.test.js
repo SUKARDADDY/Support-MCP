@@ -651,6 +651,16 @@ test('default cannot be created and an existing slug is 409 workspace_exists', a
   assert.equal((await r.api(OWNER, 'GET', '')).body.workspace.open, true, 'default was not created or closed');
 });
 
+test('POST /api/v1/w past the 500 workspace limit is 409 workspace_limit', async () => {
+  const r = await created();
+  const insert = r.env.DB.sqlite.prepare("INSERT INTO workspaces(slug, name, created_by, created_at) VALUES (?, 'W', 'x', 1)");
+  for (let i = 0; i < 498; i++) insert.run(`w${String(i).padStart(4, '0')}`); // acme is the 1st: 499 now
+  assert.equal((await r.apiAt(null, OWNER, 'POST', '', { slug: 'last-one', name: 'Last' })).status, 201);
+  const res = await r.apiAt(null, OWNER, 'POST', '', { slug: 'one-more', name: 'Too many' });
+  assert.deepEqual([res.status, res.body.error.code], [409, 'workspace_limit']);
+  assert.match(res.body.error.message, /at most 500/);
+});
+
 test('GET /api/v1/w lists the caller\'s workspaces, and default while it is open', async () => {
   const r = await created();
   await r.apiAt(null, OWNER, 'POST', '', { slug: 'beta', name: 'Beta' });
@@ -796,7 +806,7 @@ test('a sign-in cookie is ignored on the team API and MCP, so default\'s first a
   const claim = await send('/api/v1/w/default/members', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ identity: 'tech@example.com', role_id: 'admin' }) });
   assert.equal(claim.status, 403);
   assert.equal((await send('/api/v1/w')).status, 403);
-  assert.equal((await send('/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'session_list', arguments: {} } }) })).status, 403);
+  assert.equal((await send('/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'session_list', arguments: {} } }) })).status, 401, 'a cookie is no credential on /mcp');
   assert.equal(r.env.DB.sqlite.prepare("SELECT COUNT(*) AS n FROM members WHERE workspace = 'default'").get().n, 0);
 
   // The account page does accept it, and the same Access login claims default as before.

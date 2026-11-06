@@ -1156,8 +1156,8 @@ test('a sign-in cookie is not accepted on the team API or the MCP address', asyn
   assert.equal(claim.status, 403);
   assert.equal(sql(env, "SELECT COUNT(*) AS n FROM members WHERE workspace = 'default'")[0].n, 0, 'nobody claimed default');
   const rpc = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'session_list', arguments: {} } });
-  assert.equal((await api('/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: rpc })).status, 403);
-  assert.equal((await api('/w/acme/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: rpc })).status, 403);
+  assert.equal((await api('/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: rpc })).status, 401);
+  assert.equal((await api('/w/acme/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: rpc })).status, 401);
 });
 
 test('secrets stay out of every table', async () => {
@@ -1442,7 +1442,7 @@ test('a form is cut off at its size limit while it is read, with or without a le
   assert.equal((await post(unread, { 'content-length': '100000' })).status, 413);
   assert.equal(touched, false);
   // Multi-byte text is counted in bytes, not characters.
-  assert.equal((await post(new TextEncoder().encode('e=' + '\u00e9'.repeat(3000)))).status, 413);
+  assert.equal((await post(new TextEncoder().encode('e=' + '\u00e9'.repeat(5000)))).status, 413);
 });
 
 test('provider responses are read with a cap too', async () => {

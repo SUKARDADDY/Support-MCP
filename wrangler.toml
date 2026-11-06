@@ -5,6 +5,10 @@
 name = "support-mcp"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
+# OAuth reads an MCP client's metadata document from the address the client
+# gives as its client_id. This flag makes that fetch reach only public hosts
+# (never this Worker's own zone), which is what keeps it from being abused.
+compatibility_flags = ["global_fetch_strictly_public"]
 workers_dev = false
 routes = [{ pattern = "support.REPLACE_ME.example", custom_domain = true }]
 
@@ -15,6 +19,10 @@ enabled = true
 # Your Zero Trust team domain and the AUD tag of the Access app guarding /mcp.
 ACCESS_TEAM_DOMAIN = "REPLACE_ME.cloudflareaccess.com"
 ACCESS_AUD = "REPLACE_ME"
+# Only with OAuth, when cf/access-setup.sh ran with OAUTH=1: the AUD tag of the
+# second Access application, which covers /mcp and /w/*. A service token's JWT
+# for it is accepted on the MCP addresses (never on /api). Leave empty otherwise.
+ACCESS_MCP_AUD = ""
 # Comma-separated identities (emails or service token client ids). They alone
 # may create workspaces (POST /api/v1/w), and with this empty nobody can. They
 # are also the only ones who may add the default workspace's first member; if
@@ -24,7 +32,8 @@ DEPLOYMENT_ADMINS = ""
 # Sign-in for people (docs/sign-in-setup.md). Nothing here is secret. Leave a
 # method's id empty to hide it. People can sign in only if a team has added
 # them (or they are in DEPLOYMENT_ADMINS).
-# Your public address, with no path (https://support.example.com). Required.
+# Your public address, with no path (https://support.example.com). Required for
+# sign-in, and it is the issuer of the OAuth tokens MCP clients use.
 PUBLIC_ORIGIN = ""
 GOOGLE_CLIENT_ID = ""
 MICROSOFT_CLIENT_ID = ""
@@ -49,6 +58,15 @@ binding = "DB"
 database_name = "support-mcp"
 database_id = "REPLACE_ME"
 migrations_dir = "migrations"
+
+# OAuth for MCP clients (docs/mcp-clients.md): grants, tokens and registered
+# clients, stored hashed. Create it with `wrangler kv namespace create OAUTH_KV`
+# and put the id it prints here. The binding name must stay OAUTH_KV. Without
+# it, OAuth is off and the MCP addresses admit only Access logins and service
+# tokens. The free plan allows 100,000 reads and 1,000 writes a day.
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "REPLACE_ME"
 
 # Durable Objects: one Session per pairing code, one Registry per workspace.
 [[durable_objects.bindings]]

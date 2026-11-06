@@ -12,6 +12,12 @@ import { matchStep } from './totp.js';
 const HOUR_MS = 3600_000;
 
 export const SESSION_TOUCH_MS = 5 * 60_000; // last_seen is written at most this often
+// The idle limit is never shorter than two touch intervals. A shorter one would
+// sign out someone who is using the site, because last_seen is written no more
+// often than SESSION_TOUCH_MS.
+export const MIN_IDLE_MS = 2 * SESSION_TOUCH_MS;
+// Sign-in rows that ended (expired or revoked) this long ago are deleted.
+export const SESSION_KEEP_MS = 30 * 86400_000;
 export const EMAIL_LINK_TTL_MS = 10 * 60_000;
 export const EMAIL_LINKS_PER_HOUR = 5;
 // Every FACTOR_FAILURES_PER_LOCK wrong tries in a row lock the factor. The first
@@ -82,6 +88,9 @@ export function accountStore(db, { secret }) {
   async function createSession(userId, { maxMs }) {
     const token = randomToken(32);
     const now = Date.now();
+    // Old rows are of no use: delete the ones that ended long ago, as email links are.
+    await q('DELETE FROM login_sessions WHERE expires_at < ? OR (revoked_at IS NOT NULL AND revoked_at < ?)',
+      now - SESSION_KEEP_MS, now - SESSION_KEEP_MS).run();
     await q('INSERT INTO login_sessions(id_hash, user_id, created_at, last_seen, expires_at, factor_at, revoked_at) VALUES (?, ?, ?, ?, ?, NULL, NULL)',
       await sha256Hex(token), userId, now, now, now + maxMs).run();
     return token;
@@ -90,20 +99,28 @@ export function accountStore(db, { secret }) {
   // The live sign-in for a cookie value, or null: not found, revoked, idle too
   // long, past its absolute limit, or its person disabled. Idle and absolute
   // limits come from the current settings, so tightening them applies to
-  // sign-ins already open.
+  // sign-ins already open. The idle limit is raised to MIN_IDLE_MS if it is shorter.
+  //
+  // `factorAt` is when this sign-in passed its authenticator code, but it counts
+  // only while the person still has an authenticator that is no newer than that
+  // code. If the factor row is gone (an operator reset it) or was replaced after
+  // the code, the sign-in has no second factor.
   async function sessionForToken(token, { idleMs, maxMs }) {
     if (typeof token !== 'string' || token.length < 20 || token.length > 100) return null;
     const idHash = await sha256Hex(token);
     const row = await q(`SELECT s.id_hash, s.user_id, s.created_at, s.last_seen, s.expires_at, s.factor_at, s.revoked_at,
-        u.email AS email, u.disabled_at AS disabled_at
-      FROM login_sessions s JOIN users u ON u.id = s.user_id WHERE s.id_hash = ?`, idHash).first();
+        u.email AS email, u.disabled_at AS disabled_at, f.created_at AS factor_created_at
+      FROM login_sessions s JOIN users u ON u.id = s.user_id
+      LEFT JOIN user_factors f ON f.user_id = s.user_id WHERE s.id_hash = ?`, idHash).first();
     if (!row || row.revoked_at || row.disabled_at) return null;
     const now = Date.now();
-    if (row.expires_at <= now || row.created_at + maxMs <= now || row.last_seen + idleMs <= now) return null;
+    const idle = Math.max(idleMs, MIN_IDLE_MS);
+    if (row.expires_at <= now || row.created_at + maxMs <= now || row.last_seen + idle <= now) return null;
     if (now - row.last_seen >= SESSION_TOUCH_MS) {
       await q('UPDATE login_sessions SET last_seen = ? WHERE id_hash = ? AND revoked_at IS NULL', now, idHash).run();
     }
-    return { idHash, userId: row.user_id, email: row.email, factorAt: row.factor_at, createdAt: row.created_at };
+    const factorCounts = row.factor_at !== null && row.factor_created_at !== null && row.factor_created_at !== undefined && row.factor_at >= row.factor_created_at;
+    return { idHash, userId: row.user_id, email: row.email, factorAt: factorCounts ? row.factor_at : null, createdAt: row.created_at };
   }
 
   const markFactor = (idHash) => q('UPDATE login_sessions SET factor_at = ? WHERE id_hash = ? AND revoked_at IS NULL', Date.now(), idHash).run();

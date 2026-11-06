@@ -41,7 +41,8 @@ refuses the other mode's transport (`/ws` for an `app` session, `/agent` for a
 | Path | What |
 |---|---|
 | `src/index.js` | Worker entry: imports `agent.ps1` and `app-bundle.json`, wires `src/app.js`, exports the DO classes |
-| `src/app.js` | router, Access gate, MCP JSON-RPC handler, download page (pure: no `.ps1` import or DO classes, so `node --test` can drive routes) |
+| `src/app.js` | router, Access gate, MCP JSON-RPC handler, download page (pure: no `.ps1` import, DO classes or OAuth library, so `node --test` can drive routes) |
+| `src/oauth.js` | OAuth for MCP clients: builds the library's authorization server from the workspace list, serves the protected resource documents, checks a bearer token for one MCP address, revokes a person's grants (never imports the library; `src/index.js` passes it in) |
 | `src/session.js` | `Session` Durable Object (SQLite-backed), one per session |
 | `src/screen.js` | the screen vocabulary: lanes, the normalized actions, their audit text, and the strict check of every app result field (pure, shared by `mcp.js` and `session.js`) |
 | `src/registry.js` | `Registry` Durable Object, one instance per workspace: `idFromName("registry")` for `default` and `idFromName("registry:<slug>")` for any other. Lists that workspace's sessions |
@@ -53,13 +54,13 @@ refuses the other mode's transport (`/ws` for an `app` session, `/agent` for a
 | `src/agent-app.cs`, `src/agent-app.manifest` | the Windows app: .NET Framework 4 source (WPF window) and an `asInvoker` manifest |
 | `src/app-bundle.json` | the compiled x86 app plus the SHA-256 of its source and manifest, built by `scripts/build-app.ps1` and checked by tests |
 | `scripts/prepare-app-restart.ps1` | optional one-time reconnect after an authorized restart |
-| `test/` | `node --test` unit tests for pure logic (JWT checks, MCP dispatch, template fill, screen validation) and for the Durable Object (lanes, screen and control frames, audit rules) |
+| `test/` | `npm test` (`node --test` with the `cloudflare:workers` stub in `test/stubs/`) unit tests for pure logic (JWT checks, MCP dispatch, template fill, screen validation) and for the Durable Object (lanes, screen and control frames, audit rules) |
 
 `wrangler.toml`: add DO bindings `SESSION` → `Session`, `REGISTRY` → `Registry`,
 `[[migrations]] tag="v1" new_sqlite_classes=["Session","Registry"]` (free plan
 needs SQLite-backed DOs), `[[rules]] type="Text" globs=["**/*.ps1"]`, and
 `[vars] ACCESS_TEAM_DOMAIN="<team>.cloudflareaccess.com"`,
-`ACCESS_AUD="<Access app AUD tag>"`, `DEPLOYMENT_ADMINS=""` (comma-separated
+`ACCESS_AUD="<Access app AUD tag>"`, `ACCESS_MCP_AUD=""` (the optional second Access app that covers the MCP addresses when OAuth is on), `DEPLOYMENT_ADMINS=""` (comma-separated
 identities allowed to add `default`'s first member and to create workspaces;
 empty lets any caller add `default`'s first member and lets nobody create a
 workspace), and
@@ -77,8 +78,11 @@ work in the request path; use the WebSocket Hibernation API
 | `GET /j/<code>?client=app` | public | The downloaded app. `legacy` is an alias for `app`; any other `client` value → 404. **https only**: over plain `http:` on any host except `localhost` / `127.0.0.1` → 403 `text/plain`, code **not** consumed. `GET` serves the download page (200 `text/html`, `Cache-Control: no-store`, `Referrer-Policy: same-origin`, a CSP with `default-src 'none'` and `form-action 'self'`) and **never consumes the code**, however often the page is opened or refreshed. Only a `POST` from the page's button consumes it. If the request has an `Origin` header it must equal the relay's own origin exactly. If it has none (IE11 on Windows 7 can omit it on a same-origin form POST), its `Referer` must start with `<origin>/j/`, which the page's `Referrer-Policy: same-origin` keeps on the click. A foreign `Origin`, a foreign or missing `Referer` without an `Origin`, or neither header → 403, code unused. A first valid `POST` returns 200 `application/octet-stream` with `Content-Disposition: attachment; filename="remote-support-<sid8>.exe"`: the compiled app followed by the session configuration (below). The code is single use: a repeat after the download shows "Check your downloads" (409), an expired or ended one shows "This support link has expired" (410). A code made for a `powershell` session shows the expired page and stays unused. `HEAD` and every other method → 405 (`Allow: GET, POST`). |
 | `POST /agent?sid=<sid>` + `X-Attach-Key: <key>` | attach key | The app's transport, JSON in and out; below. 403 over plain `http:` on any host except `localhost` / `127.0.0.1`, 403 on any `Origin` header or a `key` query param, 405 on other methods, 415 on a non-JSON body, 413 over 750,000 characters (checked against `Content-Length` before the body is read, and again after it is read when there is no `Content-Length`), 401 on a bad sid, bad key, a `powershell` session or a session that is still `pending`, 409 on a stale generation, 410 when the session has ended. |
 | `GET /ws?sid=<sid>` + `X-Attach-Key: <key>` | attach key | WebSocket upgrade for the agent; 403 over plain `http:` on any host except `localhost` / `127.0.0.1`; 401 on bad/missing key, on a `key` query param, on a bad sid, or on an `app` session; 410 if session ended/expired |
-| `POST /mcp` | Access JWT | MCP JSON-RPC 2.0 for the `default` workspace. `tools/call` checks the caller's role first (below) |
-| `POST /w/<slug>/mcp` | Access JWT | the same endpoint for workspace `<slug>` (`[a-z0-9-]{1,40}`). Any other shape of path is 404 |
+| `POST /mcp` | Access JWT or OAuth token | MCP JSON-RPC 2.0 for the `default` workspace. `tools/call` checks the caller's role first (below) |
+| `POST /w/<slug>/mcp` | Access JWT or OAuth token | the same endpoint for workspace `<slug>` (`[a-z0-9-]{1,40}`). Any other shape of path is 404 |
+| `GET /.well-known/oauth-authorization-server`, `POST /oauth/token`, `POST /oauth/register` | none | the OAuth authorization server (the library's `OAuthAuthorizationServer`); 404 without the `OAUTH_KV` binding |
+| `GET /.well-known/oauth-protected-resource[/mcp\|/w/<slug>/mcp]` | none | RFC 9728 documents; 404 for a workspace that does not exist |
+| `GET`, `POST /oauth/authorize` | browser sign-in | the consent page; see [OAuth](#oauth-for-mcp-clients) |
 | `/api/v1/w/<slug>/...` | Access JWT | the team API (below) |
 | `POST /api/v1/w`, `GET /api/v1/w` | Access JWT | create a workspace, list yours (below) |
 | `GET /auth/signin`, `GET /auth/google`, `GET /auth/microsoft`, `GET /auth/<provider>/callback`, `POST /auth/email`, `GET` and `POST /auth/email/confirm`, `GET` and `POST /auth/factor`, `POST /auth/signout`, `GET /account`, `POST /account/signout-everywhere` | none, then a browser sign-in | people sign in; see [Sign-in](#sign-in-auth-and-account) |
@@ -117,16 +121,23 @@ by itself" as the PC's own clock plus that remaining time.
 
 Both addresses run one handler, in this order, so the checks below are the same on both. Each accepts **POST only** (else 405, `Allow: POST`). Because the Access app
 also admits a browser (cookie) identity, guard against CSRF first, before the
-Access check:
+credential check:
 
 - any request carrying an `Origin` header → 403 (MCP clients never send Origin;
   browsers always do on a cross-origin POST). Applies even under the local bypass.
 - a non-`application/json` `Content-Type` → 415.
 
-Then require header `Cf-Access-Jwt-Assertion`. Verify RS256 against
-`https://<ACCESS_TEAM_DOMAIN>/cdn-cgi/access/certs`, `aud` contains `ACCESS_AUD`,
-`exp` in the future, `nbf` (if present) not in the future beyond 60 s of skew,
-`iss` = `https://<ACCESS_TEAM_DOMAIN>`. Failure → 403 JSON `{"error":"forbidden"}`.
+Then the credential. If OAuth is on (the library is loaded, `OAUTH_KV` is bound
+and the issuer address is known) and the request has an `Authorization: Bearer`
+header, that token is checked (below) and nothing else is tried. Otherwise
+require header `Cf-Access-Jwt-Assertion`. Verify RS256 against
+`https://<ACCESS_TEAM_DOMAIN>/cdn-cgi/access/certs`, `aud` contains `ACCESS_AUD`
+(or `ACCESS_MCP_AUD` when that var is set and non-empty; MCP addresses only, never
+the team API), `exp` in the future, `nbf` (if present) not in the future beyond 60 s of skew,
+`iss` = `https://<ACCESS_TEAM_DOMAIN>`. Failure, or no credential at all → 401
+JSON `{"error":"unauthorized"}` with `WWW-Authenticate: Bearer
+resource_metadata="<origin>/.well-known/oauth-protected-resource<path>"` (`<path>`
+is `/mcp` or `/w/<slug>/mcp`; plain `Bearer` when OAuth is off).
 The signing keys are cached in module scope for 1 h, one entry per key address
 (`src/jwt.js`, shared with Google and Microsoft sign-in), and fetched lazily (only once
 a well-formed token names a `kid`); an unknown `kid` forces one refetch that
@@ -134,6 +145,18 @@ a well-formed token names a `kid`); an unknown `kid` forces one refetch that
 one per 60 s per address. Local bypass: only when `env.DEV_SKIP_ACCESS === "1"` (set from
 `.dev.vars`, never committed) **and** the request URL hostname is `localhost` or
 `127.0.0.1`. The deployed hostname can never satisfy it.
+
+A bearer token is checked with the library's `validateToken` for exactly this
+address, which reads one KV key. Expired, revoked, malformed, unknown, or issued
+for another address → 401 with `error="invalid_token"` added to the header. A KV
+failure → 503 with `Retry-After`. A token whose grant has no `email`, `user_id`
+and matching `workspace` is also a 401. `tools/list`, `initialize` and `ping`
+need a credential like any call, and with a token read KV once and nothing else.
+The caller is the grant's person (`props.email`) and each `tools/call` also
+checks, live, that the person exists and is not disabled, is still invited, is
+a member of the workspace (open mode never admits an OAuth caller), and, for a
+permission that needs a second factor, that the grant's authenticator is still the
+person's. The team API (`/api/`) does not accept bearer tokens.
 
 The caller identity — `email` (user), else `common_name` (service token), else
 `sub`, or `local-dev` under the bypass — is threaded to the DO and recorded in
@@ -204,7 +227,7 @@ error is `{"error":{"code","message"}}`.
 
 | Route | Needs | Body | Answer |
 |---|---|---|---|
-| `POST /api/v1/w` | a deployment admin | `{slug, name}` | 201 `{workspace:{slug,name,role_id:"admin",created_by,created_at}}`. One batch writes the `workspaces` row, the caller as an admin member, and the log rows `workspace_created` then `member_added`. `slug` matches `[a-z0-9-]{1,40}` and is not `default`; `name` is 1 to 100 characters. With `DEPLOYMENT_ADMINS` empty: 409 `no_deployment_admins`. A caller not listed: 403 `forbidden`. A taken slug, and `default`: 409 `workspace_exists` |
+| `POST /api/v1/w` | a deployment admin | `{slug, name}` | 201 `{workspace:{slug,name,role_id:"admin",created_by,created_at}}`. One batch writes the `workspaces` row, the caller as an admin member, and the log rows `workspace_created` then `member_added`. `slug` matches `[a-z0-9-]{1,40}` and is not `default`; `name` is 1 to 100 characters. With `DEPLOYMENT_ADMINS` empty: 409 `no_deployment_admins`. A caller not listed: 403 `forbidden`. A taken slug, and `default`: 409 `workspace_exists`. With 500 workspaces already created: 409 `workspace_limit` |
 | `GET /api/v1/w` | any caller | | `{workspaces:[{slug,name,role_id}]}`: `default` first when it is open (`role_id` is `null`, as in `me`) or the caller is a member of it, then the other workspaces the caller is a member of, by slug. `default`'s name is `Default` |
 | `GET /api/v1/w/<slug>` | any member, anyone while open | | `{workspace:{slug,open}, me:{identity,role_id,permissions}, recent_callers?}`; `recent_callers` (`[{identity,last_seen,kind}]`, newest first, at most 50) only while open; `role_id` is `null` while open |
 | `GET .../members` | `members.manage` | | `{members:[{identity,kind,name,role_id,added_at,added_by}]}` |
@@ -237,6 +260,7 @@ edited `technician` or `viewer`, and a deleted one keeps a row with `deleted = 1
 | 404 | `not_found` | a slug that was not created or is malformed, an unknown path, member or role |
 | 409 | `no_deployment_admins` | `POST /api/v1/w` while `DEPLOYMENT_ADMINS` is empty |
 | 409 | `workspace_exists` | `POST /api/v1/w` with a slug that is taken, or `default` |
+| 409 | `workspace_limit` | `POST /api/v1/w` when the server already holds 500 workspaces besides `default` |
 | 409 | `first_member` | in `default`: the first member is not the caller as `admin`, or `DEPLOYMENT_ADMINS` is set and the caller is not in it; or any other team write while it has no members |
 | 409 | `member_exists`, `role_exists` | already there |
 | 409 | `last_admin` | removing or demoting the last admin |
@@ -386,6 +410,78 @@ not revoked, was used within `SIGNIN_IDLE_HOURS`, began within
 check for acting on a sign-in: the role must hold the permission, and
 `sessions.control`, `members.manage` and `roles.manage` also need the sign-in's
 `factor_at`, else "a second factor is required".
+
+## OAuth for MCP clients
+
+Code: `src/oauth.js` (authorization server setup, resource documents, token
+check, grant revocation), the consent page in `src/auth.js` and `src/pages.js`,
+and the wiring in `src/app.js` and `src/index.js`. Guide: [mcp-clients.md](mcp-clients.md).
+
+The library is `@cloudflare/workers-oauth-provider` 1.2.4, pinned. It is imported
+only by `src/index.js` and passed to `createHandler` as
+`{ OAuthAuthorizationServer, AuthorizationError, CimdFetchError }`. The relay uses
+`new OAuthAuthorizationServer({ issuer, resources, authorizeEndpoint, tokenEndpoint,
+clientRegistrationEndpoint, accessTokenTTL, refreshTokenTTL,
+clientIdMetadataDocumentEnabled, allowPrivateUseRedirectUris })` and its `fetch`, `validateToken(resource,
+token, env)` and `getOAuthApi(env)` (`parseAuthRequest`, `describeConsent`,
+`beginConsent`, `approveConsent`, `denyConsent`, `completeAuthorization`,
+`listUserGrants`, `revokeGrant`). The all-in-one `OAuthProvider` is not used: it
+fixes its protected addresses at construction and answers 401 before the relay's
+own refusals.
+
+- **Issuer** is `PUBLIC_ORIGIN` (the request's own address on loopback). Resources
+  are `<origin>/mcp` and `<origin>/w/<slug>/mcp` for every row of `workspaces`,
+  read from D1 and kept ten seconds per isolate. The server is rebuilt when the
+  list changes, and a consent request for a slug not in the list reads it again
+  at once (at most every two seconds). So does a `/oauth/token` request the
+  library refuses with `invalid_target` or `invalid_grant`, when the list has
+  changed since it was read: the request runs once more on the new list. At most
+  500 workspaces: creating one more is `409 workspace_limit`. Checking a token
+  uses a server that declares only that one address. Before it reads KV, the
+  relay checks the token's shape and that its user id (the first segment) is an
+  enabled person in D1; anything else is 401 `invalid_token` with no KV read, and
+  a D1 failure is 503.
+- **Endpoints** the library serves: `/.well-known/oauth-authorization-server`
+  (without `protected_resources`), `/oauth/token` (code, refresh, revocation) and
+  `/oauth/register`. Requests for them on another host are 404.
+- **Protected resource documents** (RFC 9728) are served by the relay at
+  `/.well-known/oauth-protected-resource` and its `/mcp` and `/w/<slug>/mcp`
+  path forms: `resource`, `authorization_servers: [<origin>]`,
+  `bearer_methods_supported: ["header"]`. The bare form names the default
+  address. 404 for `default`'s second spelling and for a slug not created.
+- **Tokens**: access 3600 s, refresh 2,592,000 s from the code exchange,
+  rotating (the current and the previous refresh token are both accepted; there is
+  no reuse detection); PKCE S256 required of every request, whatever the client's
+  authentication method; each bound to one resource; `iss` in the
+  authorization response. Grant props are `{ user_id, email, workspace, factor }`
+  where `factor` is `user_factors.created_at` of the authenticator the sign-in
+  used, or null.
+- **`GET /oauth/authorize`**: not signed in → 303 to `/auth/signin?next=<this
+  request>` (up to 1,800 characters kept; the sign-in layer's return path check
+  still applies). Signed in: the library's `parseAuthRequest`. Any failure is
+  shown as a page (400) and never redirected, because the person has not chosen
+  yet; the page may carry a plain link to the client's checked redirect, labelled
+  with its host. The relay then refuses a request without a `code_challenge` of
+  43 base64url characters and `code_challenge_method=S256`, and a redirect
+  address its `form-action` source cannot name. The resource must name a workspace the
+  person is a member of (else 403); a role holding a factor permission needs
+  `factor_at` or the person goes to `/auth/factor?next=<this request>`; then
+  the consent page, whose `form-action` lists the client's redirect origin.
+- **`POST /oauth/authorize`**: the form needs `csrf` (HMAC of the sign-in's id
+  hash), `handle` (the library's, bound to the browser by a `__Host-oauth-consent-*`
+  cookie, single use, ten minutes) and `decision` of `approve` or `deny`.
+  `deny` → 303 to the client with `error=access_denied`, `state` and `iss`.
+  `approve` → the PKCE check is made again on the stored request, membership and
+  factor are read again, then
+  `completeAuthorization`, then 303 to the client with `code`, `state` and `iss`.
+- **Sign out everywhere** lists and revokes every grant of the person.
+- **Settings**: the `OAUTH_KV` binding, the `global_fetch_strictly_public`
+  compatibility flag, `PUBLIC_ORIGIN`. KV use: one read per call with a token,
+  two writes per client each hour while it is active (about 48 a day), five writes
+  for a new connection. `ACCESS_MCP_AUD` (optional) names a second Access app: on
+  the MCP addresses only, an Access JWT for it is accepted next to `ACCESS_AUD`.
+  An OAuth caller is checked with `authorize(..., { membersOnly: true })`, so an
+  empty `default` neither admits nor records it.
 
 ## Session state machine (Session DO)
 
@@ -957,7 +1053,7 @@ window's two requests, and the Client's full-control path with a fake service.
 
 ## Acceptance (each names its check)
 
-1. `node --test` green; `npx wrangler deploy --dry-run` bundles without error
+1. `npm test` green; `npx wrangler deploy --dry-run` bundles without error
    and lists `env.DB` as a D1 database.
 2. Local stack (`wrangler dev`, `.dev.vars` with `DEV_SKIP_ACCESS=1`): MCP
    `initialize` → `tools/list` returns the 7 base tools plus the nine screen

@@ -25,7 +25,10 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
-      - run: node --test
+      # The OAuth library is the one npm package. npm test loads it through a
+      # stand-in for the workerd-only cloudflare:workers module (test/stubs/).
+      - run: npm ci --ignore-scripts
+      - run: npm test
 
   # Runs on a GitHub-hosted Windows runner with the .NET Framework v4 compiler.
   # It builds the app from source against the pinned .NET Framework 4.5.2 reference
