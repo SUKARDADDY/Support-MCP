@@ -19,15 +19,17 @@ const env = {
 const PROD = 'https://support.example.com';
 const rpc = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
 
-test('POST /mcp on the deployed host without a JWT => 403', async () => {
+test('POST /mcp on the deployed host without a credential => 401 with a Bearer challenge', async () => {
   const r = await handler.fetch(
     new Request(`${PROD}/mcp`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: rpc }),
     env,
   );
-  assert.equal(r.status, 403);
+  assert.equal(r.status, 401);
+  // This handler has no OAuth library, so there is no metadata to point to.
+  assert.equal(r.headers.get('www-authenticate'), 'Bearer');
 });
 
-test('POST /mcp with a malformed JWT => 403 (no network needed)', async () => {
+test('POST /mcp with a malformed JWT => 401 (no network needed)', async () => {
   const r = await handler.fetch(
     new Request(`${PROD}/mcp`, {
       method: 'POST',
@@ -36,7 +38,7 @@ test('POST /mcp with a malformed JWT => 403 (no network needed)', async () => {
     }),
     env,
   );
-  assert.equal(r.status, 403);
+  assert.equal(r.status, 401);
 });
 
 test('POST /mcp with an Origin header => 403, even under the localhost bypass', async () => {
@@ -107,9 +109,9 @@ test('/w/<slug>/mcp refuses Origin, then non-POST, then non-JSON, before any cre
       const r = await send({ method: 'POST', headers: ct ? { 'content-type': ct } : {}, body: rpc });
       assert.equal(r.status, 415, `${path} ${ct}`);
     }
-    // Only then the credential: none, and a malformed one, are 403.
-    assert.equal((await send({ method: 'POST', headers: json, body: rpc })).status, 403);
-    assert.equal((await send({ method: 'POST', headers: { ...json, 'cf-access-jwt-assertion': 'not.a.jwt' }, body: rpc })).status, 403);
+    // Only then the credential: none, and a malformed one, are 401.
+    assert.equal((await send({ method: 'POST', headers: json, body: rpc })).status, 401);
+    assert.equal((await send({ method: 'POST', headers: { ...json, 'cf-access-jwt-assertion': 'not.a.jwt' }, body: rpc })).status, 401);
   }
 });
 

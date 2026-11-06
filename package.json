@@ -10,8 +10,11 @@
     "url": "https://github.com/SUKARDADDY/Support-MCP.git"
   },
   "scripts": {
-    "test": "node --test",
+    "test": "node --import ./test/stubs/register.mjs --test",
     "dev": "wrangler dev",
     "dry-run": "wrangler deploy --dry-run --outdir /tmp/support-mcp-dry"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "1.2.4"
   }
 }

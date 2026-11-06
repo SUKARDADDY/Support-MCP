@@ -10,7 +10,7 @@ import { createHandler } from '../src/app.js';
 import { Session } from '../src/session.js';
 import { Registry } from '../src/registry.js';
 import { BUILTIN_ROLES, OPEN_PERMISSIONS, PERMISSIONS, normalizePermissions, permissionForTool } from '../src/permissions.js';
-import { GENESIS_HASH, TeamError, chainHash, teamStore } from '../src/workspace.js';
+import { GENESIS_HASH, MAX_WORKSPACES, TeamError, chainHash, teamStore } from '../src/workspace.js';
 
 const SID = 'a'.repeat(64);
 const W = 'default';
@@ -814,6 +814,53 @@ test('a workspace needs a good slug and name; default is reserved; an existing s
   await assert.rejects(team.createWorkspace(OWNER, { slug: 'acme', name: 'Again' }), { status: 409, code: 'workspace_exists' });
   assert.equal(workspaceRows(db).find((r) => r.slug === 'acme').name, 'Acme', 'the first creation stands');
   assert.equal((await team.readAudit('acme')).rows.length, 2, 'the refused creation wrote no log row');
+});
+
+test('creation stops at 500 workspaces with 409 workspace_limit, and the list is never cut short', async () => {
+  const db = openD1();
+  const team = ownerTeam(db);
+  assert.equal(MAX_WORKSPACES, 500);
+  const insert = db.sqlite.prepare("INSERT INTO workspaces(slug, name, created_by, created_at) VALUES (?, 'W', 'x', 1)");
+  for (let i = 0; i < MAX_WORKSPACES - 1; i++) insert.run(`w${String(i).padStart(4, '0')}`);
+  await team.createWorkspace(OWNER, { slug: 'last-one', name: 'The 500th' });
+  assert.equal((await team.workspaceSlugs()).length, MAX_WORKSPACES, 'all 500 are listed');
+  await assert.rejects(team.createWorkspace(OWNER, { slug: 'one-more', name: 'Too many' }), { status: 409, code: 'workspace_limit' });
+  assert.equal(await db.prepare('SELECT COUNT(*) AS n FROM workspaces').first('n'), MAX_WORKSPACES);
+  assert.equal(await db.prepare("SELECT COUNT(*) AS n FROM members WHERE workspace = 'one-more'").first('n'), 0, 'no member row was left behind');
+  assert.equal((await team.readAudit('one-more')).rows.length, 0, 'and no log row');
+  // A slug that exists is still reported as existing, not as the limit.
+  await assert.rejects(team.createWorkspace(OWNER, { slug: 'last-one', name: 'Again' }), { status: 409, code: 'workspace_exists' });
+});
+
+test('the limit holds in the guard too: a creation planned under the limit does not land past it', async () => {
+  const db = openD1();
+  const team = ownerTeam(db);
+  const insert = db.sqlite.prepare("INSERT INTO workspaces(slug, name, created_by, created_at) VALUES (?, 'W', 'x', 1)");
+  for (let i = 0; i < MAX_WORKSPACES - 1; i++) insert.run(`w${String(i).padStart(4, '0')}`);
+  // Two creators each see room for one more. The guard lets exactly one in.
+  const other = teamStore(handle(db.sqlite), { deploymentAdmins: 'other@example.com' });
+  const results = await Promise.allSettled([
+    team.createWorkspace(OWNER, { slug: 'race-a', name: 'A' }),
+    other.createWorkspace('other@example.com', { slug: 'race-b', name: 'B' }),
+  ]);
+  assert.deepEqual(results.map((r) => r.status).sort(), ['fulfilled', 'rejected']);
+  assert.equal(results.find((r) => r.status === 'rejected').reason.code, 'workspace_limit');
+  assert.equal(await db.prepare('SELECT COUNT(*) AS n FROM workspaces').first('n'), MAX_WORKSPACES);
+});
+
+test('membersOnly never opens default and never records the caller; without it open mode is unchanged', async () => {
+  const db = openD1();
+  const team = teamStore(db);
+  const callers = () => db.sqlite.prepare('SELECT COUNT(*) AS n FROM callers').get().n;
+  for (const p of OPEN_PERMISSIONS) {
+    assert.deepEqual(await team.authorize(W, 'oauth@example.com', p, { membersOnly: true }), { ok: false, open: false, role_id: null, reason: 'not_member' }, p);
+  }
+  assert.equal(callers(), 0, 'not recorded');
+  assert.deepEqual(await team.authorize(W, 'oauth@example.com', 'sessions.view'), { ok: true, open: true, role_id: null });
+  assert.equal(callers(), 1, 'an Access caller is, as before');
+  // For a member it changes nothing.
+  db.sqlite.prepare("INSERT INTO members(workspace, identity, kind, name, role_id, added_at, added_by) VALUES ('default', 'm@example.com', 'person', NULL, 'viewer', 1, 't')").run();
+  assert.equal((await team.authorize(W, 'm@example.com', 'sessions.view', { membersOnly: true })).ok, true);
 });
 
 test('two creators racing for one slug: exactly one wins, and its log stays valid', async () => {

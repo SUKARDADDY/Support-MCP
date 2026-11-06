@@ -1,9 +1,11 @@
 // Technician sign-in: the /auth/* and /account routes. A person signs in with
 // Google, Microsoft or an emailed link, passes an authenticator code if their
 // role needs one, and gets a browser sign-in (a cookie holding a random value,
-// stored hashed). This sign-in is for the account page now. The team API and
-// /mcp still admit only Access logins and service tokens, so nothing here can
-// reach a session or claim the open default workspace.
+// stored hashed). The browser sign-in is good for the account page and for the
+// OAuth consent page (/oauth/authorize), where it lets an MCP client act as the
+// person. The team API and /mcp still admit only Access logins, service tokens
+// and OAuth tokens, so a browser sign-in alone cannot reach a session or claim
+// the open default workspace.
 //
 // These routes are for browsers, so they check what /mcp and /api refuse
 // outright: a POST must carry an Origin equal to our own (when the browser
@@ -14,12 +16,12 @@ import { MIN_SECRET_LENGTH, hmacHex, open, randomToken, seal, timingSafeEqual, b
 import { authorizationUrl, exchangeCode, identityFromIdToken, newRoundTrip, providerConfig } from './oidc.js';
 import { jwksKeyResolver } from './jwt.js';
 import { readTextCapped } from './body.js';
-import { DEFAULT_NEXT, safeNext } from './paths.js';
+import { AUTHORIZE_NEXT_MAX, DEFAULT_NEXT, safeNext } from './paths.js';
 import { newSecret, matchStep, otpauthUri } from './totp.js';
 import { mailerFromEnv } from './mail/index.js';
 import { needsSecondFactor } from './permissions.js';
 import {
-  accountPage, emailConfirmPage, emailSentPage, enrolPage, messagePage, notInvitedPage, pageHeaders,
+  accountPage, consentPage, emailConfirmPage, emailSentPage, enrolPage, messagePage, notInvitedPage, pageHeaders,
   recoveryCodesPage, signInPage, verifyPage,
 } from './pages.js';
 
@@ -27,7 +29,7 @@ const ROUND_TRIP_MS = 10 * 60_000;
 const ENROL_MS = 15 * 60_000;
 const BINDING_MS = 10 * 60_000;
 const PRE_MS = 60 * 60_000;
-const FORM_MAX = 4096;
+const FORM_MAX = 8192;
 const PROVIDER_HOSTS = ['https://accounts.google.com', 'https://login.microsoftonline.com'];
 
 const isLoopback = (hostname) => hostname === 'localhost' || hostname === '127.0.0.1';
@@ -41,7 +43,7 @@ function positive(value, fallback) {
 // Our own address, from PUBLIC_ORIGIN. Without it only a loopback request is
 // served, at the address it arrived on. A request for another host than
 // PUBLIC_ORIGIN names is refused, because the cookies would not follow it.
-function ownOrigin(env, url) {
+export function ownOrigin(env, url) {
   const configured = String(env.PUBLIC_ORIGIN || '').trim();
   const local = isLoopback(url.hostname);
   if (!configured) return local ? { origin: `${url.protocol}//${url.host}` } : { error: 'PUBLIC_ORIGIN is not set' };
@@ -92,6 +94,8 @@ export function factorRequired(memberships, deploymentAdmin) {
 
 // ---- the router --------------------------------------------------------------------
 // deps: { fetchFn, mailer, waitUntil } are for tests and the Worker runtime.
+// deps.oauth is the OAuth runtime (src/oauth.js), or undefined when the
+// library is not loaded.
 export async function handleAuth(request, env, url, deps = {}) {
   const secret = typeof env.AUTH_SECRET === 'string' ? env.AUTH_SECRET : '';
   const unavailable = (text) => new Response(messagePage({ title: 'Sign-in is not available', text }), { status: 503, headers: pageHeaders() });
@@ -109,6 +113,7 @@ export async function handleAuth(request, env, url, deps = {}) {
     cookies: parseCookies(request.headers.get('cookie')),
     fetchFn: deps.fetchFn || ((u, init) => fetch(u, init)),
     waitUntil: deps.waitUntil,
+    oauth: deps.oauth,
     idleMs: positive(env.SIGNIN_IDLE_HOURS, 12) * 3600_000,
     maxMs: positive(env.SIGNIN_MAX_DAYS, 14) * 86400_000,
     emailEnabled: Boolean(mailer) || devShow,
@@ -141,7 +146,7 @@ function respond(body, status, cookies = [], formTargets = []) {
 // A redirect inside this site. The path always passes safeNext on its way out,
 // so no value, however it got here, can send a person to another host.
 function redirect(path, cookies = [], status = 303) {
-  return redirectTo(safeNext(path, 4000), cookies, status);
+  return redirectTo(safeNext(path, 8000), cookies, status);
 }
 
 // The one redirect that leaves the site: to the sign-in provider.
@@ -223,6 +228,7 @@ async function route(c) {
   if (p === '/auth/signout') return method === 'POST' ? signOut(c, false) : methodNotAllowed('POST');
   if (p === '/account/signout-everywhere') return method === 'POST' ? signOut(c, true) : methodNotAllowed('POST');
   if (p === '/account') return method === 'GET' ? account(c) : methodNotAllowed('GET');
+  if (p === '/oauth/authorize') return oauthAuthorize(c);
   return notFound();
 }
 
@@ -473,8 +479,217 @@ async function signOut(c, everywhere) {
       // sign-in must have passed a code first.
       if (!session.factorAt && (await c.accounts.getFactor(session.userId))) return redirect(`/auth/factor?next=${encodeURIComponent(DEFAULT_NEXT)}`);
       await c.accounts.revokeAll(session.userId);
+      // Every MCP client the person connected loses its tokens too.
+      if (c.oauth && c.oauth.available(c.env, c.url)) {
+        try {
+          await c.oauth.revokeGrants(c.env, c.origin, session.userId);
+        } catch (_) {
+          return respond(messagePage({
+            title: 'Some apps are still connected',
+            text: 'We signed you out of every browser, but could not end the connections of your MCP clients. Sign in and try again.',
+            link: '/auth/signin', linkLabel: 'Sign in',
+          }), 503, [clearCookie(c, 'session')]);
+        }
+      }
     }
     else await c.accounts.revokeSession(session.idHash);
   }
   return redirect('/auth/signin?m=signed_out', [clearCookie(c, 'session')]);
+}
+
+// ---- OAuth consent: /oauth/authorize -------------------------------------------------------
+// An MCP client sends the person's browser here. The library checks the request
+// (client, exact redirect address, PKCE, resource) and keeps it in KV while this
+// page asks the person. The resource address names the workspace. The person
+// must be signed in, be a member of that workspace, and, when their role there
+// needs a second factor, have passed one in this sign-in.
+
+// What each permission lets an MCP client do. Team and log permissions are not
+// reachable through the MCP tools, so they are not listed.
+const ABILITIES = {
+  'sessions.create': 'start support sessions',
+  'sessions.view': 'list sessions and read their status',
+  'sessions.control': 'run commands, move files and control the screen on connected PCs',
+  'sessions.end': 'end sessions',
+};
+
+// The form-action source that lets the browser follow the redirect to the
+// client. Chrome applies form-action to the redirect that answers a form post,
+// so 'self' alone would block the person from getting back to the app. The
+// source is the redirect address's origin (or its scheme, for an app link such
+// as cursor://). It is built only from a plain host or a plain scheme token,
+// never from raw text. A redirect address it cannot write safely returns null,
+// and the consent page refuses that request.
+const BLOCKED_SCHEMES = new Set([
+  'javascript:', 'data:', 'blob:', 'vbscript:', 'file:', 'about:', 'ws:', 'wss:', 'ftp:', 'ftps:', 'mailto:', 'tel:', 'sms:',
+  'intent:', 'chrome:', 'chrome-extension:', 'view-source:', 'filesystem:', 'jar:',
+]);
+export function redirectSource(redirectUri) {
+  let u;
+  try { u = new URL(redirectUri); } catch (_) { return null; }
+  if (u.protocol === 'https:' || u.protocol === 'http:') {
+    return /^https?:\/\/(?:[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*|\[[0-9a-f:]+\])(?::\d{1,5})?$/.test(u.origin) ? u.origin : null;
+  }
+  return /^[a-z][a-z0-9+.-]{0,31}:$/.test(u.protocol) && !BLOCKED_SCHEMES.has(u.protocol) ? u.protocol : null;
+}
+
+// Where a redirect address leads, as the person is shown it. A web address is
+// shown by host. An app link keeps its scheme and host (cursor://anysphere.cursor-mcp),
+// so a person can see it is not a web page.
+export function returnAddress(redirectUri) {
+  try {
+    const u = new URL(redirectUri);
+    if (u.protocol === 'https:' || u.protocol === 'http:') return u.hostname;
+    return u.host ? `${u.protocol}//${u.host}` : `${u.protocol}${u.pathname}`;
+  } catch (_) {
+    return '';
+  }
+}
+const isAppLink = (redirectUri) => !/^https?:/i.test(redirectUri);
+
+const askAgain = (text, status = 400, extra = {}) => page('This approval can’t continue', text, status, extra);
+
+// A failure from the library. Before the person has chosen anything
+// (`afterChoice` false) it is shown here and never redirected, even when the
+// library says the redirect would be safe: a self-registered client could
+// otherwise send a signed-in person to its own site with no click (RFC 9700
+// 4.11.2). The page may offer a plain link back to the client, which the person
+// chooses to click. After Allow or Deny the person has acted, and the client
+// gets its error by redirect.
+function authorizeFailure(c, e, { afterChoice = false } = {}) {
+  if (e instanceof c.oauth.AuthorizationError) {
+    if (afterChoice && e.redirectTo) return redirectTo(e.redirectTo, [], 302);
+    const back = e.redirectTo && redirectSource(e.redirectUri) ? { outHref: e.redirectTo, outLabel: `Go back to ${returnAddress(e.redirectUri)}` } : {};
+    return askAgain(e.description || 'The request from the app was not valid.', 400, back);
+  }
+  if (e instanceof c.oauth.CimdFetchError) return askAgain('We could not check this app’s details. Try again, or ask the app’s maker.', 502);
+  throw e;
+}
+
+// Every authorization request must carry a PKCE S256 challenge, whatever kind of
+// client sent it. The library requires one only of clients registered without a
+// secret, and a client registers itself, so this is checked here for all.
+const PKCE_CHALLENGE = /^[A-Za-z0-9_-]{43}$/;
+function pkceProblem(request) {
+  if (request.codeChallengeMethod === 'S256' && typeof request.codeChallenge === 'string' && PKCE_CHALLENGE.test(request.codeChallenge)) return null;
+  return 'This app did not use PKCE with S256, which this server requires for every app. Ask the app’s maker to update it.';
+}
+
+async function oauthAuthorize(c) {
+  if (!c.oauth || !c.oauth.available(c.env, c.url)) return notFound();
+  const method = c.request.method;
+  if (method === 'GET') return authorizeGet(c);
+  return method === 'POST' ? authorizePost(c) : methodNotAllowed('GET, POST');
+}
+
+// The role this person holds in `workspace`, or null. Only real membership
+// counts: a workspace in open mode admits nobody over OAuth.
+async function roleIn(c, session, workspace) {
+  return (await c.team.memberships(session.email)).find((m) => m.slug === workspace) || null;
+}
+
+async function authorizeGet(c) {
+  const here = c.url.pathname + c.url.search;
+  const session = await currentSession(c);
+  if (!session) {
+    if (here.length > AUTHORIZE_NEXT_MAX) return askAgain('The request from the app is too long.');
+    return redirect(signInUrl(here));
+  }
+  let api;
+  let req;
+  try {
+    api = await c.oauth.api(c.env, c.origin, c.url.searchParams.get('resource'));
+    req = await api.parseAuthRequest(c.request);
+  } catch (e) {
+    return authorizeFailure(c, e);
+  }
+  const problem = pkceProblem(req);
+  if (problem) return askAgain(problem);
+  // The consent form can return only to an address its form-action can name.
+  const source = redirectSource(req.redirectUri);
+  if (!source) return askAgain('This app’s return address is not one this server can send you back to.');
+  const workspace = c.oauth.workspaceForResource(c.origin, req.resource);
+  const role = workspace ? await roleIn(c, session, workspace) : null;
+  if (!role) return page('You can’t connect to this workspace', 'The workspace this app asked for does not exist, or you are not a member of it. Ask a team admin to add your address, then try again.', 403);
+
+  // The second factor rule of the sign-in layer: a role that can control
+  // sessions or manage the team needs a code passed in this sign-in.
+  const gate = role.permissions.find(needsSecondFactor);
+  if (gate) {
+    const a = await authorizeSignIn(c.team, session, workspace, gate);
+    if (!a.ok && a.reason === 'second_factor') return redirect(`/auth/factor?next=${encodeURIComponent(here)}`);
+    if (!a.ok) return page('You can’t connect to this workspace', 'Your role there has changed. Check your account page.', 403);
+  }
+
+  let details;
+  let consent;
+  try {
+    details = await api.describeConsent(req);
+    consent = await api.beginConsent(req);
+  } catch (e) {
+    return authorizeFailure(c, e);
+  }
+  const html = consentPage({
+    email: session.email,
+    clientName: details.clientName, clientDomain: details.clientDomain,
+    redirectHost: returnAddress(req.redirectUri), redirectIsLoopback: details.redirectIsLoopback, redirectIsApp: isAppLink(req.redirectUri),
+    workspaceName: role.name, workspaceSlug: workspace, roleName: role.role_name || role.role_id,
+    abilities: role.permissions.filter((k) => Object.hasOwn(ABILITIES, k)).map((k) => ABILITIES[k]),
+    csrf: await csrfFor(c, 'session', session.idHash), handle: consent.handle,
+  });
+  const res = respond(html, 200, consent.headers.getSetCookie(), [source]);
+  res.headers.set('x-frame-options', 'DENY');
+  return res;
+}
+
+// Allow or Deny. Both end in a redirect back to the client, so the page that
+// sent the form lists that address in its form-action.
+function backToClient(location, libHeaders) {
+  const res = redirectTo(location, [], 303);
+  for (const cookie of libHeaders.getSetCookie()) res.headers.append('set-cookie', cookie);
+  return res;
+}
+
+async function authorizePost(c) {
+  const form = await readForm(c);
+  if (form instanceof Response) return form;
+  const session = await currentSession(c);
+  if (!session) return redirect(signInUrl(DEFAULT_NEXT));
+  if (!(await csrfOk(c, 'session', session.idHash, form.fields.csrf))) return staleForm();
+  const handle = String(form.fields.handle ?? '');
+  if (form.fields.decision !== 'approve' && form.fields.decision !== 'deny') return page('Request refused', 'Unknown action.', 400);
+  try {
+    const api = await c.oauth.api(c.env, c.origin, null);
+    if (form.fields.decision === 'deny') {
+      const denied = await api.denyConsent(c.request, handle);
+      return backToClient(denied.redirectTo, denied.headers);
+    }
+    const approved = await api.approveConsent(c.request, handle);
+    // Checked again here, where the code is made: a stored request never
+    // passes without the challenge, whatever put it there.
+    const problem = pkceProblem(approved.request);
+    if (problem) return askAgain(problem);
+    // The handle is used up. Membership and the second factor are read again
+    // now, so a change made while the page was open is honoured.
+    const workspace = c.oauth.workspaceForResource(c.origin, approved.request.resource);
+    const role = workspace ? await roleIn(c, session, workspace) : null;
+    const gate = role && role.permissions.find(needsSecondFactor);
+    const factorOk = !gate || (await authorizeSignIn(c.team, session, workspace, gate)).ok;
+    if (!role || !factorOk) return askAgain('Your access to this workspace changed while this page was open. Start again from the app.', 403);
+    const factor = session.factorAt ? await c.accounts.getFactor(session.userId) : null;
+    const helpers = await c.oauth.api(c.env, c.origin, approved.request.resource);
+    const { redirectTo: location } = await helpers.completeAuthorization({
+      request: approved.request,
+      userId: session.userId,
+      metadata: {},
+      scope: approved.request.scope,
+      // The grant's props are encrypted in KV. `factor` is when the authenticator
+      // this sign-in used was set up; a call that needs a second factor is
+      // allowed only while the person still has that authenticator.
+      props: { user_id: session.userId, email: session.email, workspace, factor: factor ? factor.created_at : null },
+    });
+    return backToClient(location, approved.headers);
+  } catch (e) {
+    return authorizeFailure(c, e, { afterChoice: true });
+  }
 }

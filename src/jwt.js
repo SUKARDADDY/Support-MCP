@@ -39,8 +39,10 @@ export async function importRsaJwk(jwk, subtle) {
   );
 }
 
-// audClaim may be a string or array; ACCESS_AUD must be contained.
+// audClaim may be a string or array; `wanted` (ACCESS_AUD) must be contained.
+// `wanted` may also be a list of audiences, any one of which is enough.
 export function audContains(audClaim, wanted) {
+  if (Array.isArray(wanted)) return wanted.some((w) => audContains(audClaim, w));
   if (Array.isArray(audClaim)) return audClaim.includes(wanted);
   return audClaim === wanted;
 }

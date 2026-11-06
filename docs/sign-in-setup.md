@@ -26,7 +26,11 @@ listed in `DEPLOYMENT_ADMINS`, can sign in. How it is built and checked is in
    minute per IP). The relay limits emailed links to five an address an hour
    and wrong authenticator codes to five, but it does not limit other requests.
 5. Optional: `SIGNIN_IDLE_HOURS` (default 12) and `SIGNIN_MAX_DAYS` (default 14)
-   set how long a browser sign-in lasts without use, and in total.
+   set how long a browser sign-in lasts without use, and in total. The idle
+   limit is never shorter than ten minutes, whatever you set.
+6. Optional: to let MCP clients such as Claude Code sign in as people, also set
+   up OAuth. See [mcp-clients.md](mcp-clients.md). The same sign-in is what its
+   consent page uses.
 
 ## Google
 
@@ -152,12 +156,21 @@ code, ends every other browser sign-in of that person, and the page says so.
 has an authenticator.
 
 To reset a person who lost both their phone and their recovery codes, after you
-have checked who they are:
+have checked who they are, delete their authenticator and end their open
+sign-ins in the same step:
 
 ```sh
-npx wrangler d1 execute support-mcp --remote \
-  --command "DELETE FROM user_factors WHERE user_id = (SELECT id FROM users WHERE email = 'person@example.com')"
+npx wrangler d1 execute support-mcp --remote --command \
+  "DELETE FROM user_factors WHERE user_id = (SELECT id FROM users WHERE email = 'person@example.com'); \
+   UPDATE login_sessions SET revoked_at = strftime('%s','now') * 1000 WHERE revoked_at IS NULL AND user_id = (SELECT id FROM users WHERE email = 'person@example.com')"
 ```
+
+The relay also stops counting an open sign-in's second factor once the
+authenticator is gone, so a sign-in you forgot to end cannot pass a factor
+check. Their MCP clients keep working for viewing but cannot control sessions
+until the person sets up a new authenticator and approves the client again.
+To end those clients at once, have the person use **Sign out everywhere** after
+they sign back in.
 
 To lock a person out of sign-in and end their open sign-ins at their next
 request, set `disabled_at` on their `users` row:

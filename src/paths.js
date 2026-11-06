@@ -16,9 +16,14 @@ function plainPath(p, max) {
     && !p.includes('\\') && !CONTROL.test(p);
 }
 
-// `max` is 300 for a path a person sends us. Our own redirects carry such a path
-// inside a query string, percent-encoded once or twice, so they allow more.
-export function safeNext(value, max = 300) {
+// `max` is 300 for a path a person sends us, except the OAuth authorize request
+// (an MCP client's sign-in), which carries a client address, a redirect address
+// and a challenge, so it gets AUTHORIZE_NEXT_MAX. Our own redirects carry such a
+// path inside a query string, percent-encoded once or twice, so they pass a
+// larger `max`.
+export const AUTHORIZE_NEXT_MAX = 1800;
+export function safeNext(value, max) {
+  max ??= typeof value === 'string' && value.startsWith('/oauth/authorize?') ? AUTHORIZE_NEXT_MAX : 300;
   if (!plainPath(value, max)) return DEFAULT_NEXT;
   let u;
   try { u = new URL(value, BASE); } catch (_) { return DEFAULT_NEXT; }

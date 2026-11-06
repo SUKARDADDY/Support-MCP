@@ -10,6 +10,10 @@ import { registryName } from './registry.js';
 import { handleApi } from './api.js';
 import { handleAuth } from './auth.js';
 import {
+  AS_METADATA_PATH, PROTECTED_RESOURCE_PREFIX, REGISTER_PATH, TOKEN_PATH, assertPersonActive, assertSecondFactor, bearerToken,
+  challengeHeader, createOAuth,
+} from './oauth.js';
+import {
   buildAppDownload,
   buildBootstrap,
   clientMode,
@@ -195,7 +199,12 @@ function makeBackend(env, origin, devTtlMs, actor, workspace) {
 // method, and each method first checks that the caller's role holds the
 // permission the called tool needs. It is given only that permission key, never
 // the tool's arguments, and a refused call never reaches a Session.
-function authorizedBackend(backend, env, actor, toolName, workspace) {
+//
+// A caller that came in with an OAuth token (`oauthCaller`) is checked further,
+// on every call: the person must still exist, be enabled and be invited; open
+// mode never admits them; and a permission that needs a second factor needs the
+// authenticator their grant was made with. Removal takes effect on the next call.
+function authorizedBackend(backend, env, actor, toolName, workspace, oauthCaller = null) {
   const check = async () => {
     const permission = permissionForTool(toolName);
     if (!permission) throw new Error(`unknown tool: ${toolName}`);
@@ -203,9 +212,12 @@ function authorizedBackend(backend, env, actor, toolName, workspace) {
     // A workspace that was never created answers every tool call the same way,
     // whoever asks. tools/list never gets here.
     if (!(await team.workspaceExists(workspace))) throw new Error('workspace not found');
-    const a = await team.authorize(workspace, actor, permission);
-    if (a.ok) return;
-    throw new Error(a.reason === 'not_member' ? 'you are not a member of this team' : `your role does not allow ${permission}`);
+    if (oauthCaller) await assertPersonActive(env, team, oauthCaller);
+    // An OAuth caller is a member or nothing: authorize does not apply open
+    // mode to them, and does not record them as a recent caller of default.
+    const a = await team.authorize(workspace, actor, permission, { membersOnly: oauthCaller !== null });
+    if (!a.ok) throw new Error(a.reason === 'not_member' ? 'you are not a member of this team' : `your role does not allow ${permission}`);
+    if (oauthCaller) await assertSecondFactor(env, oauthCaller, permission);
   };
   return Object.fromEntries(Object.entries(backend).map(([name, fn]) => [name, async (args) => {
     await check();
@@ -214,14 +226,18 @@ function authorizedBackend(backend, env, actor, toolName, workspace) {
 }
 
 // ---- Access gate -----------------------------------------------------------
-// Returns the caller identity string when allowed, or null.
-async function accessCaller(request, env, url) {
+// Returns the caller identity string when allowed, or null. `mcp` is true on
+// the MCP addresses, which may sit under a second Access application
+// (ACCESS_MCP_AUD, see cf/access-setup.sh): a JWT for either application is
+// good there. The team API accepts ACCESS_AUD only.
+async function accessCaller(request, env, url, { mcp = false } = {}) {
   if (localBypassAllowed(env, url.hostname)) return 'local-dev';
   const token = request.headers.get('Cf-Access-Jwt-Assertion');
   if (!token) return null;
+  const mcpAud = typeof env.ACCESS_MCP_AUD === 'string' ? env.ACCESS_MCP_AUD.trim() : '';
   try {
     const payload = await verifyAccessJwt(token, {
-      aud: env.ACCESS_AUD,
+      aud: mcp && mcpAud ? [env.ACCESS_AUD, mcpAud] : env.ACCESS_AUD,
       iss: `https://${env.ACCESS_TEAM_DOMAIN}`,
       keyResolver: jwksKeyResolver(`https://${env.ACCESS_TEAM_DOMAIN}/cdn-cgi/access/certs`),
       subtle: crypto.subtle,
@@ -380,15 +396,42 @@ function handleWs(request, env, url) {
   return env.SESSION.get(id).fetch(new Request(`https://do/ws?sid=${sid}`, request));
 }
 
-async function handleMcp(request, env, url, origin, devTtlMs, workspace = DEFAULT_WORKSPACE) {
+// A missing or failed credential on an MCP address is 401, with a challenge that
+// points an MCP client at this address's protected resource document, so it can
+// find the authorization server and sign in. `invalid` is a token that was sent
+// and failed (expired, revoked, for another address, malformed).
+function unauthorized(issuer, workspace, invalid) {
+  return json({ error: invalid ? 'invalid_token' : 'unauthorized' }, 401, {
+    'www-authenticate': challengeHeader(issuer, workspace, { invalid }),
+    'cache-control': 'no-store',
+  });
+}
+
+async function handleMcp(request, env, url, origin, devTtlMs, workspace = DEFAULT_WORKSPACE, oauth = null) {
   // CSRF: the Access app also admits a browser identity (cookie). MCP clients
   // never send Origin; browsers always do on cross-origin POST. Refuse it, and
   // require a JSON content type (a form post cannot set one without CORS).
   if (request.headers.has('origin')) return json({ error: 'forbidden' }, 403);
   if (request.method !== 'POST') return json({ error: 'method not allowed' }, 405, { allow: 'POST' });
   if (!isJsonContentType(request)) return json({ error: 'unsupported media type' }, 415);
-  const actor = await accessCaller(request, env, url);
-  if (!actor) return json({ error: 'forbidden' }, 403);
+  // Who is calling. An OAuth bearer token, when OAuth is set up and one is
+  // sent, is checked for exactly this address and nothing else is tried: a
+  // failure is a 401, not a fall back to the Access path. Without a bearer, an
+  // Access login, a service token or the local bypass works as it always has.
+  const oauthOn = oauth ? oauth.available(env, url) : null;
+  const bearer = oauthOn ? bearerToken(request) : null;
+  let actor;
+  let oauthCaller = null;
+  if (bearer !== null) {
+    const checked = await oauth.checkBearer(env, oauthOn.origin, workspace, bearer);
+    if (checked.unavailable) return json({ error: 'temporarily_unavailable' }, 503, { 'retry-after': '60', 'cache-control': 'no-store' });
+    if (!checked.ok) return unauthorized(oauthOn.origin, workspace, true);
+    oauthCaller = checked;
+    actor = checked.email;
+  } else {
+    actor = await accessCaller(request, env, url, { mcp: true });
+    if (!actor) return unauthorized(oauthOn && oauthOn.origin, workspace, false);
+  }
   // ?ui=0|1 picks this connection's tools. The old ?shape parameter is a 400.
   let options;
   try {
@@ -405,15 +448,31 @@ async function handleMcp(request, env, url, origin, devTtlMs, workspace = DEFAUL
   // Roles are checked on tools/call only. tools/list, initialize and ping never
   // touch the team database.
   const toolName = msg && msg.method === 'tools/call' && msg.params ? msg.params.name : undefined;
-  const backend = authorizedBackend(makeBackend(env, origin, devTtlMs, actor, workspace), env, actor, toolName, workspace);
+  const backend = authorizedBackend(makeBackend(env, origin, devTtlMs, actor, workspace), env, actor, toolName, workspace, oauthCaller);
   const { status, body } = await handleRpc(msg, backend, options);
   if (body === null) return new Response(null, { status });
   return json(body, status);
 }
 
-// options (for tests): fetch replaces the network for the sign-in providers and
-// the mail provider; mailer replaces the one chosen by MAIL_PROVIDER (null = none).
+// An OAuth route that cannot reach the database or KV answers 503, not a crash.
+async function oauthRoute(serve) {
+  try {
+    return await serve();
+  } catch (_) {
+    // Nothing is logged: an error here may carry a token or an address.
+    return json({ error: 'temporarily_unavailable' }, 503, { 'cache-control': 'no-store', 'retry-after': '30' });
+  }
+}
+
+// options: oauth is the OAuth library's classes ({ OAuthAuthorizationServer,
+// AuthorizationError, CimdFetchError }), passed in by src/index.js so this file
+// never imports a module Node cannot load. Without it OAuth is off and the MCP
+// addresses admit only Access logins, service tokens and the local bypass.
+// For tests: fetch replaces the network for the sign-in providers and the mail
+// provider; mailer replaces the one chosen by MAIL_PROVIDER (null = none);
+// oauthTuning sets how long OAuth keeps its list of workspace addresses.
 export function createHandler(agentText, appBundle = null, options = {}) {
+  const oauth = options.oauth ? createOAuth(options.oauth, options.oauthTuning) : null;
   return {
     async fetch(request, env, ctx) {
       const url = new URL(request.url);
@@ -428,19 +487,30 @@ export function createHandler(agentText, appBundle = null, options = {}) {
       if (p.startsWith('/j/')) return handleJ(request, env, url, origin, agentText, appBundle);
       if (p === '/agent') return handleAgent(request, env, url);
       if (p === '/ws') return handleWs(request, env, url);
-      if (p === '/mcp') return handleMcp(request, env, url, origin, devTtlMs);
+      if (p === '/mcp') return handleMcp(request, env, url, origin, devTtlMs, DEFAULT_WORKSPACE, oauth);
       // /w/<slug>/mcp is the same endpoint for another workspace. A slug that is
       // not well formed is an unknown route; a well-formed one that was never
       // created is answered per tool call, so tools/list stays static.
       // default has one address, /mcp, so /w/default/mcp is unknown too.
       const wm = WORKSPACE_MCP.exec(p);
-      if (wm && wm[1] !== DEFAULT_WORKSPACE) return handleMcp(request, env, url, origin, devTtlMs, wm[1]);
+      if (wm && wm[1] !== DEFAULT_WORKSPACE) return handleMcp(request, env, url, origin, devTtlMs, wm[1], oauth);
+      // OAuth: the authorization server's own addresses and the protected
+      // resource documents. They answer 404 when OAuth is not set up.
+      if (p === AS_METADATA_PATH || p === TOKEN_PATH || p === REGISTER_PATH) {
+        if (!oauth) return new Response('not found', { status: 404 });
+        return oauthRoute(() => oauth.serveServer(request, env, ctx, url));
+      }
+      if (p === PROTECTED_RESOURCE_PREFIX || p.startsWith(`${PROTECTED_RESOURCE_PREFIX}/`)) {
+        if (!oauth) return new Response('not found', { status: 404 });
+        return oauthRoute(() => oauth.serveResourceMetadata(request, env, url));
+      }
       // Sign-in and the account page are for browsers, so they have their own
       // origin and form-token checks (src/auth.js). /mcp and /api stay as above.
-      if (p === '/auth' || p.startsWith('/auth/') || p === '/account' || p.startsWith('/account/')) {
+      if (p === '/auth' || p.startsWith('/auth/') || p === '/account' || p.startsWith('/account/') || p === '/oauth/authorize') {
         return handleAuth(request, env, url, {
           fetchFn: options.fetch,
           mailer: options.mailer,
+          oauth,
           waitUntil: ctx && typeof ctx.waitUntil === 'function' ? (promise) => ctx.waitUntil(promise) : undefined,
         });
       }

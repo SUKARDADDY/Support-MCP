@@ -69,8 +69,10 @@ function shell(title, body) {
 const hidden = (name, value) => `<input type="hidden" name="${esc(name)}" value="${esc(value)}">`;
 const note = (text, kind = '') => `<p class="note${kind ? ` ${kind}` : ''}" role="${kind === 'warn' ? 'alert' : 'status'}">${esc(text)}</p>`;
 
-export function messagePage({ title, text, link, linkLabel, kind = '' }) {
-  return shell(title, `<h1>${esc(title)}</h1>${kind ? note(text, kind) : `<p>${esc(text)}</p>`}${link ? `<a class="btn primary" href="${esc(safeNext(link, 4000))}">${esc(linkLabel || 'Continue')}</a>` : ''}`);
+// `outHref` is a plain link that leaves this site (the caller has checked it).
+export function messagePage({ title, text, link, linkLabel, kind = '', outHref, outLabel }) {
+  const out = outHref ? `<p class="small"><a href="${esc(outHref)}" rel="noreferrer">${esc(outLabel || 'Go back')}</a></p>` : '';
+  return shell(title, `<h1>${esc(title)}</h1>${kind ? note(text, kind) : `<p>${esc(text)}</p>`}${link ? `<a class="btn primary" href="${esc(safeNext(link, 4000))}">${esc(linkLabel || 'Continue')}</a>` : ''}${out}`);
 }
 
 // ---- sign-in --------------------------------------------------------------------
@@ -153,4 +155,37 @@ export function accountPage({ email, workspaces, deploymentAdmin, factor, factor
 <h2>Sign out</h2>
 <form method="post" action="/auth/signout">${hidden('csrf', csrf)}<button class="btn" type="submit">Sign out</button></form>
 <form method="post" action="/account/signout-everywhere">${hidden('csrf', csrf)}<button class="btn danger" type="submit">Sign out everywhere</button></form>`);
+}
+
+// ---- OAuth consent --------------------------------------------------------------------
+// Everything about the app comes from its registration or metadata document, so
+// every value is escaped. The page names the app, where it sends the person
+// back to, the workspace and what the person's role lets it do. The two buttons
+// are separate forms so neither can fire from the other's fields.
+export function consentPage({ email, clientName, clientDomain, redirectHost, redirectIsLoopback, redirectIsApp, workspaceName, workspaceSlug, roleName, abilities, csrf, handle }) {
+  // The client chose these, so a very long value is cut short, not allowed to fill the page.
+  const clip = (v, n) => (String(v).length > n ? `${String(v).slice(0, n)}…` : String(v));
+  clientName = clip(clientName, 80);
+  if (clientDomain) clientDomain = clip(clientDomain, 100);
+  redirectHost = clip(redirectHost, 100);
+  const who = clientDomain
+    ? `<p class="small muted">Published by <strong>${esc(clientDomain)}</strong>.</p>`
+    : '<p class="small muted">This app registered itself, so its name is not verified.</p>';
+  const local = redirectIsLoopback
+    ? note('This sends access to an app on your computer. Continue only if you just started signing in from it.', 'warn')
+    : redirectIsApp
+      ? note('This opens an app on your device through a link of its own. Continue only if you just started signing in from that app.', 'warn')
+      : '';
+  const can = abilities.length
+    ? `<ul class="plain">${abilities.map((a) => `<li>${esc(a[0].toUpperCase() + a.slice(1))}</li>`).join('')}</ul>`
+    : '<p class="muted">Nothing. Your role here holds no session permissions.</p>';
+  const form = (decision, label, cls) => `<form method="post" action="/oauth/authorize">${hidden('csrf', csrf)}${hidden('handle', handle)}${hidden('decision', decision)}<button class="btn${cls}" type="submit">${label}</button></form>`;
+  return shell('Allow access', `<h1>Allow ${esc(clientName)} to connect?</h1>
+${who}${local}
+<p>It will act as <strong>${esc(email)}</strong> in this workspace for up to 30 days. Signing out everywhere, or an admin removing you, ends it at once.</p>
+<dl><dt>Workspace</dt><dd>${esc(workspaceName)} <span class="role">(${esc(workspaceSlug)})</span></dd>
+<dt>Your role</dt><dd>${esc(roleName)}</dd>
+<dt>After you allow, it returns to</dt><dd>${esc(redirectHost)}</dd></dl>
+<h2>What it can do</h2>${can}
+${form('approve', 'Allow', ' primary')}${form('deny', 'Deny', '')}`);
 }
