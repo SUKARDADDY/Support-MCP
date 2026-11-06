@@ -872,7 +872,7 @@ public static class AppTests {
         using (var relay = new FakeRelay()) {
             relay.Lifetime = 300000; relay.Start();
             var caps = (System.Collections.ArrayList)relay.Hello["caps"];
-            Assert(Wire.Text(relay.Hello, "agent") == "windows-app-2" && Wire.Text(relay.Hello, "control") == "normal" && caps.Contains("screen") && caps.Contains("uia") && caps.Contains("lanes"), "Hello must announce screen control and lanes");
+            Assert(Wire.Text(relay.Hello, "agent") == "windows-app-2" && Wire.Text(relay.Hello, "version") == Wire.Version && Wire.Text(relay.Hello, "control") == "normal" && caps.Contains("screen") && caps.Contains("uia") && caps.Contains("lanes"), "Hello must announce screen control and lanes");
             Assert(relay.WaitBusy(delegate(string[] b) { return b.Length == 0; }, 5000), "An idle client polls with no busy lane");
             for (int i = 0; i < 100 && relay.LastPoll == null; i++) Thread.Sleep(50);
             Assert(relay.LastPoll != null && relay.LastPoll.ContainsKey("busy") && Wire.Text(relay.LastPoll, "desktop") != "" && relay.LastPoll.ContainsKey("paused_until") && relay.LastPoll["paused_until"] == null, "A poll reports the desktop and no pause");

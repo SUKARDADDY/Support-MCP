@@ -2,10 +2,11 @@
 // backend. index.js supplies a backend that talks to the Durable Objects.
 
 import { normalizeAction } from './screen.js';
+import { VERSION } from './version.js';
 
 export const SUPPORTED_PROTOCOLS = ['2025-06-18', '2025-03-26'];
 export const DEFAULT_PROTOCOL = '2025-06-18';
-export const SERVER_INFO = { name: 'support-mcp', version: 'relay-v1' };
+export const SERVER_INFO = { name: 'support-mcp', version: VERSION };
 
 const SESSION_ID = { type: 'string', description: 'the session_id from session_create' };
 
@@ -52,7 +53,7 @@ const BASE_TOOLS = [
   {
     name: 'session_status',
     description:
-      'State, windows_mode (app or powershell), machine, user, expiry, whether an agent is attached, client_version, and the last log rows. App sessions also report elevated (true for administrator rights, null if unknown), control (full, normal, or null if not reported), caps (what the app can do: screen, uia, lanes, full), and, when the app reports them, desktop (default, secure or unknown), paused_until (the customer is using the PC until then) and input_blocked_until (block_input is on until then), as Unix milliseconds. The audit log shows typed text only as a length and never anything for type_secret.',
+      'State, windows_mode (app or powershell), machine, user, expiry, whether an agent is attached, client_version (the release version the client reports, else its agent string), client_agent (the agent string, which names the protocol generation, or null), and the last log rows. App sessions also report elevated (true for administrator rights, null if unknown), control (full, normal, or null if not reported), caps (what the app can do: screen, uia, lanes, full), and, when the app reports them, desktop (default, secure or unknown), paused_until (the customer is using the PC until then) and input_blocked_until (block_input is on until then), as Unix milliseconds. The audit log shows typed text only as a length and never anything for type_secret.',
     inputSchema: {
       type: 'object',
       properties: {
