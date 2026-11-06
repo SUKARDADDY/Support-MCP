@@ -393,14 +393,14 @@ public static class AppTests {
     }
 
     // A program the command started without waiting (like rundll32 user32.dll,LockWorkStation) gets up to a second to
-    // finish: here a script that waits 250 ms, started last. One that keeps running is killed once that second is over,
-    // and the client's stop ends the second at once.
+    // finish: here a copy of this test program that waits 250 ms, started last. One that keeps running is killed
+    // once that second is over, and the client's stop ends the second at once. Not a cscript script: on the
+    // 20261103 Windows Server 2025 runner image cscript takes about two seconds to start, longer than that second.
     internal static void SettleTests(FakeRelay relay, string dir) {
         string tag = Guid.NewGuid().ToString("N").Substring(0, 8);
-        string quick = Path.Combine(dir, "settle-quick-" + tag), slowPid = Path.Combine(dir, "settle-pid-" + tag), js = Path.Combine(dir, "settle-" + tag + ".js");
-        File.WriteAllText(js, "WScript.Sleep(250); var f = new ActiveXObject('Scripting.FileSystemObject').CreateTextFile('" + quick.Replace("\\", "\\\\") + "', true); f.Write('done'); f.Close();");
+        string quick = Path.Combine(dir, "settle-quick-" + tag), slowPid = Path.Combine(dir, "settle-pid-" + tag), self = System.Reflection.Assembly.GetExecutingAssembly().Location;
         var r = relay.Call(Run("$s = Start-Process cmd.exe -WindowStyle Hidden -PassThru -ArgumentList '/c ping -n 30 127.0.0.1 >nul'; Set-Content -LiteralPath '" + slowPid.Replace("'", "''")
-            + "' -Value ([string]$s.Id + ' ' + $s.StartTime.ToUniversalTime().Ticks); Start-Process cscript.exe -WindowStyle Hidden -ArgumentList '//nologo //e:jscript \"" + js.Replace("'", "''") + "\"'; [Console]::Write([DateTime]::UtcNow.Ticks)", 30));
+            + "' -Value ([string]$s.Id + ' ' + $s.StartTime.ToUniversalTime().Ticks); Start-Process -FilePath '" + self.Replace("'", "''") + "' -WindowStyle Hidden -ArgumentList '--settle \"" + quick.Replace("'", "''") + "\"'; [Console]::Write([DateTime]::UtcNow.Ticks)", 30));
         long settledMs = (DateTime.UtcNow.Ticks - long.Parse(Decode(r, "stdout_b64"))) / 10000;
         Assert(Wire.Flag(r, "ok") && File.Exists(quick), "A program the command did not wait for finishes");
         Assert(settledMs >= CommandJob.SettleMs - 100 && settledMs < 10000, "The result waits about a second for a program that keeps running: " + settledMs + " ms");
@@ -1114,6 +1114,7 @@ public static class AppTests {
     }
     public static int Main(string[] args) {
         if (args.Length == 2 && args[0] == "--peer") { Screen.Dpi(); return PeerWindow(int.Parse(args[1])); }
+        if (args.Length == 2 && args[0] == "--settle") { Thread.Sleep(250); File.WriteAllText(args[1], "done"); return 0; }
         string dir = Path.Combine(Path.GetTempPath(), "support-mcp-native-test-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
         try {
             Assert(Ui.Clock(TimeSpan.FromSeconds(0)) == "00:00:00" && Ui.Clock(TimeSpan.FromSeconds(3661)) == "01:01:01" && Ui.Clock(TimeSpan.FromHours(100)) == "100:00:00", "The session clock must format as hh:mm:ss");
