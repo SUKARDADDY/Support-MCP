@@ -11,7 +11,7 @@
 // Every change goes through the team store's guarded change (mutate), so the log
 // row commits with the change and the actor's permission is checked again at
 // commit, as for member writes. The only unlogged writes are a PC's check-in
-// details (at most every 5 minutes, like the callers table) and purging expired
+// details (at most every 5 minutes, or once a minute when one changed) and purging expired
 // codes and waiting PCs. A log detail holds names and ids, never a code, a key
 // or a field value.
 //
@@ -36,6 +36,9 @@ export const CODE_TTL_MS = 10 * MINUTE_MS;
 export const PENDING_TTL_MS = 24 * HOUR_MS;
 // A PC's reported details are written at most this often, unless one changed.
 export const CHECK_IN_REFRESH_MS = 5 * MINUTE_MS;
+// Even a changed value is written at most this often, so a PC cannot flip its
+// details to force a write on every check-in.
+export const CHECK_IN_CHANGE_MS = MINUTE_MS;
 
 export const LIMITS = Object.freeze({
   customers: 10_000, sites: 10_000, devices: 2_000, fieldDefs: 30, liveCodes: 20, pending: 20, requestsPerHour: 20,
@@ -161,7 +164,16 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
   const rowExists = (table, slug, id) => [`EXISTS (SELECT 1 FROM ${table} WHERE workspace = ? AND id = ?)`, [slug, id]];
   const liveCodes = ' AND used_at IS NULL AND expires_at > ?';
   // Every custom field id in `ids` still has a definition for this record type.
-  const fieldsDefined = (slug, entity, ids) => and(lit(true), ...ids.map((id) => ['EXISTS (SELECT 1 FROM field_defs WHERE workspace = ? AND id = ? AND entity = ?)', [slug, id, entity]]));
+  // The ids go in as one JSON array, so the statement binds three values however
+  // many fields a request sets (D1 allows 100 bound values per statement).
+  const fieldsDefined = (slug, entity, ids) => (ids.length
+    ? ['NOT EXISTS (SELECT 1 FROM json_each(?) j WHERE NOT EXISTS (SELECT 1 FROM field_defs f WHERE f.workspace = ? AND f.entity = ? AND f.id = j.value))', [JSON.stringify(ids), slug, entity]]
+    : lit(true));
+  // Whether the actor holds a permission now, read with the same SQL the guards use.
+  const holds = async (slug, actor, permission) => {
+    const [sql, params] = actorHas(slug, actor, permission);
+    return !!(await q(`SELECT 1 AS ok WHERE ${sql}`, ...params).first('ok'));
+  };
 
   // Waiting PCs past their 24 hours and codes past their 10 minutes are purged
   // as they are met. Unlogged, and filtered by workspace like every query here.
@@ -356,7 +368,9 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
       return {
         entries: [{ kind: 'field_changed', detail: `${cur.entity} ${id} ${JSON.stringify(next.label)} at ${next.position}` }],
         guard: and(actorHas(slug, actor, 'fields.manage'), actorUnchanged(slug, ctx), rowExists('field_defs', slug, id)),
-        change: ([cond, params]) => [q('UPDATE field_defs SET label = ?, position = ? WHERE workspace = ? AND id = ? AND ' + cond, next.label, next.position, slug, id, ...params)],
+        // Only the values sent are written, so a concurrent change to the other one stays.
+        change: ([cond, params]) => [q(`UPDATE field_defs SET ${[...(hasLabel ? ['label = ?'] : []), ...(hasPosition ? ['position = ?'] : [])].join(', ')} WHERE workspace = ? AND id = ? AND ${cond}`,
+          ...(hasLabel ? [label] : []), ...(hasPosition ? [body.position] : []), slug, id, ...params)],
         result: next,
       };
     });
@@ -409,6 +423,10 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
     const hasFields = Object.hasOwn(body, 'fields');
     const hasAccess = Object.hasOwn(body, 'access');
     const hasApprove = Object.hasOwn(body, 'approve');
+    // The name and the control level are the owner's, set from the PC, so a technician sending them is refused, not ignored.
+    for (const owned of ['name', 'control', 'owner_contact', 'os', 'machine', 'app_version']) {
+      if (Object.hasOwn(body, owned)) throw bad(`${owned} is set from the PC, not by the team`);
+    }
     if (!hasSite && !hasFields && !hasAccess && !hasApprove) throw bad('send site_id, fields, access or approve');
     if (hasApprove && (hasSite || hasFields || hasAccess)) throw bad('approve cannot be combined with other changes');
     const siteId = hasSite && body.site_id !== null ? validId(body.site_id, 'site_id') : null;
@@ -446,7 +464,8 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
       const changed = [];
       const sets = [];
       const values = [];
-      if (hasSite && siteId !== cur.site_id) { changed.push(`site ${cur.site_id ?? 'none'} to ${siteId ?? 'none'}`); sets.push('site_id = ?'); values.push(siteId); }
+      const siteChanges = hasSite && siteId !== cur.site_id;
+      if (siteChanges) { changed.push(`site ${cur.site_id ?? 'none'} to ${siteId ?? 'none'}`); sets.push('site_id = ?'); values.push(siteId); }
       const accessChanges = hasAccess && access !== cur.access;
       if (accessChanges) { changed.push(`access ${cur.access} to ${access}`); sets.push('access = ?'); values.push(access); }
       if (merge.ids.length) { changed.push(...merge.ids.map((f) => `field ${f}`)); sets.push('fields = json_patch(fields, ?)'); values.push(merge.patch); }
@@ -456,6 +475,8 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
         guard: and(
           base,
           siteId ? rowExists('sites', slug, siteId) : lit(true),
+          // The site a technician replaces is the one the plan read.
+          siteChanges ? ['EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND site_id IS ?)', [slug, id, cur.site_id]] : lit(true),
           fieldsDefined(slug, 'device', merge.setIds),
           // The mode a technician replaces is the one the plan read, on a PC still approved.
           accessChanges ? ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND status = 'active' AND access = ?)", [slug, id, cur.access]] : lit(true),
@@ -599,12 +620,15 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
       const now = Date.now();
       const row = await q('SELECT site_id, created_by, used_at, expires_at FROM pairing_codes WHERE hash = ? AND workspace = ?', hash, slug).first();
       if (!row || row.used_at !== null || row.expires_at <= now) throw codeInvalid();
+      // A code carries the authority of the person who made it, for as long as they hold it.
+      if (!(await holds(slug, row.created_by, 'devices.manage'))) throw codeInvalid();
       if ((await count('devices', slug)) >= LIMITS.devices) throw new TeamError(409, 'device_limit', `a team holds at most ${LIMITS.devices} PCs`);
       const device = newDevice(slug, id, fields, { key_hash: keyHash, paired_by: row.created_by });
       return {
         entries: [{ kind: 'device_paired', detail: `${id} ${JSON.stringify(device.name)}` }],
         guard: and(
           ['EXISTS (SELECT 1 FROM pairing_codes WHERE hash = ? AND workspace = ? AND used_at IS NULL AND expires_at > ?)', [hash, slug, now]],
+          actorHas(slug, row.created_by, 'devices.manage'),
           countBelow('devices', slug, LIMITS.devices),
         ),
         change: (cond) => [
@@ -626,7 +650,6 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
     const slug = body.workspace;
     const fields = readPcFields(body, PAIR_FIELDS);
     if (typeof slug !== 'string' || !(await team.workspaceExists(slug))) throw new TeamError(404, 'not_found', 'no such workspace');
-    await purgePending(slug);
     const id = newId();
     const secret = randomToken(32);
     const keyHash = await sha256Hex(secret);
@@ -635,21 +658,33 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
     return mutate(slug, `pc ${id}`, async () => {
       const now = Date.now();
       const since = now - HOUR_MS;
+      // A waiting PC past its 24 hours no longer counts. It is deleted only when
+      // this request goes through, so a refused request writes nothing.
+      const stillWaiting = " AND status = 'pending' AND expires_at > ?";
+      const notExpired = " AND NOT (status = 'pending' AND expires_at <= ?)";
+      // The hourly rule reads at most LIMITS.requestsPerHour rows of the log (the
+      // audit_by_kind index). The plan's answer is advisory; the guard decides.
+      const recentRequests = [
+        "(SELECT COUNT(*) FROM (SELECT 1 FROM audit WHERE workspace = ? AND kind = 'device_requested' AND ts > ? AND actor <> ? LIMIT ?)) < ?",
+        [slug, since, `pc ${id}`, LIMITS.requestsPerHour, LIMITS.requestsPerHour],
+      ];
       // This request's own log row is left out, so the rule reads the same before and after it.
-      const requestRows = " AND kind = 'device_requested' AND ts > ? AND actor <> ?";
-      if ((await count('audit', slug, requestRows, since, `pc ${id}`)) >= LIMITS.requestsPerHour) throw new TeamError(409, 'request_limit', 'too many requests to join this team; try again later');
-      if ((await count('devices', slug, " AND status = 'pending'")) >= LIMITS.pending) throw new TeamError(409, 'pending_limit', 'too many PCs are waiting for approval; try again later');
-      if ((await count('devices', slug)) >= LIMITS.devices) throw new TeamError(409, 'device_limit', `a team holds at most ${LIMITS.devices} PCs`);
+      if (!(await q(`SELECT 1 AS ok WHERE ${recentRequests[0]}`, ...recentRequests[1]).first('ok'))) throw new TeamError(409, 'request_limit', 'too many requests to join this team; try again later');
+      if ((await count('devices', slug, stillWaiting, now)) >= LIMITS.pending) throw new TeamError(409, 'pending_limit', 'too many PCs are waiting for approval; try again later');
+      if ((await count('devices', slug, notExpired, now)) >= LIMITS.devices) throw new TeamError(409, 'device_limit', `a team holds at most ${LIMITS.devices} PCs`);
       const expires = now + PENDING_TTL_MS;
       const device = newDevice(slug, id, fields, { status: 'pending', key_hash: keyHash, confirm_hash: confirmHash, expires_at: expires, paired_by: `pc ${id}` });
       return {
         entries: [{ kind: 'device_requested', detail: `${id} ${JSON.stringify(device.name)}` }],
         guard: and(
-          countBelow('audit', slug, LIMITS.requestsPerHour, requestRows, since, `pc ${id}`),
-          countBelow('devices', slug, LIMITS.pending, " AND status = 'pending'"),
-          countBelow('devices', slug, LIMITS.devices),
+          countBelow('devices', slug, LIMITS.pending, stillWaiting, now),
+          countBelow('devices', slug, LIMITS.devices, notExpired, now),
+          recentRequests,
         ),
-        change: (cond) => [insertDevice(device, null, cond)],
+        change: ([cond, params]) => [
+          q(`DELETE FROM devices WHERE workspace = ? AND status = 'pending' AND expires_at <= ? AND ${cond}`, slug, now, ...params),
+          insertDevice(device, null, [cond, params]),
+        ],
         result: { status: 'pending', workspace: slug, device_id: id, key: `smd1.${slug}.${id}.${secret}`, confirm, expires_at: expires },
       };
     });
@@ -670,8 +705,8 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
     return row;
   }
 
-  // A PC checks in. What it reports is written at most every 5 minutes, or at
-  // once when a value changed. Unlogged, like the callers table.
+  // A PC checks in. What it reports is written at most every 5 minutes, or every
+  // minute when a value changed. Unlogged, like the callers table.
   async function checkIn(key, body) {
     const dev = await authenticate(key);
     if (!dev) throw unknownDevice();
@@ -682,9 +717,11 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
     const now = Date.now();
     const next = { os: dev.os, machine: dev.machine, app_version: dev.app_version, ...report };
     const changed = ['os', 'machine', 'app_version'].some((f) => next[f] !== dev[f]) || dev.protocol !== 1;
-    if (changed || now - dev.last_seen >= CHECK_IN_REFRESH_MS) {
-      await q('UPDATE devices SET os = ?, machine = ?, app_version = ?, protocol = 1, last_seen = ? WHERE workspace = ? AND id = ? AND key_hash = ?',
-        next.os, next.machine, next.app_version, now, key.workspace, key.id, dev.key_hash).run();
+    // last_seen is the time of the last write, so it also holds concurrent check-ins to the same limit.
+    const minAge = changed ? CHECK_IN_CHANGE_MS : CHECK_IN_REFRESH_MS;
+    if (now - dev.last_seen >= minAge) {
+      await q('UPDATE devices SET os = ?, machine = ?, app_version = ?, protocol = 1, last_seen = ? WHERE workspace = ? AND id = ? AND key_hash = ? AND last_seen <= ?',
+        next.os, next.machine, next.app_version, now, key.workspace, key.id, dev.key_hash, now - minAge).run();
     }
     return pcOut(dev);
   }
@@ -703,11 +740,16 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
       if (dev.status !== 'active') throw new TeamError(403, 'pending', 'a technician has not approved this PC yet');
       const changed = Object.keys(patch).filter((f) => patch[f] !== dev[f]);
       if (!changed.length) return { noop: true, result: pcOut(dev) };
+      const modes = changed.filter((f) => f === 'access' || f === 'control');
       // owner_contact is personal data, so the log names it without its value.
       const detail = changed.map((f) => (f === 'owner_contact' ? f : f === 'name' ? `name ${JSON.stringify(patch.name)}` : `${f} ${dev[f]} to ${patch[f]}`));
       return {
         entries: [{ kind: 'device_changed', detail: `${key.id} ${detail.join(', ')}` }],
-        guard: ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND key_hash = ? AND status = 'active')", [key.workspace, key.id, dev.key_hash]],
+        // Each mode this change replaces is the one the plan read.
+        guard: and(
+          ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND key_hash = ? AND status = 'active')", [key.workspace, key.id, dev.key_hash]],
+          ...modes.map((f) => [`EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND ${f} = ?)`, [key.workspace, key.id, dev[f]]]),
+        ),
         change: ([cond, params]) => [q(
           `UPDATE devices SET ${changed.map((f) => `${f} = ?`).join(', ')} WHERE workspace = ? AND id = ? AND ${cond}`,
           ...changed.map((f) => patch[f]), key.workspace, key.id, ...params,

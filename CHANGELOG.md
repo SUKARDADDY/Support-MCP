@@ -32,14 +32,22 @@ to run on unattended customer PCs.
 - A custom role with `members.manage` but no device permissions can no longer add
   or change a technician or a viewer, because those roles now hold permissions
   the custom role lacks (the rule that you hand out only what you hold). Give the
-  custom role `devices.view` and `devices.manage` to restore it. Production has
-  no custom roles.
+  custom role `devices.view` and `devices.manage` to restore it.
 - A workspace that edited the `technician` or `viewer` role keeps its edit, which
   has none of the new permissions. Edit the role to add them. Admins hold every
   permission either way, and a workspace that never edited them gets the new
   defaults.
 - Add `/device/` to the Cloudflare rate-limiting rule next to `/j` and `/ws`. It
   must stay outside Access.
+- `devices.manage` and `fields.manage` join the permissions that need a second
+  factor at browser sign-in and OAuth consent. A person whose role holds either
+  must enrol an authenticator; Access callers are still exempt.
+- A technician's `PATCH .../devices/<id>` with `name`, `control` or another
+  field the PC owns is now 400 `bad_request`; those stay the owner's.
+- A PC's changed check-in details are written at most once a minute (unchanged
+  ones still every 5 minutes). A pairing code works only while the person who
+  made it still holds `devices.manage`. Migration `0004_devices.sql` adds the
+  indexes `devices_by_status` and `audit_by_kind`.
 - The README's tool count badge now says 22, as the relay lists.
 
 ## [0.2.0] - 2026-11-06

@@ -54,6 +54,8 @@ test('a technician code pairs a PC; it checks in, changes its own settings, and 
   assert.equal(paired.body.key.split('.')[2], paired.body.device_id);
   assert.equal(paired.headers.get('cache-control'), 'no-store');
 
+  // A changed value is written at most once a minute: pretend the pairing was two minutes ago.
+  w.db.sqlite.exec('UPDATE devices SET last_seen = last_seen - 120000');
   const hello = await w.send('hello', { protocol: 1, os: 'Windows 11', machine: 'POS-1', app_version: '0.4.1' }, { headers: w.bearer(paired.body.key) });
   assert.equal(hello.status, 200);
   assert.deepEqual(hello.body, {

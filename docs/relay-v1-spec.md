@@ -399,7 +399,7 @@ commit together, and a permission lost between the read and the commit is a 403.
 | `GET`, `PATCH`, `DELETE .../sites/<id>` | as customers | `PATCH`: `name, address, notes, fields` | `{site}`; `DELETE` is 409 `in_use` with PCs or live codes |
 | `GET .../devices?site=&status=&after=&limit=` | `devices.view` | | `{devices:[...], next}`; `status` is `pending` or `active` |
 | `GET .../devices/<id>` | `devices.view` | | `{device}` |
-| `PATCH .../devices/<id>` | `devices.manage` | `{site_id?, fields?, access?, approve?:{confirm}}` | `{device}` |
+| `PATCH .../devices/<id>` | `devices.manage` | `{site_id?, fields?, access?, approve?:{confirm}}`; `name`, `control`, `owner_contact`, `os`, `machine` or `app_version` is 400 `bad_request` | `{device}` |
 | `DELETE .../devices/<id>` | `devices.manage` | | `{removed:{id}}`; the PC's key ends with its row |
 | `GET .../fields` | `devices.view` | | `{fields:[{id,entity,label,position,created_at}]}` |
 | `POST .../fields` | `fields.manage` | `{entity, label}` | 201 `{field}`; `entity` is `customer`, `site` or `device` |
@@ -424,7 +424,9 @@ when more remain, else `null`.
 A technician with `devices.manage` may change a PC's `access` (`ask` or `any`)
 on an active PC. That change is logged as `device_changed` with the technician as
 actor and the old and new mode in the detail. The PC's `control` and `name` stay
-the owner's and cannot be changed here. `approve` is its own request: a waiting PC
+the owner's: sending either, or another field the PC reports, is 400 `bad_request`,
+not ignored. Only team members with `devices.manage` write custom fields; a PC
+cannot. `approve` is its own request: a waiting PC
 becomes `active` when `confirm` is the six-digit number shown on the PC (403
 `confirm_wrong` otherwise, 409 `not_pending` for an active PC).
 
@@ -438,8 +440,15 @@ Log kinds: `customer_added`, `customer_changed`, `customer_removed`, `site_added
 `device_requested`, `device_approved`, `device_changed`, `device_removed`,
 `device_left`. A detail names ids and names, never a code, a key, an owner
 contact or a field value. The only unlogged writes are a PC's check-in details (at
-most every 5 minutes, or at once when a value changed) and purging expired codes
-and waiting PCs.
+most every 5 minutes, or once a minute when a value changed) and purging expired
+codes and waiting PCs. A detail can hold customer, site and PC names, so anyone
+with `audit.view` can read them. A wrong approval number is refused with 403
+`confirm_wrong` and is not logged; only holders of `devices.manage` can try one.
+A pairing code carries its creator's authority: it redeems only while that person
+still holds `devices.manage` in the workspace (checked again at commit), so
+removing the person or their permission ends their live codes. Rotating
+`AUTH_SECRET` ends every live pairing code and waiting PC number (both are keyed
+hashes); a device key is a plain SHA-256 and is unaffected.
 
 ## The PC wire (`/device/*`)
 
@@ -480,7 +489,9 @@ answers 201 `{"protocol":1,"status":"active","workspace":"default","device_id":"
 Owner path: the same body with `"workspace":"<slug>"` in place of `code` answers
 202 `{"protocol":1,"status":"pending","workspace","device_id","key","confirm":"482913","expires_at"}`.
 `confirm` is six digits, shown only here; the PC shows them to its owner, who
-reads them to a technician. `access` is `ask` or `any` (default `ask`), `control`
+reads them to a technician. A workspace slug in `workspace` reveals whether that
+workspace exists (404 `not_found` against 202 or 409), as the public protected
+resource document does; slugs are public addresses. `access` is `ask` or `any` (default `ask`), `control`
 is `full` or `limited` (default `limited`). A code is normalised: uppercase,
 hyphens and spaces dropped. Errors: 400 `bad_request` (also both or neither of
 `code` and `workspace`, a bad field), 404 `code_invalid` (a code that is unknown,
@@ -494,7 +505,8 @@ row and the code unused. A good one writes the device, the `device_paired` (or
 `POST /device/hello`, key: `{"protocol":1,"os"?,"machine"?,"app_version"?}` answers
 200 `{"protocol":1,"device":{"id","workspace","status":"active"|"pending","name","access","control","site_id"}}`.
 Allowed while pending. The reported details are written at most every 5 minutes,
-or at once when one changed, and are not logged. Errors: 400, 401, 426.
+or once a minute when one changed (a changed value inside that minute is dropped
+and sent again at the next check-in), and are not logged. Errors: 400, 401, 426.
 
 `POST /device/update`, key: `{"protocol":1,"name"?,"access"?,"control"?,"owner_contact"?}`
 with at least one key answers 200 with the same `device`. Logged as

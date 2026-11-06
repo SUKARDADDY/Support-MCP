@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { openD1 } from './d1-fake.js';
 import { teamStore } from '../src/workspace.js';
-import { CHECK_IN_REFRESH_MS, CODE_TTL_MS, LIMITS, PENDING_TTL_MS, deviceStore, newId, normalizeCode, parseDeviceKey } from '../src/devices.js';
+import { CHECK_IN_CHANGE_MS, CHECK_IN_REFRESH_MS, CODE_TTL_MS, LIMITS, PENDING_TTL_MS, deviceStore, newId, normalizeCode, parseDeviceKey } from '../src/devices.js';
 
 const W = 'default';
 const SECRET = 'a-deployment-secret-of-at-least-32-characters';
@@ -393,7 +393,7 @@ test('a wrong key, an unknown id and a removed device all get the same device_un
   await assert.rejects(devs.leave(key), unknown);
 });
 
-test('a PC checks in unlogged, and its details are written at most every 5 minutes unless one changed', async (t) => {
+test('a PC checks in unlogged: unchanged details are written every 5 minutes, changed ones at most once a minute', async (t) => {
   const { db, team, devs } = await setup();
   const clk = clock(t);
   const { key } = await pair(devs);
@@ -411,7 +411,11 @@ test('a PC checks in unlogged, and its details are written at most every 5 minut
   const moved = clk.now();
   clk.advance(1000);
   await devs.checkIn(key, { app_version: '0.4.0' });
-  assert.deepEqual([seen().app_version, seen().last_seen], ['0.4.0', clk.now()], 'a changed value is written at once');
+  assert.deepEqual([seen().app_version, seen().last_seen], ['0.3.0', moved], 'a changed value a second after a write waits');
+  assert.equal(writes(), 1);
+  clk.advance(CHECK_IN_CHANGE_MS - 1000);
+  await devs.checkIn(key, { app_version: '0.4.0' });
+  assert.deepEqual([seen().app_version, seen().last_seen], ['0.4.0', clk.now()], 'a changed value is written once a minute has passed');
   assert.equal(writes(), 2);
   assert.equal(moved < clk.now(), true);
   assert.equal((await kinds(team)).length, log, 'check-ins write no log rows');
@@ -514,10 +518,14 @@ test('a technician with devices.manage can change a PC access mode, logged as th
   const row = (await team.readAudit(W, { limit: 500 })).rows.at(-1);
   assert.deepEqual([row.kind, row.actor], ['device_changed', TECH]);
   assert.match(row.detail, /access ask to any/);
-  // control and name are not the technician's to change; they are ignored.
-  const same = await devs.updateDevice(W, TECH, out.device_id, { access: 'any', control: 'full', name: 'Hacked' });
-  assert.deepEqual([same.name, same.control], ['Till', 'limited']);
-  assert.equal((await kinds(team)).at(-1), 'device_changed');
+  // control and name are the owner's, set from the PC: a technician sending them is refused, not ignored.
+  const log = (await kinds(team)).length;
+  for (const owned of [{ control: 'full' }, { name: 'Hacked' }, { owner_contact: 'x' }, { os: 'x' }, { machine: 'x' }, { app_version: 'x' }]) {
+    await assert.rejects(devs.updateDevice(W, TECH, out.device_id, { access: 'ask', ...owned }), refused(400, 'bad_request'), JSON.stringify(owned));
+  }
+  const kept = await devs.getDevice(W, out.device_id);
+  assert.deepEqual([kept.name, kept.control, kept.access], ['Till', 'limited', 'any']);
+  assert.equal((await kinds(team)).length, log, 'a refused request writes no log row');
   await assert.rejects(devs.updateDevice(W, TECH, out.device_id, { access: 'always' }), refused(400, 'bad_request'));
   await assert.rejects(devs.updateDevice(W, VIEW, out.device_id, { access: 'ask' }), refused(403, 'permission_denied'));
   assert.equal((await devs.getDevice(W, out.device_id)).access, 'any');
@@ -661,4 +669,330 @@ test('devices list filters by site and status', async () => {
   assert.equal((await devs.updateDevice(W, TECH, out.device_id, { site_id: null })).site_id, null);
   await assert.rejects(devs.updateDevice(W, TECH, out.device_id, { site_id: newId() }), refused(400, 'unknown_site'));
   await assert.rejects(devs.updateDevice(W, TECH, out.device_id, {}), refused(400, 'bad_request'));
+});
+
+// ---- review round: D1 limits, cheap counts, authority and races ---------------------
+// The D1 stand-in throws above 100 bound values in one statement, as the real one does.
+test('30 custom fields in one create and one PATCH work for customers, sites and devices (D1 binds at most 100 values a statement)', async () => {
+  const { devs } = await setup();
+  const defs = {};
+  for (const entity of ['customer', 'site', 'device']) {
+    defs[entity] = [];
+    for (let i = 0; i < LIMITS.fieldDefs; i++) defs[entity].push((await devs.addField(W, BOSS, { entity, label: `F${i}` })).id);
+  }
+  const values = (ids, text) => Object.fromEntries(ids.map((id) => [id, text]));
+  const customer = await devs.addRecord('customer', W, TECH, { name: 'Dana', fields: values(defs.customer, 'one') });
+  assert.equal(Object.keys(customer.fields).length, 30);
+  const patched = await devs.updateRecord('customer', W, TECH, customer.id, { fields: values(defs.customer, 'two') });
+  assert.equal(Object.values(patched.fields).every((v) => v === 'two'), true);
+  const site = await devs.addRecord('site', W, TECH, { name: 'HQ', customer_id: customer.id, fields: values(defs.site, 'one') });
+  assert.equal(Object.keys(site.fields).length, 30);
+  assert.equal(Object.keys((await devs.updateRecord('site', W, TECH, site.id, { fields: values(defs.site, 'two') })).fields).length, 30);
+  const { out } = await pair(devs);
+  const device = await devs.updateDevice(W, TECH, out.device_id, { fields: values(defs.device, 'one') });
+  assert.equal(Object.keys(device.fields).length, 30);
+  // Thirty removals in one PATCH, too.
+  const cleared = await devs.updateDevice(W, TECH, out.device_id, { fields: Object.fromEntries(defs.device.map((id) => [id, null])) });
+  assert.deepEqual(cleared.fields, {});
+  // The check is still real: one undefined id among thirty is refused.
+  await assert.rejects(devs.updateRecord('customer', W, TECH, customer.id, { fields: { ...values(defs.customer, 'x'), [newId()]: 'x' } }), refused(400, 'bad_request'));
+});
+
+test('a field definition removed between the read and the batch of a 30-field write refuses the whole write', async () => {
+  const { db, devs } = await setup();
+  const ids = [];
+  for (let i = 0; i < LIMITS.fieldDefs; i++) ids.push((await devs.addField(W, BOSS, { entity: 'customer', label: `F${i}` })).id);
+  sneakBeforeBatch(db, () => db.sqlite.prepare('DELETE FROM field_defs WHERE id = ?').run(ids[17]));
+  await assert.rejects(devs.addRecord('customer', W, TECH, { name: 'Late', fields: Object.fromEntries(ids.map((id) => [id, 'x'])) }), refused(400, 'bad_request'));
+  assert.equal(count(db, 'customers'), 0);
+});
+
+test('the hot counts have indexes, and the hourly request count reads the log through one', async () => {
+  const { db } = await setup();
+  const names = rows(db, "SELECT name FROM sqlite_master WHERE type = 'index'").map((r) => r.name);
+  assert.ok(names.includes('audit_by_kind'));
+  assert.ok(names.includes('devices_by_status'));
+  const plan = (sql, ...p) => rows(db, `EXPLAIN QUERY PLAN ${sql}`, ...p).map((r) => r.detail).join(' | ');
+  assert.match(plan("SELECT 1 FROM audit WHERE workspace = ? AND kind = 'device_requested' AND ts > ? AND actor <> ? LIMIT 20", W, 0, 'x'), /audit_by_kind/);
+  assert.match(plan("SELECT COUNT(*) FROM devices WHERE workspace = ? AND status = 'pending' AND expires_at > ?", W, 0), /devices_by_status/);
+});
+
+test('a request refused at plan time deletes nothing; a good one purges the expired waiting PCs in its own batch', async (t) => {
+  const { db, devs } = await setup();
+  const clk = clock(t);
+  for (let i = 0; i < LIMITS.pending; i++) await devs.requestJoin({ protocol: 1, workspace: W, name: `PC ${i}` });
+  db.seen.length = 0;
+  await assert.rejects(devs.requestJoin({ protocol: 1, workspace: W, name: 'Over' }), refused(409, 'request_limit'));
+  db.sqlite.exec("DELETE FROM audit WHERE kind = 'device_requested'");
+  await assert.rejects(devs.requestJoin({ protocol: 1, workspace: W, name: 'Over' }), refused(409, 'pending_limit'));
+  assert.equal(db.seen.some((s) => /^\s*DELETE/i.test(s.sql)), false, 'no purge ran for a refused request');
+  assert.equal(count(db, 'devices'), LIMITS.pending);
+  // The waits end after 24 hours: they stop counting at once, and the next good request deletes them.
+  clk.advance(PENDING_TTL_MS + 1);
+  const ok = await devs.requestJoin({ protocol: 1, workspace: W, name: 'Fresh' });
+  assert.deepEqual(rows(db, 'SELECT id FROM devices').map((r) => r.id), [ok.device_id]);
+});
+
+test('the request limit, the waiting limit and the PC limit are enforced at commit too', async (t) => {
+  const { db, devs } = await setup();
+  const clk = clock(t);
+  // 20 requests an hour ago; their PCs are gone. A sneak makes them recent after the plan counted.
+  for (let i = 0; i < LIMITS.requestsPerHour; i++) await devs.requestJoin({ protocol: 1, workspace: W, name: `PC ${i}` });
+  db.sqlite.exec('DELETE FROM devices');
+  clk.advance(HOUR + 1);
+  sneakBeforeBatch(db, () => db.sqlite.prepare("UPDATE audit SET ts = ? WHERE kind = 'device_requested'").run(clk.now()));
+  await assert.rejects(devs.requestJoin({ protocol: 1, workspace: W, name: 'Over' }), refused(409, 'request_limit'));
+  assert.equal(count(db, 'devices'), 0);
+  assert.equal(rows(db, "SELECT COUNT(*) AS n FROM audit WHERE kind = 'device_requested'")[0].n, LIMITS.requestsPerHour, 'no 21st log row');
+  // Waiting PCs arrive between the plan and the batch.
+  db.sqlite.exec("DELETE FROM audit WHERE kind = 'device_requested'");
+  const waiting = db.sqlite.prepare("INSERT INTO devices(workspace, id, status, name, access, control, key_hash, expires_at, paired_at, paired_by, last_seen) VALUES ('default', ?, 'pending', 'n', 'ask', 'full', 'h', ?, 1, 'x', 1)");
+  sneakBeforeBatch(db, () => { for (let i = 0; i < LIMITS.pending; i++) waiting.run(`waiting${String(i).padStart(13, '0')}`, clk.now() + HOUR); });
+  await assert.rejects(devs.requestJoin({ protocol: 1, workspace: W, name: 'Over' }), refused(409, 'pending_limit'));
+  assert.equal(count(db, 'devices'), LIMITS.pending);
+  // The team fills up between the plan and the batch.
+  db.sqlite.exec('DELETE FROM devices');
+  const fill = db.sqlite.prepare("INSERT INTO devices(workspace, id, status, name, access, control, key_hash, paired_at, paired_by, last_seen) VALUES ('default', ?, 'active', 'n', 'ask', 'full', 'h', 1, 'x', 1)");
+  sneakBeforeBatch(db, () => { for (let i = 0; i < LIMITS.devices; i++) fill.run(`filler${String(i).padStart(14, '0')}`); });
+  await assert.rejects(devs.requestJoin({ protocol: 1, workspace: W, name: 'Over' }), refused(409, 'device_limit'));
+  assert.equal(count(db, 'devices'), LIMITS.devices);
+});
+
+test('requests racing at the hourly limit: exactly the room that is left is used', async () => {
+  const { db, devs } = await setup();
+  for (let i = 0; i < LIMITS.requestsPerHour - 1; i++) await devs.requestJoin({ protocol: 1, workspace: W, name: `PC ${i}` });
+  db.sqlite.exec('DELETE FROM devices');
+  const results = await Promise.allSettled([1, 2, 3].map((n) => devs.requestJoin({ protocol: 1, workspace: W, name: `Race ${n}` })));
+  assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1);
+  for (const r of results.filter((x) => x.status === 'rejected')) assert.equal(r.reason.code, 'request_limit');
+  assert.equal(rows(db, "SELECT COUNT(*) AS n FROM audit WHERE kind = 'device_requested'")[0].n, LIMITS.requestsPerHour);
+});
+
+test('a redeem that finds the team full at commit is a 409 and leaves the code unused, no PC and no log row', async () => {
+  const { db, team, devs } = await setup();
+  const made = await devs.createPairingCode(W, TECH, {});
+  const log = (await kinds(team)).length;
+  const fill = db.sqlite.prepare("INSERT INTO devices(workspace, id, status, name, access, control, key_hash, paired_at, paired_by, last_seen) VALUES ('default', ?, 'active', 'n', 'ask', 'full', 'h', 1, 'x', 1)");
+  sneakBeforeBatch(db, () => { for (let i = 0; i < LIMITS.devices; i++) fill.run(`filler${String(i).padStart(14, '0')}`); });
+  await assert.rejects(devs.redeemCode({ protocol: 1, code: made.code, name: 'Late' }), refused(409, 'device_limit'));
+  assert.equal(rows(db, 'SELECT used_at FROM pairing_codes')[0].used_at, null);
+  assert.equal(count(db, 'devices'), LIMITS.devices, 'only the fillers');
+  assert.equal(rows(db, "SELECT COUNT(*) AS n FROM devices WHERE name = 'Late'")[0].n, 0);
+  assert.equal((await kinds(team)).length, log, 'no log row');
+  // Room again: the same code still works.
+  db.sqlite.exec('DELETE FROM devices');
+  assert.equal((await devs.redeemCode({ protocol: 1, code: made.code, name: 'On time' })).status, 'active');
+});
+
+test('a code works only while its creator still holds devices.manage: removal and demotion end it', async () => {
+  for (const how of ['removed', 'demoted']) {
+    const { db, team, devs } = await setup();
+    const made = await devs.createPairingCode(W, TECH, {});
+    const boss = await devs.createPairingCode(W, BOSS, {});
+    const log = (await kinds(team)).length;
+    if (how === 'removed') await team.removeMember(W, BOSS, TECH);
+    else await team.updateMember(W, BOSS, TECH, { role_id: 'viewer' });
+    const after = (await kinds(team)).length;
+    await assert.rejects(devs.redeemCode({ protocol: 1, code: made.code, name: 'Late' }), refused(404, 'code_invalid'), how);
+    assert.equal(count(db, 'devices'), 0, how);
+    assert.equal((await kinds(team)).length, after, `${how}: no log row from the refused redeem`);
+    assert.equal(rows(db, "SELECT used_at FROM pairing_codes WHERE created_by = 'tech@example.com'")[0].used_at, null, how);
+    assert.equal(after, log + 1);
+    // A code made by someone who still holds it is unaffected.
+    assert.equal((await devs.redeemCode({ protocol: 1, code: boss.code, name: 'Fine' })).status, 'active');
+  }
+});
+
+test('the creator losing devices.manage between the plan and the batch of a redeem also stops it', async () => {
+  const { db, team, devs } = await setup();
+  const made = await devs.createPairingCode(W, TECH, {});
+  const log = (await kinds(team)).length;
+  sneakBeforeBatch(db, () => db.sqlite.exec("DELETE FROM members WHERE workspace = 'default' AND identity = 'tech@example.com'"));
+  await assert.rejects(devs.redeemCode({ protocol: 1, code: made.code, name: 'Late' }), refused(404, 'code_invalid'));
+  assert.equal(count(db, 'devices'), 0);
+  assert.equal(rows(db, 'SELECT used_at FROM pairing_codes')[0].used_at, null);
+  assert.equal((await kinds(team)).length, log);
+});
+
+test('a role that loses devices.manage ends the live codes of its members', async () => {
+  const { db, team, devs } = await setup();
+  await team.addRole(W, BOSS, { id: 'pairer', name: 'Pairer', permissions: ['devices.view', 'devices.manage'] });
+  await team.addMember(W, BOSS, { identity: 'pairer@example.com', role_id: 'pairer' });
+  const made = await devs.createPairingCode(W, 'pairer@example.com', {});
+  await team.updateRole(W, BOSS, 'pairer', { permissions: ['devices.view'] });
+  await assert.rejects(devs.redeemCode({ protocol: 1, code: made.code, name: 'Late' }), refused(404, 'code_invalid'));
+  assert.equal(count(db, 'devices'), 0);
+});
+
+test('a site with only a live pairing code is in use; it can be removed once the code expires or is revoked', async (t) => {
+  const { db, devs } = await setup();
+  const clk = clock(t);
+  const customer = await devs.addRecord('customer', W, TECH, { name: 'Dana' });
+  const mk = async (name) => (await devs.addRecord('site', W, TECH, { name, customer_id: customer.id })).id;
+  const a = await mk('A');
+  await devs.createPairingCode(W, TECH, { site_id: a });
+  await assert.rejects(devs.removeRecord('site', W, TECH, a), refused(409, 'in_use'));
+  clk.advance(CODE_TTL_MS);
+  assert.deepEqual(await devs.removeRecord('site', W, TECH, a), { id: a }, 'an expired code does not hold the site');
+  const b = await mk('B');
+  const codeB = await devs.createPairingCode(W, TECH, { site_id: b });
+  await assert.rejects(devs.removeRecord('site', W, TECH, b), refused(409, 'in_use'));
+  await devs.revokePairingCode(W, TECH, codeB.id);
+  await devs.removeRecord('site', W, TECH, b);
+  // A code made between the plan and the batch holds the site too.
+  const c = await mk('C');
+  const insert = db.sqlite.prepare("INSERT INTO pairing_codes(hash, workspace, id, site_id, created_by, created_at, expires_at) VALUES (?, 'default', ?, ?, 'x', 1, ?)");
+  sneakBeforeBatch(db, () => insert.run('h'.repeat(64), newId(), c, clk.now() + CODE_TTL_MS));
+  await assert.rejects(devs.removeRecord('site', W, TECH, c), refused(409, 'in_use'));
+  assert.equal(rows(db, 'SELECT id FROM sites WHERE id = ?', c).length, 1);
+});
+
+test('every team write is re-checked at commit: eleven paths, a demoted actor changes nothing', async () => {
+  const { db, team, devs } = await setup();
+  await team.addRole(W, BOSS, { id: 'fieldmgr', name: 'Field manager', permissions: ['devices.view', 'fields.manage'] });
+  const FM = 'fields@example.com';
+  await team.addMember(W, BOSS, { identity: FM, role_id: 'fieldmgr' });
+  const customer = await devs.addRecord('customer', W, TECH, { name: 'Dana' });
+  const field = await devs.addField(W, BOSS, { entity: 'customer', label: 'Contract' });
+  const { out } = await pair(devs);
+  const code = await devs.createPairingCode(W, BOSS, {});
+  const waiting = await devs.requestJoin({ protocol: 1, workspace: W, name: 'Waiting' });
+  const state = async () => ({
+    log: (await kinds(team)).length,
+    customers: rows(db, 'SELECT name, fields, updated_at FROM customers'),
+    devices: rows(db, 'SELECT id, status, access, fields FROM devices ORDER BY id'),
+    defs: rows(db, 'SELECT id, label, position FROM field_defs'),
+    codes: rows(db, 'SELECT id FROM pairing_codes').length,
+  });
+  const before = await state();
+  const demote = (who) => () => db.sqlite.prepare("UPDATE members SET role_id = 'viewer' WHERE workspace = 'default' AND identity = ?").run(who);
+  const undo = (who, role) => db.sqlite.prepare('UPDATE members SET role_id = ? WHERE workspace = ? AND identity = ?').run(role, W, who);
+  const denied = refused(403, 'permission_denied');
+  const paths = [
+    ['addRecord', TECH, 'technician', () => devs.addRecord('customer', W, TECH, { name: 'Late' })],
+    ['updateRecord', TECH, 'technician', () => devs.updateRecord('customer', W, TECH, customer.id, { name: 'Late' })],
+    ['removeRecord', TECH, 'technician', () => devs.removeRecord('customer', W, TECH, customer.id)],
+    ['addField', FM, 'fieldmgr', () => devs.addField(W, FM, { entity: 'site', label: 'Late' })],
+    ['updateField', FM, 'fieldmgr', () => devs.updateField(W, FM, field.id, { label: 'Late' })],
+    ['removeField', FM, 'fieldmgr', () => devs.removeField(W, FM, field.id)],
+    ['updateDevice', TECH, 'technician', () => devs.updateDevice(W, TECH, out.device_id, { access: 'any' })],
+    ['approve', TECH, 'technician', () => devs.updateDevice(W, TECH, waiting.device_id, { approve: { confirm: waiting.confirm } })],
+    ['removeDevice', TECH, 'technician', () => devs.removeDevice(W, TECH, out.device_id)],
+    ['createPairingCode', TECH, 'technician', () => devs.createPairingCode(W, TECH, {})],
+    ['revokePairingCode', TECH, 'technician', () => devs.revokePairingCode(W, TECH, code.id)],
+  ];
+  for (const [name, who, role, call] of paths) {
+    sneakBeforeBatch(db, demote(who));
+    await assert.rejects(call(), denied, name);
+    undo(who, role);
+    assert.deepEqual(await state(), before, name);
+  }
+  assert.equal((await team.readAudit(W)).verified, true);
+});
+
+test('approve checks the number and the expiry again at commit', async () => {
+  const { db, team, devs } = await setup();
+  const first = await devs.requestJoin({ protocol: 1, workspace: W, name: 'One' });
+  const log = (await kinds(team)).length;
+  // The row holds another number's hash by the time the batch runs.
+  sneakBeforeBatch(db, () => db.sqlite.prepare("UPDATE devices SET confirm_hash = 'f' WHERE id = ?").run(first.device_id));
+  await assert.rejects(devs.updateDevice(W, TECH, first.device_id, { approve: { confirm: first.confirm } }), refused(403, 'confirm_wrong'));
+  assert.equal(rows(db, 'SELECT status FROM devices WHERE id = ?', first.device_id)[0].status, 'pending');
+  assert.equal((await kinds(team)).length, log);
+  const second = await devs.requestJoin({ protocol: 1, workspace: W, name: 'Two' });
+  // The wait runs out between the plan and the batch.
+  sneakBeforeBatch(db, () => db.sqlite.prepare('UPDATE devices SET expires_at = ? WHERE id = ?').run(Date.now() - 1, second.device_id));
+  await assert.rejects(devs.updateDevice(W, TECH, second.device_id, { approve: { confirm: second.confirm } }), refused(404, 'not_found'));
+  assert.equal(rows(db, "SELECT COUNT(*) AS n FROM devices WHERE status = 'active'")[0].n, 0, 'nothing was approved');
+  assert.equal((await kinds(team)).includes('device_approved'), false);
+});
+
+test('a mode or site changed between the plan and the batch is never logged as an old value that was not there', async () => {
+  const { db, team, devs } = await setup();
+  const details = async () => (await team.readAudit(W, { limit: 500 })).rows.filter((r) => r.kind === 'device_changed').map((r) => r.detail.split(' ').slice(1).join(' '));
+  // A technician asks for 'any'; someone else already set it.
+  const a = (await pair(devs, TECH, { access: 'ask' })).out;
+  sneakBeforeBatch(db, () => db.sqlite.prepare("UPDATE devices SET access = 'any' WHERE id = ?").run(a.device_id));
+  assert.equal((await devs.updateDevice(W, TECH, a.device_id, { access: 'any' })).access, 'any');
+  assert.deepEqual(await details(), [], 'the retry found nothing to change and logged nothing');
+  // A technician moves the PC to site C while another change moved it to site B.
+  const customer = await devs.addRecord('customer', W, TECH, { name: 'Dana' });
+  const sa = await devs.addRecord('site', W, TECH, { name: 'A', customer_id: customer.id });
+  const sb = await devs.addRecord('site', W, TECH, { name: 'B', customer_id: customer.id });
+  const sc = await devs.addRecord('site', W, TECH, { name: 'C', customer_id: customer.id });
+  await devs.updateDevice(W, TECH, a.device_id, { site_id: sa.id });
+  sneakBeforeBatch(db, () => db.sqlite.prepare('UPDATE devices SET site_id = ? WHERE id = ?').run(sb.id, a.device_id));
+  await devs.updateDevice(W, TECH, a.device_id, { site_id: sc.id });
+  assert.deepEqual((await details()).slice(-2), [`site none to ${sa.id}`, `site ${sb.id} to ${sc.id}`]);
+  // The PC changes both its modes while control was already changed.
+  const { key } = await pair(devs, TECH, { access: 'ask', control: 'limited' });
+  sneakBeforeBatch(db, () => db.sqlite.prepare("UPDATE devices SET control = 'full' WHERE id = ?").run(key.id));
+  await devs.updateOwn(key, { access: 'any', control: 'full' });
+  assert.equal((await details()).at(-1), 'access ask to any', 'control was already full, so it is not in the log');
+  const logged = (await details()).length;
+  sneakBeforeBatch(db, () => db.sqlite.prepare("UPDATE devices SET access = 'ask' WHERE id = ?").run(key.id));
+  await devs.updateOwn(key, { access: 'ask' });
+  assert.equal((await details()).length, logged, 'a change that was already made logs nothing new');
+  assert.equal((await team.readAudit(W)).verified, true);
+});
+
+test('renaming a field definition does not write back a position another change set', async () => {
+  const { db, devs } = await setup();
+  const field = await devs.addField(W, BOSS, { entity: 'site', label: 'Old' });
+  sneakBeforeBatch(db, () => db.sqlite.prepare('UPDATE field_defs SET position = 7 WHERE id = ?').run(field.id));
+  await devs.updateField(W, BOSS, field.id, { label: 'New' });
+  assert.deepEqual({ ...rows(db, 'SELECT label, position FROM field_defs WHERE id = ?', field.id)[0] }, { label: 'New', position: 7 });
+});
+
+test('leaving checks the key at commit: a key rotated between the plan and the batch is refused, with no log row', async () => {
+  const { db, team, devs } = await setup();
+  const { key } = await pair(devs);
+  const log = (await kinds(team)).length;
+  sneakBeforeBatch(db, () => db.sqlite.prepare("UPDATE devices SET key_hash = 'rotated' WHERE id = ?").run(key.id));
+  await assert.rejects(devs.leave(key), refused(401, 'device_unknown'));
+  assert.equal(count(db, 'devices'), 1);
+  assert.equal((await kinds(team)).length, log);
+});
+
+test('a pairing code that hashes like a live one is retried with a fresh draw: no failed batch, no 503', async (t) => {
+  const { db, devs } = await setup();
+  const first = await devs.createPairingCode(W, TECH, {});
+  // The next ten-byte draw (the code's) repeats the first code once.
+  const real = crypto.getRandomValues.bind(crypto);
+  let replay = Uint8Array.from(first.code.replace('-', ''), (c) => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'.indexOf(c));
+  t.mock.method(crypto, 'getRandomValues', (a) => {
+    real(a);
+    if (a.length === 10 && replay) { a.set(replay); replay = null; }
+    return a;
+  });
+  const failedBefore = db.failedBatches;
+  const clash = await devs.createPairingCode(W, TECH, {});
+  assert.equal(replay, null, 'the clashing draw was used');
+  assert.notEqual(clash.code, first.code);
+  assert.equal(db.failedBatches, failedBefore, 'the clash is refused by the guard, not by a failed batch');
+  assert.equal(count(db, 'pairing_codes'), 2);
+  assert.equal((await devs.redeemCode({ protocol: 1, code: first.code, name: 'First' })).status, 'active');
+});
+
+test('devices.manage and fields.manage need a second factor at sign-in', async () => {
+  const { factorRequired } = await import('../src/auth.js');
+  assert.equal(factorRequired([{ permissions: ['devices.manage'] }], false), true);
+  assert.equal(factorRequired([{ permissions: ['fields.manage'] }], false), true);
+  assert.equal(factorRequired([{ permissions: ['devices.view', 'sessions.view'] }], false), false);
+});
+
+test('check-ins that flip a value back and forth write at most once a minute', async (t) => {
+  const { db, devs } = await setup();
+  const clk = clock(t);
+  const { key } = await pair(devs);
+  clk.advance(CHECK_IN_CHANGE_MS);
+  const writes = () => db.seen.filter((s) => /^UPDATE devices SET os/.test(s.sql)).length;
+  for (let i = 0; i < 12; i++) {
+    await devs.checkIn(key, { app_version: i % 2 ? '1.0.0' : '2.0.0' });
+    clk.advance(4000);
+  }
+  assert.equal(writes(), 1, 'twelve flips in 48 seconds: one write');
+  clk.advance(CHECK_IN_CHANGE_MS);
+  await devs.checkIn(key, { app_version: '3.0.0' });
+  assert.equal(writes(), 2);
 });

@@ -338,7 +338,10 @@ apply to only one client say which.
   closed: an owner-started install can leave a waiting PC and its
   `device_requested` log row, at most 20 requests an hour and 20 waiting at once
   per workspace. A waiting PC can only check in or leave, and it disappears after
-  24 hours. The first member must be the caller, as admin. Two callers racing
+  24 hours. So a stranger who can reach `/device/` can cause up to 20
+  `device_requested` log rows an hour, and `device_left` rows when that PC
+  leaves (the same cap bounds them), and a waiting PC's check-ins are unlogged
+  writes of its details, at most once a minute. The first member must be the caller, as admin. Two callers racing
   to add it get one winner, and the other is then refused as a non-member. When `DEPLOYMENT_ADMINS` is set, only an identity it lists
   can be that first member, which stops any other Access user from racing to
   claim the team. Once there is a member, a caller who is not one is refused,
@@ -360,7 +363,10 @@ apply to only one client say which.
     live codes in each of at most 501 workspaces (about 10,000), a random guess
     hits about 1 in 10^11. Keep a Cloudflare rate-limiting rule on `/device/` (see
     the README) so guessing stays out of reach. A code that is unknown, used or
-    expired gets the same answer.
+    expired gets the same answer. A code carries its creator's authority: it
+    redeems only while that person still holds `devices.manage` in the
+    workspace, checked when it is typed and again at commit, so removing the
+    person or their permission ends their live codes.
   - *What pairing stores.* The code is stored only as `HMAC-SHA-256` under a key
     derived from `AUTH_SECRET`, and never logged. A PC's key,
     `smd1.<workspace>.<device id>.<secret>`, is shown to the PC once. Only the
@@ -369,6 +375,9 @@ apply to only one client say which.
     A waiting PC's six-digit number is stored as a keyed hash too, and shown only
     to the PC. Without an `AUTH_SECRET` of at least 32 characters the pairing
     routes answer 503. The code, the key and the number appear in no log row.
+    Rotating `AUTH_SECRET` ends every live pairing code and every waiting PC's
+    number, because both are keyed hashes; device keys are a plain SHA-256 and
+    are unaffected.
   - *A key never goes in a URL.* The PC sends it in `Authorization: Bearer`, and
     a `?key=` or `?code=` in the URL is refused. The four addresses are POST
     only, https only (loopback excepted), refuse any request with an `Origin`
@@ -376,23 +385,38 @@ apply to only one client say which.
     request and answer so a later version can coexist.
   - *An owner-started install needs a technician.* The PC joins as waiting and
     can only check in or leave. A technician approves it by typing the six-digit
-    number the owner reads out. It is gone after 24 hours.
+    number the owner reads out. It is gone after 24 hours. A wrong number is
+    refused (403 `confirm_wrong`) and not logged. Only holders of
+    `devices.manage` can try one. There is no attempt counter, so the limits are
+    that permission, the 24-hour life of the wait, and the one-in-a-million
+    chance of a blind guess.
+  - *`/device/pair` with a workspace slug says whether the workspace exists* (404
+    against 202 or 409). Slugs are already public addresses, as the protected
+    resource document shows.
   - *Uninstalling revokes.* A PC removes itself with `/device/leave`, which
     deletes its row and so its key. A technician with `devices.manage` can remove
     any PC the same way. Either takes effect on the PC's next request.
   - *Access mode.* A PC's owner, or a technician with `devices.manage`, can change
     a PC between `ask` and `any`. The log records who and the old and new mode. A
-    technician cannot change the control level or the name.
+    technician cannot change the control level or the name; a request that sends
+    either is 400, not ignored.
   - *Custom fields never grant access, and are untrusted text.* A field value is
-    plain text of at most 500 characters. Anyone with `devices.manage` writes it,
-    and a PC's owner can influence it through the name and contact. Treat it as
-    you treat session output: it may try to steer an agent that reads it later.
+    plain text of at most 500 characters. Only team members with `devices.manage`
+    write it; a PC cannot. What a PC reports or sets about itself (its name,
+    owner contact, Windows version and machine name) is untrusted text too, and
+    shows beside the field values. Treat all of it as you treat session output:
+    it may try to steer an agent that reads it later.
     Customer contact details need `devices.view`, which the technician and viewer
     roles hold and a session-only role does not.
-  - *Check-ins are not logged.* A PC's last-seen time and reported details are
-    written at most every five minutes, like the callers table. Everything else
-    about a customer, site, field or PC is a logged, guarded change that
-    re-checks the actor's permission at commit.
+  - *Check-ins are not logged.* A PC's last-seen time and unchanged details are
+    written at most every five minutes, like the callers table, and a changed
+    detail at most once a minute, so a PC cannot force a write on every
+    check-in. Everything else about a customer, site, field or PC is a logged,
+    guarded change that re-checks the actor's permission at commit.
+  - *The log names customers, sites and PCs.* A log detail holds the ids and
+    names of the records it concerns, never a code, a key, a contact or a field
+    value. Anyone with `audit.view` reads those names, so a viewer role sees
+    customer and site names there even without `devices.view`.
 - **Each session belongs to its workspace.** A session stores the workspace that
   created it, and operator calls name their workspace. A call from another
   workspace gets the same answer as a session that does not exist. A session
@@ -495,10 +519,13 @@ apply to only one client say which.
   `wrangler d1 execute` after you have checked who they are. Rotating
   `AUTH_SECRET` makes every stored authenticator secret and recovery code
   unreadable, so delete the `user_factors` rows and have people enrol again. It
-  does not end sign-ins, because the cookie value doesn't depend on it. The
-  two device permissions are groundwork: the team API admits only Access logins,
-  which are exempt from this check, so they change nothing until signed-in people
-  get those actions.
+  does not end sign-ins, because the cookie value doesn't depend on it.
+  `devices.manage` and `fields.manage` are in this set: a person whose role
+  holds either must enrol an authenticator, and the browser sign-in and the
+  OAuth consent page ask for a code before they act on that role. Access
+  callers and service tokens are exempt, and the team API admits only Access
+  logins today, so these two permissions add the enrolment requirement for
+  signed-in people before they add any new action.
 - **Browser sign-in cookies.** The cookie `__Host-smcp` is `Secure`, `HttpOnly`,
   `SameSite=Lax`, `Path=/` and has no `Domain`. Its value is 32 random bytes;
   the database holds only the SHA-256. A sign-in ends after `SIGNIN_IDLE_HOURS`

@@ -63,6 +63,8 @@ CREATE TABLE devices (
   PRIMARY KEY (workspace, id)
 );
 CREATE INDEX devices_by_site ON devices (workspace, site_id);
+-- The waiting-PC and device counts run on every owner request and every pairing.
+CREATE INDEX devices_by_status ON devices (workspace, status);
 
 -- Custom fields an admin defines for customers, sites or devices (text only).
 CREATE TABLE field_defs (
@@ -89,3 +91,7 @@ CREATE TABLE pairing_codes (
   used_at INTEGER
 );
 CREATE INDEX pairing_by_workspace ON pairing_codes (workspace, created_at);
+
+-- The hourly cap on owner requests counts device_requested rows in the log. The
+-- log's own key is (workspace, seq), so without this index the count scans the log.
+CREATE INDEX audit_by_kind ON audit (workspace, kind, ts);

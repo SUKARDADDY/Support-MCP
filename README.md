@@ -342,9 +342,10 @@ connect to them. One-off support links work as before.
 - **Custom fields.** An admin (`fields.manage`) can add text fields to
   customers, sites or devices, such as "Contract until". A value is text of at
   most 500 characters, and a record type has at most 30 fields. Custom field
-  text is untrusted input: anyone with `devices.manage` can write it, a PC's
-  owner can influence it, and later it may be shown to an AI agent. It never
-  grants access to anything.
+  text is untrusted input: only team members with `devices.manage` write it (a
+  PC cannot), and later it may be shown to an AI agent. So is what a PC reports
+  or sets about itself: its name, owner contact, Windows version and machine
+  name. None of it grants access to anything.
 - **Two ways to pair a PC.** A technician asks for a pairing code
   (`POST .../pairing`). The code is 10 characters such as `ABCDE-FGH23`, works
   once, and dies after 10 minutes. The owner types it into the PC's setup and
@@ -364,12 +365,16 @@ connect to them. One-off support links work as before.
   stay the owner's.
 - **The team log** records every change to customers, sites, custom fields,
   pairing codes and PCs, with names and ids but never a code, a key or a field
-  value. A PC's routine check-ins are not logged.
+  value. A detail can hold customer, site and PC names, so anyone with
+  `audit.view` can read them. A PC's routine check-ins are not logged.
 
 `/device/pair`, `/device/hello`, `/device/update` and `/device/leave` are public
 addresses for the PC and are not behind Access. Their request and answer shapes
 are in [docs/relay-v1-spec.md](docs/relay-v1-spec.md#the-pc-wire-device).
 Pairing needs `AUTH_SECRET` (at least 32 characters) to be set, as sign-in does.
+Rotating `AUTH_SECRET` ends every live pairing code and every waiting PC's
+six-digit number, because both are stored as keyed hashes; a PC's key is a plain
+SHA-256 and keeps working.
 To try it locally, see [docs/development.md](docs/development.md#pairing-a-pc-locally).
 
 ## Sign-in

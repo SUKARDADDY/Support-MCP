@@ -36,13 +36,15 @@ export const BUILTIN_ROLES = Object.freeze({
 });
 
 // Permissions that need a second factor when the caller is signed in as
-// themselves in a browser (or, from PR 2c, an OAuth client): controlling a
-// session and managing the team. A role that holds any of them makes its
-// members enrol an authenticator. Access logins and service tokens are
-// unaffected: this is a rule for the sign-in layer (src/auth.js).
-// devices.manage (pairing, approving and removing PCs) and fields.manage are
-// groundwork: the team API admits only Access logins, which are exempt, so they
-// change nothing until signed-in people get those actions.
+// themselves in a browser, or through OAuth consent: controlling a session,
+// managing the team, and managing saved PCs and custom fields. A role that
+// holds any of them makes its members enrol an authenticator (factorRequired
+// in src/auth.js), and the browser sign-in and the OAuth consent page ask for a
+// code before they act on that role. Access logins and service tokens are
+// exempt: this is a rule for the sign-in layer (src/auth.js). That includes
+// devices.manage and fields.manage, so a person whose role holds either must
+// enrol an authenticator even though the team API itself admits only Access
+// logins today.
 export const FACTOR_PERMISSIONS = Object.freeze(['sessions.control', 'members.manage', 'roles.manage', 'devices.manage', 'fields.manage']);
 export const needsSecondFactor = (permission) => FACTOR_PERMISSIONS.includes(permission);
 

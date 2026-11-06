@@ -285,6 +285,10 @@ test('a paired PC is listed without its hashes; a technician sets its site and f
   assert.equal(hello.body.device.access, 'any');
   await err(r.api(TECH, 'PATCH', `/devices/${paired.device_id}`, { access: 'sometimes' }), 400, 'bad_request');
   await err(r.api(TECH, 'PATCH', `/devices/${paired.device_id}`, {}), 400, 'bad_request');
+  // The name and the control level are the owner's: sent by a technician they are 400, not ignored.
+  await err(r.api(TECH, 'PATCH', `/devices/${paired.device_id}`, { name: 'Mine' }), 400, 'bad_request');
+  await err(r.api(TECH, 'PATCH', `/devices/${paired.device_id}`, { access: 'any', control: 'full' }), 400, 'bad_request');
+  assert.deepEqual([(await ok(r.api(VIEW, 'GET', `/devices/${paired.device_id}`))).body.device.name], ['Till']);
   await err(r.api(TECH, 'PATCH', `/devices/${paired.device_id}`, { site_id: 'a'.repeat(20) }), 400, 'unknown_site');
   await err(r.api(TECH, 'POST', '/devices', {}), 405, 'method_not_allowed');
 });
