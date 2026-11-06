@@ -300,7 +300,39 @@ To try a second workspace, set `DEPLOYMENT_ADMINS=local-dev` in `.dev.vars`,
 create it with `POST /api/v1/w` and `{"slug":"acme","name":"Acme"}`, and point
 the MCP client at `/w/acme/mcp`. `local-dev` is its admin.
 
-`test/workspace.test.js` and `test/api.test.js` run the team code on a D1
+### Pairing a PC locally
+
+Saved PCs need `AUTH_SECRET` in `.dev.vars` (at least 32 characters, as for
+sign-in) and the migrations applied. With `local-dev` as the first admin
+(above), play the PC with `curl`. The `/device/` addresses take no Access login
+and work over plain http on loopback. Every body carries `"protocol": 1`.
+
+```sh
+api=localhost:8787/api/v1/w/default
+# A technician asks for a code. It is shown in this answer only.
+curl -s $api/pairing -H 'content-type: application/json' -d '{}'
+# {"pairing":{"id":"...","code":"ABCDE-FGH23","expires_at":...,"site_id":null}}
+
+# The PC pairs with the code and keeps the key it gets back.
+curl -s localhost:8787/device/pair -H 'content-type: application/json' \
+  -d '{"protocol":1,"code":"ABCDE-FGH23","name":"Front desk","access":"ask","control":"full"}'
+# {"protocol":1,"status":"active","workspace":"default","device_id":"...","key":"smd1.default.<id>.<secret>"}
+
+key='smd1.default.<id>.<secret>'
+curl -s localhost:8787/device/hello -H 'content-type: application/json' \
+  -H "authorization: Bearer $key" -d '{"protocol":1,"os":"Windows 10","machine":"POS-1","app_version":"0.3.0"}'
+curl -s $api/devices                                            # the saved PC, without any hash
+curl -s localhost:8787/device/leave -H 'content-type: application/json' \
+  -H "authorization: Bearer $key" -d '{"protocol":1}'           # the key now answers 401
+```
+
+For an install the owner starts, send `"workspace":"default"` instead of `code`.
+The answer is 202 with a `confirm` number and a key. A technician approves it
+with `PATCH $api/devices/<device_id>` and `{"approve":{"confirm":"482913"}}`.
+`GET $api/audit?verify=full` shows every step in the team log.
+
+`test/workspace.test.js`, `test/api.test.js`, `test/devices.test.js`,
+`test/devices-api.test.js` and `test/device-api.test.js` run the team code on a D1
 stand-in built on `node:sqlite` (`test/d1-fake.js`), with every file in
 `migrations/` applied in name order.
 It yields before every statement like a network round trip, and its `batch()`

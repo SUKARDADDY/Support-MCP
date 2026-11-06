@@ -215,9 +215,11 @@ apply to only one client say which.
   logon entry is only written after the elevation check passes. When admin
   rights are needed, the operator can ask Windows for a UAC prompt, and the
   customer decides whether to click Yes.
-- **Pairing codes can't be guessed.** A code is 16 base32 characters, 80 bits,
-  single use, and valid for 10 minutes. The customer pastes it and never types
-  it, so its length costs nothing.
+- **Session codes can't be guessed.** A one-off session's code is 16 base32
+  characters, 80 bits, single use, and valid for 10 minutes. The customer pastes
+  it and never types it, so its length costs nothing. A saved-PC pairing code is
+  the one code a person types, so it is different: see the "Saved PCs and
+  pairing" rule below.
 - **Link previews can't use up a code.** Slack, Teams, WhatsApp and Telegram
   fetch links with a plain `GET`. The download page is served on `GET` and never
   touches the code. Only a `POST` from the page's button consumes it, and the
@@ -268,7 +270,10 @@ apply to only one client say which.
   login and bypasses everyone else. `ACCESS_MCP_AUD` names that app. On the MCP
   addresses only, an Access login for either `ACCESS_AUD` or `ACCESS_MCP_AUD` is
   accepted, with the same signature, issuer and expiry checks. The team API
-  accepts `ACCESS_AUD` only, and an empty `ACCESS_MCP_AUD` changes nothing.
+  accepts `ACCESS_AUD` only, and an empty `ACCESS_MCP_AUD` changes nothing. A
+  saved PC's four addresses under `/device/` are public and sit under none of
+  these Access apps, because a PC has no Access login; they have their own rules,
+  below.
   Access session revocation does not apply on a bypassed path. There the relay's
   own checks are the gate: the JWT or the OAuth token, and the role check on
   every tool call.
@@ -329,7 +334,11 @@ apply to only one client say which.
   team permission: editing or adding a role, or changing or removing a member,
   is refused with 409 `first_member`, so nothing a stranger writes can persist
   into the roles that turn on later. Reading the workspace and the role list
-  still works. The first member must be the caller, as admin. Two callers racing
+  still works. One write from a stranger is allowed in any workspace, open or
+  closed: an owner-started install can leave a waiting PC and its
+  `device_requested` log row, at most 20 requests an hour and 20 waiting at once
+  per workspace. A waiting PC can only check in or leave, and it disappears after
+  24 hours. The first member must be the caller, as admin. Two callers racing
   to add it get one winner, and the other is then refused as a non-member. When `DEPLOYMENT_ADMINS` is set, only an identity it lists
   can be that first member, which stops any other Access user from racing to
   claim the team. Once there is a member, a caller who is not one is refused,
@@ -340,6 +349,50 @@ apply to only one client say which.
   UAC prompt, so a separate SYSTEM permission would not hold. Give
   `sessions.control` only to people you would trust as an administrator of the
   customer's PC.
+- **Saved PCs and pairing.** A workspace keeps customers, sites, saved PCs and
+  custom fields in D1, every row keyed by workspace, and none of it is read
+  when the relay decides who may do what. These rules hold:
+  - *A typed code is longer than a pasted one.* A technician's pairing code is 10
+    characters from a 32-letter alphabet without 0, 1, I and O (50 random bits),
+    shown as `ABCDE-FGH23`. It works once and dies after 10 minutes. The owner
+    types it, so it cannot be 80 bits, and it cannot name its workspace, so the
+    relay looks it up by its keyed hash across every workspace. With at most 20
+    live codes in each of at most 501 workspaces (about 10,000), a random guess
+    hits about 1 in 10^11. Keep a Cloudflare rate-limiting rule on `/device/` (see
+    the README) so guessing stays out of reach. A code that is unknown, used or
+    expired gets the same answer.
+  - *What pairing stores.* The code is stored only as `HMAC-SHA-256` under a key
+    derived from `AUTH_SECRET`, and never logged. A PC's key,
+    `smd1.<workspace>.<device id>.<secret>`, is shown to the PC once. Only the
+    SHA-256 of its 32-byte secret is stored, compared in constant time, and a
+    wrong key, an unknown PC, a removed PC and a malformed key all get one 401.
+    A waiting PC's six-digit number is stored as a keyed hash too, and shown only
+    to the PC. Without an `AUTH_SECRET` of at least 32 characters the pairing
+    routes answer 503. The code, the key and the number appear in no log row.
+  - *A key never goes in a URL.* The PC sends it in `Authorization: Bearer`, and
+    a `?key=` or `?code=` in the URL is refused. The four addresses are POST
+    only, https only (loopback excepted), refuse any request with an `Origin`
+    header, take only JSON of at most 8 KB, and carry `"protocol": 1` in every
+    request and answer so a later version can coexist.
+  - *An owner-started install needs a technician.* The PC joins as waiting and
+    can only check in or leave. A technician approves it by typing the six-digit
+    number the owner reads out. It is gone after 24 hours.
+  - *Uninstalling revokes.* A PC removes itself with `/device/leave`, which
+    deletes its row and so its key. A technician with `devices.manage` can remove
+    any PC the same way. Either takes effect on the PC's next request.
+  - *Access mode.* A PC's owner, or a technician with `devices.manage`, can change
+    a PC between `ask` and `any`. The log records who and the old and new mode. A
+    technician cannot change the control level or the name.
+  - *Custom fields never grant access, and are untrusted text.* A field value is
+    plain text of at most 500 characters. Anyone with `devices.manage` writes it,
+    and a PC's owner can influence it through the name and contact. Treat it as
+    you treat session output: it may try to steer an agent that reads it later.
+    Customer contact details need `devices.view`, which the technician and viewer
+    roles hold and a session-only role does not.
+  - *Check-ins are not logged.* A PC's last-seen time and reported details are
+    written at most every five minutes, like the callers table. Everything else
+    about a customer, site, field or PC is a logged, guarded change that
+    re-checks the actor's permission at commit.
 - **Each session belongs to its workspace.** A session stores the workspace that
   created it, and operator calls name their workspace. A call from another
   workspace gets the same answer as a session that does not exist. A session
@@ -348,8 +401,8 @@ apply to only one client say which.
   also has its own Registry object, so `session_list` shows only the caller's
   sessions. `default` keeps the original object, so sessions made before
   workspaces existed stay in its list.
-- **Team changes go in a chained log.** Every change to members and roles writes
-  one row with a number, the time, the actor, the kind and the detail. Each row's
+- **Team changes go in a chained log.** Every change to members, roles,
+  customers, sites, custom fields, pairing codes and saved PCs writes one row with a number, the time, the actor, the kind and the detail. Each row's
   hash is SHA-256 over the previous row's hash and its own fields, so an edit,
   removal or reordering of a row makes verification fail and the log API report
   `verified: false`, unless the change is among the newest entries. A normal
@@ -418,8 +471,8 @@ apply to only one client say which.
   is `localhost` or `127.0.0.1`. In that mode only, the page does show whether
   an address was invited.
 - **A second factor for roles that can control sessions or manage the team.**
-  A role that holds `sessions.control`, `members.manage` or `roles.manage`, and
-  a deployment admin, must enrol an authenticator app (TOTP, RFC 6238: SHA-1,
+  A role that holds `sessions.control`, `members.manage`, `roles.manage`,
+  `devices.manage` or `fields.manage`, and a deployment admin, must enrol an authenticator app (TOTP, RFC 6238: SHA-1,
   30 seconds, six digits, one step either side). `authorizeSignIn` in
   `src/auth.js` refuses a sign-in that has not passed a code with "a second
   factor is required" for those permissions, and 2c calls the same check. Anyone
@@ -442,7 +495,10 @@ apply to only one client say which.
   `wrangler d1 execute` after you have checked who they are. Rotating
   `AUTH_SECRET` makes every stored authenticator secret and recovery code
   unreadable, so delete the `user_factors` rows and have people enrol again. It
-  does not end sign-ins, because the cookie value doesn't depend on it.
+  does not end sign-ins, because the cookie value doesn't depend on it. The
+  two device permissions are groundwork: the team API admits only Access logins,
+  which are exempt from this check, so they change nothing until signed-in people
+  get those actions.
 - **Browser sign-in cookies.** The cookie `__Host-smcp` is `Secure`, `HttpOnly`,
   `SameSite=Lax`, `Path=/` and has no `Domain`. Its value is 32 random bytes;
   the database holds only the SHA-256. A sign-in ends after `SIGNIN_IDLE_HOURS`
@@ -680,7 +736,8 @@ apply to only one client say which.
   relay neither logs it nor returns it.
 - **Session output is untrusted input.** Everything that comes back from a
   session is written by the customer's PC: stdout, stderr, file contents,
-  screenshots, window text, and the machine and user names. Treat it as untrusted text that may try to steer
+  screenshots, window text, and the machine and user names. So is what a saved
+  PC reports about itself and the custom field text of any record. Treat it as untrusted text that may try to steer
   the operator's AI agent. That agent can have a shell on the operator's own
   machine, so do not run it with tool calls auto-approved.
 - **The window shows, it does not enforce.** The window shows that support is

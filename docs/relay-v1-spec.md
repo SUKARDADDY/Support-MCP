@@ -84,6 +84,7 @@ work in the request path; use the WebSocket Hibernation API
 | `GET /.well-known/oauth-protected-resource[/mcp\|/w/<slug>/mcp]` | none | RFC 9728 documents; 404 for a workspace that does not exist |
 | `GET`, `POST /oauth/authorize` | browser sign-in | the consent page; see [OAuth](#oauth-for-mcp-clients) |
 | `/api/v1/w/<slug>/...` | Access JWT | the team API (below) |
+| `POST /device/pair`, `/device/hello`, `/device/update`, `/device/leave` | none (pair) or a device key in `Authorization: Bearer` | the PC wire for saved PCs ([below](#the-pc-wire-device)). Public: not under any Access app. 403 over plain `http:` except loopback, 405 other methods, 403 on any `Origin` header, 400 on `?key=` or `?code=`, 415 non-JSON, 413 over 8 KB |
 | `POST /api/v1/w`, `GET /api/v1/w` | Access JWT | create a workspace, list yours (below) |
 | `GET /auth/signin`, `GET /auth/google`, `GET /auth/microsoft`, `GET /auth/<provider>/callback`, `POST /auth/email`, `GET` and `POST /auth/email/confirm`, `GET` and `POST /auth/factor`, `POST /auth/signout`, `GET /account`, `POST /account/signout-everywhere` | none, then a browser sign-in | people sign in; see [Sign-in](#sign-in-auth-and-account) |
 | anything else | — | 404 |
@@ -222,7 +223,8 @@ The same gate as `/mcp`, before any database access: an `Origin` header → 403
 always exists. Any other slug exists once it has a row in `workspaces`. A slug
 that does not, or is malformed, is 404 `not_found` before any permission is
 looked at, and so is any other unknown path. Bodies are JSON objects of at most
-16,384 characters. Every answer is JSON with `Cache-Control: no-store`, and every
+16,384 characters (32,768 on the customer, site and device routes, which carry
+custom fields). Every answer is JSON with `Cache-Control: no-store`, and every
 error is `{"error":{"code","message"}}`.
 
 | Route | Needs | Body | Answer |
@@ -244,10 +246,16 @@ error is `{"error":{"code","message"}}`.
 `kind` is `service` when the identity has no `@`, else `person`. Identities are
 at most 200 characters with no spaces; names at most 100 characters with no
 control characters. Role ids match `[a-z0-9-]{1,40}`. Permission keys are
-`members.manage`, `roles.manage`, `audit.view`, `sessions.create`,
-`sessions.view`, `sessions.control`, `sessions.end`. Built-in roles: `admin`
-(every key, fixed), `technician` (the four `sessions.*` keys), `viewer`
-(`sessions.view`, `audit.view`). They are not stored; a stored row overrides an
+`members.manage`, `roles.manage`, `audit.view`, `devices.view`,
+`devices.manage`, `fields.manage`, `sessions.create`, `sessions.view`,
+`sessions.control`, `sessions.end`. Built-in roles: `admin` (every key, fixed),
+`technician` (`devices.view`, `devices.manage` and the four `sessions.*` keys),
+`viewer` (`audit.view`, `devices.view`, `sessions.view`). A workspace that
+edited `technician` or `viewer` before the device keys existed keeps its stored
+role without them. Because those two roles now hold more, the rule that a
+non-admin hands out only what they hold means a custom role with
+`members.manage` but no device keys can no longer add or change a technician or
+viewer. They are not stored; a stored row overrides an
 edited `technician` or `viewer`, and a deleted one keeps a row with `deleted = 1`.
 
 | Status | Code | When |
@@ -267,6 +275,12 @@ edited `technician` or `viewer`, and a deleted one keeps a row with `deleted = 1
 | 409 | `role_fixed` | creating, editing or deleting `admin` |
 | 409 | `role_in_use` | deleting a role a member holds |
 | 409 | `role_missing` | changing a member whose role no longer exists, other than giving them a role that exists (an admin can also remove them) |
+| 400 | `unknown_customer`, `unknown_site` | a site made for, or a PC or code pointed at, a customer or site that does not exist |
+| 409 | `in_use` | removing a customer that has sites, or a site that has PCs or live pairing codes |
+| 409 | `customer_limit`, `site_limit`, `field_limit`, `code_limit` | 10,000 customers, 10,000 sites, 30 custom fields per record type, 20 live pairing codes |
+| 409 | `pending`, `not_pending` | changing the access of a PC still waiting for approval; approving a PC that is not waiting |
+| 403 | `confirm_wrong` | approving a waiting PC with a number that does not match |
+| 503 | `unavailable` | a pairing or approval route when `AUTH_SECRET` is unset or under 32 characters (`Retry-After: 1`) |
 | 503 | `busy` | six tries in a row lost the race to another change (`Retry-After: 1`) |
 
 Open mode and the first-member rule below apply to `default` only. A created
@@ -327,7 +341,11 @@ which the usual rules allow, and except removal by an admin.
 
 Each change writes one row (two for the first member) of kind `member_added`,
 `member_changed`, `member_removed`, `role_added`, `role_changed`,
-`role_removed` or `roles_turned_on`, with `actor` the caller's identity.
+`role_removed` or `roles_turned_on`, with `actor` the caller's identity. The
+saved-device routes below add more kinds. Their actor is the technician for a
+team API change, `<creator> via code` for `device_paired`, and `pc <device id>`
+for a PC's own changes and requests. The last two contain a space, which no
+member identity can, so no member can pass as them.
 `hash` = hex SHA-256 of `prev_hash`, `seq`, `ts`, `actor`, `kind` and `detail`
 joined by `\n`; the first row's `prev_hash` is 64 zeros. A change reads the log
 head, checks its rules, computes the next row, then runs one `DB.batch`: the
@@ -360,6 +378,132 @@ each `hash` matching its row). An edit, removal or reordering of a row shows in
 a full check unless it is among the newest entries; deleting the newest rows
 still verifies, so note the `head` (`seq` and `hash`) outside the relay to catch
 that.
+
+### Customers, sites, saved PCs, custom fields and pairing codes
+
+Reading takes `devices.view`; every change takes `devices.manage`, except custom
+field definitions, which take `fields.manage`. While `default` is open the reads
+are 403 `permission_denied` and the writes 409 `first_member`. Ids are 20
+lowercase base32 characters (`[a-z2-7]{20}`); an id in a path that is not one is
+404. A record in another workspace is 404, like a missing one. Every change is
+one guarded change: the log row, the change and the actor's permission check
+commit together, and a permission lost between the read and the commit is a 403.
+
+| Route | Needs | Body | Answer |
+|---|---|---|---|
+| `GET .../customers?after=&limit=` | `devices.view` | | `{customers:[...], next}` |
+| `POST .../customers` | `devices.manage` | `{name, phone?, email?, notes?, fields?}` | 201 `{customer}` |
+| `GET`, `PATCH`, `DELETE .../customers/<id>` | `devices.view`, `devices.manage` | `PATCH`: any of the same keys | `{customer}`; `DELETE` `{removed:{id}}`, 409 `in_use` with sites |
+| `GET .../sites?customer=&after=&limit=` | `devices.view` | | `{sites:[...], next}` |
+| `POST .../sites` | `devices.manage` | `{customer_id, name, address?, notes?, fields?}` | 201 `{site}` |
+| `GET`, `PATCH`, `DELETE .../sites/<id>` | as customers | `PATCH`: `name, address, notes, fields` | `{site}`; `DELETE` is 409 `in_use` with PCs or live codes |
+| `GET .../devices?site=&status=&after=&limit=` | `devices.view` | | `{devices:[...], next}`; `status` is `pending` or `active` |
+| `GET .../devices/<id>` | `devices.view` | | `{device}` |
+| `PATCH .../devices/<id>` | `devices.manage` | `{site_id?, fields?, access?, approve?:{confirm}}` | `{device}` |
+| `DELETE .../devices/<id>` | `devices.manage` | | `{removed:{id}}`; the PC's key ends with its row |
+| `GET .../fields` | `devices.view` | | `{fields:[{id,entity,label,position,created_at}]}` |
+| `POST .../fields` | `fields.manage` | `{entity, label}` | 201 `{field}`; `entity` is `customer`, `site` or `device` |
+| `PATCH`, `DELETE .../fields/<id>` | `fields.manage` | `PATCH`: `{label?, position?}` | `{field}`; `DELETE` also clears the field's values from every record |
+| `POST .../pairing` | `devices.manage` | `{site_id?}` | 201 `{pairing:{id, code:"ABCDE-FGH23", expires_at, site_id}}`. The code is in this answer only |
+| `GET .../pairing` | `devices.manage` | | `{pairings:[{id,site_id,created_by,created_at,expires_at}]}`: live codes, no codes |
+| `DELETE .../pairing/<id>` | `devices.manage` | | `{removed:{id}}` |
+
+Built-in fields: a customer has `name` (required, 100 characters), `phone` and
+`email` (200), `notes` (2,000, newlines allowed); a site has `name` (required,
+100), `address` (300) and `notes`. A saved PC shows `id, site_id, status, name,
+access, control, owner_contact, os, machine, app_version, protocol, paired_at,
+paired_by, approved_by, last_seen, fields`, and `expires_at` while it is
+`pending`. It never shows its key hash, its confirm hash or its six digits.
+Custom field values are `fields: {"<field id>": "text"}`: text of at most 500
+characters, ids from the workspace's definitions for that record type, else 400.
+`PATCH` merges them: a value sets a field, `null` deletes it, and a field not
+named is left alone. Lists order by id and page with `?after=<id>&limit=` (1 to
+500, default 100); `after` must be an id, else 400, and `next` is the last id
+when more remain, else `null`.
+
+A technician with `devices.manage` may change a PC's `access` (`ask` or `any`)
+on an active PC. That change is logged as `device_changed` with the technician as
+actor and the old and new mode in the detail. The PC's `control` and `name` stay
+the owner's and cannot be changed here. `approve` is its own request: a waiting PC
+becomes `active` when `confirm` is the six-digit number shown on the PC (403
+`confirm_wrong` otherwise, 409 `not_pending` for an active PC).
+
+Limits per workspace: 10,000 customers, 10,000 sites, 2,000 PCs, 30 custom fields
+per record type, 20 live pairing codes, 20 waiting PCs. The relay stores a
+pairing code only as a keyed hash.
+
+Log kinds: `customer_added`, `customer_changed`, `customer_removed`, `site_added`,
+`site_changed`, `site_removed`, `field_added`, `field_changed`, `field_removed`,
+`pairing_code_created`, `pairing_code_revoked`, `device_paired`,
+`device_requested`, `device_approved`, `device_changed`, `device_removed`,
+`device_left`. A detail names ids and names, never a code, a key, an owner
+contact or a field value. The only unlogged writes are a PC's check-in details (at
+most every 5 minutes, or at once when a value changed) and purging expired codes
+and waiting PCs.
+
+## The PC wire (`/device/*`)
+
+What a saved PC calls: pair or ask to join, check in, change its own settings, and
+leave on uninstall. These four addresses are public, with no Access login,
+because a PC has none. Every request is `POST` with `Content-Type:
+application/json` and a body of at most 8 KB that carries `"protocol": 1`. Every
+answer, success or error, carries `"protocol": 1`. Errors are
+`{"protocol":1,"error":{"code","message"}}`.
+
+Refusals that apply to all four, in this order: plain `http:` except loopback 403
+`https_required`; any other method 405 `method_not_allowed` (`Allow: POST`); an
+`Origin` header 403 `forbidden`; `?key=` or `?code=` in the URL 400
+`bad_request`; not JSON 415 `unsupported_media_type`; over 8 KB 413
+`payload_too_large`; a body that is not a JSON object, or a `protocol` that is
+missing or not a whole number, 400 `bad_request`; a `protocol` outside 1 to 1 426
+`protocol_unsupported` with the range:
+
+```json
+{"protocol":1,"error":{"code":"protocol_unsupported","message":"..."},"supported":{"min":1,"max":1}}
+```
+
+A device key is `smd1.<workspace>.<device id>.<secret>`, sent as
+`Authorization: Bearer smd1...`. It must match
+`^smd1\.([a-z0-9-]{1,40})\.([a-z2-7]{20})\.([A-Za-z0-9_-]{43})$`; a mismatch, a
+missing header, a wrong secret, an unknown id or workspace, a removed PC and a
+waiting PC past 24 hours are all 401 `device_unknown`. The relay stores the
+SHA-256 of the secret and looks the row up by workspace and id.
+
+`POST /device/pair`, no key. Technician path, with a pairing code:
+
+```json
+{"protocol":1,"code":"ABCDE-FGH23","name":"Front desk","access":"ask","control":"full",
+ "owner_contact":"","os":"Windows 10 Pro 22H2","machine":"POS-1","app_version":"0.4.0"}
+```
+
+answers 201 `{"protocol":1,"status":"active","workspace":"default","device_id":"...","key":"smd1.default.<id>.<secret>"}`.
+Owner path: the same body with `"workspace":"<slug>"` in place of `code` answers
+202 `{"protocol":1,"status":"pending","workspace","device_id","key","confirm":"482913","expires_at"}`.
+`confirm` is six digits, shown only here; the PC shows them to its owner, who
+reads them to a technician. `access` is `ask` or `any` (default `ask`), `control`
+is `full` or `limited` (default `limited`). A code is normalised: uppercase,
+hyphens and spaces dropped. Errors: 400 `bad_request` (also both or neither of
+`code` and `workspace`, a bad field), 404 `code_invalid` (a code that is unknown,
+used, expired or malformed: one answer), 404 `not_found` (no such workspace), 409
+`request_limit` (20 join requests an hour per workspace), 409 `pending_limit` (20
+waiting at once), 409 `device_limit` (2,000 PCs), 426, 503 `unavailable` (no
+`AUTH_SECRET` of 32 characters or more). A failed attempt leaves no device, no log
+row and the code unused. A good one writes the device, the `device_paired` (or
+`device_requested`) row and, for a code, marks it used, in one batch.
+
+`POST /device/hello`, key: `{"protocol":1,"os"?,"machine"?,"app_version"?}` answers
+200 `{"protocol":1,"device":{"id","workspace","status":"active"|"pending","name","access","control","site_id"}}`.
+Allowed while pending. The reported details are written at most every 5 minutes,
+or at once when one changed, and are not logged. Errors: 400, 401, 426.
+
+`POST /device/update`, key: `{"protocol":1,"name"?,"access"?,"control"?,"owner_contact"?}`
+with at least one key answers 200 with the same `device`. Logged as
+`device_changed` by `pc <device id>`; an unchanged value writes nothing. Errors:
+400, 401, 403 `pending` (a waiting PC may only check in or leave), 426.
+
+`POST /device/leave`, key: `{"protocol":1}` answers 200
+`{"protocol":1,"removed":true}`, deletes the row and so the key, and logs
+`device_left` (also for a waiting PC). Afterwards the key is 401. Errors: 401, 426.
 
 ## Sign-in (`/auth/*` and `/account`)
 
@@ -1106,4 +1250,8 @@ window's two requests, and the Client's full-control path with a fake service.
 - `ended` is terminal; no path reopens a session or extends `expires_at`.
 - Every `tools/call` checks the caller's role before it reaches a session; team
   management is never an MCP tool.
+- Customer, site, device and custom field data is never read when the relay
+  decides who may do what. A device key is never in a URL, never logged, stored
+  only as a hash, compared in constant time, and refused on a request with an
+  `Origin` header. `/device/` stays public and outside every Access app.
 - No secrets in the repo: `.dev.vars` gitignored; attach keys stored hashed.
