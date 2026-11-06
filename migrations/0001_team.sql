@@ -1,6 +1,7 @@
 -- Team data: members, roles, recent callers and the chained team log.
 -- Every row belongs to one workspace, and every key starts with it.
--- All queries live in src/workspace.js and filter by workspace.
+-- All queries live in src/workspace.js and filter by workspace; the guarded
+-- changes in src/devices.js also write to audit through src/workspace.js.
 
 -- People (by email) and service tokens (by client id), each with one role.
 CREATE TABLE members (

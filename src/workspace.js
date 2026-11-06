@@ -1,5 +1,8 @@
 // Team data in the shared D1 database: members, roles, recent callers and the
-// chained team log. Every query the relay runs on team data is in this file.
+// chained team log. Every query the relay runs on team data is in this file,
+// except the customers, sites, devices, custom fields and pairing codes, which
+// are in src/devices.js and use this store's guarded change (mutate) so their
+// log rows commit with them.
 // Every store method takes the workspace slug first, and every query filters by
 // it, so one workspace never reads another's rows.
 //
@@ -816,6 +819,10 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
     listMembers, getMember, addMember, updateMember, removeMember,
     listRoles, addRole, updateRole, removeRole,
     readAudit, verifyAudit,
+    // The guarded change and its pieces, for src/devices.js to build on. They are
+    // returned, not copied, so a device write re-checks the actor at commit with
+    // exactly the rules a member write uses.
+    mutate, actorContext, actorHas, actorUnchanged, and, or, not, lit,
   };
 }
 
