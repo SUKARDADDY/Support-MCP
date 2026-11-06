@@ -86,7 +86,7 @@ test('a hello version of exactly 32 characters is kept, and one of 33 is ignored
 });
 
 test('a hello version that is not a short SemVer string is ignored', async () => {
-  for (const version of ['latest', '1.2', 'v1.2.3', '1.2.3 ', '01.2.3', '1.2.3+a+b', `1.2.3-${'a'.repeat(30)}`, 123, ['1.2.3'], { v: '1.2.3' }, null, '']) {
+  for (const version of ['latest', '1.2', 'v1.2.3', '1.2.3 ', '01.2.3', '1.2.3-01', '1.2.3-rc.01', '1.2.3+a+b', `1.2.3-${'a'.repeat(30)}`, 123, ['1.2.3'], { v: '1.2.3' }, null, '']) {
     const f = await attach({ version });
     const s = await f.status();
     assert.deepEqual([s.client_version, s.client_agent], ['windows-app-2', 'windows-app-2'], JSON.stringify(version));

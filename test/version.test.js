@@ -7,6 +7,7 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } f
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { VERSION_PATTERN } from '../src/version.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SCRIPT = join(ROOT, 'scripts', 'bump-version.mjs');
@@ -75,6 +76,15 @@ test('bump-version.mjs rewrites every copy, and a prerelease keeps x.y.z.0 for t
   }
 });
 
+test('the version pattern follows SemVer for prerelease and build identifiers', () => {
+  for (const good of ['0.2.0', '1.2.3-0', '1.2.3-0a', '1.2.3--', '1.2.3-rc.1', '1.2.3-alpha.0.x', '1.2.3+01', '1.2.3-rc.1+build.001']) {
+    assert.ok(VERSION_PATTERN.test(good), `${good} is accepted`);
+  }
+  for (const bad of ['1.2.3-01', '1.2.3-rc.01', '1.2.3-00', '1.2.3-1.02', '01.2.3', '1.2.3-', '1.2.3+']) {
+    assert.ok(!VERSION_PATTERN.test(bad), `${bad} is refused`);
+  }
+});
+
 test('bump-version.mjs refuses a bad version and touches no file', () => {
   const dir = copyTree();
   try {
@@ -82,6 +92,7 @@ test('bump-version.mjs refuses a bad version and touches no file', () => {
     const refused = [
       'nope', '1.2', 'v1.2.3', '1.2.3 ', '1.2.3-', `1.2.3-${'a'.repeat(40)}`,
       '65535.0.0', '0.65535.0', '0.0.65535', '01.2.3', '1.02.3', '1.2.03', '1.2.3-..', '1.2.3-a..b', '1.2.3+a+b', '1.2.3+',
+      '1.2.3-01', '1.2.3-rc.01', '1.2.3-00',
     ];
     for (const bad of refused) {
       const run = bump(dir, bad);
