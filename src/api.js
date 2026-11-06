@@ -138,8 +138,13 @@ export async function handleApi(request, env, url, { accessCaller, isJsonContent
       if (method !== 'GET') return notAllowed('GET');
       const after = intParam(url, 'after', 0, 0, Number.MAX_SAFE_INTEGER);
       const limit = intParam(url, 'limit', AUDIT_LIMIT_DEFAULT, 1, AUDIT_LIMIT_MAX);
+      // A page check covers the rows shown; verify=full checks the whole chain.
+      // Like the other parameters, an empty value counts as left out and a
+      // repeated one uses its first value.
+      const verify = url.searchParams.get('verify') || null;
+      if (verify !== null && verify !== 'full') throw new TeamError(400, 'bad_request', 'verify must be full, or left out to check only the rows shown');
       await need(team, slug, caller, ['audit.view']);
-      return json(await team.readAudit(slug, { after, limit }));
+      return json(await team.readAudit(slug, { after, limit, full: verify === 'full' }));
     }
 
     throw new TeamError(404, 'not_found', 'not found');

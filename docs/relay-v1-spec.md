@@ -191,7 +191,7 @@ error is `{"error":{"code","message"}}`.
 | `POST .../roles` | `roles.manage` | `{id, name?, permissions}` | 201 `{role}` |
 | `PATCH .../roles/<id>` | `roles.manage` | `{name?, permissions?}` | `{role}` |
 | `DELETE .../roles/<id>` | `roles.manage` | | `{removed:{id}}` |
-| `GET .../audit?after=&limit=` | `audit.view` | | `{rows:[{seq,ts,actor,kind,detail,prev_hash,hash}], head:{seq,hash}, verified}`; rows with `seq > after` (default 0), at most `limit` (1 to 500, default 100) |
+| `GET .../audit?after=&limit=&verify=` | `audit.view` | | `{rows:[{seq,ts,actor,kind,detail,prev_hash,hash}], head:{seq,hash}, verified, verified_scope}`; rows with `seq > after` (default 0), at most `limit` (1 to 500, default 100). `verify` is left out or empty (check the returned rows only, `verified_scope: "page"`) or `full` (check the whole chain, `"full"`); any other value is 400, and a repeated parameter uses its first value |
 
 `<identity>` is URL-encoded and compared trimmed and lowercased. A member's
 `kind` is `service` when the identity has no `@`, else `person`. Identities are
@@ -216,6 +216,7 @@ edited `technician` or `viewer`, and a deleted one keeps a row with `deleted = 1
 | 409 | `last_admin` | removing or demoting the last admin |
 | 409 | `role_fixed` | creating, editing or deleting `admin` |
 | 409 | `role_in_use` | deleting a role a member holds |
+| 409 | `role_missing` | changing a member whose role no longer exists, other than giving them a role that exists (an admin can also remove them) |
 | 503 | `busy` | six tries in a row lost the race to another change (`Retry-After: 1`) |
 
 While the workspace has no members, every caller holds only the four
@@ -242,15 +243,31 @@ refusal is 403 `forbidden` with a plain `message`, and writes no log row.
   holding no permission they lack. A rename counts: it leaves the role's
   permissions as they are, so a role holding more than the editor does can't be
   renamed by them.
+- Anyone else can change a member (a rename counts), demote one or remove one
+  only if that member's role holds no permission they lack. The `admin` role
+  holds every permission, so it is out of reach for anyone who is not an admin,
+  including a custom role that happens to hold them all. The refusal is
+  "you can only change members whose role is within your own permissions" (or
+  "remove"); the specific admin messages above come first where they apply.
+- Anyone else can edit a role (a rename counts) or delete it only if the role's
+  current permissions hold nothing they lack, so a role manager can't narrow or
+  delete a stronger role. The new permissions rule above still applies to an
+  edit.
 - Nobody can edit or delete the role they hold.
 - Nobody can change their own role. An `admin` is the exception: they can
   demote themselves, and `last_admin` (409) refuses it unless another admin
   remains.
 
 The planning step checks these rules, and the SQL guard on the log insert checks
-them again against the actor's role, and the role's permissions, as the plan
-read them. A change that lands between the read and the commit therefore fails
-the guard, and the retry gives the right 403.
+them again against the actor's role, the target member's role, the role being
+edited or deleted, and those roles' permissions, as the plan read them. A
+change that lands between the read and the commit therefore fails the guard,
+and the retry gives the right 403.
+
+A member whose stored role no longer exists holds no permissions. The planning
+step answers 409 `role_missing` ("that member has a role that no longer exists;
+give them a role first") to any change except giving them a role that exists,
+which the usual rules allow, and except removal by an admin.
 
 ### The team log
 
@@ -269,13 +286,26 @@ short random wait, then `busy`. A lost log number shows as a UNIQUE or
 `SQLITE_CONSTRAINT` error naming `audit`; for any other batch error the store
 reads the log head again and retries if it moved since the read, else it
 rethrows. A batch whose rules no longer hold also starts
-again, and the fresh read gives the right 403, 404 or 409. `verified` recomputes
-the whole chain: numbers 1, 2, 3 with no gap, each `prev_hash` equal to the row
-before, each `hash` matching its row. Verification covers the whole log on each
-read of `GET .../audit`, not only the returned page. An edit, removal or
-reordering of a row shows unless it is among the newest entries; deleting the
-newest rows still verifies, so note the `head` (`seq` and `hash`) outside the
-relay to catch that.
+again, and the fresh read gives the right 403, 404 or 409.
+
+`verified` on a normal read (`verified_scope: "page"`) covers only the rows the
+response returns. It recomputes each returned row's `hash`, checks that the
+numbers run on with no gap and each `prev_hash` equals the row before, and
+anchors the first returned row to the row just before it (`seq` = first `seq`
+minus 1, or the 64-zero genesis hash when the first row is number 1). It also
+checks that the row just after the page, when there is one, has a `prev_hash`
+equal to the last returned row's `hash`, so a last row that was edited and
+resealed shows. The read loads at most `limit` + 2 rows (the row before, the
+page and the row after), plus the head. A missing anchor is `false`. An empty
+page is `true`. An edit to a row further outside the page does not show in that
+read. Only the newest row of the whole log has no row after it, so a page check
+can't see that row edited and resealed; the changed `head` shows it, so note the
+head. `?verify=full` (`verified_scope: "full"`) recomputes the whole chain from
+row 1 (numbers 1, 2, 3 with no gap, each `prev_hash` equal to the row before,
+each `hash` matching its row). An edit, removal or reordering of a row shows in
+a full check unless it is among the newest entries; deleting the newest rows
+still verifies, so note the `head` (`seq` and `hash`) outside the relay to catch
+that.
 
 ## Session state machine (Session DO)
 

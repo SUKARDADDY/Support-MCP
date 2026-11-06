@@ -328,6 +328,36 @@ test('the log API pages by after and limit, and reports the head and verificatio
   assert.equal((await r.api(BOSS, 'GET', '/audit')).body.verified, false);
 });
 
+test('a log read checks the rows it returns; verify=full checks the whole chain', async () => {
+  const r = await withAdmin();
+  for (let i = 0; i < 6; i++) await r.api(BOSS, 'POST', '/members', { identity: `u${i}@example.com`, role_id: 'viewer' });
+  const clean = await r.api(BOSS, 'GET', '/audit?after=3&limit=2');
+  assert.deepEqual([clean.body.rows.map((x) => x.seq), clean.body.verified, clean.body.verified_scope, clean.body.head.seq], [[4, 5], true, 'page', 8]);
+  const full = await r.api(BOSS, 'GET', '/audit?verify=full&limit=2');
+  assert.deepEqual([full.body.rows.map((x) => x.seq), full.body.verified, full.body.verified_scope, full.body.head.seq], [[1, 2], true, 'full', 8]);
+  // A row outside the page is edited.
+  r.env.DB.sqlite.exec("UPDATE audit SET detail = 'u0@example.com as admin' WHERE seq = 1");
+  const page = await r.api(BOSS, 'GET', '/audit?after=3&limit=2');
+  assert.deepEqual([page.body.verified, page.body.verified_scope], [true, 'page']);
+  const after = await r.api(BOSS, 'GET', '/audit?verify=full&after=3&limit=2');
+  assert.deepEqual([after.body.rows.map((x) => x.seq), after.body.verified, after.body.verified_scope], [[4, 5], false, 'full']);
+  // A row on the page is edited.
+  assert.equal((await r.api(BOSS, 'GET', '/audit?after=0&limit=2')).body.verified, false);
+  // An empty page verifies, with page scope.
+  const empty = await r.api(BOSS, 'GET', '/audit?after=8');
+  assert.deepEqual([empty.body.rows, empty.body.verified, empty.body.verified_scope, empty.body.head.seq], [[], true, 'page', 8]);
+  // Only full is accepted. An empty value counts as left out, and a repeated one uses its first value.
+  for (const q of ['?verify=bad', '?verify=FULL', '?verify=page', '?verify=bad&verify=full']) {
+    const res = await r.api(BOSS, 'GET', `/audit${q}`);
+    assert.deepEqual([res.status, res.body.error.code], [400, 'bad_request'], q);
+  }
+  for (const [q, scope] of [['?verify=', 'page'], ['?verify=&limit=2', 'page'], ['?verify=full&verify=bad', 'full'], ['?verify=full&verify=', 'full']]) {
+    const res = await r.api(BOSS, 'GET', `/audit${q}`);
+    assert.deepEqual([res.status, res.body.verified_scope], [200, scope], q);
+  }
+  assert.equal((await r.api('stranger@example.com', 'GET', '/audit?verify=full')).status, 403, 'verify=full needs audit.view like any read');
+});
+
 // ---- escalation through team management ----------------------------------------------
 const LEAD = 'lead@example.com';
 const RM = 'rm@example.com';
@@ -389,8 +419,46 @@ test('a members.manage member can still add and move people within their own per
   await ok(r.api(LEAD, 'PATCH', '/members/new@example.com', { name: 'New' }));
   assert.equal((await ok(r.api(LEAD, 'PATCH', '/members/new@example.com', { role_id: 'lead' }))).body.member.role_id, 'lead');
   await ok(r.api(LEAD, 'DELETE', '/members/new@example.com'));
-  // An admin's name can be edited by a lead; only the role is protected.
-  await ok(r.api(LEAD, 'PATCH', '/members/admin2@example.com', { name: 'Second' }));
+  // Moving a peer or someone below them is fine too.
+  await ok(r.api(LEAD, 'PATCH', '/members/peer@example.com', { name: 'Peer', role_id: 'sv' }));
+  await ok(r.api(LEAD, 'DELETE', '/members/peer@example.com'));
+  await ok(r.api(LEAD, 'PATCH', '/members/v@example.com', { name: 'Vee' }));
+  await ok(r.api(LEAD, 'DELETE', '/members/v@example.com'));
+});
+
+test('a members.manage member cannot change, demote or remove a member whose role holds more than theirs', async () => {
+  const r = await withTeam();
+  const before = await r.logLength();
+  const within = /within your own permissions/;
+  // An admin, even for a rename. technician holds sessions.create, control and end, which lead lacks.
+  await forbidden(r.api(LEAD, 'PATCH', '/members/admin2@example.com', { name: 'Renamed' }), within);
+  await forbidden(r.api(LEAD, 'PATCH', `/members/${BOSS}`, { name: 'Renamed' }), within);
+  await forbidden(r.api(LEAD, 'PATCH', '/members/tech@example.com', { name: 'Renamed' }), within);
+  await forbidden(r.api(LEAD, 'PATCH', '/members/tech@example.com', { role_id: 'sv' }), within);
+  await forbidden(r.api(LEAD, 'PATCH', '/members/tech@example.com', { name: 'T', role_id: 'sv' }), within);
+  await forbidden(r.api(LEAD, 'DELETE', '/members/tech@example.com'), within);
+  // The rolemaker holds roles.manage, which lead lacks.
+  await forbidden(r.api(LEAD, 'PATCH', `/members/${RM}`, { name: 'Renamed' }), within);
+  await forbidden(r.api(LEAD, 'DELETE', `/members/${RM}`), within);
+  // A role with every permission still is not admin: its holder cannot touch an admin.
+  await ok(r.api(BOSS, 'POST', '/roles', { id: 'everything', permissions: PERMISSIONS }), 201);
+  await ok(r.api(BOSS, 'POST', '/members', { identity: 'all@example.com', role_id: 'everything' }), 201);
+  await forbidden(r.api('all@example.com', 'PATCH', '/members/admin2@example.com', { name: 'Renamed' }), within);
+  const members = (await r.api(BOSS, 'GET', '/members')).body.members;
+  assert.equal(members.find((m) => m.identity === 'admin2@example.com').name, null);
+  assert.equal(members.find((m) => m.identity === 'tech@example.com').role_id, 'technician');
+  assert.ok(members.some((m) => m.identity === RM));
+  assert.equal(await r.logLength(), before + 2, 'only the two setup changes wrote log rows');
+});
+
+test('an admin can still rename, demote and remove any member', async () => {
+  const r = await withTeam();
+  await ok(r.api(BOSS, 'PATCH', '/members/admin2@example.com', { name: 'Second' }));
+  await ok(r.api(BOSS, 'PATCH', '/members/tech@example.com', { name: 'Tech', role_id: 'sv' }));
+  await ok(r.api(BOSS, 'PATCH', `/members/${RM}`, { name: 'Role maker' }));
+  await ok(r.api(BOSS, 'DELETE', `/members/${RM}`));
+  await ok(r.api('admin2@example.com', 'PATCH', `/members/${BOSS}`, { name: 'Boss' }));
+  await ok(r.api('admin2@example.com', 'DELETE', `/members/${BOSS}`));
 });
 
 test('a roles.manage member cannot add permissions to their own role or grant ones they lack', async () => {
@@ -411,6 +479,40 @@ test('a roles.manage member cannot add permissions to their own role or grant on
   await ok(r.api(RM, 'POST', '/roles', { id: 'peek', permissions: ['sessions.view'] }), 201);
   await ok(r.api(RM, 'PATCH', '/roles/peek', { name: 'Peek', permissions: [] }));
   await ok(r.api(RM, 'DELETE', '/roles/peek'));
+});
+
+test('a roles.manage member cannot narrow, rename or delete a role that holds more than they do', async () => {
+  const r = await withTeam();
+  await ok(r.api(BOSS, 'POST', '/roles', { id: 'strong', permissions: ['sessions.view', 'sessions.control'] }), 201);
+  const before = await r.logLength();
+  const held = /you can only (change|delete) a role whose permissions you hold: you do not hold/;
+  await forbidden(r.api(RM, 'PATCH', '/roles/technician', { permissions: ['sessions.view'] }), held);
+  await forbidden(r.api(RM, 'PATCH', '/roles/technician', { permissions: [] }), held);
+  await forbidden(r.api(RM, 'PATCH', '/roles/strong', { name: 'Renamed' }), held);
+  await forbidden(r.api(RM, 'DELETE', '/roles/strong'), held);
+  await forbidden(r.api(RM, 'DELETE', '/roles/viewer'), held);
+  const roles = (await r.api(BOSS, 'GET', '/roles')).body.roles;
+  assert.deepEqual(roles.find((x) => x.id === 'technician').permissions, ['sessions.create', 'sessions.view', 'sessions.control', 'sessions.end']);
+  assert.ok(roles.some((x) => x.id === 'strong' && x.name === 'strong'));
+  assert.ok(roles.some((x) => x.id === 'viewer'));
+  assert.equal(await r.logLength(), before, 'a refused change writes no log row');
+  // Within their own permissions they can still edit and delete; an admin can edit any role.
+  await ok(r.api(RM, 'PATCH', '/roles/sv', { name: 'Seer', permissions: [] }));
+  await ok(r.api(RM, 'PATCH', '/roles/sv', { permissions: ['sessions.view'] }));
+  await ok(r.api(BOSS, 'PATCH', '/roles/strong', { permissions: ['sessions.view'] }));
+  await ok(r.api(RM, 'DELETE', '/roles/strong'));
+  await ok(r.api(BOSS, 'DELETE', '/roles/viewer'));
+});
+
+test('a member whose role is gone answers a clean 409 to a rename, and takes a new role', async () => {
+  const r = await withTeam();
+  await ok(r.api(BOSS, 'POST', '/roles', { id: 'ghost', permissions: ['sessions.view'] }), 201);
+  await ok(r.api(BOSS, 'POST', '/members', { identity: 'g@example.com', role_id: 'ghost' }), 201);
+  r.env.DB.sqlite.exec("UPDATE roles SET deleted = 1 WHERE role_id = 'ghost'");
+  const refused = await r.api(LEAD, 'PATCH', '/members/g@example.com', { name: 'G' });
+  assert.deepEqual([refused.status, refused.body], [409, { error: { code: 'role_missing', message: 'that member has a role that no longer exists; give them a role first' } }]);
+  assert.equal((await r.api(BOSS, 'PATCH', '/members/g@example.com', { name: 'G' })).body.error.code, 'role_missing');
+  assert.equal((await ok(r.api(BOSS, 'PATCH', '/members/g@example.com', { role_id: 'technician' }))).body.member.role_id, 'technician');
 });
 
 test('an admin can still promote, demote, remove and hand out any role', async () => {
