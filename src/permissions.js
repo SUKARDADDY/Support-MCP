@@ -32,6 +32,14 @@ export const BUILTIN_ROLES = Object.freeze({
   viewer: Object.freeze({ name: 'Viewer', permissions: Object.freeze(['sessions.view', 'audit.view']) }),
 });
 
+// Permissions that need a second factor when the caller is signed in as
+// themselves in a browser (or, from PR 2c, an OAuth client): controlling a
+// session and managing the team. A role that holds any of them makes its
+// members enrol an authenticator. Access logins and service tokens are
+// unaffected: this is a rule for the sign-in layer (src/auth.js).
+export const FACTOR_PERMISSIONS = Object.freeze(['sessions.control', 'members.manage', 'roles.manage']);
+export const needsSecondFactor = (permission) => FACTOR_PERMISSIONS.includes(permission);
+
 export const ROLE_ID_RE = /^[a-z0-9-]{1,40}$/;
 
 export const isPermission = (key) => typeof key === 'string' && PERMISSIONS.includes(key);

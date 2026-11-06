@@ -2,11 +2,11 @@
 // /api/v1/w/<slug>/..., plus POST and GET /api/v1/w to create a workspace and
 // list the caller's. "default" always exists; any other slug exists once it has
 // been created, and anything else is 404 before a permission is looked at. The
-// gate is the same
-// as /mcp and runs before any database access: an Origin header is refused, a
-// write must be JSON, and Cloudflare Access must admit the caller. Team
-// management is never an MCP tool, so text on a customer's screen can't make an
-// agent add a member.
+// gate is the same as /mcp and runs before any database access: an Origin
+// header is refused, a write must be JSON, and Cloudflare Access must admit the
+// caller. A browser sign-in cookie is not accepted here. Team management is
+// never an MCP tool, so text on a customer's screen can't make an agent add a
+// member.
 import { TeamError, teamFromEnv } from './workspace.js';
 
 const ROOT = '/api/v1/w';

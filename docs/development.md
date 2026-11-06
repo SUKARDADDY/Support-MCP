@@ -266,5 +266,41 @@ binding that records every call.
 `test/app.test.js` covers the app: the bundle's hashes, the download flow and
 its security headers, the polling transport, and the default mode and aliases.
 
+### Sign-in locally
+
+Sign-in works on `localhost` and `127.0.0.1` without a public address or any
+provider. In `.dev.vars` (copy `.dev.vars.example`) keep `AUTH_SECRET` and
+`DEV_SHOW_EMAIL_LINKS=1`. The second is honoured only for those hosts, and
+shows an emailed link on the page instead of sending it. Leave `PUBLIC_ORIGIN`
+empty: on loopback the relay uses the address the request came to. As for `/mcp`
+above, run `wrangler dev` against a copy of the config with the `routes` line
+removed, or the Worker sees the route's hostname instead of `localhost`. Cookies on
+plain http are named `smcp`, `smcp-oidc`, `smcp-bind` and `smcp-pre` and are not
+`Secure`, because browsers may refuse to store a `Secure` cookie for http.
+
+1. Apply the migrations to the local database (they include sign-in's):
+   `npx wrangler d1 migrations apply support-mcp --local`.
+2. Invite yourself by adding a member straight into the local database. Only
+   a member or a `DEPLOYMENT_ADMINS` identity can sign in.
+   ```sh
+   npx wrangler d1 execute support-mcp --local --command \
+     "INSERT INTO members(workspace, identity, kind, name, role_id, added_at, added_by) VALUES ('default', 'you@example.com', 'person', NULL, 'admin', 0, 'dev')"
+   ```
+   Or put `DEPLOYMENT_ADMINS=you@example.com` in `.dev.vars`.
+3. Run `npx wrangler dev --port 8787`, open `http://localhost:8787/auth/signin`,
+   enter the address, and open the link that appears. Press **Sign in**.
+4. On the account page choose **Set up your authenticator**. Type the key into
+   an authenticator app (or compute a code with `src/totp.js`), enter the
+   code, and save the recovery codes. The next sign-in asks for a code.
+
+Google and Microsoft sign-in need real client IDs and a redirect address on
+`localhost`; add `http://localhost:8787/auth/google/callback` (and the Microsoft
+one) to the app registrations if you want to try them. Resend is not called in
+development when `DEV_SHOW_EMAIL_LINKS=1`.
+
+`test/auth.test.js` covers sign-in through the real router with locally signed
+id_tokens, a fake token and key endpoint, a fake mailer and a cookie jar, so
+nothing touches the network. It reads and writes the same D1 stand-in.
+
 The wire protocol, the state machine and the acceptance checks are in
 [`docs/relay-v1-spec.md`](relay-v1-spec.md).

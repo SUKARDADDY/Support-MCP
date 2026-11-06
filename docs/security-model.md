@@ -257,7 +257,8 @@ apply to only one client say which.
   and the team API under `/api/` all check the Access JWT in the relay itself: RS256
   signature, `aud`, `iss`, `exp` and `nbf` with 60 seconds of skew. It caches
   signing keys for an hour and allows at most one forced refetch per minute
-  when it sees an unknown `kid`. Requests carrying an `Origin` header get a 403
+  when it sees an unknown `kid`. A browser sign-in cookie is not a credential
+  on these addresses. Requests carrying an `Origin` header get a 403
   and non-JSON bodies (every team API write) get a 415, which blocks cross-site
   requests from a logged-in browser. All of these refusals come before the relay
   reads any session or team data.
@@ -356,6 +357,122 @@ apply to only one client say which.
   note the `head` (number and hash) the log API returns somewhere outside the
   relay, and compare it later: a lower number, or a different hash at the same
   number, means the log changed.
+- **People sign in as themselves, by invitation only.** A technician signs in
+  with Google, Microsoft or an emailed link at `/auth/signin`. Only a person who
+  is a member of some workspace (by lowercased email) or is listed in
+  `DEPLOYMENT_ADMINS` can. Anyone else gets one "you can't sign in here" page
+  and nothing is stored. The check is read live on every request, so removing
+  the last membership ends a sign-in on its next request, and "sign out
+  everywhere" revokes every sign-in the person has (and, for a person with an
+  authenticator, needs a sign-in that has passed a code). A sign-in is for the account
+  page. It is not accepted on `/mcp`, `/w/<slug>/mcp` or the team API, which
+  still admit only Cloudflare Access logins and service tokens, so a signed-in
+  person from one team cannot claim the open `default` workspace's first admin
+  or read its recent callers. Until PR 2c, a sign-in cannot start or control a
+  session.
+- **Google and Microsoft sign-in checks the whole token.** It uses the
+  authorization code flow with PKCE (S256), a `state` and a `nonce`. The state,
+  nonce, PKCE verifier and return path live in one cookie sealed with AES-GCM
+  under a key derived from `AUTH_SECRET`, `HttpOnly`, `Secure`, `SameSite=Lax`,
+  good for ten minutes, and cleared on the callback. The relay trades the code
+  for tokens from its own server with the client secret, then checks the
+  id_token: RS256 signature against the provider's published keys, `aud` equal
+  to our client id (and `azp` when there are several), `exp` and `iat` with two
+  minutes of skew, and the nonce. Google needs `email_verified` to be `true`
+  and `iss` of either spelling. Microsoft's `iss` is built from the token's
+  `tid` and must match, the `tid` must be in `MICROSOFT_TENANTS` when that list
+  is set, and the email counts only if the token carries `xms_edov` or the
+  tenant is listed (listing a tenant trusts its administrators to set emails).
+  A person is linked to an identity by the provider's own id (Google `sub`,
+  Microsoft `tid:oid`), never by email. A known identity always signs in as the
+  person it was first linked to. A new identity joins the person who has its
+  verified email. A link is never moved to someone else. Provider keys are
+  cached per address, so Access, Google and Microsoft do not evict each other,
+  and each address has its own limit of one forced refetch a minute.
+- **Emailed links work once, in one browser, by a button.** A link holds 32
+  random bytes. The relay stores only their SHA-256, with a ten minute expiry.
+  Asking for a link sets a cookie in that browser holding a second random
+  value, also stored hashed. A browser that already holds the cookie keeps its
+  value, so a second request does not strand the first link, and the cookie is
+  cleared once no unused link is left for it. Opening the link (GET) only shows a page, so mail
+  scanners and link previews cannot use it. The button (POST) redeems it, and
+  only with the same browser's cookie. A wrong browser is refused without using
+  the link up. The answer to a request is identical whether or not the address
+  is invited, and only invited addresses are stored or mailed. Each address
+  gets at most five links an hour, counted in the same statement that inserts
+  the row. In production the mail is sent after the answer, so timing doesn't
+  show whether an address is invited. `DEV_SHOW_EMAIL_LINKS=1` puts the link on
+  the page instead of sending it, and it is honoured only when the request host
+  is `localhost` or `127.0.0.1`. In that mode only, the page does show whether
+  an address was invited.
+- **A second factor for roles that can control sessions or manage the team.**
+  A role that holds `sessions.control`, `members.manage` or `roles.manage`, and
+  a deployment admin, must enrol an authenticator app (TOTP, RFC 6238: SHA-1,
+  30 seconds, six digits, one step either side). `authorizeSignIn` in
+  `src/auth.js` refuses a sign-in that has not passed a code with "a second
+  factor is required" for those permissions, and 2c calls the same check. Anyone
+  who has enrolled passes a code at every sign-in. The secret is 20 random
+  bytes, stored encrypted (AES-GCM under a key derived from `AUTH_SECRET`, with
+  the person's id as associated data). The last used 30 second step is stored,
+  and a code for that step or an older one is refused, so a code works once.
+  Every attempt is counted before the code is checked, in the same statement
+  that sets the lock, so a crash cannot leave a count without its lock. Only
+  `locked_until` blocks a try, never the count. Every fifth wrong try in a row
+  locks the factor, even against the right code. The first lock lasts 15
+  minutes and each later one twice as long, up to 24 hours, so a guesser gets
+  five tries per lock, about 35 in the first day and 5 a day after that. The count and the lock
+  clear only on a right code. Ten recovery codes are shown once, stored as keyed
+  hashes, and each works once. A person with an authenticator must pass a code
+  before replacing it. Replacing it, or signing in with a recovery code, revokes
+  every other sign-in of that person (the current one stays), because either may
+  mean the phone or an old sign-in is no longer theirs. The page says so. There is no admin
+  reset in the product: delete the person's `user_factors` row with
+  `wrangler d1 execute` after you have checked who they are. Rotating
+  `AUTH_SECRET` makes every stored authenticator secret and recovery code
+  unreadable, so delete the `user_factors` rows and have people enrol again. It
+  does not end sign-ins, because the cookie value doesn't depend on it.
+- **Browser sign-in cookies.** The cookie `__Host-smcp` is `Secure`, `HttpOnly`,
+  `SameSite=Lax`, `Path=/` and has no `Domain`. Its value is 32 random bytes;
+  the database holds only the SHA-256. A sign-in ends after `SIGNIN_IDLE_HOURS`
+  (12) without use or `SIGNIN_MAX_DAYS` (14) after it began, whichever comes
+  first, and both are read from the current settings, so tightening them applies
+  to sign-ins already open. The last-seen time is written at most every five
+  minutes. Only for `localhost` and `127.0.0.1`, which browsers may refuse to
+  store a `Secure` cookie for over plain http, the cookies are named `smcp`,
+  `smcp-oidc`, `smcp-bind` and `smcp-pre` and are not `Secure`. A real host
+  never gets that. The relay's own address is `PUBLIC_ORIGIN`, never the
+  `Host` header, and on a real host without it, or when asked at another host,
+  every sign-in route answers 503. The same 503 comes with a missing or short
+  (under 32 characters) `AUTH_SECRET`.
+- **Browser forms are checked for cross-site posting.** `/mcp` and `/api` refuse
+  any `Origin` header outright. The sign-in and account pages are for browsers,
+  so each POST instead needs an `Origin`, when the browser sends one, equal to
+  the relay's own (otherwise 403), a form token, and a urlencoded body under 4 KB.
+  The token is an HMAC (key derived from `AUTH_SECRET`) of the sign-in's id hash
+  or, before sign-in, of the page's own cookie. Cookies are `SameSite=Lax` as a
+  third layer. A return path after sign-in must start with one `/`, never `//` or
+  `/\`, with no backslash or control character, and is checked again after the
+  URL parser has folded dot segments (`/..//evil.example` becomes
+  `//evil.example`) and refused if it then points off the site. Every redirect
+  and every link or form field that carries a return path goes through that
+  check, so none can be an open redirect. Form bodies are read with a byte cap
+  and cut off at 4 KB even when they declare no length, and so are the
+  provider's token and key responses. Every page sends a
+  Content-Security-Policy of `default-src 'none'` (so no script, font or image
+  can load, and the pages contain none), `frame-ancestors 'none'`,
+  `base-uri 'none'` and a `form-action` that adds the Google and Microsoft
+  hosts on the sign-in page only. They also send `Referrer-Policy: same-origin` (so no address leaves the site;
+  `no-referrer` would make Chrome send `Origin: null` on every form post),
+  `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`.
+- **What sign-in stores.** `users` (email), `user_identities` (provider, the
+  provider's id, the email seen at link time), `login_sessions` (hash of the
+  cookie, times, when the second factor passed), `email_links` (hashes, address,
+  times) and `user_factors` (the sealed secret, the last step, the failure
+  count, hashed recovery codes). Never a cookie value, link token, plain
+  recovery code or plain authenticator secret. Provider client secrets, the
+  mail API key and `AUTH_SECRET` are Wrangler secrets. The sign-in code writes
+  nothing to the Worker log. Old `login_sessions` rows are not pruned yet, and
+  `email_links` rows are deleted after two hours.
 - **Sessions only move forward.** The states run pending, consumed, attached,
   ended, and `ended` is final. The 24-hour limit starts at the first attach and
   a reattach does not extend it. Every handler checks the deadline inline, so a
