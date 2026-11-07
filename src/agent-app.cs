@@ -121,17 +121,51 @@ namespace SupportMcp {
         }
         public static JavaScriptSerializer Json() { return new JavaScriptSerializer { MaxJsonLength = 800000 }; }
         public static Dictionary<string, object> ReadConfig(string file) { return ReadConfig(File.ReadAllBytes(file)); }
+        // A session footer only. A footer with a "kind" (the setup download from /install) is refused, so no session
+        // role (--service, --helper, --elevate-install, the default and resume paths) can ever run on one.
         public static Dictionary<string, object> ReadConfig(byte[] all) {
-            int start = Payload(all), n = all.Length - Footer.Length - 4 - start;
-            for (int i = 0; i < Footer.Length; i++) if (all[all.Length - Footer.Length + i] != (byte)Footer[i]) throw new InvalidDataException("Invalid session configuration.");
-            var cfg = Json().Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(all, start, n));
+            var cfg = Parse(all);
+            if (cfg.ContainsKey("kind")) throw new InvalidDataException("Invalid session configuration.");
             if (!System.Text.RegularExpressions.Regex.IsMatch(Text(cfg, "sid"), "^[0-9a-f]{64}$") ||
                 !System.Text.RegularExpressions.Regex.IsMatch(Text(cfg, "key"), "^[0-9a-f]{64}$")) throw new InvalidDataException("Invalid session credentials.");
-            Uri origin = new Uri(Text(cfg, "origin"));
-            if ((origin.Scheme != "https" && !(origin.Scheme == "http" && origin.IsLoopback)) ||
-                origin.AbsolutePath != "/" || origin.UserInfo != "" || origin.Query != "" || origin.Fragment != "")
-                throw new InvalidDataException("Invalid support server.");
+            CheckOrigin(cfg);
             return cfg;
+        }
+        // The footer's kind: "" for a session, "device" for a setup download. Throws when there is no valid footer.
+        public static string Kind(byte[] all) { return Text(Parse(all), "kind"); }
+        // A setup footer: {"kind":"device","origin":...} with at most one of a technician's pairing code (ABCDE-FGH23)
+        // or a team's workspace slug, and nothing else. It carries no session and no key.
+        public const string CodePattern = "^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{5}-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{5}$", SlugPattern = "^[a-z0-9-]{1,40}$";
+        public static Dictionary<string, object> ReadDevice(byte[] all) {
+            var cfg = Parse(all);
+            foreach (string name in cfg.Keys)
+                if (name != "kind" && name != "origin" && name != "code" && name != "workspace") throw new InvalidDataException("Invalid setup configuration.");
+            if (!"device".Equals(Value(cfg, "kind"))) throw new InvalidDataException("Invalid setup configuration.");
+            bool code = cfg.ContainsKey("code"), workspace = cfg.ContainsKey("workspace");
+            if ((code && workspace) || (code && !(Value(cfg, "code") is string && System.Text.RegularExpressions.Regex.IsMatch((string)cfg["code"], CodePattern)))
+                || (workspace && !(Value(cfg, "workspace") is string && System.Text.RegularExpressions.Regex.IsMatch((string)cfg["workspace"], SlugPattern))))
+                throw new InvalidDataException("Invalid setup configuration.");
+            CheckOrigin(cfg);
+            return cfg;
+        }
+        static object Value(Dictionary<string, object> d, string key) { object v; return d.TryGetValue(key, out v) ? v : null; }
+        // The footer's JSON object, after the magic string and the size check.
+        static Dictionary<string, object> Parse(byte[] all) {
+            int start = Payload(all), n = all.Length - Footer.Length - 4 - start;
+            for (int i = 0; i < Footer.Length; i++) if (all[all.Length - Footer.Length + i] != (byte)Footer[i]) throw new InvalidDataException("Invalid session configuration.");
+            Dictionary<string, object> cfg;
+            try { cfg = Json().Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(all, start, n)); }
+            catch (Exception) { throw new InvalidDataException("Invalid session configuration."); }
+            if (cfg == null) throw new InvalidDataException("Invalid session configuration.");
+            return cfg;
+        }
+        // https, or http on loopback, with no path, user, query or fragment.
+        static void CheckOrigin(Dictionary<string, object> cfg) {
+            Uri origin;
+            if (!(Value(cfg, "origin") is string) || !Uri.TryCreate((string)cfg["origin"], UriKind.Absolute, out origin)
+                || (origin.Scheme != "https" && !(origin.Scheme == "http" && origin.IsLoopback))
+                || origin.AbsolutePath != "/" || origin.UserInfo != "" || origin.Query != "" || origin.Fragment != "")
+                throw new InvalidDataException("Invalid support server.");
         }
         // The length of the exe without its appended session configuration. The corner window's copy is cut there,
         // so the file a signed-in user can read carries no attach key.
@@ -1470,6 +1504,75 @@ namespace SupportMcp {
                 Arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(script)),
                 UseShellExecute = false, CreateNoWindow = true
             });
+        }
+    }
+
+    // The saved PC's client for the /device/ wire (docs/relay-v1-spec.md): pair or ask to join, check in, change its
+    // own settings, and leave on uninstall. Every request is POST JSON with "protocol": 1, the key (when it has one) in
+    // the Authorization header and never the URL, TLS 1.2 switched on first (Windows 7 cannot reach an https relay
+    // without it), 30-second timeouts, the default proxy and no redirects. A response over the cap, or one that does not
+    // parse, is read as offline, so a hostile answer cannot grow the process. It runs no command and sees no screen.
+    public sealed class DeviceLink {
+        public enum DeviceResult { Ok, Pending, CodeInvalid, Removed, UpdateNeeded, Offline, Refused }
+        // Result: the outcome below. Status: the HTTP status, 0 when the request never got an answer. Body: the parsed
+        // JSON answer, or null. Message: the relay's own error message, for a Refused result.
+        public sealed class Answer {
+            public readonly DeviceResult Result; public readonly int Status; public readonly Dictionary<string, object> Body; public readonly string Message;
+            public Answer(DeviceResult result, int status, Dictionary<string, object> body, string message) { Result = result; Status = status; Body = body; Message = message; }
+            // A 2xx answer, whether the PC is active (Ok) or waiting for approval (Pending).
+            public bool Ok { get { return Result == DeviceResult.Ok || Result == DeviceResult.Pending; } }
+        }
+        public const int Protocol = 1, ResponseCap = 65536;
+        readonly string origin;
+        public DeviceLink(string origin) { this.origin = origin; }
+        public Answer Pair(Dictionary<string, object> body) { return Send("/device/pair", body, null); }
+        public Answer Hello(string key, Dictionary<string, object> body) { return Send("/device/hello", body, key); }
+        public Answer Update(string key, Dictionary<string, object> body) { return Send("/device/update", body, key); }
+        public Answer Leave(string key) { return Send("/device/leave", Wire.Map(), key); }
+        Answer Send(string path, Dictionary<string, object> body, string key) {
+            try {
+                ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2 on .NET 4.5.2
+                var req = (HttpWebRequest)WebRequest.Create(origin + path);
+                req.Method = "POST"; req.ContentType = "application/json"; req.AllowAutoRedirect = false;
+                req.Timeout = 30000; req.ReadWriteTimeout = 30000;
+                req.Proxy = WebRequest.DefaultWebProxy;
+                if (key != null) req.Headers["Authorization"] = "Bearer " + key;
+                var full = new Dictionary<string, object>(body); full["protocol"] = Protocol;
+                byte[] bytes = Encoding.UTF8.GetBytes(Wire.Json().Serialize(full)); req.ContentLength = bytes.Length;
+                using (var stream = req.GetRequestStream()) stream.Write(bytes, 0, bytes.Length);
+                using (var response = (HttpWebResponse)req.GetResponse()) return Read((int)response.StatusCode, response);
+            } catch (WebException e) {
+                var r = e.Response as HttpWebResponse;
+                if (r == null) return new Answer(DeviceResult.Offline, 0, null, "");
+                using (r) return Read((int)r.StatusCode, r);
+            } catch (Exception) {
+                return new Answer(DeviceResult.Offline, 0, null, "");
+            }
+        }
+        static Answer Read(int status, HttpWebResponse response) {
+            Dictionary<string, object> body = null;
+            try {
+                using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8)) {
+                    char[] buf = new char[8192]; var data = new StringBuilder(); int n;
+                    while ((n = reader.Read(buf, 0, buf.Length)) > 0) { if (data.Length + n > ResponseCap) break; data.Append(buf, 0, n); }
+                    body = Wire.Json().Deserialize<Dictionary<string, object>>(data.ToString());
+                }
+            } catch (Exception) { }
+            return Map(status, body);
+        }
+        // The pinned mapping. A 2xx with no readable body is unexpected, so it counts as offline and the caller retries.
+        static Answer Map(int status, Dictionary<string, object> body) {
+            string code = "", message = "";
+            object err;
+            if (body != null && body.TryGetValue("error", out err) && err is Dictionary<string, object>) {
+                var e = (Dictionary<string, object>)err; code = Wire.Text(e, "code"); message = Wire.Text(e, "message");
+            }
+            if (status == 200 || status == 201) return body != null ? new Answer(DeviceResult.Ok, status, body, "") : new Answer(DeviceResult.Offline, 0, null, "");
+            if (status == 202) return body != null ? new Answer(DeviceResult.Pending, status, body, "") : new Answer(DeviceResult.Offline, 0, null, "");
+            if (status == 401) return new Answer(DeviceResult.Removed, status, body, message);
+            if (status == 426) return new Answer(DeviceResult.UpdateNeeded, status, body, message);
+            if (status == 404 && code == "code_invalid") return new Answer(DeviceResult.CodeInvalid, status, body, message);
+            return new Answer(DeviceResult.Refused, status, body, message);
         }
     }
 

@@ -108,6 +108,40 @@ public sealed class FakeRelay : IDisposable {
     public void Dispose() { Closed = true; Agent.Stop(); if (agentThread.ThreadState != System.Threading.ThreadState.Unstarted) agentThread.Join(20000); Agent.Dispose(); listener.Close(); server.Join(1000); }
 }
 
+// A fake /device/ relay for DeviceLink, on an HttpListener like FakeRelay. Status and Body are what it answers next;
+// LastPath, LastAuth and LastJson record the request it saw; Refuse drops the connection, so the client reads offline.
+sealed class FakeDevice : IDisposable {
+    readonly HttpListener listener = new HttpListener();
+    readonly Thread server;
+    public readonly string Origin;
+    public volatile int Status = 200;
+    public volatile string Body = "{\"protocol\":1}";
+    public volatile string LastPath = "", LastAuth, LastJson = "";
+    public volatile bool Refuse;
+    public FakeDevice() {
+        var tcp = new TcpListener(IPAddress.Loopback, 0); tcp.Start(); int port = ((IPEndPoint)tcp.LocalEndpoint).Port; tcp.Stop();
+        Origin = "http://127.0.0.1:" + port;
+        listener.Prefixes.Add(Origin + "/"); listener.Start();
+        server = new Thread(Serve); server.IsBackground = true; server.Start();
+    }
+    void Serve() {
+        try { while (listener.IsListening) { var ctx = listener.GetContext(); ThreadPool.QueueUserWorkItem(delegate { Reply(ctx); }); } }
+        catch (HttpListenerException) { } catch (ObjectDisposedException) { }
+    }
+    void Reply(HttpListenerContext ctx) {
+        try {
+            if (Refuse) { ctx.Response.Abort(); return; }
+            LastPath = ctx.Request.Url.AbsolutePath; LastAuth = ctx.Request.Headers["Authorization"];
+            using (var r = new StreamReader(ctx.Request.InputStream)) LastJson = r.ReadToEnd();
+            byte[] bytes = Encoding.UTF8.GetBytes(Body);
+            ctx.Response.StatusCode = Status; ctx.Response.ContentType = "application/json"; ctx.Response.ContentLength64 = bytes.Length;
+            ctx.Response.OutputStream.Write(bytes, 0, bytes.Length); ctx.Response.Close();
+        } catch (Exception) { try { ctx.Response.Abort(); } catch (Exception) { } }
+    }
+    public Dictionary<string, object> Sent() { return Wire.Json().Deserialize<Dictionary<string, object>>(LastJson); }
+    public void Dispose() { try { listener.Close(); } catch (Exception) { } server.Join(1000); }
+}
+
 public static class AppTests {
     static void Assert(bool ok, string detail) { if (!ok) throw new Exception(detail); }
     static string Decode(Dictionary<string, object> r, string key) { return Encoding.UTF8.GetString(Convert.FromBase64String(Wire.Text(r, key))); }
@@ -122,6 +156,83 @@ public static class AppTests {
     static void Throws(Action action, string part) {
         try { action(); } catch (ArgumentException e) { Assert(e.Message.Contains(part), "Wrong message: " + e.Message); return; }
         throw new Exception("Expected an error containing: " + part);
+    }
+    static void ThrowsData(Action action, string detail) {
+        try { action(); } catch (InvalidDataException) { return; }
+        throw new Exception("Expected an InvalidDataException: " + detail);
+    }
+    // An exe with a footer, built like the relay's overlay: body bytes, the JSON, its length, then the magic string.
+    static byte[] Overlay(Dictionary<string, object> cfg) {
+        byte[] body = new byte[] { 77, 90, 1, 2, 3 }, json = Encoding.UTF8.GetBytes(Wire.Json().Serialize(cfg));
+        var ms = new MemoryStream(); ms.Write(body, 0, body.Length); ms.Write(json, 0, json.Length);
+        byte[] n = BitConverter.GetBytes(json.Length); ms.Write(n, 0, n.Length);
+        byte[] footer = Encoding.ASCII.GetBytes(Wire.Footer); ms.Write(footer, 0, footer.Length);
+        return ms.ToArray();
+    }
+    static List<Dictionary<string, object>> BadDeviceFooters() {
+        var list = new List<Dictionary<string, object>>();
+        list.Add(Wire.Map("kind", "device", "origin", "https://support.example.com", "code", "ABCDE-FGH23", "workspace", "acme")); // both
+        list.Add(Wire.Map("kind", "device", "origin", "https://support.example.com", "code", "ABCDE-FGH2")); // short
+        list.Add(Wire.Map("kind", "device", "origin", "https://support.example.com", "code", "ABCDE-FGH0I")); // 0 and I are not in the alphabet
+        list.Add(Wire.Map("kind", "device", "origin", "https://support.example.com", "workspace", "Acme")); // uppercase slug
+        list.Add(Wire.Map("kind", "device", "origin", "https://support.example.com", "workspace", "")); // empty slug
+        list.Add(Wire.Map("kind", "device", "origin", "https://support.example.com", "extra", "1")); // an unknown field
+        list.Add(Wire.Map("kind", "device", "origin", "http://evil.example.com")); // http that is not loopback
+        list.Add(Wire.Map("kind", "device", "origin", "https://support.example.com/path")); // an origin with a path
+        list.Add(Wire.Map("kind", "other", "origin", "https://support.example.com")); // not a device kind
+        list.Add(Wire.Map("kind", "device")); // no origin
+        return list;
+    }
+    // ReadConfig takes a session footer and refuses a device footer; ReadDevice does the reverse. The kind is read first.
+    static void FooterReaderTests() {
+        byte[] session = Overlay(Wire.Map("sid", new string('a', 64), "key", new string('b', 64), "origin", "https://support.example.com"));
+        Assert(Wire.Kind(session) == "" && Wire.Text(Wire.ReadConfig(session), "sid") == new string('a', 64), "A session footer parses as a session");
+        ThrowsData(delegate { Wire.ReadDevice(session); }, "a session footer is not a setup footer");
+        byte[] device = Overlay(Wire.Map("kind", "device", "origin", "https://support.example.com", "code", "ABCDE-FGH23"));
+        Assert(Wire.Kind(device) == "device", "The kind is read first");
+        var d = Wire.ReadDevice(device);
+        Assert(Wire.Text(d, "code") == "ABCDE-FGH23" && Wire.Text(d, "origin") == "https://support.example.com", "A device footer with a code parses");
+        ThrowsData(delegate { Wire.ReadConfig(device); }, "no session role runs on a device footer");
+        Assert(Wire.Text(Wire.ReadDevice(Overlay(Wire.Map("kind", "device", "origin", "https://support.example.com", "workspace", "acme-1"))), "workspace") == "acme-1", "A workspace footer parses");
+        Assert(!Wire.ReadDevice(Overlay(Wire.Map("kind", "device", "origin", "https://support.example.com"))).ContainsKey("code"), "A plain device footer carries no code");
+        Assert(Wire.Text(Wire.ReadDevice(Overlay(Wire.Map("kind", "device", "origin", "http://127.0.0.1:8787"))), "origin") == "http://127.0.0.1:8787", "Loopback http is allowed for a device footer");
+        foreach (Dictionary<string, object> bad in BadDeviceFooters()) ThrowsData(delegate { Wire.ReadDevice(Overlay(bad)); }, Wire.Json().Serialize(bad));
+        Console.WriteLine("PASS a setup footer parses, a session footer still parses, and each footer reader refuses the other");
+    }
+    // DeviceLink against a fake /device/ relay: every status maps, the key goes in the header, and a drop is offline.
+    static void DeviceLinkTests() {
+        using (var relay = new FakeDevice()) {
+            var link = new DeviceLink(relay.Origin);
+            relay.Status = 201; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "status", "active", "workspace", "default", "device_id", new string('a', 20), "key", "smd1.default.id.secret"));
+            var a = link.Pair(Wire.Map("code", "ABCDE-FGH23", "name", "Front desk", "access", "any", "control", "full"));
+            Assert(a.Result == DeviceLink.DeviceResult.Ok && a.Ok && Wire.Text(a.Body, "key").StartsWith("smd1.") && Wire.Text(a.Body, "status") == "active", "A 201 pair is Ok with the key and the device id");
+            Assert(relay.LastPath == "/device/pair" && relay.LastAuth == null, "pair posts to /device/pair with no key");
+            Assert(Wire.Number(relay.Sent(), "protocol") == 1 && Wire.Text(relay.Sent(), "code") == "ABCDE-FGH23", "Every request carries protocol 1");
+            relay.Status = 202; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "status", "pending", "confirm", "482913", "key", "smd1.default.id.secret", "expires_at", 1));
+            Assert(link.Pair(Wire.Map("workspace", "acme")).Result == DeviceLink.DeviceResult.Pending, "A 202 pair is Pending");
+            relay.Status = 404; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "error", Wire.Map("code", "code_invalid", "message", "this code is not valid")));
+            Assert(link.Pair(Wire.Map("code", "ZZZZZ-ZZZZZ")).Result == DeviceLink.DeviceResult.CodeInvalid, "A 404 code_invalid is CodeInvalid");
+            relay.Status = 400; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "error", Wire.Map("code", "bad_request", "message", "send code or workspace")));
+            var refused = link.Pair(Wire.Map());
+            Assert(refused.Result == DeviceLink.DeviceResult.Refused && refused.Message == "send code or workspace", "A refusal carries the relay's own message");
+            relay.Status = 200; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "device", Wire.Map("id", "d", "workspace", "default", "status", "active", "name", "PC", "access", "ask", "control", "limited", "site_id", null)));
+            var h = link.Hello("smd1.default.id.secret", Wire.Map("os", "Windows 11", "machine", "POS-1", "app_version", "0.4.0"));
+            Assert(h.Result == DeviceLink.DeviceResult.Ok && relay.LastAuth == "Bearer smd1.default.id.secret" && relay.LastPath == "/device/hello", "hello sends the key in the Authorization header, never the URL");
+            Assert(Wire.Text(h.Body["device"] as Dictionary<string, object>, "access") == "ask", "hello returns the device the relay sent");
+            relay.Status = 401; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "error", Wire.Map("code", "device_unknown", "message", "this key is not valid")));
+            Assert(link.Hello("smd1.k", Wire.Map()).Result == DeviceLink.DeviceResult.Removed, "A 401 is Removed");
+            relay.Status = 426; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "error", Wire.Map("code", "protocol_unsupported", "message", "update needed"), "supported", Wire.Map("min", 2, "max", 2)));
+            Assert(link.Hello("smd1.k", Wire.Map()).Result == DeviceLink.DeviceResult.UpdateNeeded, "A 426 is UpdateNeeded");
+            relay.Status = 200; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "device", Wire.Map("id", "d", "status", "active")));
+            link.Update("smd1.k", Wire.Map("access", "any"));
+            Assert(relay.LastPath == "/device/update" && Wire.Text(relay.Sent(), "access") == "any" && relay.LastAuth == "Bearer smd1.k", "update posts the change with the key");
+            relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "removed", true));
+            link.Leave("smd1.k");
+            Assert(relay.LastPath == "/device/leave" && relay.Sent().Count == 1 && Wire.Number(relay.Sent(), "protocol") == 1, "leave posts only the protocol, with the key");
+            relay.Refuse = true;
+            Assert(link.Hello("smd1.k", Wire.Map()).Result == DeviceLink.DeviceResult.Offline && link.Hello("smd1.k", Wire.Map()).Status == 0, "A dropped connection is Offline with no status");
+        }
+        Console.WriteLine("PASS the device client speaks the /device/ wire: pair, check-in, update and leave, with status mapping and offline");
     }
     // The focus the confirm gives back: only to the window that had it, only while the support window still holds it.
     static void FocusReturnTests() {
@@ -1271,6 +1382,8 @@ public static class AppTests {
             ClientRuleTests(dir);
             LaneTests();
             LiveScreenTests();
+            FooterReaderTests();
+            DeviceLinkTests();
             // The downloaded PE overlay must be readable by the actual .NET client.
             string overlay = Path.Combine(dir, "overlay.exe"); byte[] cfg = Encoding.UTF8.GetBytes(Wire.Json().Serialize(Wire.Map("sid", new string('a', 64), "key", new string('b', 64), "origin", "https://support.example.com", "startup_expires_at", Client.UnixNow() + 10000)));
             using (var f = File.Create(overlay)) { f.WriteByte(77); f.WriteByte(90); f.Write(cfg, 0, cfg.Length); byte[] n = BitConverter.GetBytes(cfg.Length); f.Write(n, 0, n.Length); byte[] footer = Encoding.ASCII.GetBytes(Wire.Footer); f.Write(footer, 0, footer.Length); }
