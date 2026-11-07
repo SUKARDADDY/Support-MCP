@@ -1536,7 +1536,8 @@ namespace SupportMcp {
         // which the caller strips (Wire.Payload) before it checks the exe against the signed note. Null for anything but a
         // 200, a body over DownloadCap, a drop, or a download that takes longer than DownloadMs in all. The same TLS,
         // proxy and no-redirect rules as the wire.
-        public const int DownloadCap = 2 * 1024 * 1024, DownloadMs = 120000;
+        public const int DownloadCap = 2 * 1024 * 1024;
+        internal static int DownloadMs = 120000; // the whole download's deadline; the native tests shorten it
         public byte[] Download() {
             System.Threading.Timer deadline = null;
             try {
@@ -1547,14 +1548,15 @@ namespace SupportMcp {
                 req.Proxy = WebRequest.DefaultWebProxy;
                 req.Headers["Origin"] = origin;
                 // ReadWriteTimeout limits each read; this ends a body that keeps trickling in.
-                deadline = new System.Threading.Timer(delegate { try { req.Abort(); } catch (Exception) { } }, null, DownloadMs, Timeout.Infinite);
+                int deadlineMs = DownloadMs;
+                deadline = new System.Threading.Timer(delegate { try { req.Abort(); } catch (Exception) { } }, null, deadlineMs, Timeout.Infinite);
                 var clock = Stopwatch.StartNew();
                 using (var response = (HttpWebResponse)req.GetResponse()) {
                     if ((int)response.StatusCode != 200 || response.ContentLength > DownloadCap) return null;
                     using (var stream = response.GetResponseStream()) {
                         var data = new MemoryStream(); byte[] buf = new byte[65536]; int n;
                         while ((n = stream.Read(buf, 0, buf.Length)) > 0) {
-                            if (data.Length + n > DownloadCap || clock.ElapsedMilliseconds > DownloadMs) return null;
+                            if (data.Length + n > DownloadCap || clock.ElapsedMilliseconds > deadlineMs) return null;
                             data.Write(buf, 0, n);
                         }
                         return data.ToArray();
@@ -4389,6 +4391,7 @@ namespace SupportMcp {
         FileStream stagedHold; string stagedFile = "";
         Process switcher;
         string lastTry = ""; long lastTryAt;
+        long soonMs; // a trial asks the loop to come back this soon (a hello to retry, or a commit to try again)
 
         public DeviceService(string exe) {
             this.exe = exe; folder = Path.GetDirectoryName(exe);
@@ -4403,8 +4406,9 @@ namespace SupportMcp {
                 if (!Prepare()) return; // no device.json, or a damaged one: nothing to run
                 try { uninstall = OpenUninstall(true, EventWaitHandleRights.FullControl); } catch (Exception) { uninstall = null; }
                 StartPipe();
-                // A removed or expired PC keeps serving the pipe (so the tray shows it) but never checks in again.
-                if (!terminal) Loop();
+                // A removed or expired PC keeps serving the pipe (so the tray shows it) but never checks in again. The
+                // loop still runs while its trial is open, until the commit gets through.
+                if (!terminal || trial) Loop();
             } catch (Exception) { }
         }
         void StartPipe() {
@@ -4431,18 +4435,41 @@ namespace SupportMcp {
         // Everything before the loop: an update's open trial first (UpdateSwitch.OnStart), then device.json. A removed or
         // expired PC never checks in, so its trial is committed at once. Outside a trial, old version files go (Tidy).
         bool Prepare() {
-            UpdateSwitch.Start start;
-            try { start = UpdateSwitch.OnStart(UpdateState.Load(folder), exe); } catch (Exception) { start = UpdateSwitch.Start.Normal; }
-            if (start == UpdateSwitch.Start.Interrupted) {
+            UpdateSwitch.Start start = UpdateSwitch.Start.Normal;
+            try { var st = UpdateState.TryLoad(folder); if (st != null) start = UpdateSwitch.OnStart(st, exe, Client.UnixNow()); } catch (Exception) { }
+            if (start == UpdateSwitch.Start.Interrupted || start == UpdateSwitch.Start.Stale) {
                 var m = DeviceUpdate.Lock(30000);
-                if (m != null) { try { DeviceUpdate.RollBackLocked(folder, false); } catch (Exception) { } finally { DeviceUpdate.Unlock(m); } }
+                if (m != null) {
+                    try {
+                        if (start == UpdateSwitch.Start.Interrupted) DeviceUpdate.RollBackLocked(folder, false, false);
+                        else DeviceUpdate.ClearStale(folder, exe);
+                    } catch (Exception) { } finally { DeviceUpdate.Unlock(m); }
+                }
             }
+            // A rollback was decided and written down, but cut short (a restart midway): finish it.
+            if (start == UpdateSwitch.Start.ResumeRollback) StartRollback();
             trial = start == UpdateSwitch.Start.Trial;
+            if (trial) BeginTrial();
             if (!Load()) return false;
             link = new DeviceLink(origin);
-            if (trial && terminal) FinishTrial(DeviceLink.DeviceResult.Ok);
+            if (trial && terminal) FinishTrial(DeviceLink.DeviceResult.Ok, 200);
             if (!trial) Tidy();
             return true;
+        }
+        // This version starts on trial: it records that it started (so an interrupted trial blames it only if it ran),
+        // gives itself a fresh trial window, and starts the old file's deadline watcher, so the trial ends even when the
+        // switch that opened it is gone (a restart midway).
+        void BeginTrial() {
+            var m = DeviceUpdate.Lock(30000);
+            if (m != null) {
+                try {
+                    var st = UpdateState.TryLoad(folder);
+                    if (st != null && UpdateSwitch.OnStart(st, exe, Client.UnixNow()) == UpdateSwitch.Start.Trial) {
+                        st.Started = true; st.Deadline = Math.Max(st.Deadline, Client.UnixNow() + DeviceUpdate.TrialMs); st.Save(folder);
+                    }
+                } catch (Exception) { } finally { DeviceUpdate.Unlock(m); }
+            }
+            Launch(DeviceUpdate.WatchArgs);
         }
         void LoadHistory() {
             try {
@@ -4457,11 +4484,14 @@ namespace SupportMcp {
             while (!stop.WaitOne(0)) {
                 try {
                     if (ui == null) StartPipe(); // retry a pipe the service could not create (a squatter held the name)
-                    CheckIn(ref backoff);
+                    // A removed or expired PC sends nothing; it only commits a trial still open.
+                    if (!terminal) CheckIn(ref backoff); else if (trial) FinishTrial(DeviceLink.DeviceResult.Ok, 200);
                     if (stop.WaitOne(0)) break;
-                    Schedule sched; lock (gate) sched = lastSchedule;
-                    if (sched == Schedule.Stopped) break; // removed or expired: stop checking in for good; the pipe keeps serving
+                    Schedule sched; bool done; lock (gate) { sched = lastSchedule; done = terminal; }
+                    if (done && !trial) break; // removed or expired: stop checking in for good; the pipe keeps serving
                     long delay = sched == Schedule.Backoff ? backoff : sched == Schedule.Update ? UpdateEveryMs : NextCheckDelay(jitter);
+                    // A trial asks to come back sooner: a hello to retry, or a commit that found the lock busy.
+                    if (soonMs > 0) { delay = Math.Min(delay, soonMs); soonMs = 0; }
                     int which = WaitHandle.WaitAny(waits, (int)Math.Min(delay, int.MaxValue));
                     if (which == 0 || (uninstall != null && which == 2)) break;
                 } catch (Exception) {
@@ -4507,24 +4537,40 @@ namespace SupportMcp {
                     state = newState; backoff = NextBackoff(backoff);
                 }
             }
-            if (trial) FinishTrial(result);
+            if (trial) FinishTrial(result, a.Status);
             else if (result == DeviceLink.DeviceResult.Ok || result == DeviceLink.DeviceResult.UpdateNeeded) MaybeUpdate(a.Body);
         }
 
         // ---- updates (Updater, DeviceUpdate) -----------------------------------------------------------------------
-        // The first check-in pass of a version on trial. A 426 means this version cannot work with the relay, so the old
-        // one comes back; anything else (an answer, a 401, a refusal, no network) means it runs, so the trial is committed.
-        void FinishTrial(DeviceLink.DeviceResult result) {
-            if (!UpdateSwitch.Healthy(result)) { trial = false; StartRollback(); return; }
+        // A check-in pass of a version on trial (UpdateSwitch.TrialHealth). An answer (200 or 202) or a 401 commits. A 426
+        // or any other refusal means this version cannot work with the relay, so the old one comes back. No network or a
+        // server error keeps the trial open and tries the hello again about every 30 seconds; still so near the deadline,
+        // the trial is committed, since a network failure is not the new version's fault.
+        void FinishTrial(DeviceLink.DeviceResult result, int status) {
+            var health = UpdateSwitch.TrialHealth(result, status);
+            if (health == UpdateSwitch.Health.Unhealthy) { trial = false; StartRollback(); return; }
+            if (health == UpdateSwitch.Health.Retry) {
+                UpdateState st = null;
+                try { st = UpdateState.TryLoad(folder); } catch (Exception) { }
+                if (st == null || !UpdateSwitch.DecideNow(Client.UnixNow(), st.Deadline)) { soonMs = UpdateSwitch.RetryHelloMs; return; }
+            }
             string version;
             var done = DeviceUpdate.Commit(folder, exe, out version);
-            if (done == DeviceUpdate.Committed.Busy) return; // the next pass tries again
+            if (done == DeviceUpdate.Committed.Busy) { soonMs = UpdateSwitch.CommitRetryMs; return; } // the lock was held: again in seconds
             trial = false;
             if (done == DeviceUpdate.Committed.Done) { lock (gate) AddLine("Support updated to version " + version + "."); }
             Tidy();
         }
-        void StartRollback() {
-            try { var st = UpdateState.Load(folder); if (st.InTrial && File.Exists(st.From)) { var p = run(st.From, DeviceUpdate.RollbackArgs); if (p != null) p.Dispose(); } } catch (Exception) { }
+        void StartRollback() { Launch(DeviceUpdate.RollbackArgs); }
+        // Starts the rollback or the deadline watcher of the open trial: from the old file, or from this one when the old
+        // file is gone (the rollback then closes the trial and keeps this version, as there is nothing to go back to).
+        void Launch(string args) {
+            try {
+                var st = UpdateState.TryLoad(folder);
+                if (st == null || !st.InTrial) return;
+                var p = run(File.Exists(st.From) ? st.From : exe, args);
+                if (p != null) p.Dispose();
+            } catch (Exception) { }
         }
         // An offered release (the "update" of a hello or a 426): check its signature, note and version, download it,
         // check the size and SHA-256, write it as its own version file and start the switch. Nothing is shown. A release
@@ -4534,13 +4580,16 @@ namespace SupportMcp {
             object offered;
             if (body == null || !body.TryGetValue("update", out offered) || !(offered is Dictionary<string, object>)) return;
             if (switching) {
-                // A switch that ended without stopping this service (refused, or busy with an install or uninstall).
-                if (switcher == null || !switcher.HasExited) return;
+                // A switch that ended without stopping this service (refused, or busy with an install or uninstall). A
+                // switch that never started (no process) counts as ended, so switching cannot stick.
+                bool over;
+                try { over = switcher == null || switcher.HasExited; } catch (Exception) { over = true; }
+                if (!over) return;
                 DropStaged();
             }
             try {
-                var st = UpdateState.Load(folder);
-                if (st.InTrial) return;
+                var st = UpdateState.TryLoad(folder);
+                if (st == null || st.InTrial) return; // unreadable now, or a trial open: not now
                 string reason;
                 var note = Updater.Check((Dictionary<string, object>)offered, Wire.Version, st.Failed, releaseKey, out reason);
                 if (note == null) return;
@@ -4552,7 +4601,8 @@ namespace SupportMcp {
                 if (n < 0) return;
                 string file = Stage(all, n, note);
                 if (file == null) return;
-                st = UpdateState.Load(folder);
+                st = UpdateState.TryLoad(folder);
+                if (st == null || st.InTrial) { DropStaged(); return; } // never write a record over one that cannot be read
                 st.StagedFile = file; st.StagedVersion = note.Version; st.StagedSha = note.Sha256; st.StagedSize = note.Size;
                 st.Save(folder);
                 switching = true;
@@ -4561,42 +4611,51 @@ namespace SupportMcp {
         }
         // Writes the exe as support-<version>-<8 hex>.exe in the install folder, with the app's ACL (FullAcl.Window) from
         // the moment it exists, then reads it back and hashes it through a handle that denies writing. That handle stays
-        // open until this service stops for the switch. Null when anything fails, and then nothing is left behind.
+        // open until this service stops for the switch, or DropStaged lets it go. Null when anything fails, and then
+        // nothing is left behind and no handle stays open.
         string Stage(byte[] all, int n, ReleaseNote note) {
             string file = Path.Combine(folder, UpdateSwitch.VersionFileName(note.Version, Elevation.Nonce().Substring(0, 8)));
             FileStream hold = null; bool made = false;
             try {
-                using (var w = new FileStream(file, FileMode.CreateNew, FileSystemRights.Write, FileShare.None, 4096, FileOptions.WriteThrough, FullAcl.Window())) { made = true; w.Write(all, 0, n); }
+                using (var w = new FileStream(file, FileMode.CreateNew, FileSystemRights.Write, FileShare.None, 4096, FileOptions.WriteThrough, FullAcl.Window())) { made = true; w.Write(all, 0, n); w.Flush(true); }
                 hold = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read);
                 if (hold.Length != note.Size || ReleaseKey.Sha256Hex(hold) != note.Sha256) throw new InvalidDataException("the written file does not match the note");
                 stagedHold = hold; stagedFile = file;
                 return file;
             } catch (Exception) {
-                if (hold != null) hold.Dispose();
+                if (hold != null) try { hold.Dispose(); } catch (Exception) { }
                 if (made) try { File.Delete(file); } catch (Exception) { }
                 return null;
             }
         }
-        // Lets go of a staged file the switch did not take: the handle, the record and the file.
+        // Lets go of a staged file the switch did not take: the process, the handle, the record and the file.
         void DropStaged() {
-            switching = false; switcher = null;
+            switching = false;
+            if (switcher != null) { try { switcher.Dispose(); } catch (Exception) { } switcher = null; }
             if (stagedHold != null) { try { stagedHold.Dispose(); } catch (Exception) { } stagedHold = null; }
             if (stagedFile.Length == 0) return;
-            try { var st = UpdateState.Load(folder); if (!st.InTrial && UpdateSwitch.Same(st.StagedFile, stagedFile)) { st.ClearStaged(); st.Save(folder); } } catch (Exception) { }
+            try { var st = UpdateState.TryLoad(folder); if (st != null && !st.InTrial && UpdateSwitch.Same(st.StagedFile, stagedFile)) { st.ClearStaged(); st.Save(folder); } } catch (Exception) { }
             try { File.Delete(stagedFile); } catch (Exception) { }
             stagedFile = "";
         }
         // Outside a trial: forgets a staged file no switch took, and deletes every version file but this one and the
-        // previous one, or queues one that a tray still runs for removal at the next restart.
+        // previous one. One that a tray still runs is renamed aside first (a running exe can be renamed), and only that
+        // new name is queued for removal at the next restart, so a file installed later under the old name is never
+        // removed by it. Files set aside earlier and free by now go too.
         void Tidy() {
             try {
-                var st = UpdateState.Load(folder);
-                if (st.InTrial) return;
+                var st = UpdateState.TryLoad(folder);
+                if (st == null || st.InTrial) return;
                 if (st.StagedFile.Length > 0 && !UpdateSwitch.Same(st.StagedFile, stagedFile)) { st.ClearStaged(); st.Save(folder); }
                 foreach (string file in UpdateSwitch.Obsolete(Directory.GetFiles(folder, "support*.exe"), exe, st.Previous)) {
                     if (UpdateSwitch.Same(file, stagedFile)) continue;
-                    try { File.Delete(file); } catch (Exception) { try { Native.MoveFileEx(file, null, 4); } catch (Exception) { } }
+                    try { File.Delete(file); continue; } catch (Exception) { }
+                    string aside = Path.Combine(folder, UpdateSwitch.AsideName(Path.GetFileName(file), Elevation.Nonce().Substring(0, 8)));
+                    try { File.Move(file, aside); } catch (Exception) { continue; } // not even renamed: the next tidy tries again
+                    try { Native.MoveFileEx(aside, null, 4); } catch (Exception) { }
                 }
+                foreach (string file in Directory.GetFiles(folder, "support*" + UpdateSwitch.AsideSuffix))
+                    if (UpdateSwitch.IsAside(Path.GetFileName(file))) try { File.Delete(file); } catch (Exception) { }
             } catch (Exception) { }
         }
         // A SYSTEM child in session 0 with no window, started in the system folder.
@@ -4655,19 +4714,16 @@ namespace SupportMcp {
             try {
                 string file = Path.Combine(folder, "history.json");
                 System.Collections.ArrayList list = null;
-                try { list = Wire.Json().Deserialize<System.Collections.ArrayList>(File.ReadAllText(file)); } catch (Exception) { }
-                if (list == null) list = new System.Collections.ArrayList();
+                string text0 = UpdateState.ReadShared(file); // null when there is no file; throws when it cannot be read now
+                try { if (text0 != null) list = Wire.Json().Deserialize<System.Collections.ArrayList>(text0); } catch (Exception) { }
+                if (list == null) list = new System.Collections.ArrayList(); // missing or damaged: start a new one
                 list.Add(Wire.Map("at", Client.UnixNow(), "text", text)); TrimHistory(list);
                 WriteAtomic(file, Wire.Json().Serialize(list));
             } catch (Exception) { }
         }
-        // A crash midway must never leave a half-written file: write a sibling temp and swap it in.
+        // A crash midway must never leave a half-written file: write a sibling temp, flushed to disk, and swap it in.
         static void WriteAtomic(string file, string text) {
-            try {
-                string temp = file + ".new";
-                File.WriteAllText(temp, text);
-                if (File.Exists(file)) File.Replace(temp, file, null); else File.Move(temp, file);
-            } catch (Exception) { }
+            try { UpdateState.WriteReplace(file, text); } catch (Exception) { }
         }
 
         // The Global uninstall event, created by the service (SYSTEM) and watched by every tray. Interactive users may
@@ -4867,31 +4923,40 @@ namespace SupportMcp {
 
     // update.json beside device.json, with the locked folder's ACL: the versions that failed their trial (never taken
     // again), the file of the version before the current one (kept as the last good one), the version file the service
-    // staged for the switch with its size and SHA-256, and an open trial. Written whole through a temp file.
+    // staged for the switch with its size and SHA-256, and an open trial. Written whole through a temp file flushed to
+    // disk, and read with every sharing mode, so a reader never blocks a writer. A read-modify-write that cannot read
+    // the file (TryLoad null) writes nothing, so an unreadable record is never replaced by an empty one.
     //   {"failed":[...],"previous":"<exe>","staged":{"file","version","sha256","size"},
-    //    "trial":{"phase":"trial"|"rollback","from","from_version","to","version","deadline"}}
+    //    "trial":{"phase":"trial"|"rollback","from","from_version","to","version","deadline","started"}}
+    // started: the new version's service has run (DeviceService.BeginTrial), so an interrupted trial may blame it.
     public sealed class UpdateState {
         public const string FileName = "update.json", Trial = "trial", RollingBack = "rollback";
-        public const int FailedCap = 20;
+        public const int FailedCap = 20, SaveTries = 5;
         public readonly List<string> Failed = new List<string>();
         public string Previous = "";
         public string StagedFile = "", StagedVersion = "", StagedSha = ""; public long StagedSize;
-        public string Phase = "", From = "", FromVersion = "", To = "", Version = ""; public long Deadline;
+        public string Phase = "", From = "", FromVersion = "", To = "", Version = ""; public long Deadline; public bool Started;
         public bool InTrial { get { return Phase == Trial || Phase == RollingBack; } }
         public void AddFailed(string version) { if (!Failed.Contains(version)) Failed.Add(version); while (Failed.Count > FailedCap) Failed.RemoveAt(0); }
         public void ClearStaged() { StagedFile = StagedVersion = StagedSha = ""; StagedSize = 0; }
-        public void ClearTrial() { Phase = From = FromVersion = To = Version = ""; Deadline = 0; }
-        // A missing file is an empty state; a damaged one too, so a bad file never blocks the service.
+        public void ClearTrial() { Phase = From = FromVersion = To = Version = ""; Deadline = 0; Started = false; }
+        // A missing file is an empty state; a damaged one too, so a bad file never blocks the service. Read-only checks
+        // only: a caller that saves uses TryLoad.
         public static UpdateState Load(string folder) { return TryLoad(folder) ?? new UpdateState(); }
-        // null when the file exists but cannot be read now (a watcher then keeps watching).
+        // null when the file exists but cannot be read now, after a few short tries (a watcher then keeps watching, and
+        // a read-modify-write does nothing).
         public static UpdateState TryLoad(string folder) {
             var st = new UpdateState();
-            string file = Path.Combine(folder, FileName);
+            string file = Path.Combine(folder, FileName), text = null;
+            for (int i = 0; ; i++) {
+                try { text = ReadShared(file); break; }
+                catch (IOException) { if (i >= 2) return null; }
+                catch (UnauthorizedAccessException) { if (i >= 2) return null; }
+                Thread.Sleep(50);
+            }
+            if (text == null) return st;
             Dictionary<string, object> m;
-            try {
-                if (!File.Exists(file)) return st;
-                m = Wire.Json().Deserialize<Dictionary<string, object>>(File.ReadAllText(file));
-            } catch (IOException) { return null; } catch (UnauthorizedAccessException) { return null; } catch (Exception) { return st; }
+            try { m = Wire.Json().Deserialize<Dictionary<string, object>>(text); } catch (Exception) { return st; }
             if (m == null) return st;
             object o;
             if (m.TryGetValue("failed", out o) && o is System.Collections.ArrayList)
@@ -4906,33 +4971,70 @@ namespace SupportMcp {
                     var t = (Dictionary<string, object>)o;
                     st.Phase = Wire.Text(t, "phase"); st.From = Wire.Text(t, "from"); st.FromVersion = Wire.Text(t, "from_version");
                     st.To = Wire.Text(t, "to"); st.Version = Wire.Text(t, "version"); st.Deadline = Wire.Number(t, "deadline");
+                    object started; st.Started = t.TryGetValue("started", out started) && started is bool && (bool)started;
                     if (!st.InTrial) st.ClearTrial();
                 }
             } catch (Exception) { st.ClearStaged(); st.ClearTrial(); }
             return st;
         }
+        // Throws when update.json cannot be written after a few short tries; the caller then changes nothing more.
         public void Save(string folder) {
             var m = Wire.Map("failed", Failed.ToArray(), "previous", Previous);
             if (StagedFile.Length > 0) m["staged"] = Wire.Map("file", StagedFile, "version", StagedVersion, "sha256", StagedSha, "size", StagedSize);
-            if (InTrial) m["trial"] = Wire.Map("phase", Phase, "from", From, "from_version", FromVersion, "to", To, "version", Version, "deadline", Deadline);
-            string file = Path.Combine(folder, FileName), temp = file + ".new";
-            File.WriteAllText(temp, Wire.Json().Serialize(m));
-            if (File.Exists(file)) File.Replace(temp, file, null); else File.Move(temp, file);
+            if (InTrial) {
+                var t = Wire.Map("phase", Phase, "from", From, "from_version", FromVersion, "to", To, "version", Version, "deadline", Deadline);
+                if (Started) t["started"] = true;
+                m["trial"] = t;
+            }
+            WriteReplace(Path.Combine(folder, FileName), Wire.Json().Serialize(m));
+        }
+        // The whole text of file, read with every sharing mode (a writer may replace or delete it meanwhile). null when
+        // there is no file. Throws IOException or UnauthorizedAccessException when it cannot be read now.
+        internal static string ReadShared(string file) {
+            try {
+                using (var f = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                using (var r = new StreamReader(f, Encoding.UTF8)) return r.ReadToEnd();
+            } catch (FileNotFoundException) { return null; } catch (DirectoryNotFoundException) { return null; }
+        }
+        // Writes text to a sibling temp file, flushed to disk, and swaps it in for file. A few short tries, as a reader
+        // or a virus scanner may hold the file for a moment; the last failure is thrown.
+        internal static void WriteReplace(string file, string text) {
+            byte[] data = new UTF8Encoding(false).GetBytes(text);
+            string temp = file + ".new";
+            for (int i = 1; ; i++) {
+                try {
+                    using (var f = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough)) { f.Write(data, 0, data.Length); f.Flush(true); }
+                    if (File.Exists(file)) File.Replace(temp, file, null); else File.Move(temp, file);
+                    return;
+                } catch (IOException) { if (i >= SaveTries) throw; }
+                catch (UnauthorizedAccessException) { if (i >= SaveTries) throw; }
+                Thread.Sleep(100 * i);
+            }
         }
     }
 
     // The switch's rules, as pure functions the native tests drive.
     public static class UpdateSwitch {
-        // TrialMs: how long a new version has to finish its first check-in pass. StaleMs: past its deadline by this much,
-        // an open trial no longer makes uninstall wait. RetryMs: a release whose download or checks failed is tried again
-        // after this long at the earliest.
-        public const long TrialMs = 240000, StaleMs = 600000, RetryMs = 3600000;
+        // TrialMs: how long a new version has to finish a healthy check-in pass. StaleMs: past its deadline by this much,
+        // an open trial no longer makes uninstall wait, and a service it does not name clears it. RetryMs: a release whose
+        // download or checks failed is tried again after this long at the earliest. RetryHelloMs: a trial with no network
+        // (or a server error) tries its hello again this often. DecideBeforeMs: that close to the deadline, a trial still
+        // without a network commits, before the watcher would roll it back (a hello can itself take a minute to fail).
+        // CommitRetryMs: a commit that found the lock busy tries again this soon.
+        public const long TrialMs = 240000, StaleMs = 600000, RetryMs = 3600000, RetryHelloMs = 30000, DecideBeforeMs = 90000, CommitRetryMs = 5000;
         // --device-update and --device-update-rollback exit codes.
         public const int Ok = 0, Busy = 30, Refused = 31, RolledBack = 32;
-        public enum Start { Normal, Trial, Interrupted, Waiting }
+        public enum Start { Normal, Trial, Interrupted, Waiting, ResumeRollback, Stale }
+        public enum Health { Healthy, Unhealthy, Retry }
         static readonly System.Text.RegularExpressions.Regex VersionName = new System.Text.RegularExpressions.Regex(@"^support-(.+)-[0-9a-f]{8}\.exe\z",
             System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
         public static string VersionFileName(string version, string hex8) { return "support-" + version + "-" + hex8 + ".exe"; }
+        // An obsolete version file still in use is renamed to this before it is queued for removal at the next restart.
+        public const string AsideSuffix = ".del";
+        static readonly System.Text.RegularExpressions.Regex AsidePattern = new System.Text.RegularExpressions.Regex(@"^support[^\\/]*\.exe\.[0-9a-f]{8}\.del\z",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+        public static string AsideName(string name, string hex8) { return name + "." + hex8 + AsideSuffix; }
+        public static bool IsAside(string name) { return name != null && AsidePattern.IsMatch(name); }
         // support.exe (a fresh install) or support-<version>-<8 hex>.exe (an update).
         public static bool IsVersionFile(string name) {
             if (name == null) return false;
@@ -4951,18 +5053,30 @@ namespace SupportMcp {
                 return dir != null && string.Equals(dir.TrimEnd('\\'), Path.GetFullPath(folder).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
             } catch (Exception) { return false; }
         }
-        // What the service at self does at start about update.json. Trial: this version is on trial, and its first
-        // check-in pass decides. Interrupted: the trial away from this version never finished (a restart or a crash
-        // midway), so this version puts itself back. Waiting: a rollback is under way, or the record names other files:
-        // touch nothing.
-        public static Start OnStart(UpdateState st, string self) {
+        // What the service at self does at start about update.json, at now (Unix ms). Trial: this version is on trial, and
+        // its check-ins decide. Interrupted: the trial away from this version never finished (a restart or a crash
+        // midway), so this version puts itself back. ResumeRollback: the rollback away from this version was decided and
+        // written down but cut short, so this version starts it again. Stale: the record names other files and is past its
+        // deadline by StaleMs, so it is cleared (the failed versions and the previous file stay). Waiting: a rollback is
+        // under way, or a recent record names other files: touch nothing.
+        public static Start OnStart(UpdateState st, string self, long now) {
             if (!st.InTrial) return Start.Normal;
             if (st.Phase == UpdateState.Trial && Same(st.To, self)) return Start.Trial;
             if (Same(st.From, self)) return Start.Interrupted;
+            if (st.Phase == UpdateState.RollingBack && Same(st.To, self)) return Start.ResumeRollback;
+            if (now >= st.Deadline + StaleMs) return Start.Stale;
             return Start.Waiting;
         }
-        // How the first check-in pass of a trial ends: a 426 rolls back; an answer, a 401, a refusal or no network commits.
-        public static bool Healthy(DeviceLink.DeviceResult result) { return result != DeviceLink.DeviceResult.UpdateNeeded; }
+        // A check-in pass of a version on trial. Healthy: an answer (200 or 202) or a 401 (the PC was removed, which is
+        // not the version's fault). Retry: no network or a server error (5xx): try again, and decide at the deadline.
+        // Unhealthy: a 426 or any other refusal (a 4xx), so the old version comes back.
+        public static Health TrialHealth(DeviceLink.DeviceResult result, int status) {
+            if (result == DeviceLink.DeviceResult.Ok || result == DeviceLink.DeviceResult.Pending || result == DeviceLink.DeviceResult.Removed) return Health.Healthy;
+            if (result == DeviceLink.DeviceResult.Offline || status == 0 || status >= 500) return Health.Retry;
+            return Health.Unhealthy;
+        }
+        // A trial still without a network commits from DecideBeforeMs before its deadline on.
+        public static bool DecideNow(long now, long deadline) { return now >= deadline - DecideBeforeMs; }
         // The switch stops watching once the trial of file is committed, or someone else rolls it back.
         public static bool WatchOver(UpdateState st, string file) { return !(st.Phase == UpdateState.Trial && Same(st.To, file)); }
         // Uninstall waits for an open trial, but not for one long past its deadline: a stuck record must not block it.
@@ -4975,25 +5089,31 @@ namespace SupportMcp {
         }
     }
 
-    // --device-update <file> and --device-update-rollback, both SYSTEM with no window. The service, having staged a
-    // checked version file, starts its own exe with --device-update and that file. The switch takes the setup lock,
-    // records the trial in update.json, makes every failure of the service run the old exe with --device-update-rollback,
-    // stops the service, points the service, the tray's startup value and the Apps entry at the new file, and starts it.
-    // The new service ends its first check-in pass by committing the trial or, on a 426, starting the rollback; the
-    // switch rolls back itself when nothing has happened within TrialMs. A rollback points everything at the old file
-    // again, puts the normal restarts back and records the version as failed, so it is never taken again.
+    // --device-update <file> and --device-update-rollback [--at-deadline], all SYSTEM with no window, and started only by
+    // the service (or, for the rollback, by its failure action). The service, having staged a checked version file,
+    // starts its own exe with --device-update and that file. The switch takes the setup lock, records the trial in
+    // update.json, makes every failure of the service run the old exe with --device-update-rollback, stops the service,
+    // points the service, the tray's startup value and the Apps entry at the new file, and starts it. The new service
+    // commits the trial after a healthy check-in pass or, on a refusal, starts the rollback. It also starts the old exe
+    // with --device-update-rollback --at-deadline, a watcher that outlives a restart: the switch's own watch ends with a
+    // restart, so after one the new service starts a new watcher at its own start. Either watcher rolls back when the
+    // trial is still open at its deadline. A rollback points everything at the old file again, puts the normal restarts
+    // back and records the version as failed, so it is never taken again.
     public static class DeviceUpdate {
         // Tests: Dry records the service and registry changes in DryLog instead of making them; LockName is the lock (a
-        // Local one in tests); TrialMs and PollMs time the switch's watch.
+        // Local one in tests); TrialMs and PollMs time the watch.
         internal static bool Dry = false;
         internal static readonly List<string> DryLog = new List<string>();
         internal static string LockName = DeviceInstall.SetupMutexName;
         internal static long TrialMs = UpdateSwitch.TrialMs;
         internal static int PollMs = 2000;
+        // A rollback starts the old service again for this long (with a growing wait between tries) when it will not start,
+        // for example while a user holds the old file open without sharing.
+        internal static long StartRetryMs = 300000;
 
         public static string SwitchArgs(string file) { return "--device-update \"" + file + "\""; }
         public static string RollbackCommand(string exe) { return "\"" + exe + "\" --device-update-rollback"; }
-        public const string RollbackArgs = "--device-update-rollback";
+        public const string RollbackArgs = "--device-update-rollback", AtDeadline = "--at-deadline", WatchArgs = RollbackArgs + " " + AtDeadline;
 
         // The setup lock (DeviceInstall.SetupMutex): one install, uninstall, switch, commit or rollback at a time. null
         // when another still holds it after ms.
@@ -5016,85 +5136,142 @@ namespace SupportMcp {
             var m = Lock(0);
             if (m == null) return UpdateSwitch.Busy;
             try {
-                var st = UpdateState.Load(folder);
+                var st = UpdateState.TryLoad(folder);
+                if (st == null) return UpdateSwitch.Busy; // unreadable now: change nothing
                 if (st.InTrial || !UpdateSwitch.Same(st.StagedFile, file)) return UpdateSwitch.Refused;
-                // Still what the service checked: hashed again through a handle that denies writing, held until the new service runs.
+                // Still what the service checked: hashed again through a handle that denies writing, held until the new
+                // service runs. The using closes it on every path, before the watch below.
                 using (var hold = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read)) {
                     if (hold.Length != st.StagedSize || ReleaseKey.Sha256Hex(hold) != st.StagedSha) return UpdateSwitch.Refused;
                     string version = st.StagedVersion;
                     st.ClearStaged();
                     st.Phase = UpdateState.Trial; st.From = self; st.FromVersion = Wire.Version; st.To = file; st.Version = version;
-                    st.Deadline = Client.UnixNow() + TrialMs;
+                    st.Deadline = Client.UnixNow() + TrialMs; st.Started = false;
                     st.Save(folder);
                     try {
                         SetActions(RollbackCommand(self));
                         Stop();
                         Repoint(file, version, folder);
-                        Start();
+                        Start(false); // the new version: its failure action, not a retry here, handles a start that fails
                     } catch (Exception) {
-                        RollBackLocked(folder, true);
+                        // The switch itself failed, so the new version is failed only if its service ever ran.
+                        try { RollBackLocked(folder, true, false); } catch (Exception) { Start(true); }
                         return UpdateSwitch.RolledBack;
                     }
                 }
             } catch (Exception) {
                 return UpdateSwitch.Refused;
             } finally { Unlock(m); }
+            return Watch(folder, file);
+        }
+
+        // Watches the open trial of file until it is committed or rolled back by someone else (Ok), or rolls it back once
+        // it is still open at its deadline, and at least TrialMs after the watch began (RolledBack). The deadline is read
+        // from update.json each time, so a trial window the new version renewed at its start counts. A deadline further
+        // away than twice TrialMs (a damaged record) is not waited for.
+        static int Watch(string folder, string file) {
             var clock = Stopwatch.StartNew();
             while (true) {
                 Thread.Sleep(PollMs);
                 var now = UpdateState.TryLoad(folder);
-                if (now != null && UpdateSwitch.WatchOver(now, file)) return UpdateSwitch.Ok;
-                if (clock.ElapsedMilliseconds < TrialMs) continue;
+                if (now == null) continue;
+                if (UpdateSwitch.WatchOver(now, file)) return UpdateSwitch.Ok;
+                if (!Due(now, clock)) continue;
                 var again = Lock(60000);
                 if (again == null) continue;
                 try {
-                    if (UpdateSwitch.WatchOver(UpdateState.Load(folder), file)) return UpdateSwitch.Ok;
-                    RollBackLocked(folder, true);
+                    var st = UpdateState.TryLoad(folder);
+                    if (st == null) continue;
+                    if (UpdateSwitch.WatchOver(st, file)) return UpdateSwitch.Ok;
+                    if (!Due(st, clock)) continue;
+                    try { RollBackLocked(folder, true, true); } catch (IOException) { continue; } // update.json unreadable now: look again
                     return UpdateSwitch.RolledBack;
                 } finally { Unlock(again); }
             }
         }
+        static bool Due(UpdateState st, Stopwatch clock) {
+            long ran = clock.ElapsedMilliseconds;
+            return ran >= TrialMs && (Client.UnixNow() >= st.Deadline || ran >= 2 * TrialMs);
+        }
 
-        // --device-update-rollback: the service's failure action during a trial, or the new service on a 426. With no
+        // --device-update-rollback --at-deadline: the new service starts this from the old exe when it starts on trial. It
+        // renews the deadline to a fresh trial window from now (never shortening it), then watches like the switch, so a
+        // trial whose switch was ended by a restart still ends: committed by the new version, or rolled back at the
+        // deadline. Ok when there is no trial to watch.
+        public static int WatchDeadline(string folder) {
+            string to;
+            var m = Lock(120000);
+            if (m == null) return UpdateSwitch.Busy;
+            try {
+                var st = UpdateState.TryLoad(folder);
+                if (st == null) return UpdateSwitch.Busy;
+                if (st.Phase != UpdateState.Trial) return UpdateSwitch.Ok;
+                to = st.To;
+                long fresh = Client.UnixNow() + TrialMs;
+                if (st.Deadline < fresh) { st.Deadline = fresh; st.Save(folder); }
+            } finally { Unlock(m); }
+            return Watch(folder, to);
+        }
+
+        // --device-update-rollback: the service's failure action during a trial, or the new service on a refusal. With no
         // trial open (a crash after the commit raced it), it only puts the normal restarts back and starts the service.
+        // With update.json unreadable it changes nothing and only starts the service, so a next failure tries again.
         public static int RollBack(string folder) {
             var m = Lock(120000);
             if (m == null) return UpdateSwitch.Busy;
             try {
-                if (RollBackLocked(folder, true)) return UpdateSwitch.RolledBack;
+                bool rolled;
+                try { rolled = RollBackLocked(folder, true, true); }
+                catch (IOException) { Start(false); return UpdateSwitch.Busy; }
+                if (rolled) return UpdateSwitch.RolledBack;
                 try { SetActions(null); } catch (Exception) { }
-                Start();
+                Start(true);
                 return UpdateSwitch.Ok;
             } finally { Unlock(m); }
         }
 
-        // Puts the old version back; the caller holds the lock. restart stops the service first and starts it after; the
-        // old version finishing an interrupted trial at its own start passes false. False when no trial was open. The
-        // version is recorded as failed first, so even a rollback cut short never takes it again.
-        internal static bool RollBackLocked(string folder, bool restart) {
-            var st = UpdateState.Load(folder);
+        // Puts the old version back; the caller holds the lock. restart stops the service first and starts it after,
+        // in a finally, so an exception midway never leaves it stopped; the old version finishing an interrupted trial
+        // at its own start passes false. blame records the version as failed; without it (an interrupted switch) the
+        // version is failed only if update.json says its service started. The version is recorded first, so even a
+        // rollback cut short never takes it again. False when no trial was open; IOException when update.json cannot be
+        // read (nothing changed).
+        internal static bool RollBackLocked(string folder, bool restart, bool blame) {
+            var st = UpdateState.TryLoad(folder);
+            if (st == null) throw new IOException("update.json cannot be read now");
             if (!st.InTrial) return false;
-            string from = st.From, fromVersion = st.FromVersion, version = st.Version;
-            if (st.Phase == UpdateState.Trial) { st.Phase = UpdateState.RollingBack; st.AddFailed(version); st.Save(folder); }
-            if (restart) Stop();
-            try { if (File.Exists(from)) Repoint(from, fromVersion, folder); } catch (Exception) { }
-            try { SetActions(null); } catch (Exception) { }
-            DeviceService.AppendHistory(folder, "Support couldn't update to version " + version + ", so it went back to version " + fromVersion + ".");
-            st = UpdateState.Load(folder); st.ClearTrial(); st.Save(folder);
-            if (restart) Start();
-            return true;
+            try {
+                string from = st.From, fromVersion = st.FromVersion, version = st.Version;
+                if (st.Phase == UpdateState.Trial) { st.Phase = UpdateState.RollingBack; if (blame || st.Started) st.AddFailed(version); st.Save(folder); }
+                if (restart) Stop();
+                try { if (File.Exists(from)) Repoint(from, fromVersion, folder); } catch (Exception) { }
+                try { SetActions(null); } catch (Exception) { }
+                DeviceService.AppendHistory(folder, "Support couldn't update to version " + version + ", so it went back to version " + fromVersion + ".");
+                st = UpdateState.TryLoad(folder);
+                if (st == null) throw new IOException("update.json cannot be read now"); // the next start of the old version finishes it
+                st.ClearTrial(); st.Save(folder);
+                return true;
+            } finally { if (restart) Start(true); }
+        }
+        // The service at self found a trial record about other files, long past its deadline: it is cleared, keeping the
+        // failed versions and the previous file. The caller holds the lock.
+        internal static void ClearStale(string folder, string self) {
+            var st = UpdateState.TryLoad(folder);
+            if (st == null || UpdateSwitch.OnStart(st, self, Client.UnixNow()) != UpdateSwitch.Start.Stale) return;
+            st.ClearTrial(); st.Save(folder);
         }
 
         public enum Committed { Done, NoTrial, Busy }
-        // The new service at self after a healthy first pass: the normal restarts come back and the trial closes; the old
-        // file stays as the previous one. Busy: the lock was held, or update.json could not be written; try again later.
+        // The new service at self after a healthy pass: the normal restarts come back and the trial closes; the old file
+        // stays as the previous one. Busy: the lock was held, or update.json could not be read or written; try again soon.
         internal static Committed Commit(string folder, string self, out string version) {
             version = "";
             var m = Lock(60000);
             if (m == null) return Committed.Busy;
             try {
-                var st = UpdateState.Load(folder);
-                if (UpdateSwitch.OnStart(st, self) != UpdateSwitch.Start.Trial) return Committed.NoTrial;
+                var st = UpdateState.TryLoad(folder);
+                if (st == null) return Committed.Busy;
+                if (UpdateSwitch.OnStart(st, self, Client.UnixNow()) != UpdateSwitch.Start.Trial) return Committed.NoTrial;
                 try { SetActions(null); } catch (Exception) { }
                 version = st.Version; st.Previous = st.From; st.ClearTrial(); st.Save(folder);
                 return Committed.Done;
@@ -5113,7 +5290,21 @@ namespace SupportMcp {
             Scm.SetFailureActions(DeviceSetup.ServiceName, rollbackCommand);
         }
         static void Stop() { if (Dry) Log("stop"); else Scm.StopAndWait(DeviceSetup.ServiceName, 60000); }
-        static void Start() { if (Dry) Log("start"); else Scm.StartTolerant(DeviceSetup.ServiceName); }
+        // Starts the service. retry: keep trying for StartRetryMs, waiting 1 s, then 2, 4 and so on up to 30 s between tries,
+        // so a user who holds the old file open without sharing only delays the rollback. Never throws.
+        static void Start(bool retry) {
+            if (Dry) { Log("start"); return; }
+            var clock = Stopwatch.StartNew(); int wait = 1000;
+            while (true) {
+                Scm.StartTolerant(DeviceSetup.ServiceName);
+                if (!retry) return;
+                var status = Scm.Status(DeviceSetup.ServiceName);
+                if (status == null || status == ServiceControllerStatus.Running || status == ServiceControllerStatus.StartPending) return; // running, or gone
+                if (clock.ElapsedMilliseconds >= StartRetryMs) return;
+                try { Thread.Sleep(wait); } catch (Exception) { return; }
+                wait = Math.Min(wait * 2, 30000);
+            }
+        }
         static void Log(string line) { lock (DryLog) DryLog.Add(line); }
     }
 
@@ -5440,7 +5631,9 @@ namespace SupportMcp {
             try {
                 string folder = DeviceSetup.Folder;
                 // An update's trial decides within minutes which version stays; removing the PC meanwhile would race it.
-                if (UpdateSwitch.UninstallBusy(UpdateState.Load(folder), Client.UnixNow())) return Busy;
+                // update.json that cannot be read at this moment counts as busy too: try again in a few minutes.
+                var upd = UpdateState.TryLoad(folder);
+                if (upd == null || UpdateSwitch.UninstallBusy(upd, Client.UnixNow())) return Busy;
                 // Only an actual leave call counts as reaching the relay; a missing or damaged device.json leaves the
                 // PC on the team's list, so the final window says so.
                 bool reached = false;
@@ -5635,7 +5828,10 @@ namespace SupportMcp {
             }
             if (role == "--device-update-rollback") {
                 Native.SafeDllSearch(); int code = UpdateSwitch.Refused;
-                try { if (args.Length == 1) code = DeviceUpdate.RollBack(DeviceSetup.Folder); } catch (Exception) { }
+                try {
+                    if (args.Length == 1) code = DeviceUpdate.RollBack(DeviceSetup.Folder);
+                    else if (args.Length == 2 && args[1] == DeviceUpdate.AtDeadline) code = DeviceUpdate.WatchDeadline(DeviceSetup.Folder);
+                } catch (Exception) { }
                 Environment.Exit(code);
             }
             if (role == "--helper") { try { Helper.Run(executable, args); } catch (Exception) { } Environment.Exit(0); }
