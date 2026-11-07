@@ -3672,10 +3672,43 @@ namespace SupportMcp {
         public static string ModeText(string access) {
             return access == "any" ? "Your support team can connect to this PC any time, even when nobody is at it." : "Support asks you on this PC before each connection.";
         }
-        public const string UninstallText = "To remove Support, open Settings, then Apps, and uninstall Support.";
+        // Where the owner uninstalls: Settings, then Apps from Windows 10 (build 10240) on; Control Panel before it.
+        public static readonly string AppsPlace = HasSettingsApps() ? "Settings, then Apps" : "Control Panel, then Programs and Features";
+        public static readonly string UninstallText = "To remove Support, open " + AppsPlace + ", and uninstall Support.";
+        static bool HasSettingsApps() {
+            try {
+                using (var hklm = Microsoft.Win32.RegistryKey.OpenBaseKey(Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryView.Registry64))
+                using (var k = hklm.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion")) {
+                    int build; if (k != null && Int32.TryParse(k.GetValue("CurrentBuildNumber") as string, out build)) return build >= 10240;
+                }
+            } catch (Exception) { }
+            return Environment.OSVersion.Version >= new Version(6, 2);
+        }
 
         // A short description of this Windows, reported to the relay. Never fails the install.
-        public static string Os() { try { return Environment.OSVersion.VersionString; } catch (Exception) { return "Windows"; } }
+        // The Windows name and build from the registry: Environment.OSVersion reports 6.2 on Windows 10 and 11 to an exe
+        // that does not declare them, and Windows 11 still names itself "Windows 10" in ProductName.
+        public static string Os() {
+            try {
+                // The 64-bit view: this x86 exe would otherwise read the WOW64 copy, whose ProductName can be stale.
+                using (var hklm = Microsoft.Win32.RegistryKey.OpenBaseKey(Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryView.Registry64))
+                using (var k = hklm.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion")) {
+                    string product = k == null ? null : k.GetValue("ProductName") as string, build = k == null ? null : k.GetValue("CurrentBuildNumber") as string;
+                    string release = k == null ? null : k.GetValue("DisplayVersion") as string;
+                    if (String.IsNullOrEmpty(release) && k != null) release = k.GetValue("ReleaseId") as string;
+                    return OsName(product, build, release);
+                }
+            } catch (Exception) { }
+            try { return Environment.OSVersion.VersionString; } catch (Exception) { return "Windows"; }
+        }
+        internal static string OsName(string product, string build, string release) {
+            if (String.IsNullOrEmpty(product)) return "Windows" + (String.IsNullOrEmpty(build) ? "" : " (build " + build + ")");
+            int number; string name = product.Trim();
+            if (Int32.TryParse(build, out number) && number >= 22000 && name.StartsWith("Windows 10", StringComparison.Ordinal)) name = "Windows 11" + name.Substring(10);
+            if (!String.IsNullOrEmpty(release)) name += " " + release.Trim();
+            if (!String.IsNullOrEmpty(build)) name += " (build " + build.Trim() + ")";
+            return name.Length > 100 ? name.Substring(0, 100) : name;
+        }
         // Starts the tray as the signed-in user, when it is installed. A failure is not an error: it starts at the next sign-in.
         public static void StartTray() {
             try { if (File.Exists(Exe)) using (Process.Start(new ProcessStartInfo(Exe, "--tray") { UseShellExecute = false, WorkingDirectory = Folder })) { } } catch (Exception) { }
@@ -3713,6 +3746,7 @@ namespace SupportMcp {
         TextBox codeBox, nameBox;
         CheckBox noCode;
         RadioButton askRadio, anyRadio, fullRadio, limitedRadio;
+        DeviceSetup.Screen? focusedFor;
         readonly TextBlock terminalHead, terminalBody;
 
         public SetupWindow(Palette palette, Dictionary<string, object> footer, string exe) {
@@ -3774,7 +3808,7 @@ namespace SupportMcp {
                 else if (e.Key == Key.Enter && next.IsEnabled && next.Visibility == Visibility.Visible) { e.Handled = true; OnNext(); }
             };
             Closing += delegate(object sender, System.ComponentModel.CancelEventArgs e) { if (installing) e.Cancel = true; };
-            Loaded += delegate { Render(); };
+            Loaded += delegate { Render(); Activate(); };
         }
 
         TextBlock Lbl(string text, double size, FontWeight weight, Brush color, string font, VerticalAlignment valign) {
@@ -3783,7 +3817,7 @@ namespace SupportMcp {
 
         void BuildPanels() {
             // Intro.
-            panels[DeviceSetup.Screen.Intro] = Para("Support keeps this PC on your support team's list so they can help when you ask. This short setup asks how they may connect. You stay in control: remove Support any time from Settings, then Apps.");
+            panels[DeviceSetup.Screen.Intro] = Para("Support keeps this PC on your support team's list so they can help when you ask. This short setup asks how they may connect. You stay in control: remove Support any time from " + DeviceSetup.AppsPlace + ".");
 
             // Code.
             var codePanel = new StackPanel();
@@ -3854,7 +3888,8 @@ namespace SupportMcp {
                 Text = text, FontSize = 14, FontFamily = new FontFamily(Ui.TextFont), Foreground = p.Ink, CaretBrush = p.Ink,
                 Background = p.Surface2, BorderBrush = p.Line, BorderThickness = new Thickness(1), Padding = new Thickness(10, 7, 10, 7),
             };
-            box.ToolTip = hint;
+            // For screen readers only: a tooltip would open on keyboard focus and cover the error line under the field.
+            System.Windows.Automation.AutomationProperties.SetHelpText(box, hint);
             return box;
         }
         RadioButton Choice(string group, string title, string detail) {
@@ -3911,6 +3946,12 @@ namespace SupportMcp {
             worker.SetApartmentState(ApartmentState.STA); worker.IsBackground = true; worker.Start();
         }
         void FinishInstall(bool unavailable, bool wasDeclined, int exit) {
+            ShowOutcome(unavailable, wasDeclined, exit);
+            // The permission prompt can hand the foreground to another window, such as the browser the download came
+            // from: come back to the front with the outcome.
+            Activate();
+        }
+        void ShowOutcome(bool unavailable, bool wasDeclined, int exit) {
             installing = false;
             if (unavailable) { screen = DeviceSetup.Screen.Unavailable; Render(); return; }
             if (wasDeclined) { declined = true; Render(); return; }
@@ -3956,7 +3997,7 @@ namespace SupportMcp {
                     terminalBody.Text = (digits != null ? "Read this number to your support team: " + digits + ". " : "Your request is waiting for your support team to approve it. ") + "This PC waits for up to 24 hours. You can close this window; the tray icon shows its state.";
                 } else if (screen == DeviceSetup.Screen.Already) {
                     terminalHead.Text = "Support is already set up on this PC";
-                    terminalBody.Text = "Open Support to see its state, or remove it from Settings, then Apps.";
+                    terminalBody.Text = "Open Support to see its state, or remove it from " + DeviceSetup.AppsPlace + ".";
                 } else {
                     terminalHead.Text = "Can't install on this account";
                     terminalBody.Text = DeviceSetup.UnavailableText;
@@ -3974,6 +4015,18 @@ namespace SupportMcp {
             else if (screen == DeviceSetup.Screen.Install) next.Content = declined ? "Try again" : "Install";
             else if (screen == DeviceSetup.Screen.Control) next.Content = "Next";
             else next.Content = "Next";
+
+            // Keyboard: a new step puts the focus on its own field, so typing and the arrow keys work without a mouse.
+            // Focusing a choice does not select it: nothing is preselected.
+            if (focusedFor != screen) {
+                focusedFor = screen;
+                UIElement target = screen == DeviceSetup.Screen.Code ? (noCode != null && noCode.IsChecked == true ? (UIElement)noCode : codeBox)
+                    : screen == DeviceSetup.Screen.Name ? nameBox
+                    : screen == DeviceSetup.Screen.Access ? (anyRadio.IsChecked == true ? anyRadio : askRadio)
+                    : screen == DeviceSetup.Screen.Control ? (limitedRadio.IsChecked == true ? limitedRadio : fullRadio)
+                    : next.Visibility == Visibility.Visible ? (UIElement)next : null;
+                if (target != null) Dispatcher.BeginInvoke(DispatcherPriority.Input, (Action)delegate { target.Focus(); Keyboard.Focus(target); });
+            }
         }
 
         public void Finish() { var t = worker; if (t != null) t.Join(120000); }
@@ -4429,7 +4482,7 @@ namespace SupportMcp {
         public const string AllowAction = "Allow support to connect any time";
         public const string AllowConfirm = "Allow support to connect any time? You can't undo this from this PC. Only your support team can turn it back to asking first.";
         public const string Uninstall = "Uninstall Support…";
-        public const string UninstallMissing = "To remove Support, open Settings, then Apps, and uninstall Support.";
+        public static readonly string UninstallMissing = DeviceSetup.UninstallText;
         public static string Mode(string access) { return access == "any" ? "Support can connect any time." : "Support asks you before each connection."; }
         public static string State(string state, string confirm) {
             if (state == DeviceState.Active) return "Your support team can see this PC.";
@@ -4448,7 +4501,9 @@ namespace SupportMcp {
             list.Add("uninstall");
             return list;
         }
-        public static bool ShowTeamOnly(string state, string access) { return access == "any" && state != DeviceState.Removed && state != DeviceState.Expired; }
+        public static bool ShowTeamOnly(string state, string access) { return access == "any" && ShowMode(state); }
+        // A removed or unapproved PC has no access left, so it shows no mode line.
+        public static bool ShowMode(string state) { return state != DeviceState.Removed && state != DeviceState.Expired; }
         // The newest few history lines, newest first.
         public static List<string> Recent(System.Collections.ArrayList history, int n) {
             var lines = new List<string>();
@@ -4562,6 +4617,7 @@ namespace SupportMcp {
             string state = Wire.Text(status, "state"), access = Wire.Text(status, "access");
             nameLine.Text = Wire.Text(status, "name");
             modeLine.Text = TrayText.Mode(access);
+            modeLine.Visibility = TrayText.ShowMode(state) ? Visibility.Visible : Visibility.Collapsed;
             stateLine.Text = TrayText.State(state, Wire.Text(status, "confirm"));
             teamOnly.Visibility = TrayText.ShowTeamOnly(state, access) ? Visibility.Visible : Visibility.Collapsed;
             bool canAllow = TrayText.Actions(state, access).Contains("allow_any_time");
@@ -4596,9 +4652,11 @@ namespace SupportMcp {
                 }
             } catch (Exception) { return null; }
         }
+        // A second start in the session (the setup's Open Support) asks the running tray to open its panel.
+        const string ShowEvent = "Local\\SupportMcpTrayShow";
         public static void Run(Application app) {
             bool first; using (var mutex = new Mutex(true, "Local\\SupportMcpTray", out first)) {
-                if (!first) return;
+                if (!first) { try { using (var show = EventWaitHandle.OpenExisting(ShowEvent)) show.Set(); } catch (Exception) { } return; }
                 var panel = new TrayPanel(Palette.Detect());
                 string state = ""; IntPtr handle = IntPtr.Zero; Gdi.Icon icon = null;
                 var notify = new WF.NotifyIcon { Text = "Support", Visible = false };
@@ -4627,12 +4685,20 @@ namespace SupportMcp {
                     });
                 };
                 poll.Tick += delegate { refresh(); };
-                notify.MouseClick += delegate(object sender, WF.MouseEventArgs e) {
-                    if (e.Button != WF.MouseButtons.Left) return;
-                    if (panel.IsVisible) { panel.Hide(); return; }
+                Action open = delegate {
                     panel.Note(null); panel.Show(); panel.Place(); panel.Activate();
                     poll.Interval = TimeSpan.FromSeconds(4); refresh();
                 };
+                notify.MouseClick += delegate(object sender, WF.MouseEventArgs e) {
+                    if (e.Button != WF.MouseButtons.Left) return;
+                    if (panel.IsVisible) { panel.Hide(); return; }
+                    open();
+                };
+                var showRequests = new EventWaitHandle(false, EventResetMode.AutoReset, ShowEvent);
+                var shower = new Thread(delegate() {
+                    while (true) { showRequests.WaitOne(); try { panel.Dispatcher.BeginInvoke(new Action(delegate { if (!panel.IsVisible) open(); })); } catch (Exception) { return; } }
+                });
+                shower.IsBackground = true; shower.Start();
                 panel.IsVisibleChanged += delegate { if (!panel.IsVisible) poll.Interval = TimeSpan.FromMinutes(1); };
                 panel.AllowConfirmed += delegate {
                     ThreadPool.QueueUserWorkItem(delegate {

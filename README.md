@@ -428,8 +428,8 @@ The install puts these on the PC:
   the relay every few minutes. In this release it runs no commands, takes no
   screenshots and opens no files for anyone.
 - **A tray icon** starts at each sign-in.
-- **An entry in Windows Settings > Apps**, named "Support", is how the owner
-  uninstalls.
+- **An entry in Windows Settings > Apps** (Control Panel > Programs and
+  Features on Windows 7), named "Support", is how the owner uninstalls.
 
 Running the wizard on a PC that is already set up says so and opens the tray.
 

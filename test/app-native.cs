@@ -291,6 +291,12 @@ public static class AppTests {
         Assert(DeviceSetup.ExitText(DeviceSetup.CodeInvalid).Contains("code") && DeviceSetup.ExitText(DeviceSetup.Network).Contains("reach") && DeviceSetup.ExitText(DeviceSetup.Refused).Contains("refused"), "code, network and refused each say what happened");
         Assert(DeviceSetup.ShowConfirm("482913") == "482 913" && DeviceSetup.ShowConfirm("abc") == null && DeviceSetup.ShowConfirm(null) == null, "six digits show as two groups");
         Assert(DeviceSetup.ModeText("any").Contains("any time") && DeviceSetup.ModeText("ask").Contains("asks you") && DeviceSetup.Folder.EndsWith("SupportMCP") && DeviceSetup.Exe.EndsWith("support.exe"), "the mode text and the install paths");
+        // The OS line: Windows 11 still says "Windows 10" in ProductName, so the build decides; capped at the relay's 100.
+        Assert(DeviceSetup.OsName("Windows 10 Pro", "26200", "25H2") == "Windows 11 Pro 25H2 (build 26200)", "Windows 11 by its build");
+        Assert(DeviceSetup.OsName("Windows 10 Pro", "19045", "22H2") == "Windows 10 Pro 22H2 (build 19045)", "Windows 10 stays Windows 10");
+        Assert(DeviceSetup.OsName("Windows 7 Professional", "7601", null) == "Windows 7 Professional (build 7601)", "Windows 7 has no release");
+        Assert(DeviceSetup.OsName(null, "7601", null) == "Windows (build 7601)" && DeviceSetup.OsName(new string('x', 300), "1", null).Length == 100, "no name, and the cap");
+        Assert(DeviceSetup.Os().StartsWith("Windows", StringComparison.Ordinal) && DeviceSetup.Os().IndexOf("NT 6.2", StringComparison.Ordinal) < 0, "this PC's line names Windows, not NT 6.2: " + DeviceSetup.Os());
         Console.WriteLine("PASS the setup wizard rules: code format, step validation, the answers argument, and the exit-code map");
     }
     // The elevated install's pure parts: the leftover decision, the service command line, the registry builders, the
@@ -432,6 +438,7 @@ public static class AppTests {
         Assert(!TrayText.Actions(DeviceState.Pending, "ask").Contains("allow_any_time"), "a pending PC never offers the any-time action");
         Assert(!TrayText.Actions(DeviceState.Active, "any").Contains("allow_any_time"), "an any-time PC never offers the action again");
         Assert(TrayText.ShowTeamOnly(DeviceState.Active, "any") && !TrayText.ShowTeamOnly(DeviceState.Active, "ask") && !TrayText.ShowTeamOnly(DeviceState.Removed, "any"), "only an any-time PC says only the team can change it");
+        Assert(TrayText.ShowMode(DeviceState.Active) && TrayText.ShowMode(DeviceState.Pending) && !TrayText.ShowMode(DeviceState.Removed) && !TrayText.ShowMode(DeviceState.Expired), "a removed or unapproved PC shows no mode line");
         Assert(TrayText.AllowConfirm.Contains("undo this from this PC") && TrayText.AllowConfirm.Contains("Only your support team"), "the confirm says it can't be undone from this PC and only the team can turn it back");
 
         // Recent history, newest first, limited.
