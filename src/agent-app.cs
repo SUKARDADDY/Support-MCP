@@ -3983,8 +3983,8 @@ confirm = exit == DeviceSetup.Pending ? DeviceService.ReadConfirm() : null;
         public const string DisplayName = "Support", Publisher = "Support-MCP";
         public const string ServiceDisplay = "Support device service";
         public const string ServiceDescription = "Lets this PC's support team see it on their list and connect when you allow it. Uninstalling Support from Windows Settings removes this service.";
-        const string RunKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", TrayValueName = "SupportMcpTray";
-        const string AppsKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\SupportMcpDevice";
+        public const string RunKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", TrayValueName = "SupportMcpTray";
+        public const string AppsKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\SupportMcpDevice";
 
         // What to do about what is already on the PC: a running service means Support is set up (exit 23); the folder
         // without a service is a crash leftover to clean before a fresh install; nothing means a clean install.
@@ -4565,6 +4565,208 @@ confirm = exit == DeviceSetup.Pending ? DeviceService.ReadConfirm() : null;
         sealed class Busy { public volatile bool Set; }
     }
 
+    // Uninstall. The unelevated --uninstall (run by the Apps entry and the tray) copies itself to a fresh Temp folder
+    // and re-runs from there, so nothing in the install folder stays open; it shows a confirm, then runs the elevated
+    // --device-remove. The pure parts (the removal plan, the exit-code map, the Temp-copy rule, and what counts as a
+    // reached relay) are static so the native tests can check them. --device-remove never touches
+    // HKLM\SOFTWARE\SupportMCP or anything of the one-off sessions.
+    public static class DeviceUninstall {
+        public const int Removed = 0, Unreachable = 10, Fail = 20;
+        public enum Outcome { Removed, RemovedUnreachable, Declined, Failed }
+        public static Outcome Map(int exit) {
+            if (exit == Removed) return Outcome.Removed;
+            if (exit == Unreachable) return Outcome.RemovedUnreachable;
+            if (exit == -1223) return Outcome.Declined;
+            return Outcome.Failed;
+        }
+        // --uninstall must run from a copy, not the install folder's support.exe. True when it is still the installed one.
+        public static bool NeedsRestage(string exePath) {
+            try { return string.Equals(Path.GetFullPath(exePath), Path.GetFullPath(DeviceSetup.Exe), StringComparison.OrdinalIgnoreCase); }
+            catch (Exception) { return false; }
+        }
+        // Leave counts as done whether the relay answered 200 or 401; only a network failure leaves the PC on the list.
+        public static bool LeaveReachedRelay(DeviceLink.DeviceResult result) { return result != DeviceLink.DeviceResult.Offline; }
+        // Everything an uninstall removes, by exact name. The native test checks the list names only our artifacts and
+        // never the one-off sessions' shared record (HKLM\SOFTWARE\SupportMCP).
+        public static List<string> RemovalPlan() {
+            var list = new List<string>();
+            list.Add("service " + DeviceSetup.ServiceName);
+            list.Add("hklm64 " + DeviceInstall.RunKey + "\\" + DeviceInstall.TrayValueName);
+            list.Add("hklm64 " + DeviceInstall.AppsKey);
+            list.Add("folder " + DeviceSetup.Folder);
+            return list;
+        }
+
+        // --device-remove <nonce>, elevated. Reads device.json, leaves the relay, signals the trays and ends any that
+        // stay, stops and deletes the service, drops the registry entries, and removes the folder (locked leftovers go
+        // at the next restart). Returns Removed, Unreachable, or Fail when the attempt was withdrawn.
+        public static int Remove(string[] args) {
+            if (args.Length != 2 || !System.Text.RegularExpressions.Regex.IsMatch(args[1], "^[0-9a-f]{32}$")) return Fail;
+            var want = Elevation.Wanted("device-remove", args[1]);
+            if (want == null) return Fail;
+            using (want) {
+                string folder = DeviceSetup.Folder;
+                bool reached = true;
+                try {
+                    var dev = Wire.Json().Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(folder, "device.json")));
+                    string origin = Wire.Text(dev, "origin"), key = Wire.Text(dev, "key");
+                    if (key.Length > 0 && origin.Length > 0) reached = LeaveReachedRelay(new DeviceLink(origin).Leave(key).Result);
+                } catch (Exception) { }
+                DeviceService.SignalUninstall(); // every tray watches this and exits
+                EndTrays();                       // best effort for any that did not
+                try { Scm.Remove(DeviceSetup.ServiceName); } catch (Exception) { }
+                DeviceInstall.RemoveRegistry();
+                RemoveFolder(folder);
+                return reached ? Removed : Unreachable;
+            }
+        }
+        static void EndTrays() {
+            try {
+                foreach (var pr in Process.GetProcessesByName("support")) {
+                    try { if (string.Equals(pr.MainModule.FileName, DeviceSetup.Exe, StringComparison.OrdinalIgnoreCase)) pr.Kill(); }
+                    catch (Exception) { }
+                    finally { pr.Dispose(); }
+                }
+            } catch (Exception) { }
+        }
+        // The junction-safe delete; anything still locked (a tray that has not closed) goes at the next restart.
+        static void RemoveFolder(string folder) {
+            try { if (Directory.Exists(folder)) Native.DeleteTree(folder); } catch (Exception) { }
+            if (!Directory.Exists(folder)) return;
+            try {
+                foreach (string f in Directory.GetFiles(folder, "*", SearchOption.AllDirectories)) try { Native.MoveFileEx(f, null, 4); } catch (Exception) { }
+                var dirs = new List<string>(Directory.GetDirectories(folder, "*", SearchOption.AllDirectories));
+                dirs.Sort(); dirs.Reverse(); // deepest first
+                foreach (string d in dirs) try { Native.MoveFileEx(d, null, 4); } catch (Exception) { }
+                Native.MoveFileEx(folder, null, 4);
+            } catch (Exception) { }
+        }
+
+        public static void Run(Application app, string exe) {
+            // Run from a Temp copy, so the install folder (support.exe) is not held open while it is removed.
+            if (NeedsRestage(exe)) {
+                try { string staged = Elevation.Stage(exe); using (Process.Start(new ProcessStartInfo(staged, "--uninstall") { UseShellExecute = false, WorkingDirectory = Path.GetTempPath() })) { } } catch (Exception) { }
+                return;
+            }
+            bool first; using (var mutex = new Mutex(true, "Local\\SupportMcpUninstall", out first)) {
+                if (!first) return;
+                var window = new UninstallWindow(Palette.Detect(), exe);
+                window.Closed += delegate { app.Shutdown(); };
+                app.Run(window);
+                window.Finish();
+            }
+        }
+    }
+
+    // The confirm-and-result window for --uninstall. Cancel/Uninstall, then the elevated removal and a final message.
+    public sealed class UninstallWindow : Window {
+        const double CardWidth = 440, Pad = 20;
+        readonly Palette p;
+        readonly string exe;
+        enum Screen { Confirm, Removing, Unavailable, Done, DoneUnreachable }
+        Screen screen = Screen.Confirm;
+        string note = "";
+        Thread worker;
+
+        readonly Border bodyHost;
+        readonly TextBlock heading, body, noteLine;
+        readonly FlatButton cancel, go;
+
+        public UninstallWindow(Palette palette, string exe) {
+            p = palette; this.exe = exe;
+            Ui.Transparent(this);
+            Topmost = false; ShowInTaskbar = true; Title = "Uninstall Support";
+            Width = CardWidth + 2 * Pad; SizeToContent = SizeToContent.Height; WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            Foreground = p.Ink;
+            Grid inner; var card = Ui.Card(p, CardWidth, out inner);
+            var root = new Grid { Margin = new Thickness(Pad) }; root.Children.Add(card); Content = root;
+            var stack = new StackPanel(); inner.Children.Add(stack);
+            stack.Children.Add(new Border { Height = 3, Background = p.Stop });
+            var head = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(16, 12, 16, 0) };
+            var glyph = Glyph.Headset().Paint(p.Muted).Sized(16); glyph.Margin = new Thickness(0, 0, 8, 0); head.Children.Add(glyph);
+            head.Children.Add(Ui.Label("Support", 12, FontWeights.SemiBold, p.Muted, Ui.TextFont));
+            stack.Children.Add(head);
+            var wrap = new StackPanel { Margin = new Thickness(16, 8, 16, 4) };
+            heading = Ui.Label("", 17, FontWeights.SemiBold, p.Ink, Ui.DisplayFont); heading.Margin = new Thickness(0, 0, 0, 8); heading.LineHeight = 22;
+            wrap.Children.Add(heading);
+            bodyHost = new Border(); wrap.Children.Add(bodyHost);
+            body = Ui.Label("", 13, FontWeights.Normal, p.Muted, Ui.TextFont); body.LineHeight = 19; bodyHost.Child = body;
+            noteLine = Ui.Label("", 12.5, FontWeights.Normal, p.Stop, Ui.TextFont); noteLine.Margin = new Thickness(0, 10, 0, 0); noteLine.Visibility = Visibility.Collapsed;
+            wrap.Children.Add(noteLine);
+            stack.Children.Add(wrap);
+            var foot = new Border { BorderBrush = p.Line, BorderThickness = new Thickness(0, 1, 0, 0), Padding = new Thickness(12, 10, 12, 12), Margin = new Thickness(0, 12, 0, 0) };
+            var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+            cancel = new FlatButton("Cancel", p.Ink, p.Surface2, p.Line, p.Work, 34, 96, 14, 6, 13, true);
+            go = new FlatButton("Uninstall", Brushes.White, p.StopSolid, p.StopSolidHover, p.Work, 34, 120, 16, 6, 13, true); go.Margin = new Thickness(8, 0, 0, 0);
+            buttons.Children.Add(cancel); buttons.Children.Add(go);
+            foot.Child = buttons; stack.Children.Add(foot);
+
+            cancel.Click += delegate { if (screen == Screen.Done || screen == Screen.DoneUnreachable || screen == Screen.Unavailable) Close(); else if (screen != Screen.Removing) Close(); };
+            go.Click += delegate { OnGo(); };
+            PreviewKeyDown += delegate(object sender, KeyEventArgs e) { if (e.Key == Key.Escape && screen != Screen.Removing) { e.Handled = true; Close(); } };
+            Closing += delegate(object sender, System.ComponentModel.CancelEventArgs e) { if (screen == Screen.Removing) e.Cancel = true; };
+            Loaded += delegate { Render(); };
+        }
+
+        void OnGo() {
+            if (screen == Screen.Done || screen == Screen.DoneUnreachable || screen == Screen.Unavailable) { Close(); return; }
+            if (screen == Screen.Removing) return;
+            BeginRemove();
+        }
+        void BeginRemove() {
+            screen = Screen.Removing; note = ""; Render();
+            IntPtr owner = new WindowInteropHelper(this).Handle;
+            worker = new Thread(delegate() {
+                int exit = DeviceUninstall.Fail; bool unavailable = false, declined = false;
+                try {
+                    Consent path = ConsentPath.Detect();
+                    if (path == Consent.Unavailable) unavailable = true;
+                    else {
+                        string nonce = Elevation.Nonce(); string staged = Elevation.Stage(exe);
+                        using (var want = Elevation.Want("device-remove", nonce))
+                        try { exit = Native.RunElevated(staged, "--device-remove " + nonce, owner, delegate { }); }
+                        finally { try { Elevation.DeleteTree(Path.GetDirectoryName(staged)); } catch (Exception) { } }
+                        if (exit == -1223) declined = true;
+                    }
+                } catch (Exception) { exit = DeviceUninstall.Fail; }
+                bool un = unavailable, dec = declined; int code = exit;
+                Post(delegate { Finish(un, dec, code); });
+            });
+            worker.SetApartmentState(ApartmentState.STA); worker.IsBackground = true; worker.Start();
+        }
+        void Finish(bool unavailable, bool declined, int exit) {
+            if (unavailable) { screen = Screen.Unavailable; Render(); return; }
+            if (declined) { screen = Screen.Confirm; note = "Windows didn't get permission, so nothing was removed. Click Uninstall to try again."; Render(); return; }
+            DeviceUninstall.Outcome outcome = DeviceUninstall.Map(exit);
+            if (outcome == DeviceUninstall.Outcome.Removed) screen = Screen.Done;
+            else if (outcome == DeviceUninstall.Outcome.RemovedUnreachable) screen = Screen.DoneUnreachable;
+            else { screen = Screen.Confirm; note = "Support couldn't be removed. Try again, or ask your support team for help."; }
+            Render();
+        }
+        void Post(Action a) { Dispatcher.BeginInvoke(DispatcherPriority.Normal, a); }
+
+        void Render() {
+            if (screen == Screen.Confirm) {
+                heading.Text = "Uninstall Support?";
+                body.Text = "This removes the app, the background service that lets your support team see this PC, and this PC's saved access. Your support team can no longer connect.";
+            } else if (screen == Screen.Removing) {
+                heading.Text = "Removing Support…"; body.Text = "This takes a moment.";
+            } else if (screen == Screen.Unavailable) {
+                heading.Text = "Can't remove on this account"; body.Text = DeviceSetup.UnavailableText;
+            } else if (screen == Screen.Done) {
+                heading.Text = "Support was removed"; body.Text = "Support is no longer on this PC.";
+            } else {
+                heading.Text = "Support was removed"; body.Text = "Support is no longer on this PC. Your support team will still see this PC in their list until they remove it.";
+            }
+            bool terminal = screen == Screen.Done || screen == Screen.DoneUnreachable || screen == Screen.Unavailable;
+            noteLine.Text = note; noteLine.Visibility = note.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+            cancel.Visibility = (screen == Screen.Confirm) ? Visibility.Visible : Visibility.Collapsed;
+            go.Visibility = screen == Screen.Removing ? Visibility.Collapsed : Visibility.Visible;
+            go.Content = terminal ? "Close" : "Uninstall";
+        }
+        public void Finish() { var t = worker; if (t != null) t.Join(120000); }
+    }
+
     public static class Program {
         [STAThread] public static void Main(string[] args) {
             string role = args.Length > 0 ? args[0] : "", executable = System.Reflection.Assembly.GetExecutingAssembly().Location;
@@ -4586,14 +4788,20 @@ confirm = exit == DeviceSetup.Pending ? DeviceService.ReadConfirm() : null;
                 finally { if (held != null) held.Dispose(); }
                 Environment.Exit(code);
             }
+            // The elevated remove step: run from the staged copy the uninstaller launched; it reads device.json from
+            // the install folder, not a footer, so the staged exe needs none.
+            if (role == "--device-remove") {
+                Native.SafeDllSearch(); int code = DeviceUninstall.Fail;
+                try { code = DeviceUninstall.Remove(args); } catch (Exception) { }
+                Environment.Exit(code);
+            }
             WF.Application.EnableVisualStyles();
             try {
                 var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
                 if (role == "--window") { RunWindow(app, args); return; }
                 // The installed support.exe carries no footer, so its roles are routed before any footer is read.
                 if (role == "--tray") { Tray.Run(app); return; }
-                // Uninstall is PR 4 step 7; until then it points the owner to Windows Settings instead of failing.
-                if (role == "--uninstall") { WF.MessageBox.Show(TrayText.UninstallMissing, "Support"); return; }
+                if (role == "--uninstall") { DeviceUninstall.Run(app, executable); return; }
                 // A setup download carries a device footer (kind "device"). It runs the wizard, and is checked before
                 // any session footer is read, so no session role ever runs on it (Wire.ReadConfig refuses it too).
                 byte[] self = File.ReadAllBytes(executable);

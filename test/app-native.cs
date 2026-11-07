@@ -444,6 +444,38 @@ public static class AppTests {
         Assert(!TrayIcon.ColorFor(DeviceState.Active).Equals(TrayIcon.ColorFor(DeviceState.Pending)) && !TrayIcon.ColorFor(DeviceState.Pending).Equals(TrayIcon.ColorFor(DeviceState.Removed)), "the icon colour follows the state");
         Console.WriteLine("PASS the tray: the state-to-text map, the one-way action rule, the history lines, and the run-time icon handle");
     }
+    // Uninstall's pure parts: the removal plan (our names only, never the one-off shared record), the exit-code map,
+    // the Temp-copy rule, and that a 401 from leave counts as done.
+    static void UninstallTests() {
+        var plan = DeviceUninstall.RemovalPlan();
+        Assert(plan.Count == 4, "four artifacts");
+        Assert(plan[0] == "service SupportMcpDevice", "the service by its exact name");
+        Assert(plan[1].Contains("CurrentVersion\\Run\\SupportMcpTray"), "the HKLM Run tray value");
+        Assert(plan[2].Contains("Uninstall\\SupportMcpDevice"), "the Apps uninstall entry");
+        Assert(plan[3] == "folder " + DeviceSetup.Folder && plan[3].EndsWith("\\SupportMCP"), "the install folder");
+        // Never the one-off sessions' shared record HKLM\SOFTWARE\SupportMCP, and nothing outside our names.
+        foreach (string item in plan) {
+            Assert(item.IndexOf("SOFTWARE\\SupportMCP") < 0, "never the shared record: " + item);
+            Assert(item.Contains("SupportMcpDevice") || item.Contains("SupportMcpTray") || item.EndsWith("\\SupportMCP"), "only our names: " + item);
+        }
+
+        // The exit-code map.
+        Assert(DeviceUninstall.Map(DeviceUninstall.Removed) == DeviceUninstall.Outcome.Removed, "0 is removed");
+        Assert(DeviceUninstall.Map(DeviceUninstall.Unreachable) == DeviceUninstall.Outcome.RemovedUnreachable, "10 is removed but the relay was unreachable");
+        Assert(DeviceUninstall.Map(-1223) == DeviceUninstall.Outcome.Declined, "a declined Windows prompt");
+        Assert(DeviceUninstall.Map(DeviceUninstall.Fail) == DeviceUninstall.Outcome.Failed && DeviceUninstall.Map(999) == DeviceUninstall.Outcome.Failed, "anything else is a failure");
+
+        // The Temp-copy rule: run from the install folder restages; run from anywhere else proceeds.
+        Assert(DeviceUninstall.NeedsRestage(DeviceSetup.Exe), "the installed support.exe restages itself");
+        Assert(!DeviceUninstall.NeedsRestage(Path.Combine(Path.GetTempPath(), "SupportMcpStage-x\\support.exe")), "a Temp copy proceeds");
+
+        // leave: a 200 or a 401 both count as done (reached); only a network failure leaves the PC on the list.
+        Assert(DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Ok), "200 counts as done");
+        Assert(DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Removed), "401 counts as done");
+        Assert(!DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Offline), "a network failure is not reached");
+        Assert(DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Refused), "an unexpected refusal still removes locally");
+        Console.WriteLine("PASS uninstall: the removal plan, the exit-code map, the Temp-copy rule, and leave's 401 as done");
+    }
     // The focus the confirm gives back: only to the window that had it, only while the support window still holds it.
     static void FocusReturnTests() {
         Func<IntPtr, bool> ours = delegate(IntPtr w) { return (int)w >= 100; }, here = delegate(IntPtr w) { return (int)w != 7; };
@@ -1598,6 +1630,7 @@ public static class AppTests {
             DeviceInstallTests();
             DeviceServiceTests(dir);
             TrayTests();
+            UninstallTests();
             // The downloaded PE overlay must be readable by the actual .NET client.
             string overlay = Path.Combine(dir, "overlay.exe"); byte[] cfg = Encoding.UTF8.GetBytes(Wire.Json().Serialize(Wire.Map("sid", new string('a', 64), "key", new string('b', 64), "origin", "https://support.example.com", "startup_expires_at", Client.UnixNow() + 10000)));
             using (var f = File.Create(overlay)) { f.WriteByte(77); f.WriteByte(90); f.Write(cfg, 0, cfg.Length); byte[] n = BitConverter.GetBytes(cfg.Length); f.Write(n, 0, n.Length); byte[] footer = Encoding.ASCII.GetBytes(Wire.Footer); f.Write(footer, 0, footer.Length); }
