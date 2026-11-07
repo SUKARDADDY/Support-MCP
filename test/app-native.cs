@@ -389,8 +389,12 @@ public static class AppTests {
             return DeviceService.StatusFrame("PC", "ask", "limited", DeviceState.Active, "", 7, new System.Collections.ArrayList());
         };
         new UiServer(pipeName, handle, delegate(uint ssn) { return true; }, sddl, 1024);
-        using (var greedy = new System.IO.Pipes.NamedPipeClientStream(".", pipeName, System.IO.Pipes.PipeDirection.InOut)) {
-            try { greedy.Connect(2000); throw new Exception("the device pipe gave out full access"); } catch (UnauthorizedAccessException) { }
+        // The greedy client is checked on one instance with the service's real ACL: this account holds full access on
+        // the test pipe above, so a client running as it would always get in there.
+        using (var real = Native.PipeServer(pipeName + "-acl", "D:P(A;;GA;;;SY)(A;;0x12008B;;;IU)", 1, true)) {
+            using (var greedy = new System.IO.Pipes.NamedPipeClientStream(".", pipeName + "-acl", System.IO.Pipes.PipeDirection.InOut)) {
+                try { greedy.Connect(2000); throw new Exception("the device pipe gave out full access"); } catch (UnauthorizedAccessException) { }
+            }
         }
         using (var c = Pipes.Client(pipeName)) {
             c.Connect(2000);
@@ -476,16 +480,20 @@ public static class AppTests {
         Assert(!DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Offline), "a network failure is not reached");
         Assert(DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Refused), "an unexpected refusal still removes locally");
 
-        // The real removal on a temp folder whose exe is locked: it is renamed aside, so the original path is free for
-        // a fresh install. This drives the shared DeviceInstall.RemoveFolderAside, not a parallel copy.
+        // The real removal on a temp folder whose exe is running (as a tray left behind would be): it is renamed aside,
+        // so the original path is free for a fresh install. A running exe, not an open file handle: Windows renames a
+        // folder whose exe is running, but not one holding an open handle of any share mode. This drives the shared
+        // DeviceInstall.RemoveFolderAside, not a parallel copy.
         string root = Path.Combine(dir, "uninst-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(root);
         string f = Path.Combine(root, "SupportMCP"); Directory.CreateDirectory(f);
-        string fexe = Path.Combine(f, "support.exe"); File.WriteAllText(fexe, "x"); File.WriteAllText(Path.Combine(f, "device.json"), "{}");
-        using (new FileStream(fexe, FileMode.Open, FileAccess.Read, FileShare.Read)) {
+        string fexe = Path.Combine(f, "support.exe"); File.Copy(Path.Combine(Environment.SystemDirectory, "PING.EXE"), fexe); File.WriteAllText(Path.Combine(f, "device.json"), "{}");
+        var running = Process.Start(new ProcessStartInfo(fexe, "-n 60 127.0.0.1") { UseShellExecute = false, CreateNoWindow = true });
+        try {
+            Thread.Sleep(500);
             DeviceUninstall.TestRemoveFolder(f);
-            Assert(!Directory.Exists(f), "a locked install folder is renamed aside, freeing the original path for a reinstall");
-            Assert(Directory.GetDirectories(root, "SupportMCP.removed-*").Length >= 1, "the locked folder is kept under a unique removed name, not at the original path");
-        }
+            Assert(!Directory.Exists(f), "a folder whose exe is running is renamed aside, freeing the original path for a reinstall");
+            Assert(Directory.GetDirectories(root, "SupportMCP.removed-*").Length >= 1, "the running exe's folder is kept under a unique removed name, not at the original path");
+        } finally { try { running.Kill(); } catch (Exception) { } running.WaitForExit(5000); running.Dispose(); }
         foreach (string d in Directory.GetDirectories(root, "SupportMCP.removed-*")) try { Directory.Delete(d, true); } catch (Exception) { }
         // A plain (unlocked) folder is removed outright, with no leftover.
         Directory.CreateDirectory(f); File.WriteAllText(Path.Combine(f, "device.json"), "{}");
@@ -493,12 +501,22 @@ public static class AppTests {
         Assert(!Directory.Exists(f) && Directory.GetDirectories(root, "SupportMCP.removed-*").Length == 0, "an unlocked folder is removed with nothing left behind");
 
         // Two elevated installs or removes at once: the second is refused while the first holds the setup mutex.
+        // Only SYSTEM and Administrators may open it, so a standard (or filtered) test account checks that refusal and
+        // the held-mutex refusal on its own handle; an elevated one opens it twice, as two elevated installs would.
         string mn = "Local\\SupportMcpDeviceSetupTest-" + Guid.NewGuid().ToString("N");
+        bool elevated = new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator);
         using (var m1 = DeviceInstall.SetupMutex(mn)) {
             Assert(m1.WaitOne(0), "the first elevated install or remove takes the setup mutex");
-            using (var m2 = DeviceInstall.SetupMutex(mn)) Assert(!m2.WaitOne(0), "a second one is refused while the first holds it");
-            m1.ReleaseMutex();
-            using (var m3 = DeviceInstall.SetupMutex(mn)) { Assert(m3.WaitOne(0), "once released, the next one takes it"); m3Release(m3); }
+            if (elevated) {
+                using (var m2 = DeviceInstall.SetupMutex(mn)) Assert(!m2.WaitOne(0), "a second one is refused while the first holds it");
+                m1.ReleaseMutex();
+                using (var m3 = DeviceInstall.SetupMutex(mn)) { Assert(m3.WaitOne(0), "once released, the next one takes it"); m3Release(m3); }
+            } else {
+                try { DeviceInstall.SetupMutex(mn).Dispose(); throw new Exception("a standard user opened the setup mutex"); } catch (UnauthorizedAccessException) { }
+                bool second = true; var other = new Thread(delegate() { second = m1.WaitOne(0); if (second) m1.ReleaseMutex(); }); other.Start(); other.Join();
+                Assert(!second, "a second one is refused while the first holds it");
+                m1.ReleaseMutex();
+            }
         }
         Console.WriteLine("PASS uninstall: the removal plan and exit codes, the rename-aside removal, and the setup mutex refusal");
     }
