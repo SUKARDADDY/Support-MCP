@@ -451,8 +451,11 @@ check-in the relay may offer its current release. The PC takes it only when:
 The PC writes the new version as its own file in `%ProgramFiles%\SupportMCP`,
 points the service, the tray's startup entry and the Apps entry at it, and
 starts it on trial. If the new version crashes, fails to start, gets a protocol
-refusal from the relay, or does not finish a check-in within 4 minutes, the PC
-goes back to the old version and never tries that one again. The tray's history says "Support updated to version 0.5.1" or
+refusal or another refusal from the relay, or has no answer from it within 4
+minutes, the PC goes back to the old version and never tries that one again. No
+network at all is not the new version's fault: it keeps trying, and is kept if
+the relay is still unreachable at the end of the trial. A restart during the
+trial starts a fresh 4 minutes. The tray's history says "Support updated to version 0.5.1" or
 that it went back, and the tray shows the version. Tray icons already running keep
 the old version until the next sign-in.
 

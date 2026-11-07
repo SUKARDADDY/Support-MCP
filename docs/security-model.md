@@ -495,9 +495,9 @@ apply to only one client say which.
     `/install` and keeps it only when its size and SHA-256 match the signed note.
     So a relay, or anyone who controls it, can offer a release or hold one back,
     but cannot make a PC run anything the key did not sign, or go back to an older
-    signed release. What it can do: answer a new version's first check-in with a
-    426, so that version rolls back and is skipped from then on until a newer
-    release; and hold updates back. Both are accepted. A release reaches 10% of
+    signed release. What it can do: answer a new version's check-in with a 426
+    or another refusal, so that version rolls back and is skipped from then on
+    until a newer release; and hold updates back. Both are accepted. A release reaches 10% of
     PCs for a day, then half for a day, then all, by a group derived from the
     release and the PC's id, and `UPDATE_ROLLOUT` pauses it or pins a share.
   - *How a version is swapped.* The service writes each version as its own file
@@ -509,12 +509,32 @@ apply to only one client say which.
     folder users can write, and no file is renamed, so a user holding the old file
     open blocks nothing. While the new version is on trial, every failure of the
     service (a crash, or a stop with an error) runs the old file's rollback, also
-    after a restart. The new version must also finish one check-in pass (an
-    answer, a 401 or no network all count, a 426 does not) within 4 minutes, or
-    the switch brings the old version back. A version that fails is
-    recorded on the PC and never tried again. The owner sees only history lines
-    and the version in the tray: no prompt and no window. One-off session apps
-    never update themselves.
+    after a restart. The new version must also get a healthy answer to a
+    check-in within 4 minutes: a 200, a 202 or a 401 keeps it; a 426 or any
+    other refusal rolls it back at once. With no network or a server error it
+    tries again every 30 seconds, and near the deadline a PC still without a
+    network keeps it, since that is not the version's fault. A watcher started
+    from the old file rolls back a trial still open at the deadline. The switch
+    starts one; after a restart the new version starts another at its own start
+    and gets a fresh 4 minutes, so a version that never finishes a healthy
+    check-in is rolled back even across restarts. Only SYSTEM starts these
+    steps, and only the service (or its failure action) does. A rollback that a
+    restart cut short is finished at the next start, and a record that names
+    neither the running file nor the old one and is 10 minutes past its deadline
+    is cleared. A version that fails is recorded on the PC and never tried
+    again; one whose service never ran (a restart before the switch finished)
+    does not count as failed. The owner sees only history lines and the version
+    in the tray: no prompt and no window. One-off session apps never update
+    themselves.
+  - *A signed-in user can delay a rollback, not stop it for good.* The old file
+    is readable by every user, so a user can hold it open without sharing and
+    the old service then cannot start. The rollback keeps trying to start it for
+    5 minutes, with a growing wait between tries, while it holds the setup lock
+    (so an uninstall meanwhile says "busy"). If the user still holds the file
+    after that, the service stays stopped until the next restart, when Windows
+    starts it as usual. The user gains no control over the PC or the service
+    this way; it is a local denial of service of the support app only, and it
+    lasts until the next restart at most.
   - *If the release key is lost or exposed.* PCs cannot be moved to a new key
     without a release signed by the old one: a release that carries the new public
     key moves them. Without the old key, each PC needs a reinstall. Keep the key
@@ -552,7 +572,10 @@ apply to only one client say which.
     stops and deletes the service, and deletes the startup value, the Apps entry
     and the folder, with every version file and the update record in it, with the
     junction-safe delete the one-off cleanup uses. Anything still locked is
-    deleted at the next restart. While an update's trial is open it changes
+    deleted at the next restart. A version file still in use after an update
+    is renamed first and only the new name is queued, so a later install of
+    `support.exe` is never deleted by a queued removal. While an update's trial
+    is open it changes
     nothing and says "Support is finishing an update. Try again in a few
     minutes." If the relay cannot be
     reached, the PC is still removed locally, the key stays valid on the relay,

@@ -23,10 +23,16 @@ to run on unattended customer PCs.
 - Trial and rollback. Each version is kept as its own file,
   `support-<version>-<8 hex>.exe`, in `%ProgramFiles%\SupportMCP`. The service,
   the tray's startup entry and the Apps entry are pointed at the new file, which
-  runs on trial. A crash or a failed start puts the old version back, also after
-  a restart, and so do a protocol refusal and a first check-in not finished
-  within 4 minutes. That version is never tried again. Old files are deleted once nothing uses
-  them, or at the next restart.
+  runs on trial for 4 minutes. A check-in answered with 200, 202 or 401 keeps
+  it. A crash, a failed start, a protocol refusal (426) or any other refusal
+  puts the old version back, and so does a trial still open at its deadline.
+  With no network or a server error, the new version tries again every 30
+  seconds, and is kept if the relay is still unreachable near the deadline.
+  After a restart during the trial, the new version gets a fresh 4 minutes and
+  starts a watcher from the old file, so the deadline holds across restarts. A
+  version that failed is never tried again; a restart before it ever ran does
+  not count against it. Old files are deleted once nothing uses them; one still
+  in use is renamed and removed at the next restart.
 - Three deploy settings: `RELEASE_SIGNATURE` and `RELEASE_SIGNED_AT`, made at
   deploy time by `scripts/sign-release.mjs`, and `UPDATE_ROLLOUT` (empty for the
   stages, `pause`, or a share from 0 to 100). Without a signature the relay
@@ -56,8 +62,8 @@ to run on unattended customer PCs.
   offline and read only at deploy time; the relay, Cloudflare and CI never hold
   it. A relay can offer a release or hold one back, but cannot make a PC run
   anything else or go back to an older version. It can make a new version fail
-  its trial by refusing its protocol; that version is then skipped until a newer
-  one.
+  its trial by refusing its check-ins (a 426 or another refusal); that version
+  is then skipped until a newer one.
 - The apps stay unsigned for Windows. The release key signs only the release
   note, which only a saved PC's update check reads.
 

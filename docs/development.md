@@ -274,10 +274,15 @@ release signed long before its deploy would skip them.
 
    ```sh
    export BWS_ACCESS_TOKEN=...   # from a secure prompt; unset it afterwards
-   bws secret get <secret id> --output json | jq -r .value \
+   bws secret get <secret id> --output json \
+     | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).value))' \
      | node scripts/sign-release.mjs --out release-files
    unset BWS_ACCESS_TOKEN
    ```
+
+   `bws` prints the secret as JSON; the one-line `node` step passes on only its
+   `value`, the PEM, so the key goes from pipe to pipe and is never on a command
+   line or on disk.
 
    `scripts/sign-release.mjs` reads the key from stdin only. It checks that the
    bundle was built from `src/agent-app.cs` and carries `VERSION`, builds the
@@ -289,7 +294,7 @@ release signed long before its deploy would skip them.
 3. Deploy right away with the two settings, so the relay offers the release:
 
    ```sh
-   npx wrangler deploy --tag v0.3.0 --message "<one-line summary>" \
+   npx wrangler deploy --tag vX.Y.Z --message "<one-line summary>" \
      --var RELEASE_SIGNATURE:<signature> --var RELEASE_SIGNED_AT:<seconds>
    ```
 
@@ -310,12 +315,20 @@ offered one. Each PC reports its version at every check-in, so the team's device
 list shows how far a release has gone.
 
 The release key was made once with `scripts/release-key.mjs`, which creates the
-key in memory, prints the private key to stdout for your secrets manager, and
-writes only the public key (64 bytes `X||Y`, base64) to the file you name:
+key in memory, writes the private key (a PEM block) to stdout for your secrets
+manager, and writes only the public key (64 bytes `X||Y`, base64) to the file you
+name. It refuses to print the key to a terminal, so pipe it to the clipboard:
 
 ```sh
-node scripts/release-key.mjs release-key.pub | <store stdin as a secret>
+node scripts/release-key.mjs release-key.pub | pbcopy   # macOS; clip on Windows, wl-copy on Linux
 ```
+
+Paste it, from `-----BEGIN` to `-----END ... -----` inclusive, into the value of
+a new secret in the Bitwarden Secrets Manager web app, then clear the clipboard
+(and any clipboard history). Do not pass it to `bws secret create`: that puts the
+key on a command line, where other processes and the shell history can see it.
+Any other way of storing it works if it never puts the key on a command line or
+on disk.
 
 The same public key is the constant `ReleaseKey.ProjectKey` in
 `src/agent-app.cs`; `test/release.test.js` fails when the two differ. To move to a
