@@ -1,6 +1,6 @@
 // support-mcp relay router: Access JWT gate + MCP JSON-RPC handler + the team
 // API (/api/v1/...) + the public customer paths (/healthz, /j/<code>, /agent,
-// /ws) + the public PC wire for saved PCs (/device/...). Kept free of the .ps1 import and the DO classes so node --test can drive
+// /ws) + the saved PC's setup download (/install) and its public wire (/device/...). Kept free of the .ps1 import and the DO classes so node --test can drive
 // it route-level; index.js wires it to the real agent template.
 import { verifyAccessJwt, jwksKeyResolver, localBypassAllowed, callerIdentity } from './jwt.js';
 import { handleRpc, parseToolOptions } from './mcp.js';
@@ -10,6 +10,7 @@ import { DEFAULT_WORKSPACE, teamFromEnv } from './workspace.js';
 import { registryName } from './registry.js';
 import { handleApi } from './api.js';
 import { handleDevice } from './device-api.js';
+import { linkCode } from './devices.js';
 import { handleAuth } from './auth.js';
 import {
   AS_METADATA_PATH, PROTECTED_RESOURCE_PREFIX, REGISTER_PATH, TOKEN_PATH, assertPersonActive, assertSecondFactor, bearerToken,
@@ -18,6 +19,7 @@ import {
 import {
   buildAppDownload,
   buildBootstrap,
+  buildDeviceDownload,
   clientMode,
   normalizeWindowsMode,
   INVALID_LINK_SCRIPT,
@@ -93,6 +95,31 @@ function appPage(url, state = 'pending', sid = '', expiredStatus = 410) {
     <body><main${ready ? '' : ' class="off"'}><div class="edge"></div><div class="top">${SCREEN_SVG}<span>Remote support</span></div>
     <div class="body"><div class="hero"><div class="tile">${HEADSET_SVG}</div><h1>Support session</h1></div>${content}</div></main></body></html>`, {
     status: ready ? 200 : downloaded ? 409 : expiredStatus,
+    headers: { ...noStore, 'content-type': 'text/html; charset=utf-8', 'x-content-type-options': 'nosniff', 'referrer-policy': 'same-origin',
+      'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" },
+  });
+}
+
+// The setup page of /install. query is the checked query string ('' or
+// '?code=ABCDE-FGH23' or '?workspace=<slug>'); the form posts it back unchanged.
+// From a technician's link the page says the code is in the download; it never
+// checks or uses the code, so a link preview changes nothing.
+function installPage(query, hasCode) {
+  const step = (en, he) => `<li><span>${en}</span><span class="he" lang="he" dir="rtl">${he}</span></li>`;
+  const content = `<p class="sub">Download Support on the computer your support team looks after. A short setup asks how support may connect, then Windows asks once for permission.</p>
+       <p class="sub he" lang="he" dir="rtl">הורידו את Support במחשב שצוות התמיכה מטפל בו. הגדרה קצרה שואלת איך התמיכה יכולה להתחבר, ואז Windows מבקש אישור פעם אחת.</p>
+       <form method="post" action="/install${query}"><button type="submit">Download Support<span class="he" lang="he" dir="rtl">הורדת Support</span></button></form>
+       <ol>${step('Download Support.', 'הורידו את Support.')}${step('If Microsoft Edge says the file <strong>&ldquo;isn&rsquo;t commonly downloaded&rdquo;</strong>, point at the download, click the three dots (<strong>...</strong>), then click <strong>Keep</strong>. In the box that opens, click <strong>Show more</strong>, then <strong>Keep anyway</strong>.', 'אם Microsoft Edge מציג שהקובץ <bdi dir="ltr"><strong>&ldquo;isn&rsquo;t commonly downloaded&rdquo;</strong></bdi>, העבירו את העכבר מעל ההורדה, לחצו על שלוש הנקודות (<bdi dir="ltr"><strong>...</strong></bdi>) ואז על <bdi dir="ltr"><strong>Keep</strong></bdi>. בחלון שנפתח לחצו על <bdi dir="ltr"><strong>Show more</strong></bdi> ואז על <bdi dir="ltr"><strong>Keep anyway</strong></bdi>.')}${step('Open the downloaded file. If Windows says &ldquo;Windows protected your PC&rdquo;, click <strong>More info</strong>, then <strong>Run anyway</strong>.', 'פתחו את הקובץ שהורד. אם Windows מציג <bdi dir="ltr">&ldquo;Windows protected your PC&rdquo;</bdi>, לחצו על <bdi dir="ltr"><strong>More info</strong></bdi> ואז על <bdi dir="ltr"><strong>Run anyway</strong></bdi>.')}${step('Answer the setup&rsquo;s questions, then click <strong>Yes</strong> when Windows asks for permission.', 'ענו על שאלות ההגדרה, ואז לחצו על <bdi dir="ltr"><strong>Yes</strong></bdi> כש-Windows מבקש אישור.')}</ol>
+       ${hasCode ? `<p class="note">This link carries a setup code that works once, for 10 minutes. Use it only on this PC.</p>
+       <p class="note he" lang="he" dir="rtl">הקישור הזה כולל קוד הגדרה שעובד פעם אחת, למשך 10 דקות. השתמשו בו רק במחשב הזה.</p>` : ''}
+       <p class="note">Support stays on this PC until you uninstall it from Windows Settings (Control Panel on Windows 7 and 8.1).</p>
+       <p class="note he" lang="he" dir="rtl">Support נשאר במחשב עד שמסירים אותו בהגדרות של Windows (בלוח הבקרה ב-<bdi dir="ltr">Windows 7</bdi> וב-<bdi dir="ltr">8.1</bdi>).</p>
+       <p class="note">If your antivirus removes the file, tell support.</p>
+       <p class="note he" lang="he" dir="rtl">אם האנטי-וירוס מוחק את הקובץ, ספרו לתמיכה.</p>`;
+  return new Response(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Remote support</title>
+    <style>${APP_PAGE_CSS}</style></head>
+    <body><main><div class="edge"></div><div class="top">${SCREEN_SVG}<span>Remote support</span></div>
+    <div class="body"><div class="hero"><div class="tile">${HEADSET_SVG}</div><h1>Set up Support on this PC</h1></div>${content}</div></main></body></html>`, {
     headers: { ...noStore, 'content-type': 'text/html; charset=utf-8', 'x-content-type-options': 'nosniff', 'referrer-policy': 'same-origin',
       'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'" },
   });
@@ -351,6 +378,59 @@ async function handleJ(request, env, url, origin, agentText, appBundle) {
   return psText(script, 200);
 }
 
+// The checked query of an /install link: nothing, a technician's code, or a
+// team's workspace for an install the owner starts. Returns { query, code?,
+// workspace? }, or null for anything else (both, a bad value, another
+// parameter, a repeated one).
+const INSTALL_SLUG = /^[a-z0-9-]{1,40}$/;
+function installQuery(url) {
+  const names = [...url.searchParams.keys()];
+  if (names.length === 0) return { query: '' };
+  if (names.length !== 1) return null;
+  const value = url.searchParams.get(names[0]);
+  if (names[0] === 'code') {
+    const code = linkCode(value);
+    return code ? { query: `?code=${code}`, code } : null;
+  }
+  if (names[0] === 'workspace') return INSTALL_SLUG.test(value) ? { query: `?workspace=${value}`, workspace: value } : null;
+  return null;
+}
+
+// GET /install shows the setup page; the page's form POSTs back to download the
+// app with a device footer. Like the /j/ app link, a GET never downloads, so a
+// chat app's link preview fetches only the page. Unlike /j/, nothing is used up:
+// the code inside is redeemed by the PC itself, over /device/pair. Outside Access.
+async function handleInstall(request, url, origin, appBundle) {
+  if (request.method !== 'GET' && request.method !== 'POST') {
+    return new Response(request.method === 'HEAD' ? null : 'Open this link in a browser.', { status: 405, headers: { ...noStore, allow: 'GET, POST' } });
+  }
+  // The download runs the whole setup against `origin`, so refuse plain http on a real host.
+  if (url.protocol !== 'https:' && !isLoopback(url.hostname)) return psText('This setup link must use https. Open the link again with https:// at the start of the address.\n', 403);
+  const checked = installQuery(url);
+  if (!checked) return psText('This setup link is not valid. Ask your support team for a new one.\n', 400);
+  if (!appBundle) return new Response('not found', { status: 404, headers: noStore });
+  if (request.method === 'GET') return installPage(checked.query, checked.code !== undefined);
+  // The same rule as the /j/ download: Origin equal to this relay, or no Origin
+  // and a Referer from our own /install page.
+  const originHeader = request.headers.get('origin');
+  const fromOurPage = originHeader !== null ? originHeader === origin : (request.headers.get('referer') || '').startsWith(`${origin}/install`);
+  if (!fromOurPage) return new Response('Open the setup page and click the download button.', { status: 403, headers: noStore });
+  let body;
+  try {
+    body = buildDeviceDownload(appBundle, { origin, code: checked.code, workspace: checked.workspace });
+  } catch (_) {
+    return new Response('not found', { status: 404, headers: noStore });
+  }
+  return new Response(body, {
+    headers: {
+      ...noStore,
+      'content-type': 'application/octet-stream',
+      'x-content-type-options': 'nosniff',
+      'content-disposition': 'attachment; filename="support-setup.exe"',
+    },
+  });
+}
+
 const AGENT_BODY_MAX = 750000;
 
 // The downloaded app's transport: authenticated HTTPS long polling.
@@ -487,6 +567,7 @@ export function createHandler(agentText, appBundle = null, options = {}) {
 
       if (p === '/healthz') return json({ ok: true, service: 'support-mcp', stage: 'relay-v1', version: VERSION });
       if (p.startsWith('/j/')) return handleJ(request, env, url, origin, agentText, appBundle);
+      if (p === '/install') return handleInstall(request, url, origin, appBundle);
       if (p === '/agent') return handleAgent(request, env, url);
       if (p === '/ws') return handleWs(request, env, url);
       if (p === '/mcp') return handleMcp(request, env, url, origin, devTtlMs, DEFAULT_WORKSPACE, oauth);
@@ -516,7 +597,7 @@ export function createHandler(agentText, appBundle = null, options = {}) {
           waitUntil: ctx && typeof ctx.waitUntil === 'function' ? (promise) => ctx.waitUntil(promise) : undefined,
         });
       }
-      if (p === '/api' || p.startsWith('/api/')) return handleApi(request, env, url, { accessCaller, isJsonContentType });
+      if (p === '/api' || p.startsWith('/api/')) return handleApi(request, env, url, { accessCaller, isJsonContentType, origin });
       // A PC pairs and checks in here with its own key. Public: outside Access.
       if (p.startsWith('/device/')) return handleDevice(request, env, url, { isLoopback, isJsonContentType });
       return new Response('not found', { status: 404 });

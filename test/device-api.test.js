@@ -46,7 +46,7 @@ const refuses = (res, status, code) => {
 // ---- the whole round trip -------------------------------------------------------------
 test('a technician code pairs a PC; it checks in, changes its own settings, and leaves', async () => {
   const w = await wire();
-  const paired = await w.send('pair', { protocol: 1, code: await w.code(), name: 'Front desk', access: 'ask', control: 'full', owner_contact: 'Sam', os: 'Windows 10 Pro 22H2', machine: 'POS-1', app_version: '0.4.0' });
+  const paired = await w.send('pair', { protocol: 1, code: await w.code(), name: 'Front desk', access: 'ask', control: 'full', os: 'Windows 10 Pro 22H2', machine: 'POS-1', app_version: '0.4.0' });
   assert.equal(paired.status, 201);
   assert.deepEqual(Object.keys(paired.body).sort(), ['device_id', 'key', 'protocol', 'status', 'workspace']);
   assert.deepEqual([paired.body.protocol, paired.body.status, paired.body.workspace], [1, 'active', 'default']);
@@ -64,7 +64,7 @@ test('a technician code pairs a PC; it checks in, changes its own settings, and 
   });
   assert.deepEqual({ ...rows(w.db, 'SELECT os, app_version FROM devices')[0] }, { os: 'Windows 11', app_version: '0.4.1' });
 
-  const updated = await w.send('update', { protocol: 1, name: 'Till', access: 'any', control: 'limited', owner_contact: 'Dana' }, { headers: w.bearer(paired.body.key) });
+  const updated = await w.send('update', { protocol: 1, name: 'Till', access: 'any', control: 'limited' }, { headers: w.bearer(paired.body.key) });
   assert.equal(updated.status, 200);
   assert.deepEqual([updated.body.protocol, updated.body.device.name, updated.body.device.access, updated.body.device.control], [1, 'Till', 'any', 'limited']);
 
@@ -75,6 +75,19 @@ test('a technician code pairs a PC; it checks in, changes its own settings, and 
   refuses(await w.send('leave', { protocol: 1 }, { headers: w.bearer(paired.body.key) }), 401, 'device_unknown');
   assert.equal(rows(w.db, 'SELECT COUNT(*) AS n FROM devices')[0].n, 0, 'the row and its key hash are gone');
   assert.deepEqual((await w.team.readAudit('default', { limit: 500 })).rows.map((r) => r.kind).slice(2), ['pairing_code_created', 'device_paired', 'device_changed', 'device_left']);
+});
+
+test('a PC that sends owner_contact to pair or update gets 400 bad_request, and nothing is written', async () => {
+  const w = await wire();
+  const code = await w.code();
+  refuses(await w.send('pair', { protocol: 1, code, name: 'One', owner_contact: 'Sam' }), 400, 'bad_request');
+  refuses(await w.send('pair', { protocol: 1, workspace: 'default', name: 'One', owner_contact: 'Sam' }), 400, 'bad_request');
+  assert.equal(rows(w.db, 'SELECT COUNT(*) AS n FROM devices')[0].n, 0);
+  const paired = await w.send('pair', { protocol: 1, code, name: 'One' });
+  assert.equal(paired.status, 201, 'the code was not used up');
+  refuses(await w.send('update', { protocol: 1, owner_contact: 'Sam' }, { headers: w.bearer(paired.body.key) }), 400, 'bad_request');
+  refuses(await w.send('update', { protocol: 1, name: 'Two', owner_contact: 'Sam' }, { headers: w.bearer(paired.body.key) }), 400, 'bad_request');
+  assert.deepEqual({ ...rows(w.db, 'SELECT name, owner_contact FROM devices')[0] }, { name: 'One', owner_contact: '' });
 });
 
 test('a pairing code works once: the second use, an unknown code and a malformed one get the same 404 code_invalid', async () => {

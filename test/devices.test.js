@@ -163,9 +163,10 @@ test('a scripted run of every kind of change writes exactly the expected log kin
 test('log details hold names and ids, never a field value, an owner contact, a code, a key or a confirm number', async () => {
   const { db, team, devs } = await setup();
   const field = await devs.addField(W, BOSS, { entity: 'device', label: 'Account' });
-  const { made, out } = await pair(devs, TECH, { owner_contact: 'private-contact-text' });
+  const { made, out } = await pair(devs, TECH);
   await devs.updateDevice(W, TECH, out.device_id, { fields: { [field.id]: 'secret-field-text' } });
-  await devs.updateOwn(keyOf(out), { owner_contact: 'other-private-text' });
+  await devs.updateDevice(W, TECH, out.device_id, { owner_contact: 'private-contact-text' });
+  await devs.updateDevice(W, TECH, out.device_id, { owner_contact: 'other-private-text' });
   const waiting = await devs.requestJoin({ protocol: 1, workspace: W, name: 'Waiting' });
   const stored = rows(db, 'SELECT actor, detail FROM audit').map((r) => `${r.actor} ${r.detail}`).join('\n');
   for (const secret of [made.code, made.code.replace('-', ''), keyOf(out).secret, keyOf(waiting).secret, 'secret-field-text', 'private-contact-text', 'other-private-text']) {
@@ -423,17 +424,17 @@ test('a PC checks in unlogged: unchanged details are written every 5 minutes, ch
   await assert.rejects(devs.checkIn(key, { machine: 'x'.repeat(101) }), refused(400, 'bad_request'));
 });
 
-test('a PC changes its own name, access, control and contact; a no-op writes no log row', async () => {
+test('a PC changes its own name, access and control; a no-op writes no log row', async () => {
   const { team, devs } = await setup();
   const { key } = await pair(devs);
   const log = (await kinds(team)).length;
-  const out = await devs.updateOwn(key, { name: 'Till', access: 'any', control: 'limited', owner_contact: 'Sam 050' });
+  const out = await devs.updateOwn(key, { name: 'Till', access: 'any', control: 'limited' });
   assert.deepEqual([out.name, out.access, out.control], ['Till', 'any', 'limited']);
   assert.equal((await kinds(team)).length, log + 1);
   assert.equal((await devs.updateOwn(key, { name: 'Till', access: 'any' })).name, 'Till');
   assert.equal((await kinds(team)).length, log + 1, 'unchanged values write nothing');
   const shown = await devs.getDevice(W, key.id);
-  assert.deepEqual([shown.owner_contact, shown.paired_by], ['Sam 050', TECH]);
+  assert.deepEqual([shown.owner_contact, shown.paired_by], ['', TECH]);
   await assert.rejects(devs.updateOwn(key, {}), refused(400, 'bad_request'));
   await assert.rejects(devs.updateOwn(key, { name: '' }), refused(400, 'bad_request'));
   await assert.rejects(devs.updateOwn(key, { access: 'always' }), refused(400, 'bad_request'));
@@ -520,7 +521,7 @@ test('a technician with devices.manage can change a PC access mode, logged as th
   assert.match(row.detail, /access ask to any/);
   // control and name are the owner's, set from the PC: a technician sending them is refused, not ignored.
   const log = (await kinds(team)).length;
-  for (const owned of [{ control: 'full' }, { name: 'Hacked' }, { owner_contact: 'x' }, { os: 'x' }, { machine: 'x' }, { app_version: 'x' }]) {
+  for (const owned of [{ control: 'full' }, { name: 'Hacked' }, { os: 'x' }, { machine: 'x' }, { app_version: 'x' }]) {
     await assert.rejects(devs.updateDevice(W, TECH, out.device_id, { access: 'ask', ...owned }), refused(400, 'bad_request'), JSON.stringify(owned));
   }
   const kept = await devs.getDevice(W, out.device_id);
@@ -529,6 +530,45 @@ test('a technician with devices.manage can change a PC access mode, logged as th
   await assert.rejects(devs.updateDevice(W, TECH, out.device_id, { access: 'always' }), refused(400, 'bad_request'));
   await assert.rejects(devs.updateDevice(W, VIEW, out.device_id, { access: 'ask' }), refused(403, 'permission_denied'));
   assert.equal((await devs.getDevice(W, out.device_id)).access, 'any');
+});
+
+test('the owner contact is the team side: a technician sets and clears it, logged without its value; a PC that sends one is refused', async () => {
+  const { db, team, devs } = await setup();
+  const { out, key } = await pair(devs);
+  const set = await devs.updateDevice(W, TECH, out.device_id, { owner_contact: ' Sam, 050-1234567 ' });
+  assert.equal(set.owner_contact, 'Sam, 050-1234567');
+  assert.equal((await devs.getDevice(W, out.device_id)).owner_contact, 'Sam, 050-1234567');
+  const row = (await team.readAudit(W, { limit: 500 })).rows.at(-1);
+  assert.deepEqual([row.kind, row.actor, row.detail], ['device_changed', TECH, `${out.device_id} owner_contact`]);
+  // The same value again is no change and writes no log row; an empty one clears it.
+  let log = (await kinds(team)).length;
+  await devs.updateDevice(W, TECH, out.device_id, { owner_contact: 'Sam, 050-1234567' });
+  assert.equal((await kinds(team)).length, log);
+  assert.equal((await devs.updateDevice(W, TECH, out.device_id, { owner_contact: '' })).owner_contact, '');
+  assert.equal((await kinds(team)).length, log + 1);
+  // It combines with other changes, but not with an approval; it is text up to 200 characters.
+  const both = await devs.updateDevice(W, TECH, out.device_id, { owner_contact: 'Dana', access: 'any' });
+  assert.deepEqual([both.owner_contact, both.access], ['Dana', 'any']);
+  assert.match((await team.readAudit(W, { limit: 500 })).rows.at(-1).detail, /^[a-z2-7]{20} access ask to any, owner_contact$/);
+  for (const body of [{ owner_contact: 'x'.repeat(201) }, { owner_contact: 5 }, { owner_contact: 'a\u0007b' }, { owner_contact: 'x', approve: { confirm: '123456' } }]) {
+    await assert.rejects(devs.updateDevice(W, TECH, out.device_id, body), refused(400, 'bad_request'), JSON.stringify(body));
+  }
+  await assert.rejects(devs.updateDevice(W, VIEW, out.device_id, { owner_contact: 'x' }), refused(403, 'permission_denied'));
+  // A PC can no longer send it: pair with a code, an owner-started request and an update are all 400, and write nothing.
+  log = (await kinds(team)).length;
+  const devices = count(db, 'devices');
+  const made = await devs.createPairingCode(W, TECH, {});
+  await assert.rejects(devs.redeemCode({ protocol: 1, code: made.code, name: 'Two', owner_contact: 'x' }), refused(400, 'bad_request'));
+  await assert.rejects(devs.redeemCode({ protocol: 1, code: made.code, name: 'Two', owner_contact: '' }), refused(400, 'bad_request'), 'even an empty one');
+  await assert.rejects(devs.requestJoin({ protocol: 1, workspace: W, name: 'Two', owner_contact: 'x' }), refused(400, 'bad_request'));
+  await assert.rejects(devs.updateOwn(key, { owner_contact: 'Mallory' }), refused(400, 'bad_request'));
+  await assert.rejects(devs.updateOwn(key, { name: 'Till', owner_contact: 'Mallory' }), refused(400, 'bad_request'), 'not ignored next to a good field');
+  assert.equal(count(db, 'devices'), devices);
+  assert.equal((await kinds(team)).length, log + 1, 'only the code was logged');
+  assert.equal(rows(db, 'SELECT used_at FROM pairing_codes WHERE id = ?', made.id)[0].used_at, null, 'the code stays unused');
+  assert.equal((await devs.getDevice(W, out.device_id)).owner_contact, 'Dana');
+  // A wrong key is still 401 whatever the body says.
+  await assert.rejects(devs.updateOwn({ ...key, secret: 'x'.repeat(43) }, { owner_contact: 'x' }), refused(401, 'device_unknown'));
 });
 
 // ---- customers, sites and fields ----------------------------------------------------
@@ -900,8 +940,9 @@ test('approve checks the number and the expiry again at commit', async () => {
   assert.equal(rows(db, 'SELECT status FROM devices WHERE id = ?', first.device_id)[0].status, 'pending');
   assert.equal((await kinds(team)).length, log);
   const second = await devs.requestJoin({ protocol: 1, workspace: W, name: 'Two' });
-  // The wait runs out between the plan and the batch.
-  sneakBeforeBatch(db, () => db.sqlite.prepare('UPDATE devices SET expires_at = ? WHERE id = ?').run(Date.now() - 1, second.device_id));
+  // The wait runs out between the plan and the batch. A minute back, so it has expired by the plan's clock too,
+  // however many milliseconds pass between the plan and this update.
+  sneakBeforeBatch(db, () => db.sqlite.prepare('UPDATE devices SET expires_at = ? WHERE id = ?').run(Date.now() - 60000, second.device_id));
   await assert.rejects(devs.updateDevice(W, TECH, second.device_id, { approve: { confirm: second.confirm } }), refused(404, 'not_found'));
   assert.equal(rows(db, "SELECT COUNT(*) AS n FROM devices WHERE status = 'active'")[0].n, 0, 'nothing was approved');
   assert.equal((await kinds(team)).includes('device_approved'), false);

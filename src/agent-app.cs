@@ -42,9 +42,9 @@ using Shapes = System.Windows.Shapes;
 // Fully qualified, so no System.Reflection using brings new type names into scope.
 [assembly: System.Reflection.AssemblyTitle("Support-MCP")]
 [assembly: System.Reflection.AssemblyProduct("Support-MCP")]
-[assembly: System.Reflection.AssemblyVersion("0.3.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("0.3.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("0.3.0")]
+[assembly: System.Reflection.AssemblyVersion("0.4.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("0.4.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("0.4.0")]
 
 namespace SupportMcp {
     public static class SupportAccess {
@@ -104,7 +104,7 @@ namespace SupportMcp {
     public static class Wire {
         public const string Footer = "SUPPORTMCPCFG1";
         // The release version, sent in the hello. The hello's "agent" field stays the protocol generation.
-        public const string Version = "0.3.0";
+        public const string Version = "0.4.0";
         public static Dictionary<string, object> Map(params object[] pairs) {
             var d = new Dictionary<string, object>();
             for (int i = 0; i < pairs.Length; i += 2) d[(string)pairs[i]] = pairs[i + 1];
@@ -121,17 +121,51 @@ namespace SupportMcp {
         }
         public static JavaScriptSerializer Json() { return new JavaScriptSerializer { MaxJsonLength = 800000 }; }
         public static Dictionary<string, object> ReadConfig(string file) { return ReadConfig(File.ReadAllBytes(file)); }
+        // A session footer only. A footer with a "kind" (the setup download from /install) is refused, so no session
+        // role (--service, --helper, --elevate-install, the default and resume paths) can ever run on one.
         public static Dictionary<string, object> ReadConfig(byte[] all) {
-            int start = Payload(all), n = all.Length - Footer.Length - 4 - start;
-            for (int i = 0; i < Footer.Length; i++) if (all[all.Length - Footer.Length + i] != (byte)Footer[i]) throw new InvalidDataException("Invalid session configuration.");
-            var cfg = Json().Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(all, start, n));
+            var cfg = Parse(all);
+            if (cfg.ContainsKey("kind")) throw new InvalidDataException("Invalid session configuration.");
             if (!System.Text.RegularExpressions.Regex.IsMatch(Text(cfg, "sid"), "^[0-9a-f]{64}$") ||
                 !System.Text.RegularExpressions.Regex.IsMatch(Text(cfg, "key"), "^[0-9a-f]{64}$")) throw new InvalidDataException("Invalid session credentials.");
-            Uri origin = new Uri(Text(cfg, "origin"));
-            if ((origin.Scheme != "https" && !(origin.Scheme == "http" && origin.IsLoopback)) ||
-                origin.AbsolutePath != "/" || origin.UserInfo != "" || origin.Query != "" || origin.Fragment != "")
-                throw new InvalidDataException("Invalid support server.");
+            CheckOrigin(cfg);
             return cfg;
+        }
+        // The footer's kind: "" for a session, "device" for a setup download. Throws when there is no valid footer.
+        public static string Kind(byte[] all) { return Text(Parse(all), "kind"); }
+        // A setup footer: {"kind":"device","origin":...} with at most one of a technician's pairing code (ABCDE-FGH23)
+        // or a team's workspace slug, and nothing else. It carries no session and no key.
+        public const string CodePattern = @"^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{5}-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{5}\z", SlugPattern = @"^[a-z0-9-]{1,40}\z";
+        public static Dictionary<string, object> ReadDevice(byte[] all) {
+            var cfg = Parse(all);
+            foreach (string name in cfg.Keys)
+                if (name != "kind" && name != "origin" && name != "code" && name != "workspace") throw new InvalidDataException("Invalid setup configuration.");
+            if (!"device".Equals(Value(cfg, "kind"))) throw new InvalidDataException("Invalid setup configuration.");
+            bool code = cfg.ContainsKey("code"), workspace = cfg.ContainsKey("workspace");
+            if ((code && workspace) || (code && !(Value(cfg, "code") is string && System.Text.RegularExpressions.Regex.IsMatch((string)cfg["code"], CodePattern)))
+                || (workspace && !(Value(cfg, "workspace") is string && System.Text.RegularExpressions.Regex.IsMatch((string)cfg["workspace"], SlugPattern))))
+                throw new InvalidDataException("Invalid setup configuration.");
+            CheckOrigin(cfg);
+            return cfg;
+        }
+        static object Value(Dictionary<string, object> d, string key) { object v; return d.TryGetValue(key, out v) ? v : null; }
+        // The footer's JSON object, after the magic string and the size check.
+        static Dictionary<string, object> Parse(byte[] all) {
+            int start = Payload(all), n = all.Length - Footer.Length - 4 - start;
+            for (int i = 0; i < Footer.Length; i++) if (all[all.Length - Footer.Length + i] != (byte)Footer[i]) throw new InvalidDataException("Invalid session configuration.");
+            Dictionary<string, object> cfg;
+            try { cfg = Json().Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(all, start, n)); }
+            catch (Exception) { throw new InvalidDataException("Invalid session configuration."); }
+            if (cfg == null) throw new InvalidDataException("Invalid session configuration.");
+            return cfg;
+        }
+        // https, or http on loopback, with no path, user, query or fragment.
+        static void CheckOrigin(Dictionary<string, object> cfg) {
+            Uri origin;
+            if (!(Value(cfg, "origin") is string) || !Uri.TryCreate((string)cfg["origin"], UriKind.Absolute, out origin)
+                || (origin.Scheme != "https" && !(origin.Scheme == "http" && origin.IsLoopback))
+                || origin.AbsolutePath != "/" || origin.UserInfo != "" || origin.Query != "" || origin.Fragment != "")
+                throw new InvalidDataException("Invalid support server.");
         }
         // The length of the exe without its appended session configuration. The corner window's copy is cut there,
         // so the file a signed-in user can read carries no attach key.
@@ -1473,6 +1507,75 @@ namespace SupportMcp {
         }
     }
 
+    // The saved PC's client for the /device/ wire (docs/relay-v1-spec.md): pair or ask to join, check in, change its
+    // own settings, and leave on uninstall. Every request is POST JSON with "protocol": 1, the key (when it has one) in
+    // the Authorization header and never the URL, TLS 1.2 switched on first (Windows 7 cannot reach an https relay
+    // without it), 30-second timeouts, the default proxy and no redirects. A response over the cap, or one that does not
+    // parse, is read as offline, so a hostile answer cannot grow the process. It runs no command and sees no screen.
+    public sealed class DeviceLink {
+        public enum DeviceResult { Ok, Pending, CodeInvalid, Removed, UpdateNeeded, Offline, Refused }
+        // Result: the outcome below. Status: the HTTP status, 0 when the request never got an answer. Body: the parsed
+        // JSON answer, or null. Message: the relay's own error message, for a Refused result.
+        public sealed class Answer {
+            public readonly DeviceResult Result; public readonly int Status; public readonly Dictionary<string, object> Body; public readonly string Message;
+            public Answer(DeviceResult result, int status, Dictionary<string, object> body, string message) { Result = result; Status = status; Body = body; Message = message; }
+            // A 2xx answer, whether the PC is active (Ok) or waiting for approval (Pending).
+            public bool Ok { get { return Result == DeviceResult.Ok || Result == DeviceResult.Pending; } }
+        }
+        public const int Protocol = 1, ResponseCap = 65536;
+        readonly string origin;
+        public DeviceLink(string origin) { this.origin = origin; }
+        public Answer Pair(Dictionary<string, object> body) { return Send("/device/pair", body, null); }
+        public Answer Hello(string key, Dictionary<string, object> body) { return Send("/device/hello", body, key); }
+        public Answer Update(string key, Dictionary<string, object> body) { return Send("/device/update", body, key); }
+        public Answer Leave(string key) { return Send("/device/leave", Wire.Map(), key); }
+        Answer Send(string path, Dictionary<string, object> body, string key) {
+            try {
+                ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2 on .NET 4.5.2
+                var req = (HttpWebRequest)WebRequest.Create(origin + path);
+                req.Method = "POST"; req.ContentType = "application/json"; req.AllowAutoRedirect = false;
+                req.Timeout = 30000; req.ReadWriteTimeout = 30000;
+                req.Proxy = WebRequest.DefaultWebProxy;
+                if (key != null) req.Headers["Authorization"] = "Bearer " + key;
+                var full = new Dictionary<string, object>(body); full["protocol"] = Protocol;
+                byte[] bytes = Encoding.UTF8.GetBytes(Wire.Json().Serialize(full)); req.ContentLength = bytes.Length;
+                using (var stream = req.GetRequestStream()) stream.Write(bytes, 0, bytes.Length);
+                using (var response = (HttpWebResponse)req.GetResponse()) return Read((int)response.StatusCode, response);
+            } catch (WebException e) {
+                var r = e.Response as HttpWebResponse;
+                if (r == null) return new Answer(DeviceResult.Offline, 0, null, "");
+                using (r) return Read((int)r.StatusCode, r);
+            } catch (Exception) {
+                return new Answer(DeviceResult.Offline, 0, null, "");
+            }
+        }
+        static Answer Read(int status, HttpWebResponse response) {
+            Dictionary<string, object> body = null;
+            try {
+                using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8)) {
+                    char[] buf = new char[8192]; var data = new StringBuilder(); int n;
+                    while ((n = reader.Read(buf, 0, buf.Length)) > 0) { if (data.Length + n > ResponseCap) break; data.Append(buf, 0, n); }
+                    body = Wire.Json().Deserialize<Dictionary<string, object>>(data.ToString());
+                }
+            } catch (Exception) { }
+            return Map(status, body);
+        }
+        // The pinned mapping. A 2xx with no readable body is unexpected, so it counts as offline and the caller retries.
+        static Answer Map(int status, Dictionary<string, object> body) {
+            string code = "", message = "";
+            object err;
+            if (body != null && body.TryGetValue("error", out err) && err is Dictionary<string, object>) {
+                var e = (Dictionary<string, object>)err; code = Wire.Text(e, "code"); message = Wire.Text(e, "message");
+            }
+            if (status == 200 || status == 201) return body != null ? new Answer(DeviceResult.Ok, status, body, "") : new Answer(DeviceResult.Offline, 0, null, "");
+            if (status == 202) return body != null ? new Answer(DeviceResult.Pending, status, body, "") : new Answer(DeviceResult.Offline, 0, null, "");
+            if (status == 401) return new Answer(DeviceResult.Removed, status, body, message);
+            if (status == 426) return new Answer(DeviceResult.UpdateNeeded, status, body, message);
+            if (status == 404 && code == "code_invalid") return new Answer(DeviceResult.CodeInvalid, status, body, message);
+            return new Answer(DeviceResult.Refused, status, body, message);
+        }
+    }
+
     // ---- Full control -----------------------------------------------------------------------------------------
     // The customer's app elevates through UAC and runs itself with --elevate-install. That copies the exe (with its
     // session configuration) into an admin-only folder, writes the deadline, registers a backstop task and starts a
@@ -1496,10 +1599,15 @@ namespace SupportMcp {
         [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetNamedPipeClientProcessId(SafePipeHandle pipe, out uint pid);
         [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetNamedPipeClientSessionId(SafePipeHandle pipe, out uint session);
         [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetNamedPipeServerProcessId(SafePipeHandle pipe, out uint pid);
+        [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetNamedPipeServerSessionId(SafePipeHandle pipe, out uint session);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern SafePipeHandle CreateNamedPipe(string name, uint openMode, uint pipeMode, uint instances, uint outSize, uint inSize, uint timeout, ref CommandJob.Security security);
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(string sddl, uint revision, out IntPtr sd, IntPtr size);
         [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr h);
         [DllImport("user32.dll", SetLastError = true)] public static extern bool BlockInput(bool block);
+        // Frees an icon handle made by Bitmap.GetHicon (the tray's icon, drawn at run time).
+        [DllImport("user32.dll", SetLastError = true)] public static extern bool DestroyIcon(IntPtr icon);
+        // Lets the process that gets the call take the foreground (-1 is ASFW_ANY): a second start hands this over so the running tray's panel gets focus.
+        [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int pid);
         [DllImport("sas.dll")] static extern void SendSAS(bool asUser);
         [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetDefaultDllDirectories(uint flags);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern bool MoveFileEx(string from, string to, uint flags);
@@ -1755,16 +1863,26 @@ namespace SupportMcp {
             return new NamedPipeClientStream(".", name, PipeAccessRights.ReadData | PipeAccessRights.WriteData | PipeAccessRights.ReadAttributes | PipeAccessRights.Synchronize,
                 PipeOptions.Asynchronous, TokenImpersonationLevel.Identification, HandleInheritability.None);
         }
+        // True when the pipe's server end runs in session 0, so it is a service and not a squatter in an interactive
+        // session. The device pipe's ACL lets only SYSTEM add instances, but a squatter can take the name first.
+        public static bool ServerIsService(SafePipeHandle pipe) { uint session; return Native.GetNamedPipeServerSessionId(pipe, out session) && session == 0; }
         // What a corner window may ask the service: exactly {"type":"status"} or {"type":"end"}. null for anything else.
         public static string UiRequest(Dictionary<string, object> m) {
             object t; if (m.Count != 1 || !m.TryGetValue("type", out t)) return null;
             return "status".Equals(t) || "end".Equals(t) ? (string)t : null;
         }
+        // What a saved PC's tray may ask the service: exactly {"type":"status"}, {"type":"allow_any_time"} or
+        // {"type":"refresh"}. Any extra field, or any other type, is null (closed), so nothing can ask for access "ask".
+        public static string DeviceRequest(Dictionary<string, object> m) {
+            object t; if (m.Count != 1 || !m.TryGetValue("type", out t)) return null;
+            return "status".Equals(t) || "allow_any_time".Equals(t) || "refresh".Equals(t) ? (string)t : null;
+        }
     }
 
     public static class FullAcl {
         public static readonly SecurityIdentifier SystemSid = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
-            AdminsSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), UsersSid = new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null);
+            AdminsSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), UsersSid = new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null),
+            InteractiveSid = new SecurityIdentifier(WellKnownSidType.InteractiveSid, null);
         // The service folder: SYSTEM and Administrators only, nothing inherited from %ProgramData%.
         public static DirectorySecurity Folder() {
             var s = new DirectorySecurity(); s.SetAccessRuleProtection(true, false);
@@ -2008,14 +2126,37 @@ namespace SupportMcp {
         [DllImport("advapi32.dll", SetLastError = true)] static extern bool CloseServiceHandle(IntPtr h);
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct Description { public string Text; }
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool ChangeServiceConfig2(IntPtr service, uint level, ref Description info);
-        // Own process, auto start, LocalSystem.
-        public static void Create(string name, string binary) {
+        // SERVICE_FAILURE_ACTIONS (level 2): restart on the first two failures, then leave it. ResetPeriod is a day,
+        // so unrelated failures far apart do not count together. The actions array is pinned in memory while the call runs.
+        [StructLayout(LayoutKind.Sequential)] struct ScAction { public int Type; public uint Delay; }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct FailureActions {
+            public uint ResetPeriod; public string RebootMessage, Command; public uint Count; public IntPtr Actions;
+        }
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool ChangeServiceConfig2(IntPtr service, uint level, ref FailureActions info);
+        // Own process, auto start, LocalSystem. display and description are the service's text; restartOnFailure adds the
+        // level-2 failure actions. The one-off full-control service keeps its exact text (see the single-argument call below).
+        public static void Create(string name, string binary) { Create(name, "Remote support session", "Gives remote support full control of this PC for one session, and removes itself when the session ends.", binary, false); }
+        public static void Create(string name, string display, string description, string binary, bool restartOnFailure) {
             IntPtr scm = OpenSCManager(null, null, 0x0003); if (scm == IntPtr.Zero) throw new Win32Exception();
             try {
-                IntPtr s = CreateService(scm, name, "Remote support session", 0xF01FF, 0x10, 2, 1, binary, null, IntPtr.Zero, null, null, null);
+                IntPtr s = CreateService(scm, name, display, 0xF01FF, 0x10, 2, 1, binary, null, IntPtr.Zero, null, null, null);
                 if (s == IntPtr.Zero) throw new Win32Exception();
-                var d = new Description { Text = "Gives remote support full control of this PC for one session, and removes itself when the session ends." };
-                ChangeServiceConfig2(s, 1, ref d); CloseServiceHandle(s);
+                try {
+                    var d = new Description { Text = description };
+                    ChangeServiceConfig2(s, 1, ref d);
+                    if (restartOnFailure) {
+                        // Two restarts after a one-minute wait, then no more. SC_ACTION_RESTART is 1, SC_ACTION_NONE is 0.
+                        var actions = new ScAction[3];
+                        actions[0].Type = 1; actions[0].Delay = 60000;
+                        actions[1].Type = 1; actions[1].Delay = 60000;
+                        actions[2].Type = 0; actions[2].Delay = 0;
+                        var pin = GCHandle.Alloc(actions, GCHandleType.Pinned);
+                        try {
+                            var fa = new FailureActions { ResetPeriod = 86400, RebootMessage = null, Command = null, Count = (uint)actions.Length, Actions = pin.AddrOfPinnedObject() };
+                            ChangeServiceConfig2(s, 2, ref fa);
+                        } finally { pin.Free(); }
+                    }
+                } finally { CloseServiceHandle(s); }
             } finally { CloseServiceHandle(scm); }
         }
         public static ServiceControllerStatus? Status(string name) { try { using (var c = new ServiceController(name)) return c.Status; } catch (InvalidOperationException) { return null; } }
@@ -2423,15 +2564,29 @@ namespace SupportMcp {
     // user switching, Remote Desktop) cannot take the 8 instances. A request is {"type":"status"} or {"type":"end"};
     // anything else, or nothing for 5 s, closes the connection.
     sealed class UiServer {
-        const string Sddl = "D:P(A;;GA;;;SY)(A;;0x12008B;;;IU)";
+        internal const string Sddl = "D:P(A;;GA;;;SY)(A;;0x12008B;;;IU)";
         public const int Instances = 8, ReadMs = 5000, PerProcess = 2;
-        readonly Func<Dictionary<string, object>> status; readonly Action end; readonly Func<uint, bool> allowSession;
+        // handle takes the parsed request and returns the reply to write, or null to close the connection. The
+        // corner-window server (status/end) and the saved PC's server (status/allow_any_time/refresh) are both built on it.
+        readonly Func<Dictionary<string, object>, Dictionary<string, object>> handle; readonly Func<uint, bool> allowSession; readonly int readMax;
         readonly Dictionary<uint, long> seen = new Dictionary<uint, long>(); readonly Dictionary<uint, int> open = new Dictionary<uint, int>();
         public UiServer(string name, Func<Dictionary<string, object>> status, Action end) : this(name, status, end, delegate(uint s) { return s == Native.WTSGetActiveConsoleSessionId(); }, Sddl) { }
         // allowSession and sddl: the tests' own. Only the owner of a pipe's ACL may add instances, and the tests do not run as SYSTEM.
-        internal UiServer(string name, Func<Dictionary<string, object>> status, Action end, Func<uint, bool> allowSession, string sddl) {
-            this.status = status; this.end = end; this.allowSession = allowSession;
+        internal UiServer(string name, Func<Dictionary<string, object>> status, Action end, Func<uint, bool> allowSession, string sddl)
+            : this(name, StatusEnd(status, end), allowSession, sddl, 1024) { }
+        // The general form: a request handler, the session gate and the SDDL. The saved PC's service uses this.
+        internal UiServer(string name, Func<Dictionary<string, object>, Dictionary<string, object>> handle, Func<uint, bool> allowSession, string sddl, int readMax) {
+            this.handle = handle; this.allowSession = allowSession; this.readMax = readMax;
             for (int i = 0; i < Instances; i++) { var pipe = Native.PipeServer(name, sddl, Instances, i == 0, true); var t = new Thread(Serve); t.IsBackground = true; t.Start(pipe); }
+        }
+        // The corner window's vocabulary as a handler: status or end (then status), anything else closes the connection.
+        static Func<Dictionary<string, object>, Dictionary<string, object>> StatusEnd(Func<Dictionary<string, object>> status, Action end) {
+            return delegate(Dictionary<string, object> m) {
+                string request = Pipes.UiRequest(m);
+                if (request == null) return null;
+                if (request == "end") end();
+                return status();
+            };
         }
         void Serve(object o) {
             var pipe = (NamedPipeServerStream)o;
@@ -2442,11 +2597,10 @@ namespace SupportMcp {
                     if (!Native.GetNamedPipeClientProcessId(pipe.SafePipeHandle, out pid) || !Native.GetNamedPipeClientSessionId(pipe.SafePipeHandle, out session) || !allowSession(session)) throw new UnauthorizedAccessException();
                     lock (open) { int n; open.TryGetValue(pid, out n); if (n >= PerProcess) throw new UnauthorizedAccessException(); open[pid] = n + 1; counted = true; }
                     while (true) {
-                        string request = Pipes.UiRequest(Pipes.Read(pipe, 1024, ReadMs));
-                        if (request == null) break;
-                        if (request == "end") end();
+                        Dictionary<string, object> reply = handle(Pipes.Read(pipe, readMax, ReadMs));
+                        if (reply == null) break;
                         lock (seen) seen[session] = PauseClock.Now();
-                        Pipes.Write(pipe, status());
+                        Pipes.Write(pipe, reply);
                     }
                 } catch (Exception) { }
                 if (counted) lock (open) { if (--open[pid] == 0) open.Remove(pid); }
@@ -3414,11 +3568,1416 @@ namespace SupportMcp {
         }
     }
 
+    // ---- Saved PC: setup --------------------------------------------------------------------------------------
+    // The rules of the setup wizard, kept apart from its window so the native tests can check them. The wizard runs
+    // as the signed-in user and never holds a key. It hands its answers to the elevated install step as one argument
+    // (base64url JSON) and reads the outcome from that step's exit code; no file passes between the two.
+    public static class DeviceSetup {
+        public const string ServiceName = "SupportMcpDevice";
+        // The elevated step's exit codes.
+        public const int Active = 0, Pending = 10, CodeInvalid = 20, Network = 21, Refused = 22, AlreadySetUp = 23;
+        public const int MaxName = 100, MaxAnswers = 1024;
+        const string Alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        // The install folder and the app in it, under %ProgramFiles% read from HKLM (FullInstall.Root).
+        public static string Folder { get { return Path.Combine(FullInstall.Root, "SupportMCP"); } }
+        public static string Exe { get { return Path.Combine(Folder, "support.exe"); } }
+        // The wizard's screens. Code to Install are steps 1 to 5.
+        public enum Screen { Intro, Code, Name, Access, Control, Install, Done, Waiting, Already, Unavailable }
+        public static int StepOf(Screen s) { return s >= Screen.Code && s <= Screen.Install ? (int)s : 0; }
+
+        // A typed code in the form the team shows (ABCDE-FGH23), or null. Case, spaces and hyphens do not matter.
+        public static string NormalizeCode(string typed) {
+            var plain = new StringBuilder();
+            foreach (char c in typed ?? "") { if (c == '-' || c == ' ') continue; plain.Append(char.ToUpperInvariant(c)); }
+            string code = plain.ToString();
+            if (code.Length != 10 || !CodeCharsOk(code)) return null;
+            return code.Substring(0, 5) + "-" + code.Substring(5);
+        }
+        // True while what is typed so far could still become a code: only the code's letters and digits, spaces and
+        // hyphens, and at most 10 of the letters and digits.
+        public static bool CodeCharsOk(string typed) {
+            int n = 0;
+            foreach (char c in typed ?? "") {
+                if (c == '-' || c == ' ') continue;
+                if (Alphabet.IndexOf(char.ToUpperInvariant(c)) < 0) return false;
+                n++;
+            }
+            return n <= 10;
+        }
+        // An error text for a PC name, or "" when it is good. The relay allows 100 characters with no control characters.
+        public static string CheckName(string name) {
+            string t = (name ?? "").Trim();
+            if (t.Length == 0) return "Give this PC a name your support team will recognise.";
+            if (t.Length > MaxName) return "Use at most " + MaxName + " characters.";
+            foreach (char c in t) if (char.IsControl(c)) return "Use letters, digits and spaces only.";
+            return "";
+        }
+        // What stops the wizard from leaving a screen, or "" when nothing does. access and control are null until chosen:
+        // nothing is preselected.
+        public static string Missing(Screen s, string code, bool useWorkspace, string name, string access, string control) {
+            if (s == Screen.Code && !useWorkspace && NormalizeCode(code) == null) return "Type the code from your support team, like ABCDE-FGH23.";
+            if (s == Screen.Name) return CheckName(name);
+            if (s == Screen.Access && access != "ask" && access != "any") return "Choose how support may connect.";
+            if (s == Screen.Control && control != "full" && control != "limited") return "Choose how much support can do.";
+            return "";
+        }
+
+        // The answers argument: base64url of {"name","access","control"} plus "code" (a technician's code) or
+        // "workspace": true (an install the owner starts, with the workspace from the install step's own footer). No
+        // owner contact: the team keeps it. Nothing secret beyond the code the owner typed.
+        public static string EncodeAnswers(string name, string access, string control, string code) {
+            var m = Wire.Map("name", (name ?? "").Trim(), "access", access, "control", control);
+            if (code == null) m["workspace"] = true; else m["code"] = code;
+            string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(Wire.Json().Serialize(m)));
+            return b64.TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        }
+        // The answers back, checked again, since anyone could start the install step with any argument.
+        public static Dictionary<string, object> DecodeAnswers(string arg) {
+            if (arg == null || arg.Length == 0 || arg.Length > MaxAnswers || !System.Text.RegularExpressions.Regex.IsMatch(arg, @"^[A-Za-z0-9_-]+\z")) throw new InvalidDataException("Invalid setup answers.");
+            string b64 = arg.Replace('-', '+').Replace('_', '/');
+            b64 += new string('=', (4 - b64.Length % 4) % 4);
+            Dictionary<string, object> m;
+            try { m = Wire.Json().Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(Convert.FromBase64String(b64))); }
+            catch (Exception) { throw new InvalidDataException("Invalid setup answers."); }
+            if (m == null || m.Count != 4) throw new InvalidDataException("Invalid setup answers.");
+            object name, access, control, code, workspace;
+            bool hasCode = m.TryGetValue("code", out code), hasWorkspace = m.TryGetValue("workspace", out workspace);
+            if (!m.TryGetValue("name", out name) || !(name is string) || CheckName((string)name) != "" || ((string)name).Trim() != (string)name
+                || !m.TryGetValue("access", out access) || !("ask".Equals(access) || "any".Equals(access))
+                || !m.TryGetValue("control", out control) || !("full".Equals(control) || "limited".Equals(control))
+                || hasCode == hasWorkspace
+                || (hasCode && !(code is string && NormalizeCode((string)code) == (string)code))
+                || (hasWorkspace && !true.Equals(workspace))) throw new InvalidDataException("Invalid setup answers.");
+            return m;
+        }
+
+        // Where the wizard goes after the install step's exit code, and what it says there.
+        public static Screen After(int exit) {
+            if (exit == Active) return Screen.Done;
+            if (exit == Pending) return Screen.Waiting;
+            if (exit == CodeInvalid) return Screen.Code;
+            if (exit == AlreadySetUp) return Screen.Already;
+            return Screen.Install; // network, refused, or anything unknown: try again from the install step
+        }
+        public static string ExitText(int exit) {
+            if (exit == Active || exit == Pending || exit == AlreadySetUp) return "";
+            if (exit == CodeInvalid) return "That code didn't work. It may be used or expired. Ask your support team for a new one.";
+            if (exit == Network) return "Can't reach your support team right now. Check the internet connection, then try again.";
+            return "Setup didn't finish. Your support team's server refused it. Try again, or ask your support team for help.";
+        }
+        public const string DeclinedText = "Windows didn't get permission, so nothing was installed. Click Try again to ask once more.";
+        public const string UnavailableText = "This Windows account can't install programs. Ask an administrator of this PC to run the setup.";
+        // Six digits as the owner reads them: "482 913".
+        public static string ShowConfirm(string digits) {
+            return digits != null && System.Text.RegularExpressions.Regex.IsMatch(digits, @"^[0-9]{6}\z") ? digits.Substring(0, 3) + " " + digits.Substring(3) : null;
+        }
+        public static string ModeText(string access) {
+            return access == "any" ? "Your support team can connect to this PC any time, even when nobody is at it." : "Support asks you on this PC before each connection.";
+        }
+        // Where the owner uninstalls: Settings, then Apps from Windows 10 (build 10240) on; Control Panel before it.
+        public static readonly string AppsPlace = HasSettingsApps() ? "Settings, then Apps" : "Control Panel, then Programs and Features";
+        public static readonly string UninstallText = "To remove Support, open " + AppsPlace + ", and uninstall Support.";
+        static bool HasSettingsApps() {
+            try {
+                using (var hklm = Microsoft.Win32.RegistryKey.OpenBaseKey(Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryView.Registry64))
+                using (var k = hklm.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion")) {
+                    int build; if (k != null && Int32.TryParse(k.GetValue("CurrentBuildNumber") as string, out build)) return build >= 10240;
+                }
+            } catch (Exception) { }
+            // Without a manifest Windows 8 to 11 all report 6.2, so an unreadable registry means Control Panel, which every build has.
+            return false;
+        }
+
+        // A short description of this Windows, reported to the relay. Never fails the install.
+        // The Windows name and build from the registry: Environment.OSVersion reports 6.2 on Windows 10 and 11 to an exe
+        // that does not declare them, and Windows 11 still names itself "Windows 10" in ProductName.
+        public static string Os() {
+            try {
+                // The 64-bit view: this x86 exe would otherwise read the WOW64 copy, whose ProductName can be stale.
+                using (var hklm = Microsoft.Win32.RegistryKey.OpenBaseKey(Microsoft.Win32.RegistryHive.LocalMachine, Microsoft.Win32.RegistryView.Registry64))
+                using (var k = hklm.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion")) {
+                    string product = k == null ? null : k.GetValue("ProductName") as string, build = k == null ? null : k.GetValue("CurrentBuildNumber") as string;
+                    string release = k == null ? null : k.GetValue("DisplayVersion") as string;
+                    if (String.IsNullOrEmpty(release) && k != null) release = k.GetValue("ReleaseId") as string;
+                    return OsName(product, build, release);
+                }
+            } catch (Exception) { }
+            try { return Environment.OSVersion.VersionString; } catch (Exception) { return "Windows"; }
+        }
+        internal static string OsName(string product, string build, string release) {
+            if (String.IsNullOrEmpty(product)) return "Windows" + (String.IsNullOrEmpty(build) ? "" : " (build " + build + ")");
+            int number; string name = product.Trim();
+            if (Int32.TryParse(build, out number) && number >= 22000 && name.StartsWith("Windows 10", StringComparison.Ordinal)) name = "Windows 11" + name.Substring(10);
+            if (!String.IsNullOrEmpty(release)) name += " " + release.Trim();
+            if (!String.IsNullOrEmpty(build)) name += " (build " + build.Trim() + ")";
+            return name.Length > 100 ? name.Substring(0, 100) : name;
+        }
+        // Starts the tray as the signed-in user, when it is installed. A failure is not an error: it starts at the next sign-in.
+        public static void StartTray() {
+            try { if (File.Exists(Exe)) using (Process.Start(TrayStart())) { } } catch (Exception) { }
+        }
+        // The tray starts in the system folder: a process's current directory blocks renaming it, and the install folder
+        // must stay free to rename aside when the PC is removed.
+        internal static ProcessStartInfo TrayStart() { return new ProcessStartInfo(Exe, "--tray") { UseShellExecute = false, WorkingDirectory = Environment.SystemDirectory }; }
+        // The wizard, one per session.
+        public static void Run(Application app, Dictionary<string, object> footer, string exe) {
+            bool first; using (var mutex = new Mutex(true, "Local\\SupportMcpSetup", out first)) {
+                if (!first) return;
+                var window = new SetupWindow(Palette.Detect(), footer, exe);
+                window.Closed += delegate { app.Shutdown(); };
+                app.Run(window);
+                window.Finish();
+            }
+        }
+    }
+
+    // The setup wizard, shown as the signed-in user from a /install download. One window, five steps (code, name,
+    // access, control, install), in the app's palette. It holds no key: it hands its answers to the elevated install
+    // step as one base64url argument and reads the outcome from that step's exit code (DeviceSetup).
+    public sealed class SetupWindow : Window {
+        const double CardWidth = 460, Pad = 20;
+        readonly Palette p;
+        readonly Dictionary<string, object> footer;
+        readonly string exe, prefilledCode, workspace;
+        readonly bool offersWorkspace;
+        DeviceSetup.Screen screen;
+        volatile bool installing, declined;
+        string confirm;
+        Thread worker;
+
+        readonly Border bodyHost;
+        readonly TextBlock heading, stepLine, error;
+        readonly FlatButton back, next, cancel;
+        readonly Dictionary<DeviceSetup.Screen, FrameworkElement> panels = new Dictionary<DeviceSetup.Screen, FrameworkElement>();
+        TextBox codeBox, nameBox;
+        CheckBox noCode;
+        RadioButton askRadio, anyRadio, fullRadio, limitedRadio;
+        DeviceSetup.Screen? focusedFor;
+        readonly TextBlock terminalHead, terminalBody;
+
+        public SetupWindow(Palette palette, Dictionary<string, object> footer, string exe) {
+            this.p = palette; this.footer = footer; this.exe = exe;
+            prefilledCode = Wire.Text(footer, "code");
+            workspace = Wire.Text(footer, "workspace");
+            offersWorkspace = workspace.Length > 0;
+            screen = Scm.Status(DeviceSetup.ServiceName) != null ? DeviceSetup.Screen.Already : DeviceSetup.Screen.Intro;
+
+            Ui.Transparent(this);
+            Topmost = false; ShowInTaskbar = true; Title = "Support setup";
+            Width = CardWidth + 2 * Pad; SizeToContent = SizeToContent.Height; WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            Foreground = p.Ink;
+            Grid inner; var card = Ui.Card(p, CardWidth, out inner);
+            var root = new Grid { Margin = new Thickness(Pad) }; root.Children.Add(card); Content = root;
+            var stack = new StackPanel(); inner.Children.Add(stack);
+            stack.Children.Add(new Border { Height = 3, Background = p.Work });
+
+            var header = new Grid { Height = 36, Margin = new Thickness(14, 0, 14, 0), Background = Brushes.Transparent };
+            var title = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            var screenGlyph = Glyph.Screen().Paint(p.Muted).Sized(16); screenGlyph.Margin = new Thickness(0, 0, 8, 0);
+            title.Children.Add(screenGlyph);
+            title.Children.Add(Lbl("Support setup", 12, FontWeights.SemiBold, p.Muted, Ui.TextFont, VerticalAlignment.Center));
+            header.Children.Add(title);
+            stepLine = Lbl("", 12, FontWeights.Normal, p.Muted, Ui.TextFont, VerticalAlignment.Center); stepLine.HorizontalAlignment = HorizontalAlignment.Right;
+            header.Children.Add(stepLine);
+            Ui.Drag(this, header);
+            stack.Children.Add(header);
+
+            var bodyWrap = new StackPanel { Margin = new Thickness(20, 6, 20, 4) };
+            heading = Lbl("", 17, FontWeights.SemiBold, p.Ink, Ui.DisplayFont, VerticalAlignment.Top); heading.Margin = new Thickness(0, 0, 0, 10); heading.LineHeight = 22;
+            bodyWrap.Children.Add(heading);
+            bodyHost = new Border(); bodyWrap.Children.Add(bodyHost);
+            error = Lbl("", 12.5, FontWeights.Normal, p.Stop, Ui.TextFont, VerticalAlignment.Top); error.Margin = new Thickness(0, 10, 0, 0); error.Visibility = Visibility.Collapsed;
+            bodyWrap.Children.Add(error);
+            terminalHead = Lbl("", 15.5, FontWeights.SemiBold, p.Ink, Ui.DisplayFont, VerticalAlignment.Top); terminalHead.Margin = new Thickness(0, 0, 0, 8); terminalHead.LineHeight = 21;
+            terminalBody = Lbl("", 13, FontWeights.Normal, p.Muted, Ui.TextFont, VerticalAlignment.Top); terminalBody.LineHeight = 19;
+            stack.Children.Add(bodyWrap);
+
+            var foot = new Border { BorderBrush = p.Line, BorderThickness = new Thickness(0, 1, 0, 0), Padding = new Thickness(12, 10, 12, 12), Margin = new Thickness(0, 10, 0, 0) };
+            var footGrid = new Grid();
+            footGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            footGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            footGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            cancel = new FlatButton("Cancel", p.Ink, p.Surface2, p.Line, p.Work, 34, 88, 14, 6, 13, true);
+            cancel.Click += delegate { Close(); };
+            footGrid.Children.Add(cancel);
+            back = new FlatButton("Back", p.Ink, p.Surface2, p.Line, p.Work, 34, 88, 14, 6, 13, true);
+            back.Click += delegate { OnBack(); };
+            Grid.SetColumn(back, 0); footGrid.Children.Add(back);
+            next = new FlatButton("Next", Brushes.White, p.Work, p.Work, p.Ink, 34, 120, 16, 6, 13, true);
+            next.Click += delegate { OnNext(); };
+            Grid.SetColumn(next, 2); footGrid.Children.Add(next);
+            foot.Child = footGrid; stack.Children.Add(foot);
+
+            BuildPanels();
+            PreviewKeyDown += delegate(object sender, KeyEventArgs e) {
+                if (e.Key == Key.Escape && !installing) { e.Handled = true; Close(); }
+                else if (e.Key == Key.Enter && next.IsEnabled && next.Visibility == Visibility.Visible) { e.Handled = true; OnNext(); }
+            };
+            Closing += delegate(object sender, System.ComponentModel.CancelEventArgs e) { if (installing) e.Cancel = true; };
+            Loaded += delegate { Render(); Activate(); };
+        }
+
+        TextBlock Lbl(string text, double size, FontWeight weight, Brush color, string font, VerticalAlignment valign) {
+            var t = Ui.Label(text, size, weight, color, font); t.VerticalAlignment = valign; return t;
+        }
+
+        void BuildPanels() {
+            // Intro.
+            panels[DeviceSetup.Screen.Intro] = Para("Support keeps this PC on your support team's list so they can help when you ask. This short setup asks how they may connect. You stay in control: remove Support any time from " + DeviceSetup.AppsPlace + ".");
+
+            // Code.
+            var codePanel = new StackPanel();
+            codePanel.Children.Add(Para("Enter the code your support team sent you. It looks like ABCDE-FGH23."));
+            codeBox = Field(prefilledCode.Length > 0 ? prefilledCode : "", "ABCDE-FGH23");
+            codeBox.CharacterCasing = CharacterCasing.Upper;
+            codeBox.TextChanged += delegate { if (error.Visibility == Visibility.Visible) { error.Visibility = Visibility.Collapsed; } };
+            codePanel.Children.Add(codeBox);
+            if (offersWorkspace) {
+                noCode = new CheckBox { Content = "I don't have a code", Foreground = p.Ink, Margin = new Thickness(0, 12, 0, 0), FontSize = 13 };
+                noCode.Checked += delegate { codeBox.IsEnabled = false; error.Visibility = Visibility.Collapsed; };
+                noCode.Unchecked += delegate { codeBox.IsEnabled = true; };
+                codePanel.Children.Add(noCode);
+                codePanel.Children.Add(Sub("Without a code, this PC joins your team and waits for a technician to approve it. The setup shows a number to read out."));
+            }
+            panels[DeviceSetup.Screen.Code] = codePanel;
+
+            // Name.
+            var namePanel = new StackPanel();
+            namePanel.Children.Add(Para("Give this PC a name your support team will recognise."));
+            nameBox = Field("", "Front desk"); namePanel.Children.Add(nameBox);
+            var chips = new WrapPanel { Margin = new Thickness(0, 10, 0, 0) };
+            foreach (string suggestion in Suggestions()) {
+                string value = suggestion;
+                var chip = new FlatButton(value, p.Ink, p.Surface2, p.Line, p.Work, 28, 0, 12, 14, 12.5, true); chip.Margin = new Thickness(0, 0, 8, 8);
+                chip.Click += delegate { nameBox.Text = value; nameBox.CaretIndex = value.Length; error.Visibility = Visibility.Collapsed; };
+                chips.Children.Add(chip);
+            }
+            namePanel.Children.Add(chips);
+            panels[DeviceSetup.Screen.Name] = namePanel;
+
+            // Access. Nothing is preselected.
+            var accessPanel = new StackPanel();
+            askRadio = Choice("access", "Ask me each time", "Support asks you here, on this PC, before each connection.");
+            anyRadio = Choice("access", "Connect any time (unattended)", "Your support team can connect even when nobody is at this PC. You can turn this on later, but only your team can turn it back off.");
+            accessPanel.Children.Add(askRadio); accessPanel.Children.Add(anyRadio);
+            panels[DeviceSetup.Screen.Access] = accessPanel;
+
+            // Control. Nothing is preselected.
+            var controlPanel = new StackPanel();
+            fullRadio = Choice("control", "Full control", "Also works through Windows security prompts and the sign-in screen.");
+            limitedRadio = Choice("control", "Limited support", "Works as the signed-in user only, not Windows security prompts.");
+            controlPanel.Children.Add(fullRadio); controlPanel.Children.Add(limitedRadio);
+            panels[DeviceSetup.Screen.Control] = controlPanel;
+
+            // Install.
+            panels[DeviceSetup.Screen.Install] = Para("Windows will ask for permission to install Support. Click Install, then Yes when Windows asks.");
+
+            // The terminal screens share one message panel.
+            var terminal = new StackPanel(); terminal.Children.Add(terminalHead); terminal.Children.Add(terminalBody);
+            panels[DeviceSetup.Screen.Done] = terminal;
+            panels[DeviceSetup.Screen.Waiting] = terminal;
+            panels[DeviceSetup.Screen.Already] = terminal;
+            panels[DeviceSetup.Screen.Unavailable] = terminal;
+        }
+
+        List<string> Suggestions() {
+            var list = new List<string>();
+            string machine = Environment.MachineName;
+            if (machine.Length > 0 && machine.Length <= DeviceSetup.MaxName) list.Add(machine);
+            foreach (string s in Common()) if (!list.Contains(s)) list.Add(s);
+            return list;
+        }
+        static IEnumerable<string> Common() { yield return "Front desk"; yield return "Reception"; yield return "Office PC"; }
+
+        TextBox Field(string text, string hint) {
+            var box = new TextBox {
+                Text = text, FontSize = 14, FontFamily = new FontFamily(Ui.TextFont), Foreground = p.Ink, CaretBrush = p.Ink,
+                Background = p.Surface2, BorderBrush = p.Line, BorderThickness = new Thickness(1), Padding = new Thickness(10, 7, 10, 7),
+            };
+            // For screen readers only: a tooltip would open on keyboard focus and cover the error line under the field.
+            System.Windows.Automation.AutomationProperties.SetHelpText(box, hint);
+            return box;
+        }
+        RadioButton Choice(string group, string title, string detail) {
+            var text = new StackPanel();
+            text.Children.Add(Ui.Label(title, 13.5, FontWeights.SemiBold, p.Ink, Ui.TextFont));
+            var sub = Ui.Label(detail, 12, FontWeights.Normal, p.Muted, Ui.TextFont); sub.Margin = new Thickness(0, 2, 0, 0);
+            text.Children.Add(sub);
+            var radio = new RadioButton { GroupName = group, Content = text, Foreground = p.Ink, Margin = new Thickness(0, 0, 0, 12), Padding = new Thickness(6, 0, 0, 0) };
+            radio.Checked += delegate { error.Visibility = Visibility.Collapsed; };
+            return radio;
+        }
+        StackPanel Para(string text) { var s = new StackPanel(); s.Children.Add(Ui.Label(text, 13, FontWeights.Normal, p.Muted, Ui.TextFont)); return s; }
+        FrameworkElement Sub(string text) { var t = Ui.Label(text, 12, FontWeights.Normal, p.Muted, Ui.TextFont); t.Margin = new Thickness(0, 8, 0, 0); return t; }
+
+        string Access() { return anyRadio.IsChecked == true ? "any" : askRadio.IsChecked == true ? "ask" : null; }
+        string Control() { return fullRadio.IsChecked == true ? "full" : limitedRadio.IsChecked == true ? "limited" : null; }
+        bool UseWorkspace() { return offersWorkspace && noCode != null && noCode.IsChecked == true; }
+
+        void OnNext() {
+            if (screen >= DeviceSetup.Screen.Done) { if (screen == DeviceSetup.Screen.Already) DeviceSetup.StartTray(); Close(); return; }
+            if (screen == DeviceSetup.Screen.Install) { BeginInstall(); return; }
+            string miss = DeviceSetup.Missing(screen, codeBox != null ? codeBox.Text : "", UseWorkspace(), nameBox != null ? nameBox.Text : "", Access(), Control());
+            if (miss != "") { error.Text = miss; error.Visibility = Visibility.Visible; return; }
+            error.Visibility = Visibility.Collapsed;
+            screen = screen + 1; Render();
+        }
+        void OnBack() {
+            if (screen >= DeviceSetup.Screen.Code && screen <= DeviceSetup.Screen.Install) { declined = false; error.Visibility = Visibility.Collapsed; screen = screen - 1; Render(); }
+        }
+
+        void BeginInstall() {
+            if (installing) return;
+            installing = true; declined = false; error.Visibility = Visibility.Collapsed;
+            string answers = DeviceSetup.EncodeAnswers(nameBox.Text, Access(), Control(), UseWorkspace() ? null : DeviceSetup.NormalizeCode(codeBox.Text));
+            IntPtr owner = new WindowInteropHelper(this).Handle;
+            Render();
+            worker = new Thread(delegate() {
+                int exit = DeviceSetup.Refused; bool unavailable = false, wasDeclined = false;
+                try {
+                    Consent path = ConsentPath.Detect();
+                    if (path == Consent.Unavailable) unavailable = true;
+                    else {
+                        string nonce = Elevation.Nonce(); string staged = Elevation.Stage(exe);
+                        // Want is held open for the whole elevated run; the installer opens it (Wanted) and refuses once it is gone.
+                        using (var want = Elevation.Want("device", nonce))
+                        try { exit = Native.RunElevated(staged, "--device-install " + nonce + " " + answers, owner, delegate { }); }
+                        finally { try { Elevation.DeleteTree(Path.GetDirectoryName(staged)); } catch (Exception) { } }
+                        if (exit == -1223) wasDeclined = true;
+                    }
+                } catch (Exception) { exit = DeviceSetup.Refused; }
+                bool un = unavailable, dec = wasDeclined; int code = exit;
+                Post(delegate { FinishInstall(un, dec, code); });
+            });
+            worker.SetApartmentState(ApartmentState.STA); worker.IsBackground = true; worker.Start();
+        }
+        void FinishInstall(bool unavailable, bool wasDeclined, int exit) {
+            ShowOutcome(unavailable, wasDeclined, exit);
+            // The permission prompt can hand the foreground to another window, such as the browser the download came
+            // from: come back to the front with the outcome.
+            Activate();
+        }
+        void ShowOutcome(bool unavailable, bool wasDeclined, int exit) {
+            installing = false;
+            if (unavailable) { screen = DeviceSetup.Screen.Unavailable; Render(); return; }
+            if (wasDeclined) { declined = true; Render(); return; }
+            confirm = null;
+            if (exit == DeviceSetup.Active || exit == DeviceSetup.Pending) {
+                DeviceSetup.StartTray();
+                // Reading the six digits talks to the service pipe for a few seconds, so it runs off the UI thread and
+                // updates the Waiting screen when it arrives.
+                if (exit == DeviceSetup.Pending) {
+                    var t = new Thread(delegate() { string c = DeviceService.ReadConfirm(); Post(delegate { confirm = c; if (screen == DeviceSetup.Screen.Waiting) Render(); }); });
+                    t.IsBackground = true; t.Start();
+                }
+            }
+            DeviceSetup.Screen nextScreen = DeviceSetup.After(exit);
+            string text = DeviceSetup.ExitText(exit);
+            if (nextScreen == DeviceSetup.Screen.Code || nextScreen == DeviceSetup.Screen.Install) { if (text.Length > 0) { error.Text = text; error.Visibility = Visibility.Visible; } }
+            screen = nextScreen; Render();
+        }
+
+        void Post(Action a) { Dispatcher.BeginInvoke(DispatcherPriority.Normal, a); }
+
+        void Render() {
+            bool terminal = screen >= DeviceSetup.Screen.Done;
+            int step = DeviceSetup.StepOf(screen);
+            stepLine.Text = step > 0 ? "Step " + step + " of 5" : "";
+            bodyHost.Child = panels.ContainsKey(screen) ? panels[screen] : null;
+
+            if (screen == DeviceSetup.Screen.Intro) heading.Text = "Set up Support on this PC";
+            else if (screen == DeviceSetup.Screen.Code) heading.Text = "Your support code";
+            else if (screen == DeviceSetup.Screen.Name) heading.Text = "Name this PC";
+            else if (screen == DeviceSetup.Screen.Access) heading.Text = "How may support connect?";
+            else if (screen == DeviceSetup.Screen.Control) heading.Text = "How much can support do?";
+            else if (screen == DeviceSetup.Screen.Install) heading.Text = installing ? "Setting up..." : "Ready to install";
+            heading.Visibility = terminal ? Visibility.Collapsed : Visibility.Visible;
+
+            if (terminal) {
+                if (screen == DeviceSetup.Screen.Done) {
+                    terminalHead.Text = (nameBox != null ? nameBox.Text.Trim() : "This PC") + " is ready";
+                    terminalBody.Text = "Your support team now sees this PC in their list. " + DeviceSetup.ModeText(Access()) + " " + DeviceSetup.UninstallText;
+                } else if (screen == DeviceSetup.Screen.Waiting) {
+                    string digits = DeviceSetup.ShowConfirm(confirm);
+                    terminalHead.Text = "Almost there";
+                    terminalBody.Text = (digits != null ? "Read this number to your support team: " + digits + ". " : "Your request is waiting for your support team to approve it. ") + "This PC waits for up to 24 hours. You can close this window; the tray icon shows its state.";
+                } else if (screen == DeviceSetup.Screen.Already) {
+                    terminalHead.Text = "Support is already set up on this PC";
+                    terminalBody.Text = "Open Support to see its state, or remove it from " + DeviceSetup.AppsPlace + ".";
+                } else {
+                    terminalHead.Text = "Can't install on this account";
+                    terminalBody.Text = DeviceSetup.UnavailableText;
+                }
+            } else if (screen == DeviceSetup.Screen.Install && declined) {
+                error.Text = DeviceSetup.DeclinedText; error.Visibility = Visibility.Visible;
+            }
+
+            back.Visibility = (!terminal && !installing && screen > DeviceSetup.Screen.Intro) ? Visibility.Visible : Visibility.Collapsed;
+            cancel.Visibility = (!terminal && !installing && screen == DeviceSetup.Screen.Intro) ? Visibility.Visible : Visibility.Collapsed;
+            next.IsEnabled = !installing;
+            next.Visibility = installing ? Visibility.Collapsed : Visibility.Visible;
+            if (screen == DeviceSetup.Screen.Already) next.Content = "Open Support";
+            else if (terminal) next.Content = screen == DeviceSetup.Screen.Done ? "Finish" : "Close";
+            else if (screen == DeviceSetup.Screen.Install) next.Content = declined ? "Try again" : "Install";
+            else if (screen == DeviceSetup.Screen.Control) next.Content = "Next";
+            else next.Content = "Next";
+
+            // Keyboard: a new step puts the focus on its own field, so typing and the arrow keys work without a mouse.
+            // Focusing a choice does not select it: nothing is preselected.
+            if (focusedFor != screen) {
+                focusedFor = screen;
+                UIElement target = screen == DeviceSetup.Screen.Code ? (noCode != null && noCode.IsChecked == true ? (UIElement)noCode : codeBox)
+                    : screen == DeviceSetup.Screen.Name ? nameBox
+                    : screen == DeviceSetup.Screen.Access ? (anyRadio.IsChecked == true ? anyRadio : askRadio)
+                    : screen == DeviceSetup.Screen.Control ? (limitedRadio.IsChecked == true ? limitedRadio : fullRadio)
+                    : next.Visibility == Visibility.Visible ? (UIElement)next : null;
+                if (target != null) Dispatcher.BeginInvoke(DispatcherPriority.Input, (Action)delegate { target.Focus(); Keyboard.Focus(target); });
+            }
+        }
+
+        public void Finish() { var t = worker; if (t != null) t.Join(120000); }
+    }
+
+    // --device-install <nonce> <answers>: the elevated step of the setup wizard, for a saved PC. It starts like the
+    // one-off full-control install: the DLL search is narrowed first (Program.Main), the exe runs from a staged, held
+    // copy, and the exe and its device footer are read once through that held handle (FullInstall.ReadSelf). The
+    // Want/Wanted nonce means a Yes the customer gives after the wizard has closed installs nothing. The install
+    // pairs over the /device/ wire, lays down %ProgramFiles%\SupportMCP, writes support.exe (the exe without its
+    // footer) that users may read and run and device.json plus history.json that only SYSTEM and administrators can,
+    // registers the SupportMcpDevice service, the tray's startup value and the Apps uninstall entry, and starts the
+    // service. On any failure after pairing it leaves the relay with the new key and removes everything it made. It
+    // never touches HKLM\SOFTWARE\SupportMCP (the one-off sessions' shared record). Only SYSTEM or an elevated
+    // administrator process ever holds the key.
+    public static class DeviceInstall {
+        public const string DisplayName = "Support", Publisher = "Support-MCP";
+        public const string ServiceDisplay = "Support device service";
+        public const string ServiceDescription = "Lets this PC's support team see it on their list and connect when you allow it. Uninstalling Support from Windows Settings removes this service.";
+        public const string RunKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", TrayValueName = "SupportMcpTray";
+        public const string AppsKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\SupportMcpDevice";
+
+        // What to do about what is already on the PC: a running service means Support is set up (exit 23); the folder
+        // without a service is a crash leftover to clean before a fresh install; nothing means a clean install.
+        public enum Leftover { Proceed, Clean, AlreadySetUp }
+        public static Leftover LeftoverAction(bool serviceExists, bool folderExists) {
+            if (serviceExists) return Leftover.AlreadySetUp;
+            if (folderExists) return Leftover.Clean;
+            return Leftover.Proceed;
+        }
+        // The service's binary path (quoted, because %ProgramFiles% has a space) and the tray's startup command.
+        public static string ServiceBinary(string exe) { return "\"" + exe + "\" --device-service"; }
+        public static string TrayRunValue(string exe) { return "\"" + exe + "\" --tray"; }
+        // The Apps-list entry's values. A string is written as a REG_SZ, a whole number as a REG_DWORD. There is no
+        // DisplayIcon: the exe carries no icon (the tray draws its own at run time).
+        public static Dictionary<string, object> AppsValues(string version, string folder, string exe, int estimatedSizeKb) {
+            return Wire.Map("DisplayName", DisplayName, "DisplayVersion", version, "Publisher", Publisher,
+                "InstallLocation", folder, "UninstallString", "\"" + exe + "\" --uninstall",
+                "NoModify", 1, "NoRepair", 1, "EstimatedSize", estimatedSizeKb);
+        }
+        // The install folder: created by an elevated administrator, owned by Administrators, SYSTEM and Administrators
+        // full and nothing inherited. device.json and history.json inherit this; support.exe gets its own ACL below.
+        public static DirectorySecurity LockedFolder() { var s = FullAcl.Folder(); s.SetOwner(FullAcl.AdminsSid); return s; }
+
+        // One elevated install or remove at a time across the whole PC. A Global mutex, so sessions share it, with an
+        // ACL that only Administrators and SYSTEM (who run these elevated steps) may take.
+        public const string SetupMutexName = "Global\\SupportMcpDeviceSetup";
+        public static Mutex SetupMutex() { return SetupMutex(SetupMutexName); }
+        internal static Mutex SetupMutex(string name) {
+            var sec = new MutexSecurity();
+            sec.AddAccessRule(new MutexAccessRule(FullAcl.SystemSid, MutexRights.FullControl, AccessControlType.Allow));
+            sec.AddAccessRule(new MutexAccessRule(FullAcl.AdminsSid, MutexRights.FullControl, AccessControlType.Allow));
+            bool created; return new Mutex(false, name, out created, sec);
+        }
+        // Removes the install folder even when a tray still holds support.exe: rename it aside first (a rename works
+        // with a running exe, and frees the original path for a fresh install), delete what is not locked with the
+        // junction-safe walk, and queue anything that remains for the next restart. Only the top level is listed, so
+        // no junction is ever followed.
+        public static void RemoveFolderAside(string folder) {
+            try { if (Directory.Exists(folder)) Native.DeleteTree(folder); } catch (Exception) { }
+            if (!Directory.Exists(folder)) return;
+            string moved = folder + ".removed-" + Guid.NewGuid().ToString("N");
+            try { Directory.Move(folder, moved); } catch (Exception) { moved = folder; }
+            try { Native.DeleteTree(moved); } catch (Exception) { }
+            if (!Directory.Exists(moved)) return;
+            try {
+                foreach (string f in Directory.GetFiles(moved)) try { Native.MoveFileEx(f, null, 4); } catch (Exception) { }
+                foreach (string d in Directory.GetDirectories(moved)) try { Native.MoveFileEx(d, null, 4); } catch (Exception) { }
+                Native.MoveFileEx(moved, null, 4);
+            } catch (Exception) { }
+        }
+
+        public static int Install(byte[] self, Dictionary<string, object> footer, string[] args) {
+            if (args.Length != 3 || !System.Text.RegularExpressions.Regex.IsMatch(args[1], @"^[0-9a-f]{32}\z")) return DeviceSetup.Refused;
+            Dictionary<string, object> answers;
+            try { answers = DeviceSetup.DecodeAnswers(args[2]); } catch (Exception) { return DeviceSetup.Refused; }
+            // The wizard holds this event open while UAC is asked. Gone means the wizard closed before the Yes: install nothing.
+            var want = Elevation.Wanted("device", args[1]);
+            if (want == null) return DeviceSetup.Refused;
+            using (want) return Install(self, footer, answers, want);
+        }
+        static int Install(byte[] self, Dictionary<string, object> footer, Dictionary<string, object> answers, EventWaitHandle want) {
+            // One install or remove at a time across the PC: a second gets "already set up" and touches nothing. The
+            // want handle (Wanted) already refused a late Yes after the wizard closed, so no further want check is needed.
+            Mutex only = null; bool held = false;
+            try { only = SetupMutex(); try { held = only.WaitOne(0); } catch (AbandonedMutexException) { held = true; } } catch (Exception) { }
+            if (!held) { if (only != null) only.Dispose(); return DeviceSetup.AlreadySetUp; }
+            try { return InstallLocked(self, footer, answers); }
+            finally { try { only.ReleaseMutex(); } catch (Exception) { } only.Dispose(); }
+        }
+        static int InstallLocked(byte[] self, Dictionary<string, object> footer, Dictionary<string, object> answers) {
+            string origin = Wire.Text(footer, "origin"), folder = DeviceSetup.Folder, exe = DeviceSetup.Exe;
+            Leftover action = LeftoverAction(Scm.Status(DeviceSetup.ServiceName) != null, Directory.Exists(folder) || File.Exists(folder));
+            if (action == Leftover.AlreadySetUp) return DeviceSetup.AlreadySetUp;
+            if (action == Leftover.Clean) CleanLeftover(folder);
+            if (Scm.Status(DeviceSetup.ServiceName) != null || Directory.Exists(folder) || File.Exists(folder)) return DeviceSetup.AlreadySetUp;
+
+            string name = Wire.Text(answers, "name"), access = Wire.Text(answers, "access"), control = Wire.Text(answers, "control");
+            var body = Wire.Map("name", name, "access", access, "control", control, "os", DeviceSetup.Os(), "machine", Environment.MachineName, "app_version", Wire.Version);
+            if (answers.ContainsKey("code")) body["code"] = Wire.Text(answers, "code"); else body["workspace"] = Wire.Text(footer, "workspace");
+            DeviceLink.Answer a = new DeviceLink(origin).Pair(body);
+            if (a.Result == DeviceLink.DeviceResult.Offline) return DeviceSetup.Network;
+            if (a.Result == DeviceLink.DeviceResult.CodeInvalid) return DeviceSetup.CodeInvalid;
+            if (!a.Ok) return DeviceSetup.Refused;
+            string key = Wire.Text(a.Body, "key"), status = Wire.Text(a.Body, "status");
+
+            // Roll back removes only what this run made, so a concurrent run's artifacts (there are none, under the
+            // mutex, but a crash leftover of this session's own is the only thing that could pre-exist) stay untouched.
+            bool madeFolder = false, madeService = false, madeRegistry = false;
+            try {
+                Native.CreateLocked(folder, LockedFolder()); madeFolder = true; // CreateLocked fails if the folder exists, so this run made it
+                using (var f = new FileStream(exe, FileMode.CreateNew)) f.Write(self, 0, Wire.Payload(self));
+                File.SetAccessControl(exe, FullAcl.Window()); // users may read and run support.exe, like the one-off window copy
+                var record = Wire.Map("origin", origin, "workspace", Wire.Text(a.Body, "workspace"), "device_id", Wire.Text(a.Body, "device_id"),
+                    "key", key, "status", status, "name", name, "access", access, "control", control);
+                if (status == "pending") record["confirm"] = Wire.Text(a.Body, "confirm");
+                File.WriteAllText(Path.Combine(folder, "device.json"), Wire.Json().Serialize(record)); // inherits the locked folder ACL
+                var history = new System.Collections.ArrayList();
+                history.Add(Wire.Map("at", Client.UnixNow(), "text", "Support was set up on this PC."));
+                if (status == "pending") history.Add(Wire.Map("at", Client.UnixNow(), "text", "Waiting for your support team to approve this PC."));
+                File.WriteAllText(Path.Combine(folder, "history.json"), Wire.Json().Serialize(history));
+
+                Scm.Create(DeviceSetup.ServiceName, ServiceDisplay, ServiceDescription, ServiceBinary(exe), true); madeService = true;
+                WriteRegistry(exe, Wire.Version, folder, (Wire.Payload(self) + 1023) / 1024); madeRegistry = true;
+                Scm.Start(DeviceSetup.ServiceName);
+                return status == "pending" ? DeviceSetup.Pending : DeviceSetup.Active;
+            } catch (Exception) {
+                RollBack(origin, key, folder, madeService, madeRegistry, madeFolder);
+                return DeviceSetup.Refused;
+            }
+        }
+
+        // A crash leftover: tell the relay to forget the PC with any key still in device.json, then remove the folder
+        // through handles, so a junction swapped in is removed and never followed.
+        static void CleanLeftover(string folder) {
+            try {
+                var old = ReadDeviceJson(folder);
+                if (old != null) { string key = Wire.Text(old, "key"), origin = Wire.Text(old, "origin"); if (key.Length > 0 && origin.Length > 0) new DeviceLink(origin).Leave(key); }
+            } catch (Exception) { }
+            RemoveFolderAside(folder);
+        }
+        static Dictionary<string, object> ReadDeviceJson(string folder) {
+            try { return Wire.Json().Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(folder, "device.json"))); }
+            catch (Exception) { return null; }
+        }
+        // Undo a failed install, in order, touching only what this run created: leave the relay with the new key,
+        // then the service, the registry entries and the folder it made.
+        static void RollBack(string origin, string key, string folder, bool service, bool registry, bool folderMade) {
+            try { if (key != null && key.Length > 0 && origin.Length > 0) new DeviceLink(origin).Leave(key); } catch (Exception) { }
+            if (service) try { Scm.Remove(DeviceSetup.ServiceName); } catch (Exception) { }
+            if (registry) RemoveRegistry();
+            if (folderMade) RemoveFolderAside(folder);
+        }
+        static void WriteRegistry(string exe, string version, string folder, int sizeKb) {
+            using (var hklm = SasShare.Machine()) {
+                using (var run = hklm.CreateSubKey(RunKey)) run.SetValue(TrayValueName, TrayRunValue(exe), Microsoft.Win32.RegistryValueKind.String);
+                using (var app = hklm.CreateSubKey(AppsKey))
+                    foreach (var kv in AppsValues(version, folder, exe, sizeKb))
+                        app.SetValue(kv.Key, kv.Value, kv.Value is int ? Microsoft.Win32.RegistryValueKind.DWord : Microsoft.Win32.RegistryValueKind.String);
+            }
+        }
+        public static void RemoveRegistry() {
+            try {
+                using (var hklm = SasShare.Machine()) {
+                    using (var run = hklm.OpenSubKey(RunKey, true)) if (run != null) run.DeleteValue(TrayValueName, false);
+                    hklm.DeleteSubKeyTree(AppsKey, false);
+                }
+            } catch (Exception) { }
+        }
+    }
+
+    // The display state of a saved PC, as the tray shows it. active and pending are the server's; the rest are local.
+    public static class DeviceState {
+        public const string Active = "active", Pending = "pending", Expired = "expired", Removed = "removed", UpdateNeeded = "update_needed", Offline = "offline";
+    }
+
+    // --device-service: the saved PC's background service (LocalSystem). It checks in with the relay over the
+    // /device/ wire, keeps a short local history, and serves a status pipe the tray reads. It runs no command and
+    // takes no screenshot: PR 4 adds only check-ins. The pure parts (the state map, the timing, the status frame and
+    // the history rules) are static so the native tests can drive them without a live service.
+    public sealed class DeviceService : ServiceBase {
+        public const string PipeName = "SupportMcpDevice-ui";
+        // The tray's pipe: SYSTEM creates instances, interactive users read and write data, never the network.
+        internal const string Sddl = "D:P(A;;GA;;;SY)(A;;0x12008B;;;IU)";
+        // Every tray watches this; the uninstaller sets it (PR 4 step 7). Only SYSTEM creates it.
+        public const string UninstallEvent = "Global\\SupportMcpDeviceUninstall";
+        public const long CheckEveryMs = 300000, JitterMaxMs = 30000, RetryMinMs = 60000, RetryMaxMs = 900000, UpdateEveryMs = 6 * 3600 * 1000L, RefreshMinMs = 30000;
+        public const int HistoryCap = 50, PipeReadMax = 65536;
+
+        // ---- the pure parts --------------------------------------------------------------------------------------
+        public enum Schedule { Normal, Backoff, Update, Stopped }
+        // The next check-in delay on a network error: one minute, doubling each time, capped at fifteen.
+        public static long NextBackoff(long current) { return Math.Min(current <= 0 ? RetryMinMs : current * 2, RetryMaxMs); }
+        // Five minutes from the last answer, with up to thirty seconds of jitter on top.
+        public static long NextCheckDelay(Random r) { return CheckEveryMs + r.Next(0, (int)JitterMaxMs + 1); }
+        // The display state and what to do next, from the status before the call and the wire result. status is the
+        // last server-known status ("active" or "pending"), not the display state, so a 401 is read correctly.
+        public static string Classify(string status, DeviceLink.DeviceResult result, string bodyStatus, out Schedule schedule) {
+            if (result == DeviceLink.DeviceResult.Ok) { schedule = Schedule.Normal; return bodyStatus == DeviceState.Pending ? DeviceState.Pending : DeviceState.Active; }
+            if (result == DeviceLink.DeviceResult.Removed) { schedule = Schedule.Stopped; return status == DeviceState.Pending ? DeviceState.Expired : DeviceState.Removed; }
+            if (result == DeviceLink.DeviceResult.UpdateNeeded) { schedule = Schedule.Update; return DeviceState.UpdateNeeded; }
+            schedule = Schedule.Backoff; return DeviceState.Offline; // offline, or an unexpected refusal: keep trying
+        }
+        // The history lines a 200 adds: approval, and any change the team made to the access or control mode.
+        public static List<string> HistoryFor(string oldStatus, string oldAccess, string oldControl, string newStatus, string newAccess, string newControl) {
+            var lines = new List<string>();
+            if (oldStatus == DeviceState.Pending && newStatus == DeviceState.Active) lines.Add("Your support team approved this PC.");
+            if (oldAccess != newAccess) lines.Add(newAccess == "any" ? "Access set to connect any time." : "Access set to ask each time.");
+            if (oldControl != newControl) lines.Add(newControl == "full" ? "Control set to full control." : "Control set to limited support.");
+            return lines;
+        }
+        // The status frame the tray reads. confirm is shown only while pending.
+        public static Dictionary<string, object> StatusFrame(string name, string access, string control, string state, string confirm, long lastOkAt, object history) {
+            var m = Wire.Map("name", name, "access", access, "control", control, "state", state, "last_ok_at", lastOkAt, "history", history);
+            if (state == DeviceState.Pending && confirm != null && confirm.Length > 0) m["confirm"] = confirm;
+            return m;
+        }
+        // The last HistoryCap lines are kept, newest last.
+        public static void TrimHistory(System.Collections.ArrayList list) { while (list.Count > HistoryCap) list.RemoveAt(0); }
+        // A refresh forces a check-in at most once every thirty seconds.
+        public static bool RefreshDue(long lastRefresh, long now) { return now - lastRefresh >= RefreshMinMs; }
+
+        // ---- the running service ---------------------------------------------------------------------------------
+        readonly string exe, folder;
+        readonly object gate = new object();
+        readonly ManualResetEvent stop = new ManualResetEvent(false);
+        readonly AutoResetEvent wake = new AutoResetEvent(false);
+        readonly Random jitter = new Random();
+        readonly System.Collections.ArrayList history = new System.Collections.ArrayList();
+        DeviceLink link;
+        string origin = "", key = "", deviceId = "", workspace = "";
+        string name = "", access = "ask", control = "limited", status = DeviceState.Active, state = DeviceState.Active, confirm = "";
+        long lastOkAt, lastRefresh = long.MinValue / 2;
+        bool updateLogged, terminal;
+        int allowing;
+        int localChanges; // bumped under the gate by each local access change, so CheckIn can spot a stale answer
+        Thread worker; UiServer ui; EventWaitHandle uninstall;
+
+        public DeviceService(string exe) {
+            this.exe = exe; folder = Path.GetDirectoryName(exe);
+            ServiceName = DeviceSetup.ServiceName; CanStop = true; CanShutdown = true; AutoLog = false;
+        }
+        protected override void OnStart(string[] args) { worker = new Thread(Run); worker.IsBackground = true; worker.Start(); }
+        protected override void OnStop() { stop.Set(); wake.Set(); if (worker != null) worker.Join(10000); }
+        protected override void OnShutdown() { stop.Set(); wake.Set(); }
+
+        void Run() {
+            try {
+                if (!Load()) return; // no device.json, or a damaged one: nothing to run
+                link = new DeviceLink(origin);
+                try { uninstall = OpenUninstall(true, EventWaitHandleRights.FullControl); } catch (Exception) { uninstall = null; }
+                StartPipe();
+                // A removed or expired PC keeps serving the pipe (so the tray shows it) but never checks in again.
+                if (!terminal) Loop();
+            } catch (Exception) { }
+        }
+        void StartPipe() {
+            try { ui = new UiServer(PipeName, Handle, delegate(uint s) { return true; }, Sddl, 1024); } // the SDDL limits callers to interactive users
+            catch (Exception) { ui = null; } // a squatter took the name: the loop retries, and the service still checks in
+        }
+        // device.json, written by the install. Returns false when it is missing or damaged. A stored terminal state
+        // (removed or expired) is kept, so the service serves it without a fresh check-in.
+        bool Load() {
+            try {
+                var m = Wire.Json().Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(folder, "device.json")));
+                if (m == null) return false;
+                origin = Wire.Text(m, "origin"); key = Wire.Text(m, "key"); deviceId = Wire.Text(m, "device_id"); workspace = Wire.Text(m, "workspace");
+                name = Wire.Text(m, "name"); access = Wire.Text(m, "access"); control = Wire.Text(m, "control");
+                status = Wire.Text(m, "status"); confirm = Wire.Text(m, "confirm");
+                string stored = Wire.Text(m, "state");
+                terminal = stored == DeviceState.Removed || stored == DeviceState.Expired;
+                state = terminal ? stored : status;
+                if (key.Length == 0 || origin.Length == 0) return false;
+            } catch (Exception) { return false; }
+            LoadHistory();
+            return true;
+        }
+        void LoadHistory() {
+            try {
+                var list = Wire.Json().Deserialize<System.Collections.ArrayList>(File.ReadAllText(Path.Combine(folder, "history.json")));
+                if (list != null) lock (gate) { history.Clear(); history.AddRange(list); Trim(); }
+            } catch (Exception) { }
+        }
+
+        void Loop() {
+            long backoff = 0;
+            var waits = uninstall == null ? new WaitHandle[] { stop, wake } : new WaitHandle[] { stop, wake, uninstall };
+            while (!stop.WaitOne(0)) {
+                try {
+                    if (ui == null) StartPipe(); // retry a pipe the service could not create (a squatter held the name)
+                    CheckIn(ref backoff);
+                    if (stop.WaitOne(0)) break;
+                    Schedule sched; lock (gate) sched = lastSchedule;
+                    if (sched == Schedule.Stopped) break; // removed or expired: stop checking in for good; the pipe keeps serving
+                    long delay = sched == Schedule.Backoff ? backoff : sched == Schedule.Update ? UpdateEveryMs : NextCheckDelay(jitter);
+                    int which = WaitHandle.WaitAny(waits, (int)Math.Min(delay, int.MaxValue));
+                    if (which == 0 || (uninstall != null && which == 2)) break;
+                } catch (Exception) {
+                    // One bad pass must never end the worker: wait a minute (or until stop) and try again.
+                    if (WaitHandle.WaitAny(waits, (int)RetryMinMs) == 0) break;
+                }
+            }
+        }
+        Schedule lastSchedule = Schedule.Normal;
+        void CheckIn(ref long backoff) {
+            // A local "any time" change made while this hello is in flight is newer than its answer's access.
+            int seenLocal; lock (gate) seenLocal = localChanges;
+            DeviceLink.Answer a;
+            try { a = link.Hello(key, Report()); } catch (Exception) { a = new DeviceLink.Answer(DeviceLink.DeviceResult.Offline, 0, null, ""); }
+            // A 200 must carry a device object; a malformed one counts as offline, so one bad answer never ends the loop.
+            Dictionary<string, object> dev = ReadDev(a.Body);
+            DeviceLink.DeviceResult result = a.Result == DeviceLink.DeviceResult.Ok && dev == null ? DeviceLink.DeviceResult.Offline : a.Result;
+            Schedule sched;
+            string before; lock (gate) before = status;
+            string bodyStatus = dev != null ? Wire.Text(dev, "status") : "";
+            string newState = Classify(before, result, bodyStatus, out sched);
+            lock (gate) {
+                lastSchedule = sched;
+                if (result == DeviceLink.DeviceResult.Ok) {
+                    backoff = 0; lastOkAt = Client.UnixNow();
+                    string nn = Wire.Text(dev, "name"), na = Wire.Text(dev, "access"), nc = Wire.Text(dev, "control"), ns = Wire.Text(dev, "status");
+                    if (localChanges != seenLocal) na = access; // a stale answer: the next check-in brings the team's view
+                    var lines = HistoryFor(status, access, control, ns, na, nc);
+                    bool changed = lines.Count > 0 || state != newState || (nn.Length > 0 && nn != name) || na != access || nc != control || ns != status || (ns == DeviceState.Active && confirm.Length > 0);
+                    foreach (string line in lines) AddLine(line);
+                    if (nn.Length > 0) name = nn;
+                    access = na; control = nc; status = ns; state = newState;
+                    if (ns == DeviceState.Active) confirm = "";
+                    if (changed) Save(); // write only when something actually changed
+                } else if (sched == Schedule.Stopped) {
+                    state = newState; terminal = true;
+                    AddLine(newState == DeviceState.Expired ? "This PC's request was not approved in time." : "Your support team removed this PC.");
+                    Save(); // persist the terminal state, so a reboot serves it without a fresh check-in
+                } else if (sched == Schedule.Update) {
+                    state = newState; backoff = 0;
+                    if (!updateLogged) { updateLogged = true; AddLine("Support needs an update to keep working with your team."); }
+                } else {
+                    state = newState; backoff = NextBackoff(backoff);
+                }
+            }
+        }
+        Dictionary<string, object> Report() { return Wire.Map("os", DeviceSetup.Os(), "machine", Environment.MachineName, "app_version", Wire.Version); }
+        static Dictionary<string, object> ReadDev(Dictionary<string, object> body) { object o; return body != null && body.TryGetValue("device", out o) ? o as Dictionary<string, object> : null; }
+
+        // The pipe handler. status and refresh answer at once; allow_any_time is accepted at once and its relay call
+        // runs in the background (the change shows on the next status read), so the pipe never waits on the network.
+        Dictionary<string, object> Handle(Dictionary<string, object> m) {
+            string request = Pipes.DeviceRequest(m);
+            if (request == null) return null;
+            if (request == "allow_any_time") QueueAllow();
+            else if (request == "refresh") Refresh();
+            return Snapshot();
+        }
+        Dictionary<string, object> Snapshot() {
+            lock (gate) { var copy = new System.Collections.ArrayList(history); return StatusFrame(name, access, control, state, confirm, lastOkAt, copy); }
+        }
+        // Call 3: any interactive user may turn on "any time", and only when it is "ask". Nothing here ever sends "ask".
+        void QueueAllow() {
+            lock (gate) { if (access != "ask" || terminal) return; }
+            if (Interlocked.CompareExchange(ref allowing, 1, 0) != 0) return; // one in flight at a time
+            ThreadPool.QueueUserWorkItem(delegate { try { AllowAnyTime(); } finally { Interlocked.Exchange(ref allowing, 0); } });
+        }
+        void AllowAnyTime() {
+            lock (gate) { if (access != "ask" || terminal) return; }
+            DeviceLink.Answer a;
+            try { a = link.Update(key, Wire.Map("access", "any")); } catch (Exception) { return; }
+            if (!a.Ok) return;
+            lock (gate) {
+                var dev = ReadDev(a.Body);
+                string na = dev != null ? Wire.Text(dev, "access") : "any";
+                if (na != access) { access = na; localChanges++; AddLine("You turned on connect any time from this PC."); Save(); }
+            }
+        }
+        void Refresh() {
+            lock (gate) { long now = PauseClock.Now(); if (!RefreshDue(lastRefresh, now)) return; lastRefresh = now; }
+            wake.Set();
+        }
+
+        // history.json beside device.json, newest last, the last HistoryCap kept. The caller holds the gate.
+        void AddLine(string text) { history.Add(Wire.Map("at", Client.UnixNow(), "text", text)); Trim(); SaveHistory(); }
+        void Trim() { TrimHistory(history); }
+        void SaveHistory() { WriteAtomic(Path.Combine(folder, "history.json"), Wire.Json().Serialize(history)); }
+        void Save() {
+            var m = Wire.Map("origin", origin, "workspace", workspace, "device_id", deviceId, "key", key, "status", status, "name", name, "access", access, "control", control);
+            if (status == DeviceState.Pending && confirm.Length > 0) m["confirm"] = confirm;
+            if (terminal) m["state"] = state; // removed or expired, so a reboot serves it without checking in
+            WriteAtomic(Path.Combine(folder, "device.json"), Wire.Json().Serialize(m));
+        }
+        // A crash midway must never leave a half-written file: write a sibling temp and swap it in.
+        static void WriteAtomic(string file, string text) {
+            try {
+                string temp = file + ".new";
+                File.WriteAllText(temp, text);
+                if (File.Exists(file)) File.Replace(temp, file, null); else File.Move(temp, file);
+            } catch (Exception) { }
+        }
+
+        // The Global uninstall event, created by the service (SYSTEM) and watched by every tray. Interactive users may
+        // wait on it (not BUILTIN\Users, which includes guests); SYSTEM and Administrators have full control.
+        static EventWaitHandle OpenUninstall(bool create, EventWaitHandleRights rights) {
+            if (!create) { EventWaitHandle e; return EventWaitHandle.TryOpenExisting(UninstallEvent, rights, out e) ? e : null; }
+            var sec = new EventWaitHandleSecurity();
+            sec.AddAccessRule(new EventWaitHandleAccessRule(FullAcl.SystemSid, EventWaitHandleRights.FullControl, AccessControlType.Allow));
+            sec.AddAccessRule(new EventWaitHandleAccessRule(FullAcl.AdminsSid, EventWaitHandleRights.FullControl, AccessControlType.Allow));
+            sec.AddAccessRule(new EventWaitHandleAccessRule(FullAcl.InteractiveSid, EventWaitHandleRights.Synchronize, AccessControlType.Allow));
+            bool created; return new EventWaitHandle(false, EventResetMode.ManualReset, UninstallEvent, out created, sec);
+        }
+        // A tray opens this to watch for uninstall; null when the service has not created it.
+        public static EventWaitHandle WatchUninstall() { try { return OpenUninstall(false, EventWaitHandleRights.Synchronize); } catch (Exception) { return null; } }
+        // The uninstaller sets the event (PR 4 step 7). Modify is the right needed to Set; Synchronize lets it also wait.
+        public static void SignalUninstall() { try { var e = OpenUninstall(false, EventWaitHandleRights.Synchronize | EventWaitHandleRights.Modify); if (e != null) using (e) e.Set(); } catch (Exception) { } }
+
+        // The wizard reads a pending PC's six digits from the status pipe once the service is running. It trusts only a
+        // server in session 0 (a service), so a squatter in an interactive session cannot feed it a number.
+        public static string ReadConfirm() {
+            for (int i = 0; i < 10; i++) {
+                try {
+                    using (var c = Pipes.Client(PipeName)) {
+                        c.Connect(1000);
+                        if (Pipes.ServerIsService(c.SafePipeHandle)) {
+                            Pipes.Write(c, Wire.Map("type", "status"));
+                            var r = Pipes.Read(c, PipeReadMax, UiServer.ReadMs);
+                            string s = Wire.Text(r, "state");
+                            if (s == DeviceState.Pending) return Wire.Text(r, "confirm");
+                            if (s.Length > 0) return null;
+                        }
+                    }
+                } catch (Exception) { }
+                Thread.Sleep(500);
+            }
+            return null;
+        }
+
+        // ---- test surface: the native tests drive the real CheckIn, Handle and persistence ----
+        internal bool TestInit() { if (!Load()) return false; link = new DeviceLink(origin); return true; }
+        long testBackoff;
+        internal void TestCheckInOnce() { long b = testBackoff; CheckIn(ref b); testBackoff = b; }
+        internal Dictionary<string, object> TestHandle(Dictionary<string, object> m) { return Handle(m); }
+        internal Dictionary<string, object> TestStatus() { return Snapshot(); }
+        internal bool TestTerminal { get { return terminal; } }
+        internal static EventWaitHandle TestCreateEvent(string name) {
+            var sec = new EventWaitHandleSecurity();
+            sec.AddAccessRule(new EventWaitHandleAccessRule(WindowsIdentity.GetCurrent().User, EventWaitHandleRights.FullControl, AccessControlType.Allow));
+            bool created; return new EventWaitHandle(false, EventResetMode.ManualReset, name, out created, sec);
+        }
+        internal static EventWaitHandle TestOpenEvent(string name, EventWaitHandleRights rights) { EventWaitHandle e; return EventWaitHandle.TryOpenExisting(name, rights, out e) ? e : null; }
+    }
+
+
+    // The tray's words and choices, kept apart from its windows so the native tests can check them. The one-way rule
+    // (call 3): the only access action is turning on "any time", shown only while the PC is active and asks first.
+    // There is no action that sets "ask"; only the support team can switch back.
+    public static class TrayText {
+        public const string NoOne = "No one is connected.";
+        public const string NotRunning = "Support's background service isn't running.";
+        public const string TeamOnly = "Only your support team can change this.";
+        public const string AllowAction = "Allow support to connect any time";
+        public const string AllowConfirm = "Allow support to connect any time? You can't undo this from this PC. Only your support team can turn it back to asking first.";
+        public const string Uninstall = "Uninstall Support…";
+        public static readonly string UninstallMissing = DeviceSetup.UninstallText;
+        public static string Mode(string access) { return access == "any" ? "Support can connect any time." : "Support asks you before each connection."; }
+        public static string State(string state, string confirm) {
+            if (state == DeviceState.Active) return "Your support team can see this PC.";
+            if (state == DeviceState.Pending) { string d = DeviceSetup.ShowConfirm(confirm); return d != null ? "Waiting for approval: read them " + d + "." : "Waiting for approval."; }
+            if (state == DeviceState.Expired) return "This PC's request wasn't approved, or was removed. Set up again with a new code.";
+            if (state == DeviceState.Removed) return "Your support team removed this PC.";
+            if (state == DeviceState.UpdateNeeded) return "Support needs an update.";
+            if (state == DeviceState.Offline) return "Can't reach your support team right now.";
+            return NotRunning;
+        }
+        // The panel's actions for a state and mode. "allow_any_time" only while active and asking first; "uninstall"
+        // always. Nothing here ever sets "ask".
+        public static List<string> Actions(string state, string access) {
+            var list = new List<string>();
+            if (state == DeviceState.Active && access == "ask") list.Add("allow_any_time");
+            list.Add("uninstall");
+            return list;
+        }
+        public static bool ShowTeamOnly(string state, string access) { return access == "any" && ShowMode(state); }
+        // A removed or unapproved PC has no access left, so it shows no mode line.
+        public static bool ShowMode(string state) { return state != DeviceState.Removed && state != DeviceState.Expired; }
+        // The newest few history lines, newest first.
+        public static List<string> Recent(System.Collections.ArrayList history, int n) {
+            var lines = new List<string>();
+            if (history == null) return lines;
+            for (int i = history.Count - 1; i >= 0 && lines.Count < n; i--) {
+                var d = history[i] as Dictionary<string, object>;
+                if (d == null) continue;
+                long at = Wire.Number(d, "at");
+                string when = at > 0 ? new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddMilliseconds(at).ToLocalTime().ToString("d MMM, HH:mm", System.Globalization.CultureInfo.InvariantCulture) + "  " : "";
+                lines.Add(when + Wire.Text(d, "text"));
+            }
+            return lines;
+        }
+        // The tray tooltip: at most 63 characters, as NotifyIcon allows.
+        public static string Tip(string name) { string t = "Support" + (string.IsNullOrEmpty(name) ? "" : ": " + name); return t.Length > 63 ? t.Substring(0, 60) + "..." : t; }
+    }
+
+    // The tray icon, drawn at run time from the app's headset shape (the exe carries no icon). Create returns an icon
+    // handle the caller frees with Native.DestroyIcon.
+    public static class TrayIcon {
+        public static IntPtr Create(int size, Gdi.Color color) {
+            using (var bmp = new Gdi.Bitmap(size, size, Img.PixelFormat.Format32bppArgb))
+            using (var g = Gdi.Graphics.FromImage(bmp)) {
+                g.SmoothingMode = Gdi.Drawing2D.SmoothingMode.AntiAlias;
+                g.Clear(Gdi.Color.Transparent);
+                float k = size / 20f;
+                using (var pen = new Gdi.Pen(color, Math.Max(1.5f, 1.8f * k)))
+                using (var brush = new Gdi.SolidBrush(color)) {
+                    g.DrawArc(pen, 3.5f * k, 3f * k, 13f * k, 13f * k, 180, 180);
+                    g.FillRectangle(brush, 2.5f * k, 9.5f * k, 3.5f * k, 6f * k);
+                    g.FillRectangle(brush, 14f * k, 9.5f * k, 3.5f * k, 6f * k);
+                }
+                return bmp.GetHicon();
+            }
+        }
+        public static Gdi.Color ColorFor(string state) {
+            if (state == DeviceState.Active) return Gdi.Color.FromArgb(0x1F, 0x9D, 0x55);
+            if (state == DeviceState.Pending) return Gdi.Color.FromArgb(0x25, 0x63, 0xEB);
+            return Gdi.Color.FromArgb(0x5B, 0x64, 0x72);
+        }
+    }
+
+    // --tray: one per signed-in session. The icon opens a small panel near the clock with the PC's name, its mode,
+    // its state and a short local history. It reads everything from the service's status pipe, polling every few
+    // seconds while the panel is open and every minute otherwise, and exits when the uninstall event is set.
+    public sealed class TrayPanel : Window {
+        const double CardWidth = 340, Pad = 16;
+        readonly Palette p;
+        readonly TextBlock nameLine, modeLine, teamOnly, stateLine, noOne, note;
+        readonly StackPanel historyBox, confirmBox;
+        readonly FlatButton allow, confirmYes, confirmNo, uninstall;
+        public event Action AllowConfirmed;
+        public event Action UninstallClicked;
+
+        public TrayPanel(Palette palette) {
+            p = palette;
+            Ui.Transparent(this);
+            Title = "Support"; ShowInTaskbar = false; Topmost = true;
+            Width = CardWidth + 2 * Pad; SizeToContent = SizeToContent.Height; WindowStartupLocation = WindowStartupLocation.Manual;
+            Foreground = p.Ink;
+            Grid inner; var card = Ui.Card(p, CardWidth, out inner);
+            var root = new Grid { Margin = new Thickness(Pad) }; root.Children.Add(card); Content = root;
+            var stack = new StackPanel(); inner.Children.Add(stack);
+            stack.Children.Add(new Border { Height = 3, Background = p.Live });
+            var body = new StackPanel { Margin = new Thickness(16, 12, 16, 14) };
+            var head = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 8) };
+            var glyph = Glyph.Headset().Paint(p.Muted).Sized(16); glyph.Margin = new Thickness(0, 0, 8, 0); head.Children.Add(glyph);
+            head.Children.Add(Ui.Label("Support", 12, FontWeights.SemiBold, p.Muted, Ui.TextFont));
+            body.Children.Add(head);
+            nameLine = Ui.Label("", 15.5, FontWeights.SemiBold, p.Ink, Ui.DisplayFont); body.Children.Add(nameLine);
+            modeLine = Line(13, p.Ink, 6); body.Children.Add(modeLine);
+            teamOnly = Line(12, p.Muted, 2); teamOnly.Text = TrayText.TeamOnly; body.Children.Add(teamOnly);
+            allow = new FlatButton(TrayText.AllowAction, p.Work, p.WorkSoft, p.WorkSoft, p.Work, 30, 0, 12, 6, 12.5, true); allow.Margin = new Thickness(0, 8, 0, 0); allow.HorizontalAlignment = HorizontalAlignment.Left;
+            body.Children.Add(allow);
+            confirmBox = new StackPanel { Margin = new Thickness(0, 8, 0, 0), Visibility = Visibility.Collapsed };
+            confirmBox.Children.Add(Ui.Label(TrayText.AllowConfirm, 12.5, FontWeights.Normal, p.Ink, Ui.TextFont));
+            var confirmButtons = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 8, 0, 0) };
+            confirmNo = new FlatButton("Cancel", p.Ink, p.Surface2, p.Line, p.Work, 30, 72, 12, 6, 12.5, true);
+            confirmYes = new FlatButton("Allow any time", p.Stop, p.StopBg, p.StopBgHover, p.Work, 30, 0, 12, 6, 12.5, true); confirmYes.Margin = new Thickness(8, 0, 0, 0);
+            confirmButtons.Children.Add(confirmNo); confirmButtons.Children.Add(confirmYes);
+            confirmBox.Children.Add(confirmButtons);
+            body.Children.Add(confirmBox);
+            stateLine = Line(13, p.Ink, 10); body.Children.Add(stateLine);
+            noOne = Line(12.5, p.Muted, 4); noOne.Text = TrayText.NoOne; body.Children.Add(noOne);
+            historyBox = new StackPanel { Margin = new Thickness(0, 10, 0, 0) }; body.Children.Add(historyBox);
+            note = Line(12, p.Stop, 8); note.Visibility = Visibility.Collapsed; body.Children.Add(note);
+            uninstall = new FlatButton(TrayText.Uninstall, p.Muted, Brushes.Transparent, p.Surface2, p.Work, 28, 0, 8, 6, 12.5, true); uninstall.Margin = new Thickness(-8, 10, 0, 0); uninstall.HorizontalAlignment = HorizontalAlignment.Left;
+            body.Children.Add(uninstall);
+            stack.Children.Add(body);
+
+            allow.Click += delegate { allow.Visibility = Visibility.Collapsed; confirmBox.Visibility = Visibility.Visible; confirmNo.Focus(); };
+            confirmNo.Click += delegate { confirmBox.Visibility = Visibility.Collapsed; allow.Visibility = Visibility.Visible; };
+            confirmYes.Click += delegate { confirmBox.Visibility = Visibility.Collapsed; var a = AllowConfirmed; if (a != null) a(); };
+            uninstall.Click += delegate { var u = UninstallClicked; if (u != null) u(); };
+            Deactivated += delegate { Hide(); };
+            PreviewKeyDown += delegate(object sender, KeyEventArgs e) { if (e.Key == Key.Escape) { e.Handled = true; Hide(); } };
+            Closing += delegate(object sender, System.ComponentModel.CancelEventArgs e) { if (!quitting) { e.Cancel = true; Hide(); } };
+        }
+        bool quitting;
+        public void Quit() { quitting = true; Close(); }
+        TextBlock Line(double size, Brush color, double top) { var t = Ui.Label("", size, FontWeights.Normal, color, Ui.TextFont); t.Margin = new Thickness(0, top, 0, 0); return t; }
+
+        // Shows a status frame, or null when the service did not answer.
+        public void Render(Dictionary<string, object> status) {
+            if (status == null) {
+                nameLine.Text = "Support"; modeLine.Text = ""; stateLine.Text = TrayText.NotRunning;
+                teamOnly.Visibility = Visibility.Collapsed; allow.Visibility = Visibility.Collapsed; confirmBox.Visibility = Visibility.Collapsed;
+                noOne.Visibility = Visibility.Collapsed; historyBox.Children.Clear();
+                return;
+            }
+            string state = Wire.Text(status, "state"), access = Wire.Text(status, "access");
+            nameLine.Text = Wire.Text(status, "name");
+            modeLine.Text = TrayText.Mode(access);
+            modeLine.Visibility = TrayText.ShowMode(state) ? Visibility.Visible : Visibility.Collapsed;
+            stateLine.Text = TrayText.State(state, Wire.Text(status, "confirm"));
+            teamOnly.Visibility = TrayText.ShowTeamOnly(state, access) ? Visibility.Visible : Visibility.Collapsed;
+            bool canAllow = TrayText.Actions(state, access).Contains("allow_any_time");
+            if (!canAllow) { allow.Visibility = Visibility.Collapsed; confirmBox.Visibility = Visibility.Collapsed; }
+            else if (confirmBox.Visibility != Visibility.Visible) allow.Visibility = Visibility.Visible;
+            noOne.Visibility = Visibility.Visible;
+            historyBox.Children.Clear();
+            object h; status.TryGetValue("history", out h);
+            foreach (string line in TrayText.Recent(h as System.Collections.ArrayList, 4)) {
+                var t = Ui.Label(line, 11.5, FontWeights.Normal, p.Muted, Ui.TextFont); t.Margin = new Thickness(0, 2, 0, 0); historyBox.Children.Add(t);
+            }
+        }
+        public void Note(string text) { note.Text = text ?? ""; note.Visibility = string.IsNullOrEmpty(text) ? Visibility.Collapsed : Visibility.Visible; }
+        // Bottom right of the work area, by the clock.
+        public void Place() {
+            UpdateLayout();
+            Rect area = SystemParameters.WorkArea;
+            Left = area.Right - Width + Pad - 8; Top = area.Bottom - ActualHeight + Pad - 8;
+        }
+    }
+
+    public static class Tray {
+        // One status request to the service. null when it does not answer.
+        public static Dictionary<string, object> Ask(string type) {
+            try {
+                using (var c = Pipes.Client(DeviceService.PipeName)) {
+                    c.Connect(1500);
+                    // Trust only a server in session 0 (the service), so a squatter in this session cannot answer.
+                    if (!Pipes.ServerIsService(c.SafePipeHandle)) return null;
+                    Pipes.Write(c, Wire.Map("type", type));
+                    return Pipes.Read(c, DeviceService.PipeReadMax, UiServer.ReadMs);
+                }
+            } catch (Exception) { return null; }
+        }
+        // A second start in the session (the setup's Open Support) asks the running tray to open its panel.
+        const string ShowEvent = "Local\\SupportMcpTrayShow";
+        public static void Run(Application app) {
+            bool first; using (var mutex = new Mutex(true, "Local\\SupportMcpTray", out first)) {
+                if (!first) { try { using (var show = EventWaitHandle.OpenExisting(ShowEvent)) { Native.AllowSetForegroundWindow(-1); show.Set(); } } catch (Exception) { } return; }
+                // Created first, so a second start during the icon and panel setup is not dropped. It stays null when another object holds the name.
+                EventWaitHandle showRequests = null;
+                try { showRequests = new EventWaitHandle(false, EventResetMode.AutoReset, ShowEvent); } catch (Exception) { }
+                var panel = new TrayPanel(Palette.Detect());
+                string state = ""; IntPtr handle = IntPtr.Zero; Gdi.Icon icon = null;
+                var notify = new WF.NotifyIcon { Text = "Support", Visible = false };
+                Action<string> paint = delegate(string s) {
+                    IntPtr fresh = TrayIcon.Create(16, TrayIcon.ColorFor(s));
+                    var shown = Gdi.Icon.FromHandle(fresh);
+                    notify.Icon = shown;
+                    if (icon != null) icon.Dispose();
+                    if (handle != IntPtr.Zero) Native.DestroyIcon(handle);
+                    icon = shown; handle = fresh;
+                };
+                paint(""); notify.Visible = true;
+                var poll = new DispatcherTimer { Interval = TimeSpan.FromMinutes(1) };
+                var busy = new Busy();
+                Action refresh = delegate {
+                    if (busy.Set) return; busy.Set = true;
+                    ThreadPool.QueueUserWorkItem(delegate {
+                        var st = Ask("status");
+                        panel.Dispatcher.BeginInvoke(new Action(delegate {
+                            busy.Set = false;
+                            panel.Render(st);
+                            string s = st == null ? "" : Wire.Text(st, "state");
+                            notify.Text = TrayText.Tip(st == null ? "" : Wire.Text(st, "name"));
+                            if (s != state) { state = s; paint(s); }
+                        }));
+                    });
+                };
+                poll.Tick += delegate { refresh(); };
+                Action open = delegate {
+                    panel.Note(null); panel.Show(); panel.Place(); panel.Activate();
+                    poll.Interval = TimeSpan.FromSeconds(4); refresh();
+                };
+                notify.MouseClick += delegate(object sender, WF.MouseEventArgs e) {
+                    if (e.Button != WF.MouseButtons.Left) return;
+                    if (panel.IsVisible) { panel.Hide(); return; }
+                    open();
+                };
+                if (showRequests != null) {
+                    var shower = new Thread(delegate() {
+                        while (true) { showRequests.WaitOne(); try { panel.Dispatcher.BeginInvoke(new Action(delegate { if (!panel.IsVisible) open(); })); } catch (Exception) { return; } }
+                    });
+                    shower.IsBackground = true; shower.Start();
+                }
+                panel.IsVisibleChanged += delegate { if (!panel.IsVisible) poll.Interval = TimeSpan.FromMinutes(1); };
+                panel.AllowConfirmed += delegate {
+                    ThreadPool.QueueUserWorkItem(delegate {
+                        var st = Ask("allow_any_time");
+                        panel.Dispatcher.BeginInvoke(new Action(delegate { if (st == null) panel.Note(TrayText.NotRunning); else panel.Render(st); }));
+                    });
+                };
+                panel.UninstallClicked += delegate {
+                    bool started = false;
+                    try { if (File.Exists(DeviceSetup.Exe)) using (Process.Start(new ProcessStartInfo(DeviceSetup.Exe, "--uninstall") { UseShellExecute = false, WorkingDirectory = Path.GetTempPath() })) { started = true; } } catch (Exception) { }
+                    if (!started) panel.Note(TrayText.UninstallMissing);
+                    else panel.Hide();
+                };
+                // The uninstall event: when the service has created it, watch it; set means quit at once.
+                var watcher = new Thread(delegate() {
+                    while (true) {
+                        var e = DeviceService.WatchUninstall();
+                        if (e != null) { using (e) e.WaitOne(); break; }
+                        Thread.Sleep(30000);
+                    }
+                    try { panel.Dispatcher.BeginInvoke(new Action(delegate { app.Shutdown(); })); } catch (Exception) { }
+                });
+                watcher.IsBackground = true; watcher.Start();
+                poll.Start(); refresh();
+                app.Run();
+                poll.Stop();
+                notify.Visible = false; notify.Dispose();
+                if (icon != null) icon.Dispose();
+                if (handle != IntPtr.Zero) Native.DestroyIcon(handle);
+                panel.Quit();
+            }
+        }
+        // A flag the poll's worker and the UI share; only the UI thread sets it back.
+        sealed class Busy { public volatile bool Set; }
+    }
+
+    // Uninstall. The unelevated --uninstall (run by the Apps entry and the tray) copies itself to a fresh Temp folder
+    // and re-runs from there, so nothing in the install folder stays open; it shows a confirm, then runs the elevated
+    // --device-remove. The pure parts (the removal plan, the exit-code map, the Temp-copy rule, and what counts as a
+    // reached relay) are static so the native tests can check them. --device-remove never touches
+    // HKLM\SOFTWARE\SupportMCP or anything of the one-off sessions.
+    public static class DeviceUninstall {
+        public const int Removed = 0, Unreachable = 10, Fail = 20;
+        public enum Outcome { Removed, RemovedUnreachable, Declined, Failed }
+        public static Outcome Map(int exit) {
+            if (exit == Removed) return Outcome.Removed;
+            if (exit == Unreachable) return Outcome.RemovedUnreachable;
+            if (exit == -1223) return Outcome.Declined;
+            return Outcome.Failed;
+        }
+        // --uninstall must run from a copy, not the install folder's support.exe. True when it is still the installed one.
+        public static bool NeedsRestage(string exePath) {
+            try { return string.Equals(Path.GetFullPath(exePath), Path.GetFullPath(DeviceSetup.Exe), StringComparison.OrdinalIgnoreCase); }
+            catch (Exception) { return false; }
+        }
+        // Leave counts as done whether the relay answered 200 or 401; only a network failure leaves the PC on the list.
+        // Only a 200 (forgotten now) or a 401 (already gone) means the relay no longer holds this PC. Anything else, a
+        // refusal or a server error included, removes locally but tells the owner the team must remove it.
+        public static bool LeaveReachedRelay(DeviceLink.DeviceResult result) { return result == DeviceLink.DeviceResult.Ok || result == DeviceLink.DeviceResult.Removed; }
+        // Everything an uninstall removes, by exact name. The native test checks the list names only our artifacts and
+        // never the one-off sessions' shared record (HKLM\SOFTWARE\SupportMCP).
+        public static List<string> RemovalPlan() {
+            var list = new List<string>();
+            list.Add("service " + DeviceSetup.ServiceName);
+            list.Add("hklm64 " + DeviceInstall.RunKey + "\\" + DeviceInstall.TrayValueName);
+            list.Add("hklm64 " + DeviceInstall.AppsKey);
+            list.Add("folder " + DeviceSetup.Folder);
+            return list;
+        }
+
+        // --device-remove <nonce>, elevated. Reads device.json, leaves the relay, signals the trays and ends any that
+        // stay, stops and deletes the service, drops the registry entries, and removes the folder (locked leftovers go
+        // at the next restart). Returns Removed, Unreachable, or Fail when the attempt was withdrawn.
+        public static int Remove(string[] args) {
+            if (args.Length != 2 || !System.Text.RegularExpressions.Regex.IsMatch(args[1], @"^[0-9a-f]{32}\z")) return Fail;
+            var want = Elevation.Wanted("device-remove", args[1]);
+            if (want == null) return Fail;
+            // One install or remove at a time across the PC; a second gets Fail and touches nothing.
+            Mutex only = null; bool held = false;
+            try { only = DeviceInstall.SetupMutex(); try { held = only.WaitOne(0); } catch (AbandonedMutexException) { held = true; } } catch (Exception) { }
+            if (!held) { if (only != null) only.Dispose(); want.Dispose(); return Fail; }
+            using (want)
+            try {
+                string folder = DeviceSetup.Folder;
+                // Only an actual leave call counts as reaching the relay; a missing or damaged device.json leaves the
+                // PC on the team's list, so the final window says so.
+                bool reached = false;
+                try {
+                    var dev = Wire.Json().Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(folder, "device.json")));
+                    if (dev != null) {
+                        string origin = Wire.Text(dev, "origin"), key = Wire.Text(dev, "key");
+                        if (key.Length > 0 && origin.Length > 0) reached = LeaveReachedRelay(new DeviceLink(origin).Leave(key).Result);
+                    }
+                } catch (Exception) { }
+                DeviceService.SignalUninstall();         // every tray watches this and exits
+                try { Thread.Sleep(3000); } catch (Exception) { } // give the trays a few seconds to close themselves
+                EndTrays();                              // best effort for any that remain
+                try { Scm.Remove(DeviceSetup.ServiceName); } catch (Exception) { }
+                DeviceInstall.RemoveRegistry();
+                RemoveFolder(folder);
+                return reached ? Removed : Unreachable;
+            } finally { try { only.ReleaseMutex(); } catch (Exception) { } only.Dispose(); }
+        }
+        static void EndTrays() {
+            try {
+                foreach (var pr in Process.GetProcessesByName("support")) {
+                    try { if (string.Equals(pr.MainModule.FileName, DeviceSetup.Exe, StringComparison.OrdinalIgnoreCase)) pr.Kill(); }
+                    catch (Exception) { }
+                    finally { pr.Dispose(); }
+                }
+            } catch (Exception) { }
+        }
+        // Rename the folder aside so a fresh install at the original path is never blocked, then delete it or queue it
+        // for the next restart (DeviceInstall.RemoveFolderAside, junction-safe and shared with the install's rollback).
+        static void RemoveFolder(string folder) { DeviceInstall.RemoveFolderAside(folder); }
+        internal static void TestRemoveFolder(string folder) { RemoveFolder(folder); }
+
+        public static void Run(Application app, string exe) {
+            // Run from a Temp copy, so the install folder (support.exe) is not held open while it is removed.
+            if (NeedsRestage(exe)) {
+                try { string staged = Elevation.Stage(exe); using (Process.Start(new ProcessStartInfo(staged, "--uninstall") { UseShellExecute = false, WorkingDirectory = Path.GetTempPath() })) { } } catch (Exception) { }
+                return;
+            }
+            bool first; using (var mutex = new Mutex(true, "Local\\SupportMcpUninstall", out first)) {
+                if (!first) return;
+                Elevation.SweepStaged(); // clear old SupportMcpStage-* copies, including earlier uninstall runs
+                var window = new UninstallWindow(Palette.Detect(), exe);
+                window.Closed += delegate { app.Shutdown(); };
+                app.Run(window);
+                window.Finish();
+                string stage = StagedFolder(exe); if (stage != null) FullInstall.RemoveLater(new List<string>(), stage);
+            }
+        }
+        // The folder to remove after this run: the folder of a staged copy (SupportMcpStage-* directly under Temp), else
+        // null. Anything else, the install folder included, is never a candidate.
+        internal static string StagedFolder(string exePath) { return StagedFolder(exePath, Path.GetTempPath()); }
+        internal static string StagedFolder(string exePath, string temp) {
+            try {
+                string dir = Path.GetDirectoryName(Path.GetFullPath(exePath)), parent = Path.GetDirectoryName(dir);
+                if (dir == null || parent == null || NeedsRestage(exePath)) return null;
+                bool direct = string.Equals(parent.TrimEnd('\\'), Path.GetFullPath(temp).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+                return direct && Path.GetFileName(dir).StartsWith(Elevation.StagePrefix, StringComparison.OrdinalIgnoreCase) ? dir : null;
+            } catch (Exception) { return null; }
+        }
+    }
+
+    // The confirm-and-result window for --uninstall. Cancel/Uninstall, then the elevated removal and a final message.
+    public sealed class UninstallWindow : Window {
+        const double CardWidth = 440, Pad = 20;
+        readonly Palette p;
+        readonly string exe;
+        enum Screen { Confirm, Removing, Unavailable, Done, DoneUnreachable }
+        Screen screen = Screen.Confirm;
+        string note = "";
+        Thread worker;
+
+        readonly Border bodyHost;
+        readonly TextBlock heading, body, noteLine;
+        readonly FlatButton cancel, go;
+
+        public UninstallWindow(Palette palette, string exe) {
+            p = palette; this.exe = exe;
+            Ui.Transparent(this);
+            Topmost = false; ShowInTaskbar = true; Title = "Uninstall Support";
+            Width = CardWidth + 2 * Pad; SizeToContent = SizeToContent.Height; WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            Foreground = p.Ink;
+            Grid inner; var card = Ui.Card(p, CardWidth, out inner);
+            var root = new Grid { Margin = new Thickness(Pad) }; root.Children.Add(card); Content = root;
+            var stack = new StackPanel(); inner.Children.Add(stack);
+            stack.Children.Add(new Border { Height = 3, Background = p.Stop });
+            var head = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(16, 12, 16, 0) };
+            var glyph = Glyph.Headset().Paint(p.Muted).Sized(16); glyph.Margin = new Thickness(0, 0, 8, 0); head.Children.Add(glyph);
+            head.Children.Add(Ui.Label("Support", 12, FontWeights.SemiBold, p.Muted, Ui.TextFont));
+            stack.Children.Add(head);
+            var wrap = new StackPanel { Margin = new Thickness(16, 8, 16, 4) };
+            heading = Ui.Label("", 17, FontWeights.SemiBold, p.Ink, Ui.DisplayFont); heading.Margin = new Thickness(0, 0, 0, 8); heading.LineHeight = 22;
+            wrap.Children.Add(heading);
+            bodyHost = new Border(); wrap.Children.Add(bodyHost);
+            body = Ui.Label("", 13, FontWeights.Normal, p.Muted, Ui.TextFont); body.LineHeight = 19; bodyHost.Child = body;
+            noteLine = Ui.Label("", 12.5, FontWeights.Normal, p.Stop, Ui.TextFont); noteLine.Margin = new Thickness(0, 10, 0, 0); noteLine.Visibility = Visibility.Collapsed;
+            wrap.Children.Add(noteLine);
+            stack.Children.Add(wrap);
+            var foot = new Border { BorderBrush = p.Line, BorderThickness = new Thickness(0, 1, 0, 0), Padding = new Thickness(12, 10, 12, 12), Margin = new Thickness(0, 12, 0, 0) };
+            var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+            cancel = new FlatButton("Cancel", p.Ink, p.Surface2, p.Line, p.Work, 34, 96, 14, 6, 13, true);
+            go = new FlatButton("Uninstall", Brushes.White, p.StopSolid, p.StopSolidHover, p.Work, 34, 120, 16, 6, 13, true); go.Margin = new Thickness(8, 0, 0, 0);
+            buttons.Children.Add(cancel); buttons.Children.Add(go);
+            foot.Child = buttons; stack.Children.Add(foot);
+
+            cancel.Click += delegate { if (screen == Screen.Done || screen == Screen.DoneUnreachable || screen == Screen.Unavailable) Close(); else if (screen != Screen.Removing) Close(); };
+            go.Click += delegate { OnGo(); };
+            PreviewKeyDown += delegate(object sender, KeyEventArgs e) { if (e.Key == Key.Escape && screen != Screen.Removing) { e.Handled = true; Close(); } };
+            Closing += delegate(object sender, System.ComponentModel.CancelEventArgs e) { if (screen == Screen.Removing) e.Cancel = true; };
+            Loaded += delegate { Render(); Activate(); };
+        }
+
+        void OnGo() {
+            if (screen == Screen.Done || screen == Screen.DoneUnreachable || screen == Screen.Unavailable) { Close(); return; }
+            if (screen == Screen.Removing) return;
+            BeginRemove();
+        }
+        void BeginRemove() {
+            screen = Screen.Removing; note = ""; Render();
+            IntPtr owner = new WindowInteropHelper(this).Handle;
+            worker = new Thread(delegate() {
+                int exit = DeviceUninstall.Fail; bool unavailable = false, declined = false;
+                try {
+                    Consent path = ConsentPath.Detect();
+                    if (path == Consent.Unavailable) unavailable = true;
+                    else {
+                        string nonce = Elevation.Nonce(); string staged = Elevation.Stage(exe);
+                        using (var want = Elevation.Want("device-remove", nonce))
+                        try { exit = Native.RunElevated(staged, "--device-remove " + nonce, owner, delegate { }); }
+                        finally { try { Elevation.DeleteTree(Path.GetDirectoryName(staged)); } catch (Exception) { } }
+                        if (exit == -1223) declined = true;
+                    }
+                } catch (Exception) { exit = DeviceUninstall.Fail; }
+                bool un = unavailable, dec = declined; int code = exit;
+                Post(delegate { Finish(un, dec, code); });
+            });
+            worker.SetApartmentState(ApartmentState.STA); worker.IsBackground = true; worker.Start();
+        }
+        void Finish(bool unavailable, bool declined, int exit) {
+            // The elevated step leaves another window in front (on Windows 7 the result sat behind Programs and Features), so each outcome takes focus back.
+            if (unavailable) { screen = Screen.Unavailable; Render(); Activate(); return; }
+            if (declined) { screen = Screen.Confirm; note = "Windows didn't get permission, so nothing was removed. Click Uninstall to try again."; Render(); Activate(); return; }
+            DeviceUninstall.Outcome outcome = DeviceUninstall.Map(exit);
+            if (outcome == DeviceUninstall.Outcome.Removed) screen = Screen.Done;
+            else if (outcome == DeviceUninstall.Outcome.RemovedUnreachable) screen = Screen.DoneUnreachable;
+            else { screen = Screen.Confirm; note = "Support couldn't be removed. Try again, or ask your support team for help."; }
+            Render(); Activate();
+        }
+        void Post(Action a) { Dispatcher.BeginInvoke(DispatcherPriority.Normal, a); }
+
+        void Render() {
+            if (screen == Screen.Confirm) {
+                heading.Text = "Uninstall Support?";
+                body.Text = "This removes the app, the background service that lets your support team see this PC, and this PC's saved access. Your support team can no longer connect.";
+            } else if (screen == Screen.Removing) {
+                heading.Text = "Removing Support…"; body.Text = "This takes a moment.";
+            } else if (screen == Screen.Unavailable) {
+                heading.Text = "Can't remove on this account"; body.Text = DeviceSetup.UnavailableText;
+            } else if (screen == Screen.Done) {
+                heading.Text = "Support was removed"; body.Text = "Support is no longer on this PC.";
+            } else {
+                heading.Text = "Support was removed"; body.Text = "Support is no longer on this PC. Your support team will still see this PC in their list until they remove it.";
+            }
+            bool terminal = screen == Screen.Done || screen == Screen.DoneUnreachable || screen == Screen.Unavailable;
+            noteLine.Text = note; noteLine.Visibility = note.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+            cancel.Visibility = (screen == Screen.Confirm) ? Visibility.Visible : Visibility.Collapsed;
+            go.Visibility = screen == Screen.Removing ? Visibility.Collapsed : Visibility.Visible;
+            go.Content = terminal ? "Close" : "Uninstall";
+            // Keyboard: the safe choice has the focus while it asks, Close once it is done.
+            FlatButton target = screen == Screen.Confirm ? cancel : terminal ? go : null;
+            if (target != null) Dispatcher.BeginInvoke(DispatcherPriority.Input, (Action)delegate { target.Focus(); Keyboard.Focus(target); });
+        }
+        public void Finish() { var t = worker; if (t != null) t.Join(120000); }
+    }
+
     public static class Program {
         [STAThread] public static void Main(string[] args) {
             string role = args.Length > 0 ? args[0] : "", executable = System.Reflection.Assembly.GetExecutingAssembly().Location;
             // The roles that run elevated or as SYSTEM show nothing at all: no window, no message box.
             if (role == "--service") { try { ServiceBase.Run(new SupportService(executable, Wire.ReadConfig(executable))); } catch (Exception) { } return; }
+            if (role == "--device-service") { try { ServiceBase.Run(new DeviceService(executable)); } catch (Exception) { } return; }
             if (role == "--helper") { try { Helper.Run(executable, args); } catch (Exception) { } Environment.Exit(0); }
             if (role == "--elevate-install") {
                 Native.SafeDllSearch(); int code = 1; FileStream held = null;
@@ -3426,10 +4985,32 @@ namespace SupportMcp {
                 finally { if (held != null) held.Dispose(); }
                 Environment.Exit(code);
             }
+            // The elevated install step of a saved PC: reads its own exe and device footer once through a held handle,
+            // like --elevate-install, then installs. Anything other than exit 0 or 10 leaves nothing of this run.
+            if (role == "--device-install") {
+                Native.SafeDllSearch(); int code = DeviceSetup.Refused; FileStream held = null;
+                try { byte[] self = FullInstall.ReadSelf(executable, out held); code = DeviceInstall.Install(self, Wire.ReadDevice(self), args); } catch (Exception) { }
+                finally { if (held != null) held.Dispose(); }
+                Environment.Exit(code);
+            }
+            // The elevated remove step: run from the staged copy the uninstaller launched; it reads device.json from
+            // the install folder, not a footer, so the staged exe needs none.
+            if (role == "--device-remove") {
+                Native.SafeDllSearch(); int code = DeviceUninstall.Fail;
+                try { code = DeviceUninstall.Remove(args); } catch (Exception) { }
+                Environment.Exit(code);
+            }
             WF.Application.EnableVisualStyles();
             try {
                 var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
                 if (role == "--window") { RunWindow(app, args); return; }
+                // The installed support.exe carries no footer, so its roles are routed before any footer is read.
+                if (role == "--tray") { Tray.Run(app); return; }
+                if (role == "--uninstall") { DeviceUninstall.Run(app, executable); return; }
+                // A setup download carries a device footer (kind "device"). It runs the wizard, and is checked before
+                // any session footer is read, so no session role ever runs on it (Wire.ReadConfig refuses it too).
+                byte[] self = File.ReadAllBytes(executable);
+                if (Wire.Kind(self) == "device") { DeviceSetup.Run(app, Wire.ReadDevice(self), executable); return; }
                 bool administrator = SupportAccess.IsAdministrator();
                 var config = Wire.ReadConfig(executable);
                 bool requestedResume = args.Length == 1 && (args[0] == "--prepare-restart" || args[0] == "--resume");

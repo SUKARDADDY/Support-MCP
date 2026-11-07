@@ -39,6 +39,9 @@ AI agent does the diagnosis and the fix while a person watches.
   offers limited support ("normal mode"): the screen, mouse and keyboard and
   commands as the signed-in user, but no Windows security prompts.
 - A small window in the corner shows that the session is live.
+- A PC's owner can also install the app permanently as a saved PC, so the
+  support team keeps it on their list. Nobody can connect to a saved PC yet. See
+  [Saved devices](#saved-devices).
 - When the customer uses the mouse or keyboard, support's input pauses for 3
   seconds.
 - Access ends 24 hours after the PC connects, or sooner if either side ends it.
@@ -330,15 +333,24 @@ The routes, bodies and errors are in
 
 Each workspace can keep customers, their sites and their saved PCs, so a team
 knows which PC is whose. A PC joins with its own long-lived key, which is not
-tied to a 24-hour session. This release stores and pairs PCs; it does not yet
-connect to them. One-off support links work as before.
+tied to a 24-hour session. A PC's owner can install the Windows app on it
+permanently, as a saved PC. This release stores, pairs and installs PCs; it does
+not yet connect to them. One-off support links work as before.
+
+> **Not for real customers' unattended PCs yet.** Nobody can connect to a saved
+> PC in this release, and the rules that decide who may connect, and when, are not
+> enforced yet. Until a later release ships them, do not install a saved PC on a
+> real customer's unattended machine. Use it on your own test machines.
 
 - **Records.** A customer has a name, phone, email and notes. A site belongs to
   one customer and has a name, address and notes. A saved PC has the name its
   owner gave it, an access mode (`ask` or `any`), a control level (`full` or
-  `limited`), an optional owner contact, a site, and what the PC reports about
-  itself: Windows version, machine name, app version and when it was last seen.
-  Reading needs `devices.view`; changing needs `devices.manage`.
+  `limited`), an owner contact that technicians keep, a site, and what the PC
+  reports about itself: Windows version, machine name, app version and when it was last seen.
+  Reading needs `devices.view`; changing needs `devices.manage`. The owner
+  contact is set by a technician with `devices.manage` (`PATCH .../devices/<id>`
+  with `owner_contact`). The PC cannot send it: `/device/pair` and
+  `/device/update` answer 400 if it does.
 - **Custom fields.** An admin (`fields.manage`) can add text fields to
   customers, sites or devices, such as "Contract until". A value is text of at
   most 500 characters, and a record type has at most 30 fields. Custom field
@@ -348,9 +360,13 @@ connect to them. One-off support links work as before.
   name. None of it grants access to anything.
 - **Two ways to pair a PC.** A technician asks for a pairing code
   (`POST .../pairing`). The code is 10 characters such as `ABCDE-FGH23`, works
-  once, and dies after 10 minutes. The owner types it into the PC's setup and
-  the PC joins with its own key. Or the owner starts the install, and the PC
-  joins as *waiting* with a six-digit number the owner reads out. A technician
+  once, and dies after 10 minutes. The answer also carries a ready-to-send
+  `link` such as `https://support.example.com/install?code=ABCDE-FGH23`. The
+  owner opens the link, downloads Support, and the setup wizard has the code
+  filled in. Or the owner types the code into the wizard. Either way the PC joins
+  with its own key. Or the owner starts the install from the team's install link
+  (`/install?workspace=<slug>`), and the PC joins as *waiting* with a six-digit
+  number the owner reads out. A technician
   approves it by typing that number. A waiting PC can only check in or leave, and
   it is gone after 24 hours. A workspace takes at most 20 live codes, 20 waiting
   PCs and 20 join requests an hour.
@@ -359,10 +375,11 @@ connect to them. One-off support links work as before.
   URL. A wrong key, an unknown PC and a removed PC all get the same 401. A PC
   removes itself when it is uninstalled (`/device/leave`), and a technician can
   remove any saved PC, which ends its key at once.
-- **Access mode.** The PC's owner can switch it between `ask` and `any`. So can
-  a technician with `devices.manage`; that change is logged with the technician
-  as the actor and the old and new mode. The control level and the PC's name
-  stay the owner's.
+- **Access mode.** `ask` means support asks first; `any` means support may
+  connect at any time. A technician with `devices.manage` can switch it either
+  way; that change is logged with the technician as the actor and the old and new
+  mode. On the PC the switch goes one way only: see [The tray](#the-tray). The
+  control level and the PC's name stay the owner's.
 - **The team log** records every change to customers, sites, custom fields,
   pairing codes and PCs, with names and ids but never a code, a key or a field
   value. A detail can hold customer, site and PC names, so anyone with
@@ -376,6 +393,82 @@ Rotating `AUTH_SECRET` ends every live pairing code and every waiting PC's
 six-digit number, because both are stored as keyed hashes; a PC's key is a plain
 SHA-256 and keeps working.
 To try it locally, see [docs/development.md](docs/development.md#pairing-a-pc-locally).
+
+### Setting up a saved PC
+
+The owner opens the install link, which is `/install` on the relay. The page
+has a download button and nothing else happens until it is clicked, so a chat
+app's link preview downloads nothing. A technician's link carries the pairing
+code. The team's link (`/install?workspace=<slug>`) carries only the workspace.
+The download is `support-setup.exe`, the same unsigned Windows app with a small
+footer that names the relay and the code or the workspace. It runs a setup
+wizard with these steps:
+
+1. **Pairing code.** It is filled in from a technician's link. With the team's
+   link, the owner can choose "I don't have a code" and join the workspace
+   instead.
+2. **The PC's name.** Up to 100 characters.
+3. **How support may connect.** "Ask me each time" or "Connect any time
+   (unattended)". Nothing is preselected.
+4. **How much control.** Full control or limited support. Nothing is preselected.
+5. **Install.** Windows asks once for permission. This is the consent to the
+   install, together with the owner's choices above.
+
+A PC that joined without a code shows a six-digit number. The owner reads it to a
+technician, who approves the PC with it. The number stays on the screen, and in
+the tray, until a technician approves the PC or 24 hours pass.
+
+The install puts these on the PC:
+
+- **`%ProgramFiles%\SupportMCP`** holds `support.exe`, which users can read and
+  run, a device record with the PC's key, and a short local history. Only SYSTEM
+  and administrators can read the record and the history.
+- **A Windows service**, "Support device service" (`SupportMcpDevice`), runs as
+  LocalSystem, starts automatically and restarts on failure. It checks in with
+  the relay every few minutes. In this release it runs no commands, takes no
+  screenshots and opens no files for anyone.
+- **A tray icon** starts at each sign-in.
+- **An entry in Windows Settings > Apps** (Control Panel > Programs and
+  Features on Windows 7 and 8.1), named "Support", is how the owner uninstalls.
+
+Running the wizard on a PC that is already set up says so and opens the tray.
+
+### The tray
+
+The tray icon opens a panel with the PC's name, its access mode, its state (for
+example "Your support team can see this PC" or "Waiting for approval"), "No one
+is connected.", a few lines of recent local history and "Uninstall Support".
+
+The access mode changes in one direction only. While it is "ask each time", the
+panel offers "Allow support to connect any time". The button asks for a
+confirmation that says it cannot be undone from this PC. Once it is "any time",
+the panel says "Only your support team can change this." Nothing in the app turns
+it back to "ask each time"; only the support team can, through the team API. The
+rule is the app's: the relay still takes either mode from a holder of the PC's
+key (which only SYSTEM or an elevated administrator can read), as PR 3 pinned.
+
+This means **any user signed in at the PC, including a standard user or a guest,
+can turn on unattended access.** Windows asks for no administrator prompt for
+this. It is the owner's call, made with that in mind, and it is one more reason
+not to use a saved PC on a real customer's unattended machine yet.
+
+### Uninstalling
+
+The owner can uninstall from Settings > Apps, or with "Uninstall Support" in the
+tray. Windows asks once for permission. Then:
+
+- The relay forgets the PC, so its key stops working.
+- The tray closes.
+- The service, the startup entry, the Apps entry and the folder are removed.
+  Anything still locked is deleted at the next restart.
+
+If the relay cannot be reached, everything is still removed from the PC. The
+final window then says the support team will still see the PC in their list until
+they remove it, and the team must remove it with `DELETE .../devices/<id>`.
+
+A saved PC and a one-off support session are separate. A one-off session uses
+its own service, folder and pipe, and removes itself when it ends. Uninstalling a
+saved PC does not touch it.
 
 ## Sign-in
 
@@ -445,6 +538,7 @@ flowchart LR
 | `POST /j/<code>?client=app` | public, single use, https only, same origin | returns the session's executable and uses the code up |
 | `GET /j/<code>` | public, single use, https only | serves the PowerShell agent script with the session values filled in, to PowerShell clients only |
 | `POST /agent?sid=` | attach key in a header, https only | the app's transport: hello, long poll, results and end, as JSON |
+| `GET /install`, `POST /install` | public, https only | `GET` shows the setup page for a saved PC and never downloads. `POST` from that page returns `support-setup.exe` with a device footer. `?code=` or `?workspace=`, at most one. It uses no code up: the PC redeems the code over `/device/pair`. Not behind Access |
 | `GET /ws?sid=` | attach key in a header, https only | PowerShell agent WebSocket, using the hibernation API |
 | `POST /mcp` | Cloudflare Access, then the caller's role | MCP JSON-RPC 2.0, stateless HTTP, for the `default` workspace |
 | `POST /w/<slug>/mcp` | Cloudflare Access, then the caller's role | the same endpoint for another workspace |
@@ -474,7 +568,7 @@ keyed by workspace.
 | `src/screen.js` | the screen actions, their audit text, and the strict check of every field an app result may carry |
 | `src/jwt.js` | RS256 verification of the Access JWT with WebCrypto |
 | `src/template.js` | builds the served script and the downloaded executable, validates every value placed in them, and maps the mode aliases |
-| `src/agent-app.cs` | the Windows app: C# source for .NET Framework 4.5.2 or later. One exe with several roles: the customer's app (WPF window, dialogs, HTTPS polling client with two lanes, normal-mode screen control), `--elevate-install`, the full-control `--service`, the SYSTEM `--helper` that runs screen operations on the console session, and the `--window` corner window |
+| `src/agent-app.cs` | the Windows app: C# source for .NET Framework 4.5.2 or later. One exe with several roles: the customer's app (WPF window, dialogs, HTTPS polling client with two lanes, normal-mode screen control), `--elevate-install`, the full-control `--service`, the SYSTEM `--helper` that runs screen operations on the console session, and the `--window` corner window. For a saved PC it also has the setup wizard (no arguments, with a device footer), `--device-install`, the `--device-service`, the `--tray` and `--uninstall` with `--device-remove` |
 | `src/agent-app.manifest` | the app's `asInvoker` manifest. The app asks for elevation only through `--elevate-install`, after the customer started it |
 | `src/app-bundle.json` | the compiled x86 app with the SHA-256 of its source and manifest. Tests fail when the source changed without a rebuild |
 | `src/agent.ps1` | the PowerShell agent: bootstrap, run and cleanup roles in one file |
@@ -668,8 +762,10 @@ check are in [docs/development.md](docs/development.md).
   PowerShell fallback has no screen access either.
 - A workspace holds at most 10,000 customers, 10,000 sites and 2,000 saved PCs,
   30 custom fields per record type, 20 live pairing codes and 20 waiting PCs.
-  Saved PCs cannot be connected to yet: in this release a saved PC is a record
-  and a key, and nothing in the relay reads a record to decide who may do what.
+  Saved PCs cannot be connected to yet: in this release a saved PC is a record,
+  a key and a service that only checks in, and nothing in the relay reads a
+  record to decide who may do what. Do not use a saved PC on a real customer's
+  unattended machine until the release that enforces those rules.
 - Cloudflare Access, or the relay's OAuth for MCP clients, decides who can reach
   the relay, and each workspace's roles decide what its members can do.
   `session_list` lists the sessions of the workspace you called it on. A session

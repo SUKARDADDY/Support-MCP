@@ -273,7 +273,8 @@ apply to only one client say which.
   accepts `ACCESS_AUD` only, and an empty `ACCESS_MCP_AUD` changes nothing. A
   saved PC's four addresses under `/device/` are public and sit under none of
   these Access apps, because a PC has no Access login; they have their own rules,
-  below.
+  below. So does `/install`, the setup page and download that a PC's owner opens
+  from a link.
   Access session revocation does not apply on a bypassed path. There the relay's
   own checks are the gate: the JWT or the OAuth token, and the role check on
   every tool call.
@@ -379,8 +380,9 @@ apply to only one client say which.
     number, because both are keyed hashes; device keys are a plain SHA-256 and
     are unaffected.
   - *A key never goes in a URL.* The PC sends it in `Authorization: Bearer`, and
-    a `?key=` or `?code=` in the URL is refused. The four addresses are POST
-    only, https only (loopback excepted), refuse any request with an `Origin`
+    a `?key=` or `?code=` in the URL of a `/device/` request is refused. (The
+    install link is a different address and does carry a code: see below.) The
+    four addresses are POST only, https only (loopback excepted), refuse any request with an `Origin`
     header, take only JSON of at most 8 KB, and carry `"protocol": 1` in every
     request and answer so a later version can coexist.
   - *An owner-started install needs a technician.* The PC joins as waiting and
@@ -396,14 +398,31 @@ apply to only one client say which.
   - *Uninstalling revokes.* A PC removes itself with `/device/leave`, which
     deletes its row and so its key. A technician with `devices.manage` can remove
     any PC the same way. Either takes effect on the PC's next request.
-  - *Access mode.* A PC's owner, or a technician with `devices.manage`, can change
-    a PC between `ask` and `any`. The log records who and the old and new mode. A
+  - *Access mode.* A technician with `devices.manage` can change a PC between
+    `ask` and `any`, either way. The log records who and the old and new mode. A
     technician cannot change the control level or the name; a request that sends
-    either is 400, not ignored.
+    either is 400, not ignored. On the PC the switch is one way: anyone signed in
+    can turn `ask` to `any`, and nobody at the PC can turn it back (see "A saved
+    PC installs a permanent service" below).
+  - *The owner contact is the team's.* Only a technician with `devices.manage`
+    sets or clears a PC's owner contact. A PC that sends one to `/device/pair` or
+    `/device/update` gets 400 `bad_request`, so a person who holds the PC's key
+    cannot overwrite what the team recorded. The log names the field, never the
+    value.
+  - *An install link carries a working code.* A technician's link,
+    `/install?code=ABCDE-FGH23`, is a pairing code in a URL. The code can land in
+    the browser's history, in a chat app's link preview (the preview fetches only
+    the setup page, which never checks or uses the code) and in the relay's own
+    request logs. Whoever uses it first within its 10 minutes pairs their PC, and
+    the real owner then sees that the code did not work. The code is still single
+    use and still dies after 10 minutes. Send the link over a channel you trust,
+    and ask for a new one if the owner says the code failed. The team's link,
+    `/install?workspace=<slug>`, carries no secret: a PC that joins through it is
+    a waiting PC until a technician approves it.
   - *Custom fields never grant access, and are untrusted text.* A field value is
     plain text of at most 500 characters. Only team members with `devices.manage`
     write it; a PC cannot. What a PC reports or sets about itself (its name,
-    owner contact, Windows version and machine name) is untrusted text too, and
+    Windows version and machine name) is untrusted text too, and
     shows beside the field values. Treat all of it as you treat session output:
     it may try to steer an agent that reads it later.
     Customer contact details need `devices.view`, which the technician and viewer
@@ -417,6 +436,79 @@ apply to only one client say which.
     names of the records it concerns, never a code, a key, a contact or a field
     value. Anyone with `audit.view` reads those names, so a viewer role sees
     customer and site names there even without `devices.view`.
+- **A saved PC installs a permanent service.** This is the one place the app
+  stays on a PC after a session. A one-off support link is unchanged, and
+  nothing here touches it. These rules hold:
+  - *What the install puts on the PC, and where.* The owner runs the setup, and
+    one Windows permission prompt elevates it. It creates
+    `%ProgramFiles%\SupportMCP` (the path comes from the registry, as for full
+    control), and in it `support.exe`, the device record `device.json` and the
+    local history `history.json`. It registers a Windows service,
+    "Support device service" (`SupportMcpDevice`, LocalSystem, automatic start,
+    restart on failure, a quoted path), a tray startup value `SupportMcpTray`
+    under `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`, and an entry
+    under `...\Uninstall\SupportMcpDevice` that Windows Settings > Apps (Control
+    Panel on Windows 7 and 8.1) shows.
+    It does not touch `HKLM\SOFTWARE\SupportMCP`, which one-off sessions share,
+    and it uses names different from theirs, so a saved install and a one-off
+    session on the same PC do not step on each other.
+  - *It reuses the one-off install's hardening.* The elevated step runs from a
+    copy the app stages alone in a new Temp folder, turns on the safe DLL search
+    (no DLL loads from the current folder), reads its own file once through a handle that denies writing and renaming,
+    and installs only if the wizard that started it is still waiting for the
+    answer, so a late Yes after the wizard closed installs nothing. The wizard
+    passes its answers to the elevated step as one argument and takes the outcome
+    back as an exit code, so no file in a user folder carries either. If any
+    step fails after the PC paired, the install tells the relay to forget the PC
+    and removes what it made.
+  - *Who can hold the key.* The PC's key is held only by SYSTEM or by an elevated
+    administrator process. `support.exe` is readable and runnable by users,
+    because the tray and the uninstall run from it, but it carries no key. The
+    folder, the device record and the history are readable only by SYSTEM and
+    administrators (inheritance off). The key is never in a URL, a command line,
+    a log, the tray or a file a standard user can read.
+  - *Consent at setup.* The wizard asks for the PC's name, then how support may
+    connect ("Ask me each time" or "Connect any time (unattended)") and how
+    much control (full control or limited support). Nothing is preselected for
+    either, so the owner must choose. The Windows permission prompt is the
+    second consent. No other path installs a saved PC.
+  - *The service only checks in.* In this release it contacts the relay every few
+    minutes with the PC's key and writes local history. It runs no commands,
+    takes no screenshots and opens no files for anyone, and it never reads a
+    session footer. Nobody can connect to a saved PC yet, and Stage 1 stays off
+    real customers' unattended PCs until the release that enforces rules about
+    who may connect and when.
+  - *The status pipe.* The tray talks to the service over the pipe
+    `SupportMcpDevice-ui`. Only SYSTEM can create instances, it is closed to the
+    network, and interactive users can read and write data on it. It serves
+    every signed-in session, with a cap per process. It answers three requests
+    and nothing else: read the status, refresh now (at most once every 30
+    seconds), and turn the access mode to "any time". No request turns it back to
+    "ask each time", and the service never sends that mode on its own. The
+    tray's pipe client allows the server to identify it only, so a process that
+    took the pipe's name first cannot act as SYSTEM or as the user.
+  - *Anyone signed in can turn on unattended access.* The one-way rule is a
+    decision by the project owner. The tray asks "Allow support to connect any
+    time?" and says the owner cannot undo it from this PC. That prompt is not
+    a barrier: every interactive user may send the request, including a standard
+    user or a guest, and Windows asks for no administrator prompt. Once it is
+    "any time", nobody at the PC can turn it off. Only a technician with
+    `devices.manage` (through the team API) or an uninstall can end it. The
+    tray says so plainly ("Only your support team can change this."). The rule
+    is the app's, not the relay's: `/device/update` takes either mode from the
+    holder of the key, and only SYSTEM or an elevated administrator process holds
+    it. Nothing can
+    connect to a saved PC yet, so this has no effect today, but weigh it before
+    you use a saved PC where a stranger can sign in.
+  - *Uninstall revokes and removes.* Uninstalling from Settings > Apps or the
+    tray asks for one Windows permission prompt. It runs from a temporary copy,
+    so nothing in the install folder stays open. It tells the relay to forget the
+    PC (`/device/leave`, so the key stops working), has the service end every
+    tray, stops and deletes the service, and deletes the startup value, the Apps
+    entry and the folder with the junction-safe delete the one-off cleanup uses.
+    Anything still locked is deleted at the next restart. If the relay cannot be
+    reached, the PC is still removed locally, the key stays valid on the relay,
+    and the team must remove the PC from their list to end it.
 - **Each session belongs to its workspace.** A session stores the workspace that
   created it, and operator calls name their workspace. A call from another
   workspace gets the same answer as a session that does not exist. A session
@@ -701,7 +793,7 @@ apply to only one client say which.
   can't bring an ended session back, because the relay checks again after it
   hashes the key and reads the body. A reconnect gets a new generation, and a
   request from an older one gets a 409.
-- **Full control removes itself in three layers.** First, any end of the
+- **Full control in a one-off session removes itself in three layers.** First, any end of the
   session (`session_end`, End session, the relay's alarm, the deadline) makes the
   service stop the helper, release its share of the registry value, delete its
   registration, and start a detached `cmd` that deletes the folder once the
@@ -720,7 +812,8 @@ apply to only one client say which.
   control survives a restart or a sign-out within the same deadline, and a
   restart never extends it. That guarantee is against the customer's PC, not the
   operator: with SYSTEM rights an operator can change or remove any of these
-  layers. There is no uninstall entry: nothing stays installed to uninstall.
+  layers. A one-off session has no uninstall entry: nothing stays installed to
+  uninstall. (A saved PC is different and does have one, described above.)
 - **Normal mode leaves nothing behind.** It installs no service, scheduled task
   or logon entry, so restarting the PC ends access, and it deletes its temporary
   command folder on exit. A command runs inside a Windows Job Object, so a

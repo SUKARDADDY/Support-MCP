@@ -81,8 +81,9 @@ async function need(team, slug, caller, permissions, onOpen = 'deny') {
   throw new TeamError(403, 'permission_denied', `your role does not allow ${refusal}`);
 }
 
-// deps: { accessCaller(request, env, url) -> identity|null, isJsonContentType(request) -> bool } from app.js.
-export async function handleApi(request, env, url, { accessCaller, isJsonContentType }) {
+// deps: { accessCaller(request, env, url) -> identity|null, isJsonContentType(request) -> bool, origin } from app.js.
+// origin is this relay's address, for the install link in a pairing answer.
+export async function handleApi(request, env, url, { accessCaller, isJsonContentType, origin }) {
   const method = request.method;
   if (request.headers.has('origin')) return fail(403, 'forbidden', 'cross-site requests are refused');
   if (!['GET', 'POST', 'PATCH', 'DELETE'].includes(method)) return notAllowed('GET, POST, PATCH, DELETE');
@@ -247,7 +248,8 @@ export async function handleApi(request, env, url, { accessCaller, isJsonContent
       return notAllowed('PATCH, DELETE');
     }
 
-    // A pairing code is shown once, in the 201 answer, and never again.
+    // A pairing code is shown once, in the 201 answer, and never again. The
+    // answer also carries the install link with that code, ready to send.
     if (collection === 'pairing') {
       if (item === undefined) {
         if (method === 'GET') {
@@ -256,7 +258,8 @@ export async function handleApi(request, env, url, { accessCaller, isJsonContent
         }
         if (method === 'POST') {
           await need(team, slug, caller, ['devices.manage'], 'first_member');
-          return json({ pairing: await devs.createPairingCode(slug, caller, await readBody(request)) }, 201);
+          const pairing = await devs.createPairingCode(slug, caller, await readBody(request));
+          return json({ pairing: { ...pairing, link: `${origin}/install?code=${pairing.code}` } }, 201);
         }
         return notAllowed('GET, POST');
       }

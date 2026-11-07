@@ -59,8 +59,8 @@ export const BUILTIN_FIELDS = Object.freeze({
     address: Object.freeze({ max: 300 }),
     notes: Object.freeze({ max: 2000, multiline: true }),
   }),
-  // What the owner sets, and what the PC reports about itself. access and
-  // control are the two modes below.
+  // What the owner sets, what the team keeps (owner_contact) and what the PC
+  // reports about itself. access and control are the two modes below.
   device: Object.freeze({
     name: Object.freeze({ max: 100, required: true }),
     owner_contact: Object.freeze({ max: 200 }),
@@ -87,12 +87,25 @@ const ZERO_HASH = '0'.repeat(64);
 const bad = (message) => new TeamError(400, 'bad_request', message);
 const unknownDevice = () => new TeamError(401, 'device_unknown', 'this key is not valid');
 const codeInvalid = () => new TeamError(404, 'code_invalid', 'this code is not valid');
+// The owner's contact is the team's to keep: a PC that sends one is refused, so a
+// PC administrator holding the key can't overwrite what the team set.
+const noOwnerContact = (body) => {
+  if (Object.hasOwn(body, 'owner_contact')) throw bad('owner_contact is kept by the team, not sent by the PC');
+};
 
 export const newId = () => base32Encode(randomBytes(13)).slice(0, 20).toLowerCase();
 
 // The text a person types: uppercase, hyphens and spaces dropped.
 export const normalizeCode = (v) => String(v ?? '').toUpperCase().replace(/[\s-]/g, '');
 const showCode = (code) => `${code.slice(0, 5)}-${code.slice(5)}`;
+
+// A code as an install link carries it (/install?code=): the 10 characters, with
+// or without the hyphen, in any case. Returns the shown form, ABCDE-FGH23, or null.
+export function linkCode(v) {
+  if (typeof v !== 'string' || !/^[A-Za-z0-9]{5}-?[A-Za-z0-9]{5}$/.test(v)) return null;
+  const code = v.toUpperCase().replace('-', '');
+  return CODE_RE.test(code) ? showCode(code) : null;
+}
 
 function newCode() {
   const bytes = randomBytes(CODE_LENGTH);
@@ -414,23 +427,26 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
   }
 
   // A technician's change to a saved PC: its site, its custom fields, its access
-  // mode (the owner's control level and name stay the owner's), or approval of a
-  // waiting PC with the six-digit number its owner reads out. Approval is its own
-  // request: it is not mixed with other changes.
+  // mode, its owner's contact (the owner's control level and name stay the
+  // owner's), or approval of a waiting PC with the six-digit number its owner
+  // reads out. Approval is its own request: it is not mixed with other changes.
   async function updateDevice(slug, actorIdentity, id, body) {
     const actor = normalizeIdentity(actorIdentity);
     const hasSite = Object.hasOwn(body, 'site_id');
     const hasFields = Object.hasOwn(body, 'fields');
     const hasAccess = Object.hasOwn(body, 'access');
+    const hasContact = Object.hasOwn(body, 'owner_contact');
     const hasApprove = Object.hasOwn(body, 'approve');
     // The name and the control level are the owner's, set from the PC, so a technician sending them is refused, not ignored.
-    for (const owned of ['name', 'control', 'owner_contact', 'os', 'machine', 'app_version']) {
+    for (const owned of ['name', 'control', 'os', 'machine', 'app_version']) {
       if (Object.hasOwn(body, owned)) throw bad(`${owned} is set from the PC, not by the team`);
     }
-    if (!hasSite && !hasFields && !hasAccess && !hasApprove) throw bad('send site_id, fields, access or approve');
-    if (hasApprove && (hasSite || hasFields || hasAccess)) throw bad('approve cannot be combined with other changes');
+    if (!hasSite && !hasFields && !hasAccess && !hasContact && !hasApprove) throw bad('send site_id, fields, access, owner_contact or approve');
+    if (hasApprove && (hasSite || hasFields || hasAccess || hasContact)) throw bad('approve cannot be combined with other changes');
     const siteId = hasSite && body.site_id !== null ? validId(body.site_id, 'site_id') : null;
     const access = hasAccess ? oneOf(body.access, ACCESS_MODES, 'access') : undefined;
+    // An empty contact clears it.
+    const contact = hasContact ? textValue(body.owner_contact, 'owner_contact', BUILTIN_FIELDS.device.owner_contact) : undefined;
     let confirm;
     if (hasApprove) {
       confirm = isObject(body.approve) ? body.approve.confirm : undefined;
@@ -468,6 +484,9 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
       if (siteChanges) { changed.push(`site ${cur.site_id ?? 'none'} to ${siteId ?? 'none'}`); sets.push('site_id = ?'); values.push(siteId); }
       const accessChanges = hasAccess && access !== cur.access;
       if (accessChanges) { changed.push(`access ${cur.access} to ${access}`); sets.push('access = ?'); values.push(access); }
+      // owner_contact is personal data, so the log names it without its value.
+      const contactChanges = hasContact && contact !== cur.owner_contact;
+      if (contactChanges) { changed.push('owner_contact'); sets.push('owner_contact = ?'); values.push(contact); }
       if (merge.ids.length) { changed.push(...merge.ids.map((f) => `field ${f}`)); sets.push('fields = json_patch(fields, ?)'); values.push(merge.patch); }
       if (!changed.length) return { noop: true, result: deviceOut(cur) };
       return {
@@ -482,7 +501,10 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
           accessChanges ? ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND status = 'active' AND access = ?)", [slug, id, cur.access]] : lit(true),
         ),
         change: ([cond, params]) => [q(`UPDATE devices SET ${sets.join(', ')} WHERE workspace = ? AND id = ? AND ${cond}`, ...values, slug, id, ...params)],
-        result: deviceOut({ ...cur, site_id: hasSite ? siteId : cur.site_id, access: accessChanges ? access : cur.access, fields: JSON.stringify(merge.merged) }),
+        result: deviceOut({
+          ...cur, site_id: hasSite ? siteId : cur.site_id, access: accessChanges ? access : cur.access,
+          owner_contact: contactChanges ? contact : cur.owner_contact, fields: JSON.stringify(merge.merged),
+        }),
       };
     });
   }
@@ -566,7 +588,7 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
 
   // ---- the PC's side ------------------------------------------------------------
   // The named fields of a /device body: text from BUILTIN_FIELDS.device, and the
-  // two modes. Anything not named is ignored.
+  // two modes. Anything not named is ignored, except owner_contact (noOwnerContact).
   function readPcFields(body, names) {
     const out = {};
     for (const field of names) {
@@ -577,7 +599,7 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
     }
     return out;
   }
-  const PAIR_FIELDS = ['name', 'access', 'control', 'owner_contact', 'os', 'machine', 'app_version'];
+  const PAIR_FIELDS = ['name', 'access', 'control', 'os', 'machine', 'app_version'];
 
   // The new device row for a pair or a request. Safe defaults: asks first, limited.
   function newDevice(slug, id, fields, extra) {
@@ -585,7 +607,7 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
     return {
       workspace: slug, id, site_id: null, status: 'active',
       name: fields.name || fields.machine || 'PC', access: fields.access ?? 'ask', control: fields.control ?? 'limited',
-      owner_contact: fields.owner_contact ?? '', os: fields.os ?? '', machine: fields.machine ?? '', app_version: fields.app_version ?? '',
+      owner_contact: '', os: fields.os ?? '', machine: fields.machine ?? '', app_version: fields.app_version ?? '',
       protocol: 1, key_hash: '', confirm_hash: null, expires_at: null, paired_at: now, paired_by: '', approved_by: null,
       last_seen: now, fields: '{}', ...extra,
     };
@@ -606,6 +628,7 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
   // they commit together or not at all, and a failed attempt leaves nothing.
   async function redeemCode(body) {
     needSecret();
+    noOwnerContact(body);
     const code = normalizeCode(body.code);
     const fields = readPcFields(body, PAIR_FIELDS);
     if (!CODE_RE.test(code)) throw codeInvalid();
@@ -647,6 +670,7 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
   // once per workspace, so strangers can't fill a team's list.
   async function requestJoin(body) {
     needSecret();
+    noOwnerContact(body);
     const slug = body.workspace;
     const fields = readPcFields(body, PAIR_FIELDS);
     if (typeof slug !== 'string' || !(await team.workspaceExists(slug))) throw new TeamError(404, 'not_found', 'no such workspace');
@@ -726,13 +750,14 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
     return pcOut(dev);
   }
 
-  // The owner's changes from the PC itself: name, access, control, contact. Logged
-  // as device_changed by "pc <id>". A waiting PC may not (403 pending).
+  // The owner's changes from the PC itself: name, access, control. Logged as
+  // device_changed by "pc <id>". A waiting PC may not (403 pending).
   async function updateOwn(key, body) {
     // A wrong key is 401 whatever the body says.
     if (!(await authenticate(key))) throw unknownDevice();
-    const patch = readPcFields(body, ['name', 'access', 'control', 'owner_contact']);
-    if (!Object.keys(patch).length) throw bad('send name, access, control or owner_contact');
+    noOwnerContact(body);
+    const patch = readPcFields(body, ['name', 'access', 'control']);
+    if (!Object.keys(patch).length) throw bad('send name, access or control');
     if (patch.name === '') throw bad('name is required');
     return mutate(key.workspace, `pc ${key.id}`, async () => {
       const dev = await authenticate(key);
@@ -741,8 +766,7 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
       const changed = Object.keys(patch).filter((f) => patch[f] !== dev[f]);
       if (!changed.length) return { noop: true, result: pcOut(dev) };
       const modes = changed.filter((f) => f === 'access' || f === 'control');
-      // owner_contact is personal data, so the log names it without its value.
-      const detail = changed.map((f) => (f === 'owner_contact' ? f : f === 'name' ? `name ${JSON.stringify(patch.name)}` : `${f} ${dev[f]} to ${patch[f]}`));
+      const detail = changed.map((f) => (f === 'name' ? `name ${JSON.stringify(patch.name)}` : `${f} ${dev[f]} to ${patch[f]}`));
       return {
         entries: [{ kind: 'device_changed', detail: `${key.id} ${detail.join(', ')}` }],
         // Each mode this change replaces is the one the plan read.

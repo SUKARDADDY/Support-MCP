@@ -77,6 +77,7 @@ work in the request path; use the WebSocket Hibernation API
 | `GET /j/<code>` | public | **GET only, https only.** The code is consumed only for a request whose `User-Agent` contains `PowerShell/` (`irm` sends `WindowsPowerShell/5.1.x` or `PowerShell/7.x`). Code valid+unused → 200 `text/plain` agent script with placeholders filled, code consumed; else 404 `text/plain` `Write-Host 'This support link is invalid or expired.'` (runnable, harmless). Any other `User-Agent` (a chat link preview, a browser) → 200 `text/plain`, `Cache-Control: no-store`, a one-line `Write-Host` telling the reader to paste the command into PowerShell, and the Durable Object is **not** touched. Over plain `http:` on any host except `localhost` / `127.0.0.1` → 200 `text/plain` `Write-Host` line asking for the https link, code **not** consumed. Any other method → 405 `text/plain` (harmless one-liner, `Allow: GET`) and the code is **not** consumed. Malformed percent-encoding → the same harmless 404 script, never 500. The `User-Agent` test keeps previews from burning the code. It is not a security control, since any client can send the header. |
 | `GET /j/<code>?client=app` | public | The downloaded app. `legacy` is an alias for `app`; any other `client` value → 404. **https only**: over plain `http:` on any host except `localhost` / `127.0.0.1` → 403 `text/plain`, code **not** consumed. `GET` serves the download page (200 `text/html`, `Cache-Control: no-store`, `Referrer-Policy: same-origin`, a CSP with `default-src 'none'` and `form-action 'self'`) and **never consumes the code**, however often the page is opened or refreshed. Only a `POST` from the page's button consumes it. If the request has an `Origin` header it must equal the relay's own origin exactly. If it has none (IE11 on Windows 7 can omit it on a same-origin form POST), its `Referer` must start with `<origin>/j/`, which the page's `Referrer-Policy: same-origin` keeps on the click. A foreign `Origin`, a foreign or missing `Referer` without an `Origin`, or neither header → 403, code unused. A first valid `POST` returns 200 `application/octet-stream` with `Content-Disposition: attachment; filename="remote-support-<sid8>.exe"`: the compiled app followed by the session configuration (below). The code is single use: a repeat after the download shows "Check your downloads" (409), an expired or ended one shows "This support link has expired" (410). A code made for a `powershell` session shows the expired page and stays unused. `HEAD` and every other method → 405 (`Allow: GET, POST`). |
 | `POST /agent?sid=<sid>` + `X-Attach-Key: <key>` | attach key | The app's transport, JSON in and out; below. 403 over plain `http:` on any host except `localhost` / `127.0.0.1`, 403 on any `Origin` header or a `key` query param, 405 on other methods, 415 on a non-JSON body, 413 over 750,000 characters (checked against `Content-Length` before the body is read, and again after it is read when there is no `Content-Length`), 401 on a bad sid, bad key, a `powershell` session or a session that is still `pending`, 409 on a stale generation, 410 when the session has ended. |
+| `GET /install[?code=<code>\|?workspace=<slug>]`, `POST /install[...]` | public | The setup download for a saved PC ([below](#the-install-page-install)). `GET` shows the page and never downloads. `POST` from the page returns `support-setup.exe` with a device footer. Not under any Access app |
 | `GET /ws?sid=<sid>` + `X-Attach-Key: <key>` | attach key | WebSocket upgrade for the agent; 403 over plain `http:` on any host except `localhost` / `127.0.0.1`; 401 on bad/missing key, on a `key` query param, on a bad sid, or on an `app` session; 410 if session ended/expired |
 | `POST /mcp` | Access JWT or OAuth token | MCP JSON-RPC 2.0 for the `default` workspace. `tools/call` checks the caller's role first (below) |
 | `POST /w/<slug>/mcp` | Access JWT or OAuth token | the same endpoint for workspace `<slug>` (`[a-z0-9-]{1,40}`). Any other shape of path is 404 |
@@ -399,12 +400,12 @@ commit together, and a permission lost between the read and the commit is a 403.
 | `GET`, `PATCH`, `DELETE .../sites/<id>` | as customers | `PATCH`: `name, address, notes, fields` | `{site}`; `DELETE` is 409 `in_use` with PCs or live codes |
 | `GET .../devices?site=&status=&after=&limit=` | `devices.view` | | `{devices:[...], next}`; `status` is `pending` or `active` |
 | `GET .../devices/<id>` | `devices.view` | | `{device}` |
-| `PATCH .../devices/<id>` | `devices.manage` | `{site_id?, fields?, access?, approve?:{confirm}}`; `name`, `control`, `owner_contact`, `os`, `machine` or `app_version` is 400 `bad_request` | `{device}` |
+| `PATCH .../devices/<id>` | `devices.manage` | `{site_id?, fields?, access?, owner_contact?, approve?:{confirm}}`; `owner_contact` is at most 200 characters and an empty string clears it; `name`, `control`, `os`, `machine` or `app_version` is 400 `bad_request` | `{device}` |
 | `DELETE .../devices/<id>` | `devices.manage` | | `{removed:{id}}`; the PC's key ends with its row |
 | `GET .../fields` | `devices.view` | | `{fields:[{id,entity,label,position,created_at}]}` |
 | `POST .../fields` | `fields.manage` | `{entity, label}` | 201 `{field}`; `entity` is `customer`, `site` or `device` |
 | `PATCH`, `DELETE .../fields/<id>` | `fields.manage` | `PATCH`: `{label?, position?}` | `{field}`; `DELETE` also clears the field's values from every record |
-| `POST .../pairing` | `devices.manage` | `{site_id?}` | 201 `{pairing:{id, code:"ABCDE-FGH23", expires_at, site_id}}`. The code is in this answer only |
+| `POST .../pairing` | `devices.manage` | `{site_id?}` | 201 `{pairing:{id, code:"ABCDE-FGH23", expires_at, site_id, link}}`. `link` is `<origin>/install?code=ABCDE-FGH23`, ready to send. The code and the link are in this answer only |
 | `GET .../pairing` | `devices.manage` | | `{pairings:[{id,site_id,created_by,created_at,expires_at}]}`: live codes, no codes |
 | `DELETE .../pairing/<id>` | `devices.manage` | | `{removed:{id}}` |
 
@@ -422,10 +423,12 @@ named is left alone. Lists order by id and page with `?after=<id>&limit=` (1 to
 when more remain, else `null`.
 
 A technician with `devices.manage` may change a PC's `access` (`ask` or `any`)
-on an active PC. That change is logged as `device_changed` with the technician as
-actor and the old and new mode in the detail. The PC's `control` and `name` stay
-the owner's: sending either, or another field the PC reports, is 400 `bad_request`,
-not ignored. Only team members with `devices.manage` write custom fields; a PC
+on an active PC, in either direction. That change is logged as `device_changed`
+with the technician as actor and the old and new mode in the detail. A technician
+may also set or clear the PC's `owner_contact`; the log row names the field and
+never the value. The PC's `control` and `name` stay the owner's: sending either,
+or another field the PC reports, is 400 `bad_request`, not ignored. The owner
+contact is the team's: the PC cannot send it (see `/device/pair` below). Only team members with `devices.manage` write custom fields; a PC
 cannot. `approve` is its own request: a waiting PC
 becomes `active` when `confirm` is the six-digit number shown on the PC (403
 `confirm_wrong` otherwise, 409 `not_pending` for an active PC).
@@ -449,6 +452,47 @@ still holds `devices.manage` in the workspace (checked again at commit), so
 removing the person or their permission ends their live codes. Rotating
 `AUTH_SECRET` ends every live pairing code and waiting PC number (both are keyed
 hashes); a device key is a plain SHA-256 and is unaffected.
+
+## The install page (`/install`)
+
+How a PC's owner gets the app for a saved PC. It is public, under no Access app,
+like `/j/` and `/device/`. It uses no code up: the PC redeems a code itself over
+`/device/pair`.
+
+The query holds nothing, or exactly one parameter. `?code=` is a pairing code of
+10 characters from the pairing alphabet, with or without the hyphen and in any
+case; the relay writes it back as `ABCDE-FGH23`. `?workspace=` is a slug
+(`[a-z0-9-]{1,40}`). Both together, another parameter, a repeated parameter or a
+bad value is 400 `text/plain`. Plain `http:` on any host except loopback is 403.
+Any method other than `GET` and `POST` is 405 (`Allow: GET, POST`). Without an
+app bundle the answer is 404.
+
+- `GET /install` answers 200 `text/html`, `Cache-Control: no-store`,
+  `Referrer-Policy: same-origin` and a CSP with `default-src 'none'` and
+  `form-action 'self'`. The page is in the style of the `/j/` download page, in
+  English and Hebrew, headed "Set up Support on this PC", with a download button
+  and no script. The page never checks or uses the code, so a chat app's link
+  preview changes nothing. A page opened from a technician's link says the code
+  works once, for 10 minutes.
+- `POST /install` is the button. The same-origin rule as `/j/` applies: an
+  `Origin` header must equal the relay's own origin, or, with none, the `Referer`
+  must start with `<origin>/install`; otherwise 403. A good request answers 200
+  `application/octet-stream`, `Content-Disposition: attachment;
+  filename="support-setup.exe"`, `Cache-Control: no-store`: the compiled app
+  followed by the device footer.
+
+The device footer uses the app's footer layout (the configuration bytes, their
+length as a little-endian `uint32`, then `SUPPORTMCPCFG1`). Its JSON is
+`{"kind":"device","origin":"https://...","code"?:"ABCDE-FGH23","workspace"?:"<slug>"}`
+with at most one of `code` and `workspace`. It holds no session id and no key. A
+session footer has no `kind`. The app's session reader refuses any footer with a
+`kind`, and its device reader refuses a session footer, so no session role can run
+on a device footer. The origin follows the same rule as in a session footer.
+
+The team API's `POST .../pairing` answer carries the matching link:
+`{"pairing":{"id","code":"ABCDE-FGH23","expires_at","site_id","link":"<origin>/install?code=ABCDE-FGH23"}}`.
+Like the code, the link is in that answer only. It carries a working code, so it
+can land in browser history, link previews and the relay's request logs.
 
 ## The PC wire (`/device/*`)
 
@@ -482,7 +526,7 @@ SHA-256 of the secret and looks the row up by workspace and id.
 
 ```json
 {"protocol":1,"code":"ABCDE-FGH23","name":"Front desk","access":"ask","control":"full",
- "owner_contact":"","os":"Windows 10 Pro 22H2","machine":"POS-1","app_version":"0.4.0"}
+ "os":"Windows 10 Pro 22H2","machine":"POS-1","app_version":"0.4.0"}
 ```
 
 answers 201 `{"protocol":1,"status":"active","workspace":"default","device_id":"...","key":"smd1.default.<id>.<secret>"}`.
@@ -494,7 +538,8 @@ workspace exists (404 `not_found` against 202 or 409), as the public protected
 resource document does; slugs are public addresses. `access` is `ask` or `any` (default `ask`), `control`
 is `full` or `limited` (default `limited`). A code is normalised: uppercase,
 hyphens and spaces dropped. Errors: 400 `bad_request` (also both or neither of
-`code` and `workspace`, a bad field), 404 `code_invalid` (a code that is unknown,
+`code` and `workspace`, a bad field, and an `owner_contact`, which only a
+technician sets), 404 `code_invalid` (a code that is unknown,
 used, expired or malformed: one answer), 404 `not_found` (no such workspace), 409
 `request_limit` (20 join requests an hour per workspace), 409 `pending_limit` (20
 waiting at once), 409 `device_limit` (2,000 PCs), 426, 503 `unavailable` (no
@@ -508,10 +553,13 @@ Allowed while pending. The reported details are written at most every 5 minutes,
 or once a minute when one changed (a changed value inside that minute is dropped
 and sent again at the next check-in), and are not logged. Errors: 400, 401, 426.
 
-`POST /device/update`, key: `{"protocol":1,"name"?,"access"?,"control"?,"owner_contact"?}`
+`POST /device/update`, key: `{"protocol":1,"name"?,"access"?,"control"?}`
 with at least one key answers 200 with the same `device`. Logged as
 `device_changed` by `pc <device id>`; an unchanged value writes nothing. Errors:
-400, 401, 403 `pending` (a waiting PC may only check in or leave), 426.
+400 (also an `owner_contact`), 401, 403 `pending` (a waiting PC may only check in or leave), 426. The saved
+PC's app sends `access: "any"` here when someone at the PC turns on "any time",
+and never sends `access: "ask"`; the one-way rule is the app's, since the wire lets
+the key's holder set either mode.
 
 `POST /device/leave`, key: `{"protocol":1}` answers 200
 `{"protocol":1,"removed":true}`, deletes the row and so the key, and logs
@@ -1210,6 +1258,41 @@ backstop command line and task XML, the token choice for `run`, the
 `block_input` timer and its Ctrl+Alt+Del escape, the pipe framing and the
 window's two requests, and the Client's full-control path with a fake service.
 
+### Saved PC
+
+The same exe also serves a saved PC. The first thing it reads is its footer. A
+footer with `"kind":"device"` (from `/install`) goes only to the setup wizard or
+to the device install. `Wire.ReadConfig` throws on any footer with a `kind`, so
+no session role (`--service`, `--helper`, `--window`, `--elevate-install`, the
+default and resume paths) can run on a device footer. `Wire.ReadDevice` reads
+`kind: "device"`, checks the origin as a session footer does, and accepts at most
+one of a valid code or a slug. It refuses a session footer.
+
+| Role | Runs as | Does |
+|---|---|---|
+| none, with a device footer | the owner | the setup wizard, "Support setup", five steps (code, name, how support connects, how much control, install). Nothing is preselected for the last two. It first checks for the `SupportMcpDevice` service and, if it exists, says "Support is already set up on this PC" and opens the tray. It starts `--device-install` elevated with `ShellExecuteEx` `runas` and reads the exit code. After exit 0 or 10 it starts `support.exe --tray` as the owner |
+| `--device-install <nonce> <answers>` | administrator, through UAC | stages and holds its exe like `--elevate-install`, turns on the safe DLL search, reads its own file and footer once, and goes ahead only if the wizard's named event for `<nonce>` still exists and is not set. `<answers>` is one base64url JSON argument: name (1 to 100 characters), access, control, and either the code or "use the workspace" (at most 1,024 characters; no key). It takes the origin and the workspace from its own footer. Exit codes: 0 active, 10 pending, 20 code invalid, 21 network, 22 refused, 23 already set up. It pairs over `/device/pair`, creates `%ProgramFiles%\SupportMCP` with the locked ACL, writes `support.exe` (the exe without its footer, Users may read and run it), `device.json` and `history.json` (locked), registers the service `SupportMcpDevice` ("Support device service", LocalSystem, automatic, restart on failure, quoted path, `--device-service`), the `HKLM` Run value `SupportMcpTray` and the Apps entry, and starts the service. Any failure after pairing sends `/device/leave` with the new key and rolls back only what this run made. One install or remove runs at a time, under a `Global` mutex; a second gets "already set up". It never touches `HKLM\SOFTWARE\SupportMCP` |
+| `--device-service` | LocalSystem, session 0 | reads `device.json` and checks in with `/device/hello` at start, then every 5 minutes measured from the last answer plus up to 30 seconds of jitter. After a network error it retries after 1 minute, doubling to 15. A 200 updates the name, access, control and state (active or pending). A 401 means removed (after active) or expired (while pending), and ends check-ins for good. A 426 means the app needs an update and is retried every 6 hours. It keeps the last 50 history lines in `history.json`. It runs no command, takes no screenshot and opens no file for the relay |
+| `--tray` | the signed-in user, started by the `HKLM` Run value at each sign-in | one per session (a `Local` mutex). A notification icon drawn at run time, and a panel with the name, the access mode, the state, "No one is connected.", recent history and "Uninstall Support". It reads the service through the pipe and exits when the uninstall event is set |
+| `--uninstall` | the owner | copies itself to a new Temp folder and runs from there. Confirms, then starts `--device-remove` elevated and shows "Support was removed" |
+| `--device-remove <nonce>` | administrator, through UAC | runs from the copy the uninstaller staged (it reads `device.json`, not a footer, so it holds no exe of its own), and goes ahead only while the uninstaller's named event for `<nonce>` still exists. It sends `/device/leave` (a 200 or a 401 both count as done), sets the uninstall event so every tray exits, waits a few seconds and ends any tray that remains, stops and deletes the service, deletes the Run value and the Apps entry, and removes the folder: it is renamed aside first (so a reinstall at the original path is never blocked), deleted with the junction-safe walk, and anything still locked is queued for the next restart. If the relay cannot be reached, or answers anything else (a refusal or a server error), it still removes everything and the owner is told the team must remove the PC. One install or remove runs at a time, under a `Global` mutex. Exit codes: 0 removed, 10 removed but the relay did not confirm, 20 failed |
+
+The service's pipe is `SupportMcpDevice-ui`. Only SYSTEM can create instances,
+interactive users can read and write data, and it is never open to the network. It
+serves every interactive session, with a cap per process. Messages are a 4-byte
+length and UTF-8 JSON. It answers `{"type":"status"}` with `{name, access,
+control, state, confirm?, last_ok_at, history}` (state is `active`, `pending`,
+`expired`, `removed`, `update_needed` or `offline`; `confirm` is the six digits
+while pending), `{"type":"refresh"}` with a check-in now, at most once every 30
+seconds, and `{"type":"allow_any_time"}`, which is answered at once and sends
+`access: "any"` to `/device/update` in the background when the mode is `ask` (the
+change shows on the next status read). No request sets `ask`, and the service
+never sends `ask` on its own. Any other message closes the connection. A removed
+or expired state is kept in `device.json`, so a restart serves it from the pipe
+without checking in again. A saved
+install uses names of its own (the service, the folder, the pipe, the event and the
+mutexes), so it does not collide with a one-off session's.
+
 ## Acceptance (each names its check)
 
 1. `npm test` green; `npx wrangler deploy --dry-run` bundles without error
@@ -1248,6 +1331,16 @@ window's two requests, and the Client's full-control path with a fake service.
     over `/agent` after the customer clicks Allow and then Yes in the UAC prompt (the service's `hello` says `control: full`), or Allow in the fallback dialog (`control: normal`). `windows_mode: "legacy"` and
     `"standard"` behave as `app` and `powershell`.
 
+11. Saved PC: a technician's pairing answer carries a `link`. `GET` of that link
+    shows the page and consumes nothing. `POST` from the page downloads
+    `support-setup.exe`, whose device footer names the relay and the code. The
+    setup wizard pairs the PC after one Windows permission prompt, the team API
+    lists it with its name, access and control, and the tray shows its state.
+    Uninstalling from Settings > Apps makes the key answer 401 and leaves no
+    service, folder, `SupportMcpTray` value, Apps entry or pipe, and leaves
+    `HKLM\SOFTWARE\SupportMCP` as it was (the recipe is in
+    [development.md](development.md#installing-a-saved-pc-on-a-test-machine)).
+
 ## Must keep
 
 - `/healthz` stays public and 200.
@@ -1255,8 +1348,14 @@ window's two requests, and the Client's full-control path with a fake service.
   The app asks for elevation only for full control: at its start, where the UAC
   prompt (or the app's own confirm when none will appear) is the customer's
   consent, and on an explicit `request_full_control` call.
-- Full control always removes itself: on any end of the session, at its own
-  deadline, and through the backstop task, which never runs the app.
+- Full control in a one-off session always removes itself: on any end of the
+  session, at its own deadline, and through the backstop task, which never runs
+  the app. A saved PC stays until its owner uninstalls it, and uninstalling
+  removes the PC's key at the relay.
+- The service of a saved PC runs no command, takes no screenshot and opens no
+  file for anyone in this release, and nothing in the app turns the access mode
+  from `any` back to `ask` (the relay still accepts either mode from a holder of
+  the key, as pinned earlier).
 - A screenshot, typed text and a secret are never stored by the relay: not in
   the audit log, the Session storage, the registry or the Worker log.
 - `ended` is terminal; no path reopens a session or extends `expires_at`.
@@ -1265,5 +1364,6 @@ window's two requests, and the Client's full-control path with a fake service.
 - Customer, site, device and custom field data is never read when the relay
   decides who may do what. A device key is never in a URL, never logged, stored
   only as a hash, compared in constant time, and refused on a request with an
-  `Origin` header. `/device/` stays public and outside every Access app.
+  `Origin` header. `/device/` and `/install` stay public and outside every Access
+  app.
 - No secrets in the repo: `.dev.vars` gitignored; attach keys stored hashed.

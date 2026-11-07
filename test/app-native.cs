@@ -108,8 +108,47 @@ public sealed class FakeRelay : IDisposable {
     public void Dispose() { Closed = true; Agent.Stop(); if (agentThread.ThreadState != System.Threading.ThreadState.Unstarted) agentThread.Join(20000); Agent.Dispose(); listener.Close(); server.Join(1000); }
 }
 
+// A fake /device/ relay for DeviceLink, on an HttpListener like FakeRelay. Status and Body are what it answers next;
+// LastPath, LastAuth and LastJson record the request it saw; Refuse drops the connection, so the client reads offline.
+sealed class FakeDevice : IDisposable {
+    readonly HttpListener listener = new HttpListener();
+    readonly Thread server;
+    public readonly string Origin;
+    public volatile int Status = 200;
+    public volatile string Body = "{\"protocol\":1}";
+    public volatile string LastPath = "", LastAuth, LastJson = "";
+    public volatile bool Refuse;
+    // A hello can answer with its own body after a delay, so a test can hold one in flight while another request runs.
+    public volatile string HelloBody; public volatile int HelloDelayMs;
+    public FakeDevice() {
+        var tcp = new TcpListener(IPAddress.Loopback, 0); tcp.Start(); int port = ((IPEndPoint)tcp.LocalEndpoint).Port; tcp.Stop();
+        Origin = "http://127.0.0.1:" + port;
+        listener.Prefixes.Add(Origin + "/"); listener.Start();
+        server = new Thread(Serve); server.IsBackground = true; server.Start();
+    }
+    void Serve() {
+        try { while (listener.IsListening) { var ctx = listener.GetContext(); ThreadPool.QueueUserWorkItem(delegate { Reply(ctx); }); } }
+        catch (HttpListenerException) { } catch (ObjectDisposedException) { }
+    }
+    void Reply(HttpListenerContext ctx) {
+        try {
+            if (Refuse) { ctx.Response.Abort(); return; }
+            string path = ctx.Request.Url.AbsolutePath, body = path == "/device/hello" && HelloBody != null ? HelloBody : Body;
+            LastPath = path; LastAuth = ctx.Request.Headers["Authorization"];
+            using (var r = new StreamReader(ctx.Request.InputStream)) LastJson = r.ReadToEnd();
+            if (path == "/device/hello" && HelloDelayMs > 0) Thread.Sleep(HelloDelayMs);
+            byte[] bytes = Encoding.UTF8.GetBytes(body);
+            ctx.Response.StatusCode = Status; ctx.Response.ContentType = "application/json"; ctx.Response.ContentLength64 = bytes.Length;
+            ctx.Response.OutputStream.Write(bytes, 0, bytes.Length); ctx.Response.Close();
+        } catch (Exception) { try { ctx.Response.Abort(); } catch (Exception) { } }
+    }
+    public Dictionary<string, object> Sent() { return Wire.Json().Deserialize<Dictionary<string, object>>(LastJson); }
+    public void Dispose() { try { listener.Close(); } catch (Exception) { } server.Join(1000); }
+}
+
 public static class AppTests {
     static void Assert(bool ok, string detail) { if (!ok) throw new Exception(detail); }
+    static void m3Release(System.Threading.Mutex m) { try { m.ReleaseMutex(); } catch (Exception) { } }
     static string Decode(Dictionary<string, object> r, string key) { return Encoding.UTF8.GetString(Convert.FromBase64String(Wire.Text(r, key))); }
     static Dictionary<string, object> Run(string command, int timeout) { return Wire.Map("type", "run", "command", command, "timeout_s", timeout); }
     static void WaitFile(string path) { var end = DateTime.UtcNow.AddSeconds(10); while (!File.Exists(path) && DateTime.UtcNow < end) Thread.Sleep(50); Assert(File.Exists(path), "Command did not start"); }
@@ -122,6 +161,490 @@ public static class AppTests {
     static void Throws(Action action, string part) {
         try { action(); } catch (ArgumentException e) { Assert(e.Message.Contains(part), "Wrong message: " + e.Message); return; }
         throw new Exception("Expected an error containing: " + part);
+    }
+    static void ThrowsData(Action action, string detail) {
+        try { action(); } catch (InvalidDataException) { return; }
+        throw new Exception("Expected an InvalidDataException: " + detail);
+    }
+    // An exe with a footer, built like the relay's overlay: body bytes, the JSON, its length, then the magic string.
+    static byte[] Overlay(Dictionary<string, object> cfg) {
+        byte[] body = new byte[] { 77, 90, 1, 2, 3 }, json = Encoding.UTF8.GetBytes(Wire.Json().Serialize(cfg));
+        var ms = new MemoryStream(); ms.Write(body, 0, body.Length); ms.Write(json, 0, json.Length);
+        byte[] n = BitConverter.GetBytes(json.Length); ms.Write(n, 0, n.Length);
+        byte[] footer = Encoding.ASCII.GetBytes(Wire.Footer); ms.Write(footer, 0, footer.Length);
+        return ms.ToArray();
+    }
+    static List<Dictionary<string, object>> BadDeviceFooters() {
+        var list = new List<Dictionary<string, object>>();
+        list.Add(Wire.Map("kind", "device", "origin", "https://support.example.com", "code", "ABCDE-FGH23", "workspace", "acme")); // both
+        list.Add(Wire.Map("kind", "device", "origin", "https://support.example.com", "code", "ABCDE-FGH2")); // short
+        list.Add(Wire.Map("kind", "device", "origin", "https://support.example.com", "code", "ABCDE-FGH0I")); // 0 and I are not in the alphabet
+        list.Add(Wire.Map("kind", "device", "origin", "https://support.example.com", "workspace", "Acme")); // uppercase slug
+        list.Add(Wire.Map("kind", "device", "origin", "https://support.example.com", "workspace", "")); // empty slug
+        list.Add(Wire.Map("kind", "device", "origin", "https://support.example.com", "extra", "1")); // an unknown field
+        list.Add(Wire.Map("kind", "device", "origin", "http://evil.example.com")); // http that is not loopback
+        list.Add(Wire.Map("kind", "device", "origin", "https://support.example.com/path")); // an origin with a path
+        list.Add(Wire.Map("kind", "other", "origin", "https://support.example.com")); // not a device kind
+        list.Add(Wire.Map("kind", "device")); // no origin
+        return list;
+    }
+    // ReadConfig takes a session footer and refuses a device footer; ReadDevice does the reverse. The kind is read first.
+    static void FooterReaderTests() {
+        byte[] session = Overlay(Wire.Map("sid", new string('a', 64), "key", new string('b', 64), "origin", "https://support.example.com"));
+        Assert(Wire.Kind(session) == "" && Wire.Text(Wire.ReadConfig(session), "sid") == new string('a', 64), "A session footer parses as a session");
+        ThrowsData(delegate { Wire.ReadDevice(session); }, "a session footer is not a setup footer");
+        byte[] device = Overlay(Wire.Map("kind", "device", "origin", "https://support.example.com", "code", "ABCDE-FGH23"));
+        Assert(Wire.Kind(device) == "device", "The kind is read first");
+        var d = Wire.ReadDevice(device);
+        Assert(Wire.Text(d, "code") == "ABCDE-FGH23" && Wire.Text(d, "origin") == "https://support.example.com", "A device footer with a code parses");
+        ThrowsData(delegate { Wire.ReadConfig(device); }, "no session role runs on a device footer");
+        Assert(Wire.Text(Wire.ReadDevice(Overlay(Wire.Map("kind", "device", "origin", "https://support.example.com", "workspace", "acme-1"))), "workspace") == "acme-1", "A workspace footer parses");
+        Assert(!Wire.ReadDevice(Overlay(Wire.Map("kind", "device", "origin", "https://support.example.com"))).ContainsKey("code"), "A plain device footer carries no code");
+        Assert(Wire.Text(Wire.ReadDevice(Overlay(Wire.Map("kind", "device", "origin", "http://127.0.0.1:8787"))), "origin") == "http://127.0.0.1:8787", "Loopback http is allowed for a device footer");
+        foreach (Dictionary<string, object> bad in BadDeviceFooters()) ThrowsData(delegate { Wire.ReadDevice(Overlay(bad)); }, Wire.Json().Serialize(bad));
+        Console.WriteLine("PASS a setup footer parses, a session footer still parses, and each footer reader refuses the other");
+    }
+    // DeviceLink against a fake /device/ relay: every status maps, the key goes in the header, and a drop is offline.
+    static void DeviceLinkTests() {
+        using (var relay = new FakeDevice()) {
+            var link = new DeviceLink(relay.Origin);
+            relay.Status = 201; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "status", "active", "workspace", "default", "device_id", new string('a', 20), "key", "smd1.default.id.secret"));
+            var a = link.Pair(Wire.Map("code", "ABCDE-FGH23", "name", "Front desk", "access", "any", "control", "full"));
+            Assert(a.Result == DeviceLink.DeviceResult.Ok && a.Ok && Wire.Text(a.Body, "key").StartsWith("smd1.") && Wire.Text(a.Body, "status") == "active", "A 201 pair is Ok with the key and the device id");
+            Assert(relay.LastPath == "/device/pair" && relay.LastAuth == null, "pair posts to /device/pair with no key");
+            Assert(Wire.Number(relay.Sent(), "protocol") == 1 && Wire.Text(relay.Sent(), "code") == "ABCDE-FGH23", "Every request carries protocol 1");
+            relay.Status = 202; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "status", "pending", "confirm", "482913", "key", "smd1.default.id.secret", "expires_at", 1));
+            Assert(link.Pair(Wire.Map("workspace", "acme")).Result == DeviceLink.DeviceResult.Pending, "A 202 pair is Pending");
+            relay.Status = 404; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "error", Wire.Map("code", "code_invalid", "message", "this code is not valid")));
+            Assert(link.Pair(Wire.Map("code", "ZZZZZ-ZZZZZ")).Result == DeviceLink.DeviceResult.CodeInvalid, "A 404 code_invalid is CodeInvalid");
+            relay.Status = 400; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "error", Wire.Map("code", "bad_request", "message", "send code or workspace")));
+            var refused = link.Pair(Wire.Map());
+            Assert(refused.Result == DeviceLink.DeviceResult.Refused && refused.Message == "send code or workspace", "A refusal carries the relay's own message");
+            relay.Status = 200; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "device", Wire.Map("id", "d", "workspace", "default", "status", "active", "name", "PC", "access", "ask", "control", "limited", "site_id", null)));
+            var h = link.Hello("smd1.default.id.secret", Wire.Map("os", "Windows 11", "machine", "POS-1", "app_version", "0.4.0"));
+            Assert(h.Result == DeviceLink.DeviceResult.Ok && relay.LastAuth == "Bearer smd1.default.id.secret" && relay.LastPath == "/device/hello", "hello sends the key in the Authorization header, never the URL");
+            Assert(Wire.Text(h.Body["device"] as Dictionary<string, object>, "access") == "ask", "hello returns the device the relay sent");
+            relay.Status = 401; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "error", Wire.Map("code", "device_unknown", "message", "this key is not valid")));
+            Assert(link.Hello("smd1.k", Wire.Map()).Result == DeviceLink.DeviceResult.Removed, "A 401 is Removed");
+            relay.Status = 426; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "error", Wire.Map("code", "protocol_unsupported", "message", "update needed"), "supported", Wire.Map("min", 2, "max", 2)));
+            Assert(link.Hello("smd1.k", Wire.Map()).Result == DeviceLink.DeviceResult.UpdateNeeded, "A 426 is UpdateNeeded");
+            relay.Status = 200; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "device", Wire.Map("id", "d", "status", "active")));
+            link.Update("smd1.k", Wire.Map("access", "any"));
+            Assert(relay.LastPath == "/device/update" && Wire.Text(relay.Sent(), "access") == "any" && relay.LastAuth == "Bearer smd1.k", "update posts the change with the key");
+            relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "removed", true));
+            link.Leave("smd1.k");
+            Assert(relay.LastPath == "/device/leave" && relay.Sent().Count == 1 && Wire.Number(relay.Sent(), "protocol") == 1, "leave posts only the protocol, with the key");
+            relay.Refuse = true;
+            Assert(link.Hello("smd1.k", Wire.Map()).Result == DeviceLink.DeviceResult.Offline && link.Hello("smd1.k", Wire.Map()).Status == 0, "A dropped connection is Offline with no status");
+        }
+        Console.WriteLine("PASS the device client speaks the /device/ wire: pair, check-in, update and leave, with status mapping and offline");
+    }
+    // The setup wizard's pure rules: code normalisation, step validation, the answers argument and the exit-code map.
+    static void SetupRuleTests() {
+        // A code is normalised to ABCDE-FGH23 whatever the case, spaces or hyphens; 0, 1, I and O are not in the alphabet.
+        Assert(DeviceSetup.NormalizeCode("abcde-fgh23") == "ABCDE-FGH23", "lower case");
+        Assert(DeviceSetup.NormalizeCode("ABCDEFGH23") == "ABCDE-FGH23", "no hyphen");
+        Assert(DeviceSetup.NormalizeCode(" abc de-fg h23 ") == "ABCDE-FGH23", "spaces");
+        foreach (string bad in new string[] { "", "ABCDE-FGH2", "ABCDE-FGH234", "ABCDE-FGH2I", "ABCDE-FGH2O", "ABCDE FGH2!", "11111-11111" })
+            Assert(DeviceSetup.NormalizeCode(bad) == null, "a bad code is null: " + bad);
+        Assert(DeviceSetup.CodeCharsOk("ABCDE-FGH") && DeviceSetup.CodeCharsOk("") && !DeviceSetup.CodeCharsOk("ABCDEFGHJKL") && !DeviceSetup.CodeCharsOk("ABC!"), "as typed: only the alphabet, at most ten");
+
+        // A name is required, trimmed, at most 100 characters, no control characters.
+        Assert(DeviceSetup.CheckName("Front desk") == "" && DeviceSetup.CheckName("  x  ") == "", "a plain name is fine");
+        Assert(DeviceSetup.CheckName("") != "" && DeviceSetup.CheckName("   ") != "" && DeviceSetup.CheckName(new string('x', 101)) != "" && DeviceSetup.CheckName("a\tb") != "", "bad names are refused");
+
+        // Step validation: nothing is preselected, so each choice must be made; a workspace install needs no code.
+        Assert(DeviceSetup.Missing(DeviceSetup.Screen.Code, "", false, "", null, null) != "", "a missing code stops the code step");
+        Assert(DeviceSetup.Missing(DeviceSetup.Screen.Code, "", true, "", null, null) == "", "a workspace install needs no code");
+        Assert(DeviceSetup.Missing(DeviceSetup.Screen.Code, "abcde-fgh23", false, "", null, null) == "", "a good code passes the code step");
+        Assert(DeviceSetup.Missing(DeviceSetup.Screen.Name, "", false, "", null, null) != "" && DeviceSetup.Missing(DeviceSetup.Screen.Name, "", false, "PC", null, null) == "", "the name step");
+        Assert(DeviceSetup.Missing(DeviceSetup.Screen.Access, "", false, "PC", null, null) != "" && DeviceSetup.Missing(DeviceSetup.Screen.Access, "", false, "PC", "ask", null) == "" && DeviceSetup.Missing(DeviceSetup.Screen.Access, "", false, "PC", "any", null) == "", "the access step needs a choice");
+        Assert(DeviceSetup.Missing(DeviceSetup.Screen.Control, "", false, "PC", "ask", null) != "" && DeviceSetup.Missing(DeviceSetup.Screen.Control, "", false, "PC", "ask", "full") == "" && DeviceSetup.Missing(DeviceSetup.Screen.Control, "", false, "PC", "ask", "limited") == "", "the control step needs a choice");
+        Assert(DeviceSetup.StepOf(DeviceSetup.Screen.Code) == 1 && DeviceSetup.StepOf(DeviceSetup.Screen.Install) == 5 && DeviceSetup.StepOf(DeviceSetup.Screen.Intro) == 0 && DeviceSetup.StepOf(DeviceSetup.Screen.Done) == 0, "steps 1 to 5 are code to install");
+
+        // The answers argument: base64url JSON, decoded and checked again. No owner contact (call 7).
+        string withCode = DeviceSetup.EncodeAnswers(" Front desk ", "any", "full", "ABCDE-FGH23");
+        Assert(System.Text.RegularExpressions.Regex.IsMatch(withCode, "^[A-Za-z0-9_-]+$"), "the argument is base64url with no padding");
+        var back = DeviceSetup.DecodeAnswers(withCode);
+        Assert(Wire.Text(back, "name") == "Front desk" && Wire.Text(back, "access") == "any" && Wire.Text(back, "control") == "full" && Wire.Text(back, "code") == "ABCDE-FGH23" && !back.ContainsKey("workspace"), "a code's answers round-trip, trimmed");
+        var ws = DeviceSetup.DecodeAnswers(DeviceSetup.EncodeAnswers("PC", "ask", "limited", null));
+        Assert(Wire.Flag(ws, "workspace") && !ws.ContainsKey("code") && Wire.Text(ws, "access") == "ask", "a workspace install carries workspace true, no code");
+        Assert(!back.ContainsKey("owner_contact") && !ws.ContainsKey("owner_contact"), "the answers never carry an owner contact");
+        foreach (string arg in new string[] { "", "not base64url!!", "====" })
+            ThrowsData(delegate { DeviceSetup.DecodeAnswers(arg); }, "junk: " + arg);
+        // Tampered JSON is refused: a bad access, a missing field, both a code and a workspace, an over-long argument.
+        Func<Dictionary<string, object>, string> enc = delegate(Dictionary<string, object> m) {
+            string b = Convert.ToBase64String(Encoding.UTF8.GetBytes(Wire.Json().Serialize(m)));
+            return b.TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        };
+        foreach (Dictionary<string, object> bad in new List<Dictionary<string, object>> {
+            Wire.Map("name", "PC", "access", "sometimes", "control", "full", "code", "ABCDE-FGH23"),
+            Wire.Map("name", "PC", "access", "ask", "control", "other", "code", "ABCDE-FGH23"),
+            Wire.Map("name", "", "access", "ask", "control", "full", "code", "ABCDE-FGH23"),
+            Wire.Map("name", "PC", "access", "ask", "control", "full", "code", "abcde-fgh23"),
+            Wire.Map("name", "PC", "access", "ask", "control", "full", "code", "ABCDE-FGH23", "workspace", true),
+            Wire.Map("name", "PC", "access", "ask", "control", "full"),
+            Wire.Map("name", "PC", "access", "ask", "control", "full", "owner_contact", "x", "code", "ABCDE-FGH23"),
+        }) ThrowsData(delegate { DeviceSetup.DecodeAnswers(enc(bad)); }, Wire.Json().Serialize(bad));
+        ThrowsData(delegate { DeviceSetup.DecodeAnswers(new string('A', DeviceSetup.MaxAnswers + 1)); }, "too long");
+
+        // The exit-code map: where the wizard goes and what it says.
+        Assert(DeviceSetup.After(DeviceSetup.Active) == DeviceSetup.Screen.Done && DeviceSetup.After(DeviceSetup.Pending) == DeviceSetup.Screen.Waiting && DeviceSetup.After(DeviceSetup.CodeInvalid) == DeviceSetup.Screen.Code && DeviceSetup.After(DeviceSetup.AlreadySetUp) == DeviceSetup.Screen.Already, "each exit code goes to its screen");
+        Assert(DeviceSetup.After(DeviceSetup.Network) == DeviceSetup.Screen.Install && DeviceSetup.After(DeviceSetup.Refused) == DeviceSetup.Screen.Install && DeviceSetup.After(999) == DeviceSetup.Screen.Install, "network, refused and anything unknown go back to the install step");
+        Assert(DeviceSetup.ExitText(DeviceSetup.Active) == "" && DeviceSetup.ExitText(DeviceSetup.Pending) == "" && DeviceSetup.ExitText(DeviceSetup.AlreadySetUp) == "", "the success screens carry no error");
+        Assert(DeviceSetup.ExitText(DeviceSetup.CodeInvalid).Contains("code") && DeviceSetup.ExitText(DeviceSetup.Network).Contains("reach") && DeviceSetup.ExitText(DeviceSetup.Refused).Contains("refused"), "code, network and refused each say what happened");
+        Assert(DeviceSetup.ShowConfirm("482913") == "482 913" && DeviceSetup.ShowConfirm("abc") == null && DeviceSetup.ShowConfirm(null) == null, "six digits show as two groups");
+        Assert(DeviceSetup.ModeText("any").Contains("any time") && DeviceSetup.ModeText("ask").Contains("asks you") && DeviceSetup.Folder.EndsWith("SupportMCP") && DeviceSetup.Exe.EndsWith("support.exe"), "the mode text and the install paths");
+        // The OS line: Windows 11 still says "Windows 10" in ProductName, so the build decides; capped at the relay's 100.
+        Assert(DeviceSetup.OsName("Windows 10 Pro", "26200", "25H2") == "Windows 11 Pro 25H2 (build 26200)", "Windows 11 by its build");
+        Assert(DeviceSetup.OsName("Windows 10 Pro", "19045", "22H2") == "Windows 10 Pro 22H2 (build 19045)", "Windows 10 stays Windows 10");
+        Assert(DeviceSetup.OsName("Windows 7 Professional", "7601", null) == "Windows 7 Professional (build 7601)", "Windows 7 has no release");
+        Assert(DeviceSetup.OsName(null, "7601", null) == "Windows (build 7601)" && DeviceSetup.OsName(new string('x', 300), "1", null).Length == 100, "no name, and the cap");
+        Assert(DeviceSetup.Os().StartsWith("Windows", StringComparison.Ordinal) && DeviceSetup.Os().IndexOf("NT 6.2", StringComparison.Ordinal) < 0, "this PC's line names Windows, not NT 6.2: " + DeviceSetup.Os());
+        Console.WriteLine("PASS the setup wizard rules: code format, step validation, the answers argument, and the exit-code map");
+    }
+    // The elevated install's pure parts: the leftover decision, the service command line, the registry builders, the
+    // Apps entry values, the install paths and the locked-folder ACL (read back as the FullControl tests do).
+    static void DeviceInstallTests() {
+        Assert(DeviceInstall.LeftoverAction(true, false) == DeviceInstall.Leftover.AlreadySetUp && DeviceInstall.LeftoverAction(true, true) == DeviceInstall.Leftover.AlreadySetUp, "a running service means Support is already set up");
+        Assert(DeviceInstall.LeftoverAction(false, true) == DeviceInstall.Leftover.Clean, "the folder with no service is a crash leftover to clean");
+        Assert(DeviceInstall.LeftoverAction(false, false) == DeviceInstall.Leftover.Proceed, "nothing installed means a clean install");
+
+        string exe = @"C:\Program Files\SupportMCP\support.exe";
+        Assert(DeviceInstall.ServiceBinary(exe) == "\"C:\\Program Files\\SupportMCP\\support.exe\" --device-service", "the service path is quoted, with --device-service");
+        Assert(DeviceInstall.TrayRunValue(exe) == "\"C:\\Program Files\\SupportMCP\\support.exe\" --tray", "the tray startup value is quoted, with --tray");
+
+        var apps = DeviceInstall.AppsValues("0.4.0", @"C:\Program Files\SupportMCP", exe, 512);
+        Assert(Wire.Text(apps, "DisplayName") == "Support" && Wire.Text(apps, "DisplayVersion") == "0.4.0" && Wire.Text(apps, "Publisher") == "Support-MCP", "the Apps entry names the app, its version and publisher");
+        Assert(Wire.Text(apps, "InstallLocation") == @"C:\Program Files\SupportMCP" && Wire.Text(apps, "UninstallString") == "\"" + exe + "\" --uninstall", "the Apps entry says where it is and how to uninstall it");
+        Assert(apps["NoModify"] is int && (int)apps["NoModify"] == 1 && apps["NoRepair"] is int && (int)apps["NoRepair"] == 1 && apps["EstimatedSize"] is int && (int)apps["EstimatedSize"] == 512, "NoModify, NoRepair and EstimatedSize are whole numbers");
+        Assert(!apps.ContainsKey("DisplayIcon"), "there is no DisplayIcon: the exe carries no icon");
+
+        Assert(DeviceSetup.Folder.EndsWith("\\SupportMCP") && DeviceSetup.Exe == Path.Combine(DeviceSetup.Folder, "support.exe") && Directory.Exists(FullInstall.Root), "the install folder is under %ProgramFiles%\\SupportMCP and the app is support.exe in it");
+        // A tray the wizard starts must not hold the install folder as its current directory, or it cannot be renamed aside.
+        var trayStart = DeviceSetup.TrayStart(); string trayDir = Path.GetFullPath(trayStart.WorkingDirectory).TrimEnd('\\');
+        Assert(trayStart.FileName == DeviceSetup.Exe && trayStart.Arguments == "--tray" && !trayStart.UseShellExecute, "the wizard starts the installed exe with --tray");
+        Assert(trayDir.Length > 0 && !(trayDir + "\\").StartsWith(DeviceSetup.Folder.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase), "the tray's working directory is not inside the install folder");
+
+        // The locked folder: owner Administrators, SYSTEM and Administrators full, nothing inherited (as FullAcl.Folder,
+        // which the one-off tests already check on disk, plus the owner this install sets).
+        var locked = DeviceInstall.LockedFolder();
+        Assert(locked.AreAccessRulesProtected && ((SecurityIdentifier)locked.GetOwner(typeof(SecurityIdentifier))).Equals(FullAcl.AdminsSid), "the locked folder is owned by Administrators and does not inherit");
+        var rules = locked.GetAccessRules(true, true, typeof(SecurityIdentifier));
+        Assert(rules.Count == 2, "two rules: " + rules.Count);
+        foreach (FileSystemAccessRule r in rules)
+            Assert((r.IdentityReference.Equals(FullAcl.SystemSid) || r.IdentityReference.Equals(FullAcl.AdminsSid)) && r.FileSystemRights == FileSystemRights.FullControl && !r.IsInherited
+                && r.InheritanceFlags == (InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit), "only SYSTEM and Administrators, full control, inherited by files and folders");
+        Console.WriteLine("PASS the elevated install: the leftover decision, the service and tray command lines, the Apps entry, the paths and the locked folder");
+    }
+    // The saved PC service's pure parts: the state map for every wire result, the timing and backoff, the refresh
+    // limit, the history cap, the status frame, and the live pipe (frame vocabulary and the ACL).
+    static void DeviceServiceTests(string dir) {
+        // Classify: a 200 is active or pending (from the body); a 401 is removed from active and expired from pending;
+        // 426 is update_needed; offline and an unexpected refusal keep trying. (DeviceLink already maps each HTTP
+        // status to these results, so this covers every wire status.)
+        DeviceService.Schedule sched;
+        Assert(DeviceService.Classify("active", DeviceLink.DeviceResult.Ok, "active", out sched) == DeviceState.Active && sched == DeviceService.Schedule.Normal, "200 active");
+        Assert(DeviceService.Classify("pending", DeviceLink.DeviceResult.Ok, "pending", out sched) == DeviceState.Pending && sched == DeviceService.Schedule.Normal, "200 still pending");
+        Assert(DeviceService.Classify("pending", DeviceLink.DeviceResult.Ok, "active", out sched) == DeviceState.Active, "200 pending to active");
+        Assert(DeviceService.Classify("active", DeviceLink.DeviceResult.Removed, "", out sched) == DeviceState.Removed && sched == DeviceService.Schedule.Stopped, "401 after active is removed, and stops");
+        Assert(DeviceService.Classify("pending", DeviceLink.DeviceResult.Removed, "", out sched) == DeviceState.Expired && sched == DeviceService.Schedule.Stopped, "401 while pending is expired, and stops");
+        Assert(DeviceService.Classify("active", DeviceLink.DeviceResult.UpdateNeeded, "", out sched) == DeviceState.UpdateNeeded && sched == DeviceService.Schedule.Update, "426 is update_needed, re-checked later");
+        foreach (DeviceLink.DeviceResult r in new DeviceLink.DeviceResult[] { DeviceLink.DeviceResult.Offline, DeviceLink.DeviceResult.Refused }) {
+            Assert(DeviceService.Classify("active", r, "", out sched) == DeviceState.Offline && sched == DeviceService.Schedule.Backoff, "offline or refused keeps trying: " + r);
+        }
+
+        // Backoff: one minute, doubling, capped at fifteen; it resets to one on the next failure after a success (0).
+        long b = 0; var seen = new List<long>();
+        for (int i = 0; i < 6; i++) { b = DeviceService.NextBackoff(b); seen.Add(b); }
+        Assert(seen[0] == 60000 && seen[1] == 120000 && seen[2] == 240000 && seen[3] == 480000 && seen[4] == 900000 && seen[5] == 900000, "backoff 1,2,4,8,15,15 minutes");
+        Assert(DeviceService.NextBackoff(0) == 60000, "a reset backoff starts at one minute");
+
+        // Jitter bounds: five minutes plus up to thirty seconds, never less, never more.
+        var rnd = new Random(1234); long min = long.MaxValue, max = long.MinValue;
+        for (int i = 0; i < 2000; i++) { long d = DeviceService.NextCheckDelay(rnd); if (d < min) min = d; if (d > max) max = d; }
+        Assert(min >= DeviceService.CheckEveryMs && max <= DeviceService.CheckEveryMs + DeviceService.JitterMaxMs && max > DeviceService.CheckEveryMs, "every check-in is 5 minutes plus 0 to 30 seconds");
+        Assert(DeviceService.UpdateEveryMs == 6 * 3600 * 1000L, "an update is re-checked every six hours");
+
+        // The 30-second refresh limit.
+        Assert(DeviceService.RefreshDue(0, DeviceService.RefreshMinMs) && !DeviceService.RefreshDue(0, DeviceService.RefreshMinMs - 1), "a refresh is allowed at most once every 30 seconds");
+
+        // History: the lines a 200 adds, and the cap at 50 newest.
+        Assert(DeviceService.HistoryFor("pending", "ask", "limited", "active", "ask", "limited").Count == 1, "approval alone is one line");
+        Assert(DeviceService.HistoryFor("active", "ask", "full", "active", "any", "full").Count == 1 && DeviceService.HistoryFor("active", "any", "full", "active", "ask", "full").Count == 1, "a team access change, either way, is a line");
+        Assert(DeviceService.HistoryFor("active", "ask", "limited", "active", "ask", "limited").Count == 0, "no change, no line");
+        var hist = new System.Collections.ArrayList();
+        for (int i = 0; i < 60; i++) { hist.Add(Wire.Map("at", (long)i, "text", "line " + i)); DeviceService.TrimHistory(hist); }
+        Assert(hist.Count == DeviceService.HistoryCap && Wire.Text((Dictionary<string, object>)hist[0], "text") == "line 10" && Wire.Text((Dictionary<string, object>)hist[hist.Count - 1], "text") == "line 59", "the last 50 lines are kept, newest last");
+
+        // The status frame: confirm is shown only while pending.
+        var pending = DeviceService.StatusFrame("PC", "ask", "limited", DeviceState.Pending, "482913", 111, new System.Collections.ArrayList());
+        Assert(Wire.Text(pending, "state") == DeviceState.Pending && Wire.Text(pending, "confirm") == "482913" && Wire.Number(pending, "last_ok_at") == 111, "a pending frame carries the six digits");
+        foreach (string st in new string[] { DeviceState.Active, DeviceState.Expired, DeviceState.Removed, DeviceState.Offline }) {
+            Assert(!DeviceService.StatusFrame("PC", "any", "full", st, "482913", 0, new System.Collections.ArrayList()).ContainsKey("confirm"), "no confirm outside pending: " + st);
+        }
+
+        // The pipe vocabulary: exactly status, allow_any_time and refresh; any extra field, or any attempt to set
+        // "ask", is refused (the connection closes).
+        Func<string, Dictionary<string, object>> one = delegate(string json) { return Wire.Json().Deserialize<Dictionary<string, object>>(json); };
+        Assert(Pipes.DeviceRequest(one("{\"type\":\"status\"}")) == "status" && Pipes.DeviceRequest(one("{\"type\":\"allow_any_time\"}")) == "allow_any_time" && Pipes.DeviceRequest(one("{\"type\":\"refresh\"}")) == "refresh", "the three frames");
+        foreach (string json in new string[] { "{}", "{\"type\":\"end\"}", "{\"type\":\"run\"}", "{\"type\":\"ask\"}", "{\"type\":\"allow_any_time\",\"access\":\"ask\"}", "{\"type\":\"set_access\",\"access\":\"ask\"}", "{\"Type\":\"status\"}", "{\"type\":[\"status\"]}" })
+            Assert(Pipes.DeviceRequest(one(json)) == null, "refused: " + json);
+
+        // A live pipe on the device ACL (the test account stands in for SYSTEM, which the tests do not run as): a
+        // modest client gets in and reads status; a client that asks for full access, which includes new instances,
+        // is refused; an unknown frame closes the connection.
+        var me = WindowsIdentity.GetCurrent().User;
+        string pipeName = "SupportMcpDeviceTest-" + Guid.NewGuid().ToString("N").Substring(0, 8);
+        string sddl = "D:P(A;;GA;;;" + me.Value + ")(A;;0x12008B;;;IU)";
+        Func<Dictionary<string, object>, Dictionary<string, object>> handle = delegate(Dictionary<string, object> m) {
+            string req = Pipes.DeviceRequest(m);
+            if (req == null) return null;
+            return DeviceService.StatusFrame("PC", "ask", "limited", DeviceState.Active, "", 7, new System.Collections.ArrayList());
+        };
+        new UiServer(pipeName, handle, delegate(uint ssn) { return true; }, sddl, 1024);
+        // The greedy client is checked on one instance with the service's real ACL: this account holds full access on
+        // the test pipe above, so a client running as it would always get in there.
+        using (var real = Native.PipeServer(pipeName + "-acl", DeviceService.Sddl, 1, true)) {
+            using (var greedy = new System.IO.Pipes.NamedPipeClientStream(".", pipeName + "-acl", System.IO.Pipes.PipeDirection.InOut)) {
+                try { greedy.Connect(2000); throw new Exception("the device pipe gave out full access"); } catch (UnauthorizedAccessException) { }
+            }
+            // The refusal must come from the access mask, so a modest client on the same instance gets in. That holds only when
+            // this token has the INTERACTIVE group (S-1-5-4) the ACL grants; a service or batch account does not.
+            bool interactive = false;
+            foreach (var g in WindowsIdentity.GetCurrent().Groups) if (g.Value == "S-1-5-4") interactive = true;
+            if (interactive) {
+                var accepting = new Thread(delegate() { try { real.WaitForConnection(); } catch (Exception) { } }); accepting.Start();
+                using (var modest = Pipes.Client(pipeName + "-acl")) { modest.Connect(2000); Assert(modest.IsConnected, "a modest client gets in on the same instance, so the greedy one was refused by the access mask"); }
+                accepting.Join(3000);
+            } else Console.WriteLine("SKIP the modest client on the device ACL: this token lacks the INTERACTIVE group (S-1-5-4)");
+        }
+        using (var c = Pipes.Client(pipeName)) {
+            c.Connect(2000);
+            foreach (string t in new string[] { "status", "allow_any_time", "refresh" }) {
+                Pipes.Write(c, Wire.Map("type", t));
+                Assert(Wire.Text(Pipes.Read(c, DeviceService.PipeReadMax, UiServer.ReadMs), "state") == DeviceState.Active, "a valid frame is answered: " + t);
+            }
+        }
+        using (var c = Pipes.Client(pipeName)) {
+            c.Connect(2000); Pipes.Write(c, Wire.Map("type", "set_access", "access", "ask"));
+            try { Pipes.Read(c, DeviceService.PipeReadMax, UiServer.ReadMs); throw new Exception("the service answered a frame it must refuse"); } catch (EndOfStreamException) { } catch (IOException) { }
+        }
+        Console.WriteLine("PASS the saved PC service: the state map, backoff and jitter, the refresh limit, the history cap, the status frame, and the pipe");
+    }
+    // The tray's pure parts: the state-to-text map, which actions show in which state and mode (the one-way rule), the
+    // history lines, and the run-time icon (a handle created and freed).
+    static void TrayTests() {
+        Assert(TrayText.State(DeviceState.Active, "") == "Your support team can see this PC.", "active text");
+        Assert(TrayText.State(DeviceState.Pending, "482913") == "Waiting for approval: read them 482 913.", "pending shows the six digits");
+        Assert(TrayText.State(DeviceState.Pending, "") == "Waiting for approval.", "pending without digits");
+        Assert(TrayText.State(DeviceState.Expired, "").Contains("wasn't approved") && TrayText.State(DeviceState.Removed, "").Contains("removed") && TrayText.State(DeviceState.UpdateNeeded, "").Contains("update") && TrayText.State(DeviceState.Offline, "").Contains("reach"), "each state has its own line");
+        Assert(TrayText.Mode("any").Contains("any time") && TrayText.Mode("ask").Contains("asks you"), "the mode line");
+
+        // The one-way rule: the any-time action shows only while active and asking first; never when any, never when
+        // pending; uninstall always; no action ever sets "ask".
+        foreach (string state in new string[] { DeviceState.Active, DeviceState.Pending, DeviceState.Expired, DeviceState.Removed, DeviceState.UpdateNeeded, DeviceState.Offline }) {
+            foreach (string access in new string[] { "ask", "any" }) {
+                var actions = TrayText.Actions(state, access);
+                bool expectAllow = state == DeviceState.Active && access == "ask";
+                Assert(actions.Contains("allow_any_time") == expectAllow, "allow_any_time only when active and asks first: " + state + "/" + access);
+                Assert(actions.Contains("uninstall"), "uninstall always shows: " + state + "/" + access);
+                foreach (string a in actions) Assert(a != "ask" && a != "allow_ask" && a.IndexOf("ask") < 0, "no action ever sets ask: " + a);
+            }
+        }
+        Assert(!TrayText.Actions(DeviceState.Pending, "ask").Contains("allow_any_time"), "a pending PC never offers the any-time action");
+        Assert(!TrayText.Actions(DeviceState.Active, "any").Contains("allow_any_time"), "an any-time PC never offers the action again");
+        Assert(TrayText.ShowTeamOnly(DeviceState.Active, "any") && !TrayText.ShowTeamOnly(DeviceState.Active, "ask") && !TrayText.ShowTeamOnly(DeviceState.Removed, "any"), "only an any-time PC says only the team can change it");
+        Assert(TrayText.ShowMode(DeviceState.Active) && TrayText.ShowMode(DeviceState.Pending) && !TrayText.ShowMode(DeviceState.Removed) && !TrayText.ShowMode(DeviceState.Expired), "a removed or unapproved PC shows no mode line");
+        Assert(TrayText.AllowConfirm.Contains("undo this from this PC") && TrayText.AllowConfirm.Contains("Only your support team"), "the confirm says it can't be undone from this PC and only the team can turn it back");
+
+        // Recent history, newest first, limited.
+        var hist = new System.Collections.ArrayList();
+        for (int i = 0; i < 6; i++) hist.Add(Wire.Map("at", (long)(1700000000000 + i), "text", "line " + i));
+        var recent = TrayText.Recent(hist, 4);
+        Assert(recent.Count == 4 && recent[0].Contains("line 5") && recent[3].Contains("line 2"), "the last four history lines, newest first");
+        Assert(TrayText.Recent(null, 4).Count == 0, "no history is no lines");
+        Assert(TrayText.Tip(new string('x', 200)).Length <= 63, "the tooltip fits 63 characters");
+
+        // The icon is drawn at run time: Create makes a handle, DestroyIcon frees it. A different color per state.
+        IntPtr h = TrayIcon.Create(16, TrayIcon.ColorFor(DeviceState.Active));
+        Assert(h != IntPtr.Zero, "the tray icon is drawn to a handle");
+        Assert(Native.DestroyIcon(h), "the icon handle is freed");
+        Assert(!TrayIcon.ColorFor(DeviceState.Active).Equals(TrayIcon.ColorFor(DeviceState.Pending)) && !TrayIcon.ColorFor(DeviceState.Pending).Equals(TrayIcon.ColorFor(DeviceState.Removed)), "the icon colour follows the state");
+        Console.WriteLine("PASS the tray: the state-to-text map, the one-way action rule, the history lines, and the run-time icon handle");
+    }
+    // Uninstall's pure parts: the removal plan (our names only, never the one-off shared record), the exit-code map,
+    // the Temp-copy rule, and that a 401 from leave counts as done.
+    static void UninstallTests(string dir) {
+        var plan = DeviceUninstall.RemovalPlan();
+        Assert(plan.Count == 4, "four artifacts");
+        Assert(plan[0] == "service SupportMcpDevice", "the service by its exact name");
+        Assert(plan[1].Contains("CurrentVersion\\Run\\SupportMcpTray"), "the HKLM Run tray value");
+        Assert(plan[2].Contains("Uninstall\\SupportMcpDevice"), "the Apps uninstall entry");
+        Assert(plan[3] == "folder " + DeviceSetup.Folder && plan[3].EndsWith("\\SupportMCP"), "the install folder");
+        // Never the one-off sessions' shared record HKLM\SOFTWARE\SupportMCP, and nothing outside our names.
+        foreach (string item in plan) {
+            Assert(item.IndexOf("SOFTWARE\\SupportMCP") < 0, "never the shared record: " + item);
+            Assert(item.Contains("SupportMcpDevice") || item.Contains("SupportMcpTray") || item.EndsWith("\\SupportMCP"), "only our names: " + item);
+        }
+
+        // The exit-code map.
+        Assert(DeviceUninstall.Map(DeviceUninstall.Removed) == DeviceUninstall.Outcome.Removed, "0 is removed");
+        Assert(DeviceUninstall.Map(DeviceUninstall.Unreachable) == DeviceUninstall.Outcome.RemovedUnreachable, "10 is removed but the relay was unreachable");
+        Assert(DeviceUninstall.Map(-1223) == DeviceUninstall.Outcome.Declined, "a declined Windows prompt");
+        Assert(DeviceUninstall.Map(DeviceUninstall.Fail) == DeviceUninstall.Outcome.Failed && DeviceUninstall.Map(999) == DeviceUninstall.Outcome.Failed, "anything else is a failure");
+
+        // The Temp-copy rule: run from the install folder restages; run from anywhere else proceeds.
+        Assert(DeviceUninstall.NeedsRestage(DeviceSetup.Exe), "the installed support.exe restages itself");
+        Assert(!DeviceUninstall.NeedsRestage(Path.Combine(Path.GetTempPath(), "SupportMcpStage-x\\support.exe")), "a Temp copy proceeds");
+        // The staged copy's folder is removed after the run, and only a SupportMcpStage-* folder directly under Temp is ever named.
+        string tmp = Path.Combine(Path.GetTempPath(), "SupportMcpStage-" + Guid.NewGuid().ToString("N")), tmpExe = Path.Combine(tmp, "support.exe");
+        Assert(DeviceUninstall.StagedFolder(tmpExe) == tmp, "a staged copy names its own folder");
+        Assert(DeviceUninstall.StagedFolder(DeviceSetup.Exe) == null, "the installed exe names no folder");
+        Assert(DeviceUninstall.StagedFolder(Path.Combine(Path.GetTempPath(), "other\\support.exe")) == null && DeviceUninstall.StagedFolder(Path.Combine(Path.GetTempPath(), "support.exe")) == null, "an arbitrary folder, or Temp itself, names no folder");
+        Assert(DeviceUninstall.StagedFolder(Path.Combine(tmp, "deeper\\support.exe")) == null && DeviceUninstall.StagedFolder("support.exe", "C:\\Other") == null, "a folder not directly under Temp names nothing");
+
+        // leave: a 200 or a 401 both count as done (reached); only a network failure leaves the PC on the list.
+        Assert(DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Ok), "200 counts as done");
+        Assert(DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Removed), "401 counts as done");
+        Assert(!DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Offline), "a network failure is not reached");
+        Assert(!DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Refused) && !DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.UpdateNeeded), "a refusal or a server error leaves the PC on the team's list, so the owner is told the team must remove it");
+
+        // The real removal on a temp folder whose exe is running (as a tray left behind would be): it is renamed aside,
+        // so the original path is free for a fresh install. A running exe, not an open file handle: Windows renames a
+        // folder whose exe is running, but not one holding an open handle of any share mode. This drives the shared
+        // DeviceInstall.RemoveFolderAside, not a parallel copy.
+        string root = Path.Combine(dir, "uninst-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(root);
+        string f = Path.Combine(root, "SupportMCP"); Directory.CreateDirectory(f);
+        string fexe = Path.Combine(f, "support.exe"); File.Copy(Path.Combine(Environment.SystemDirectory, "PING.EXE"), fexe); File.WriteAllText(Path.Combine(f, "device.json"), "{}");
+        var running = Process.Start(new ProcessStartInfo(fexe, "-n 60 127.0.0.1") { UseShellExecute = false, CreateNoWindow = true });
+        try {
+            Thread.Sleep(500);
+            DeviceUninstall.TestRemoveFolder(f);
+            Assert(!Directory.Exists(f), "a folder whose exe is running is renamed aside, freeing the original path for a reinstall");
+            Assert(Directory.GetDirectories(root, "SupportMCP.removed-*").Length >= 1, "the running exe's folder is kept under a unique removed name, not at the original path");
+        } finally { try { running.Kill(); } catch (Exception) { } running.WaitForExit(5000); running.Dispose(); }
+        foreach (string d in Directory.GetDirectories(root, "SupportMCP.removed-*")) try { Directory.Delete(d, true); } catch (Exception) { }
+        // A plain (unlocked) folder is removed outright, with no leftover.
+        Directory.CreateDirectory(f); File.WriteAllText(Path.Combine(f, "device.json"), "{}");
+        DeviceUninstall.TestRemoveFolder(f);
+        Assert(!Directory.Exists(f) && Directory.GetDirectories(root, "SupportMCP.removed-*").Length == 0, "an unlocked folder is removed with nothing left behind");
+
+        // Two elevated installs or removes at once: the second is refused while the first holds the setup mutex.
+        // Only SYSTEM and Administrators may open it, so a standard (or filtered) test account checks that refusal and
+        // the held-mutex refusal on its own handle; an elevated one opens it twice, as two elevated installs would.
+        string mn = "Local\\SupportMcpDeviceSetupTest-" + Guid.NewGuid().ToString("N");
+        bool elevated = new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator);
+        using (var m1 = DeviceInstall.SetupMutex(mn)) {
+            Assert(m1.WaitOne(0), "the first elevated install or remove takes the setup mutex");
+            // A Win32 mutex is re-entrant for the thread that owns it, so the second taker always runs on another thread.
+            if (elevated) {
+                bool second = true; var other = new Thread(delegate() { using (var m2 = DeviceInstall.SetupMutex(mn)) { second = m2.WaitOne(0); if (second) m2.ReleaseMutex(); } }); other.Start(); other.Join();
+                Assert(!second, "a second one is refused while the first holds it");
+                m1.ReleaseMutex();
+                using (var m3 = DeviceInstall.SetupMutex(mn)) { Assert(m3.WaitOne(0), "once released, the next one takes it"); m3Release(m3); }
+            } else {
+                try { DeviceInstall.SetupMutex(mn).Dispose(); throw new Exception("a standard user opened the setup mutex"); } catch (UnauthorizedAccessException) { }
+                bool second = true; var other = new Thread(delegate() { second = m1.WaitOne(0); if (second) m1.ReleaseMutex(); }); other.Start(); other.Join();
+                Assert(!second, "a second one is refused while the first holds it");
+                m1.ReleaseMutex();
+            }
+        }
+        Console.WriteLine("PASS uninstall: the removal plan and exit codes, the rename-aside removal, and the setup mutex refusal");
+    }
+    // Drives the real service against a fake relay with a real temp folder: a 200 with no device, a team access
+    // change, allow_any_time only from "ask" (never sending "ask"), terminal states persisted and not re-checked after
+    // a reload, and the uninstall event opened with Modify so a waiter sees the signal.
+    static void DeviceServiceLiveTests(string dir) {
+        string folder = Path.Combine(dir, "svc-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(folder);
+        string exe = Path.Combine(folder, "support.exe");
+        Func<string, string, string, string, string> dev = delegate(string st, string nm, string ac, string ct) {
+            return Wire.Json().Serialize(Wire.Map("protocol", 1, "device", Wire.Map("id", "d", "workspace", "default", "status", st, "name", nm, "access", ac, "control", ct, "site_id", null)));
+        };
+        Action<string> writeJson = delegate(string json) { File.WriteAllText(Path.Combine(folder, "device.json"), json); };
+        Func<DeviceService, int> histCount = delegate(DeviceService svc) { var h = svc.TestStatus()["history"] as System.Collections.ArrayList; return h == null ? 0 : h.Count; };
+
+        using (var relay = new FakeDevice()) {
+            writeJson(Wire.Json().Serialize(Wire.Map("origin", relay.Origin, "workspace", "default", "device_id", "d", "key", "smd1.default.id.secret", "status", "active", "name", "PC", "access", "ask", "control", "limited")));
+            var svc = new DeviceService(exe);
+            Assert(svc.TestInit(), "the service loads device.json");
+            relay.Status = 200; relay.Body = dev("active", "Front desk", "ask", "limited");
+            svc.TestCheckInOnce();
+            Assert(Wire.Text(svc.TestStatus(), "state") == DeviceState.Active && Wire.Text(svc.TestStatus(), "name") == "Front desk", "a 200 updates name and state from the device");
+            // A 200 with no "device" is treated as offline, not a crash that ends the loop.
+            relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1));
+            svc.TestCheckInOnce();
+            Assert(Wire.Text(svc.TestStatus(), "state") == DeviceState.Offline, "a 200 with no device is offline, not a crash");
+            // The team flips access to any: a history line is added.
+            int before = histCount(svc);
+            relay.Body = dev("active", "Front desk", "any", "limited");
+            svc.TestCheckInOnce();
+            Assert(Wire.Text(svc.TestStatus(), "access") == "any" && histCount(svc) == before + 1, "a team access change applies and is a history line");
+            // Back to ask (the team turned it off), so allow_any_time becomes possible again.
+            relay.Body = dev("active", "Front desk", "ask", "limited");
+            svc.TestCheckInOnce();
+            Assert(Wire.Text(svc.TestStatus(), "access") == "ask", "the team can set it back to ask");
+            // allow_any_time: the pipe answers at once, and the update runs in the background and only ever sends "any".
+            relay.Body = dev("active", "Front desk", "any", "limited"); relay.LastJson = ""; relay.LastPath = "";
+            var reply = svc.TestHandle(Wire.Map("type", "allow_any_time"));
+            Assert(reply != null && Wire.Text(reply, "state").Length > 0, "allow_any_time is answered at once");
+            bool went = false;
+            for (int i = 0; i < 100 && !went; i++) { if (Wire.Text(svc.TestStatus(), "access") == "any") went = true; else Thread.Sleep(50); }
+            Assert(went, "allow_any_time turned on any in the background");
+            Assert(relay.LastPath == "/device/update" && Wire.Text(relay.Sent(), "access") == "any", "it sent access any, never ask");
+            // A second allow_any_time while already any sends nothing (and so can never send ask).
+            relay.LastJson = ""; relay.LastPath = "";
+            svc.TestHandle(Wire.Map("type", "allow_any_time")); Thread.Sleep(300);
+            Assert(relay.LastJson == "", "allow_any_time does nothing once the mode is any");
+            // A hello still in flight when the PC turns on "any time" answers with the older "ask". That stale access is
+            // ignored: the mode stays any and no false "set to ask" line is logged. The next check-in brings the team's view.
+            relay.Body = dev("active", "Front desk", "ask", "limited");
+            svc.TestCheckInOnce();
+            Assert(Wire.Text(svc.TestStatus(), "access") == "ask", "the team set it back to ask");
+            int h0 = histCount(svc);
+            relay.HelloBody = dev("active", "Front desk", "ask", "limited"); relay.HelloDelayMs = 1500; relay.Body = dev("active", "Front desk", "any", "limited");
+            var inFlight = new Thread(delegate() { svc.TestCheckInOnce(); }); inFlight.IsBackground = true; inFlight.Start(); Thread.Sleep(300);
+            svc.TestHandle(Wire.Map("type", "allow_any_time"));
+            Assert(inFlight.Join(10000), "the held hello finishes");
+            Assert(Wire.Text(svc.TestStatus(), "access") == "any", "a stale hello answer does not undo a local any-time change");
+            Assert(histCount(svc) == h0 + 1, "only the local change is logged, no false set-to-ask line");
+            relay.HelloBody = null; relay.HelloDelayMs = 0;
+        }
+
+        // Terminal states are persisted and a reload serves them without a fresh check-in or a duplicate history line.
+        foreach (string[] pair in new string[][] { new string[] { "active", DeviceState.Removed }, new string[] { "pending", DeviceState.Expired } }) {
+            string folder2 = Path.Combine(dir, "term-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(folder2);
+            string exe2 = Path.Combine(folder2, "support.exe");
+            using (var relay = new FakeDevice()) {
+                var start = Wire.Map("origin", relay.Origin, "workspace", "default", "device_id", "d", "key", "smd1.default.id.secret", "status", pair[0], "name", "PC", "access", "ask", "control", "limited");
+                if (pair[0] == "pending") start["confirm"] = "482913";
+                File.WriteAllText(Path.Combine(folder2, "device.json"), Wire.Json().Serialize(start));
+                var svc = new DeviceService(exe2); Assert(svc.TestInit(), "init " + pair[1]);
+                relay.Status = 401; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "error", Wire.Map("code", "device_unknown", "message", "x")));
+                svc.TestCheckInOnce();
+                Assert(Wire.Text(svc.TestStatus(), "state") == pair[1] && svc.TestTerminal, "401 gives " + pair[1] + " and is terminal");
+                var stored = Wire.Json().Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(folder2, "device.json")));
+                Assert(Wire.Text(stored, "state") == pair[1], pair[1] + " is persisted to device.json");
+                int lines = histCount(svc);
+                // A reload serves the terminal state, stays terminal, and adds no duplicate history line at boot.
+                var reloaded = new DeviceService(exe2); Assert(reloaded.TestInit(), "reload " + pair[1]);
+                Assert(Wire.Text(reloaded.TestStatus(), "state") == pair[1] && reloaded.TestTerminal, "a reload serves " + pair[1] + " without a check-in");
+                Assert(histCount(reloaded) == lines, "no duplicate " + pair[1] + " line at boot");
+            }
+        }
+
+        // The uninstall event opened with Modify can be set, and a waiter sees it (the bug was Synchronize-only).
+        string en = "Local\\SupportMcpTestUninstall-" + Guid.NewGuid().ToString("N");
+        using (var created = DeviceService.TestCreateEvent(en)) {
+            var got = new ManualResetEvent(false);
+            var w = new Thread(delegate() { var we = DeviceService.TestOpenEvent(en, EventWaitHandleRights.Synchronize); if (we != null) using (we) if (we.WaitOne(5000)) got.Set(); });
+            w.IsBackground = true; w.Start(); Thread.Sleep(200);
+            var signaller = DeviceService.TestOpenEvent(en, EventWaitHandleRights.Synchronize | EventWaitHandleRights.Modify);
+            Assert(signaller != null && signaller.Set(), "the event opens with Modify and sets");
+            if (signaller != null) signaller.Dispose();
+            Assert(got.WaitOne(5000), "a waiter sees the uninstall signal");
+        }
+        Console.WriteLine("PASS the live service: a 200 with no device, a team mode change, allow_any_time one-way and async, terminal persistence across a reload, and the uninstall event");
     }
     // The focus the confirm gives back: only to the window that had it, only while the support window still holds it.
     static void FocusReturnTests() {
@@ -785,7 +1308,7 @@ public static class AppTests {
         Assert(ServiceLink.Running(sid8) && !ServiceLink.Running(Guid.NewGuid().ToString("N").Substring(0, 8)), "Running finds the service of this session only");
         // A client that asks for full access (which includes making a new pipe instance) is refused.
         // (The service's real ACL, on one instance this test account did not need rights to create.)
-        using (var real = Native.PipeServer("SupportMcpTest-acl-" + sid8, "D:P(A;;GA;;;SY)(A;;0x12008B;;;IU)", 1, true)) {
+        using (var real = Native.PipeServer("SupportMcpTest-acl-" + sid8, UiServer.Sddl, 1, true)) {
             using (var greedy = new System.IO.Pipes.NamedPipeClientStream(".", "SupportMcpTest-acl-" + sid8, System.IO.Pipes.PipeDirection.InOut)) {
                 try { greedy.Connect(2000); throw new Exception("the window pipe gave out write access that includes new instances"); } catch (UnauthorizedAccessException) { }
             }
@@ -1271,6 +1794,14 @@ public static class AppTests {
             ClientRuleTests(dir);
             LaneTests();
             LiveScreenTests();
+            FooterReaderTests();
+            DeviceLinkTests();
+            SetupRuleTests();
+            DeviceInstallTests();
+            DeviceServiceTests(dir);
+            TrayTests();
+            UninstallTests(dir);
+            DeviceServiceLiveTests(dir);
             // The downloaded PE overlay must be readable by the actual .NET client.
             string overlay = Path.Combine(dir, "overlay.exe"); byte[] cfg = Encoding.UTF8.GetBytes(Wire.Json().Serialize(Wire.Map("sid", new string('a', 64), "key", new string('b', 64), "origin", "https://support.example.com", "startup_expires_at", Client.UnixNow() + 10000)));
             using (var f = File.Create(overlay)) { f.WriteByte(77); f.WriteByte(90); f.Write(cfg, 0, cfg.Length); byte[] n = BitConverter.GetBytes(cfg.Length); f.Write(n, 0, n.Length); byte[] footer = Encoding.ASCII.GetBytes(Wire.Footer); f.Write(footer, 0, footer.Length); }

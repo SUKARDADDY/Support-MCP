@@ -11,6 +11,8 @@
 # Customer paths (/j/<code>, /ws, /healthz) are NOT under the app and stay public.
 # So does /device/ (a saved PC pairs and checks in there with its own key, and has
 # no Access login): never add it to an Access application, or no PC can pair.
+# And so does /install (the public setup page and download that a PC owner opens
+# from a link): behind Access, an owner without a login could not download Support.
 #
 # OAUTH=1 is for a relay that signs MCP clients in with its own OAuth server
 # (docs/mcp-clients.md). The relay answers /mcp itself with a Bearer challenge, so
