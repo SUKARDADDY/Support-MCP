@@ -404,6 +404,46 @@ public static class AppTests {
         }
         Console.WriteLine("PASS the saved PC service: the state map, backoff and jitter, the refresh limit, the history cap, the status frame, and the pipe");
     }
+    // The tray's pure parts: the state-to-text map, which actions show in which state and mode (the one-way rule), the
+    // history lines, and the run-time icon (a handle created and freed).
+    static void TrayTests() {
+        Assert(TrayText.State(DeviceState.Active, "") == "Your support team can see this PC.", "active text");
+        Assert(TrayText.State(DeviceState.Pending, "482913") == "Waiting for approval: read them 482 913.", "pending shows the six digits");
+        Assert(TrayText.State(DeviceState.Pending, "") == "Waiting for approval.", "pending without digits");
+        Assert(TrayText.State(DeviceState.Expired, "").Contains("wasn't approved") && TrayText.State(DeviceState.Removed, "").Contains("removed") && TrayText.State(DeviceState.UpdateNeeded, "").Contains("update") && TrayText.State(DeviceState.Offline, "").Contains("reach"), "each state has its own line");
+        Assert(TrayText.Mode("any").Contains("any time") && TrayText.Mode("ask").Contains("asks you"), "the mode line");
+
+        // The one-way rule: the any-time action shows only while active and asking first; never when any, never when
+        // pending; uninstall always; no action ever sets "ask".
+        foreach (string state in new string[] { DeviceState.Active, DeviceState.Pending, DeviceState.Expired, DeviceState.Removed, DeviceState.UpdateNeeded, DeviceState.Offline }) {
+            foreach (string access in new string[] { "ask", "any" }) {
+                var actions = TrayText.Actions(state, access);
+                bool expectAllow = state == DeviceState.Active && access == "ask";
+                Assert(actions.Contains("allow_any_time") == expectAllow, "allow_any_time only when active and asks first: " + state + "/" + access);
+                Assert(actions.Contains("uninstall"), "uninstall always shows: " + state + "/" + access);
+                foreach (string a in actions) Assert(a != "ask" && a != "allow_ask" && a.IndexOf("ask") < 0, "no action ever sets ask: " + a);
+            }
+        }
+        Assert(!TrayText.Actions(DeviceState.Pending, "ask").Contains("allow_any_time"), "a pending PC never offers the any-time action");
+        Assert(!TrayText.Actions(DeviceState.Active, "any").Contains("allow_any_time"), "an any-time PC never offers the action again");
+        Assert(TrayText.ShowTeamOnly(DeviceState.Active, "any") && !TrayText.ShowTeamOnly(DeviceState.Active, "ask") && !TrayText.ShowTeamOnly(DeviceState.Removed, "any"), "only an any-time PC says only the team can change it");
+        Assert(TrayText.AllowConfirm.Contains("undo this from this PC") && TrayText.AllowConfirm.Contains("Only your support team"), "the confirm says it can't be undone from this PC and only the team can turn it back");
+
+        // Recent history, newest first, limited.
+        var hist = new System.Collections.ArrayList();
+        for (int i = 0; i < 6; i++) hist.Add(Wire.Map("at", (long)(1700000000000 + i), "text", "line " + i));
+        var recent = TrayText.Recent(hist, 4);
+        Assert(recent.Count == 4 && recent[0].Contains("line 5") && recent[3].Contains("line 2"), "the last four history lines, newest first");
+        Assert(TrayText.Recent(null, 4).Count == 0, "no history is no lines");
+        Assert(TrayText.Tip(new string('x', 200)).Length <= 63, "the tooltip fits 63 characters");
+
+        // The icon is drawn at run time: Create makes a handle, DestroyIcon frees it. A different color per state.
+        IntPtr h = TrayIcon.Create(16, TrayIcon.ColorFor(DeviceState.Active));
+        Assert(h != IntPtr.Zero, "the tray icon is drawn to a handle");
+        Assert(Native.DestroyIcon(h), "the icon handle is freed");
+        Assert(!TrayIcon.ColorFor(DeviceState.Active).Equals(TrayIcon.ColorFor(DeviceState.Pending)) && !TrayIcon.ColorFor(DeviceState.Pending).Equals(TrayIcon.ColorFor(DeviceState.Removed)), "the icon colour follows the state");
+        Console.WriteLine("PASS the tray: the state-to-text map, the one-way action rule, the history lines, and the run-time icon handle");
+    }
     // The focus the confirm gives back: only to the window that had it, only while the support window still holds it.
     static void FocusReturnTests() {
         Func<IntPtr, bool> ours = delegate(IntPtr w) { return (int)w >= 100; }, here = delegate(IntPtr w) { return (int)w != 7; };
@@ -1557,6 +1597,7 @@ public static class AppTests {
             SetupRuleTests();
             DeviceInstallTests();
             DeviceServiceTests(dir);
+            TrayTests();
             // The downloaded PE overlay must be readable by the actual .NET client.
             string overlay = Path.Combine(dir, "overlay.exe"); byte[] cfg = Encoding.UTF8.GetBytes(Wire.Json().Serialize(Wire.Map("sid", new string('a', 64), "key", new string('b', 64), "origin", "https://support.example.com", "startup_expires_at", Client.UnixNow() + 10000)));
             using (var f = File.Create(overlay)) { f.WriteByte(77); f.WriteByte(90); f.Write(cfg, 0, cfg.Length); byte[] n = BitConverter.GetBytes(cfg.Length); f.Write(n, 0, n.Length); byte[] footer = Encoding.ASCII.GetBytes(Wire.Footer); f.Write(footer, 0, footer.Length); }

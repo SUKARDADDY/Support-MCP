@@ -1603,6 +1603,8 @@ namespace SupportMcp {
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(string sddl, uint revision, out IntPtr sd, IntPtr size);
         [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr h);
         [DllImport("user32.dll", SetLastError = true)] public static extern bool BlockInput(bool block);
+        // Frees an icon handle made by Bitmap.GetHicon (the tray's icon, drawn at run time).
+        [DllImport("user32.dll", SetLastError = true)] public static extern bool DestroyIcon(IntPtr icon);
         [DllImport("sas.dll")] static extern void SendSAS(bool asUser);
         [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetDefaultDllDirectories(uint flags);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern bool MoveFileEx(string from, string to, uint flags);
@@ -4316,6 +4318,253 @@ confirm = exit == DeviceSetup.Pending ? DeviceService.ReadConfirm() : null;
     }
 
 
+    // The tray's words and choices, kept apart from its windows so the native tests can check them. The one-way rule
+    // (call 3): the only access action is turning on "any time", shown only while the PC is active and asks first.
+    // There is no action that sets "ask"; only the support team can switch back.
+    public static class TrayText {
+        public const string NoOne = "No one is connected.";
+        public const string NotRunning = "Support's background service isn't running.";
+        public const string TeamOnly = "Only your support team can change this.";
+        public const string AllowAction = "Allow support to connect any time";
+        public const string AllowConfirm = "Allow support to connect any time? You can't undo this from this PC. Only your support team can turn it back to asking first.";
+        public const string Uninstall = "Uninstall Support…";
+        public const string UninstallMissing = "To remove Support, open Settings, then Apps, and uninstall Support.";
+        public static string Mode(string access) { return access == "any" ? "Support can connect any time." : "Support asks you before each connection."; }
+        public static string State(string state, string confirm) {
+            if (state == DeviceState.Active) return "Your support team can see this PC.";
+            if (state == DeviceState.Pending) { string d = DeviceSetup.ShowConfirm(confirm); return d != null ? "Waiting for approval: read them " + d + "." : "Waiting for approval."; }
+            if (state == DeviceState.Expired) return "This PC's request wasn't approved, or was removed. Set up again with a new code.";
+            if (state == DeviceState.Removed) return "Your support team removed this PC.";
+            if (state == DeviceState.UpdateNeeded) return "Support needs an update.";
+            if (state == DeviceState.Offline) return "Can't reach your support team right now.";
+            return NotRunning;
+        }
+        // The panel's actions for a state and mode. "allow_any_time" only while active and asking first; "uninstall"
+        // always. Nothing here ever sets "ask".
+        public static List<string> Actions(string state, string access) {
+            var list = new List<string>();
+            if (state == DeviceState.Active && access == "ask") list.Add("allow_any_time");
+            list.Add("uninstall");
+            return list;
+        }
+        public static bool ShowTeamOnly(string state, string access) { return access == "any" && state != DeviceState.Removed && state != DeviceState.Expired; }
+        // The newest few history lines, newest first.
+        public static List<string> Recent(System.Collections.ArrayList history, int n) {
+            var lines = new List<string>();
+            if (history == null) return lines;
+            for (int i = history.Count - 1; i >= 0 && lines.Count < n; i--) {
+                var d = history[i] as Dictionary<string, object>;
+                if (d == null) continue;
+                long at = Wire.Number(d, "at");
+                string when = at > 0 ? new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddMilliseconds(at).ToLocalTime().ToString("d MMM, HH:mm", System.Globalization.CultureInfo.InvariantCulture) + "  " : "";
+                lines.Add(when + Wire.Text(d, "text"));
+            }
+            return lines;
+        }
+        // The tray tooltip: at most 63 characters, as NotifyIcon allows.
+        public static string Tip(string name) { string t = "Support" + (string.IsNullOrEmpty(name) ? "" : ": " + name); return t.Length > 63 ? t.Substring(0, 60) + "..." : t; }
+    }
+
+    // The tray icon, drawn at run time from the app's headset shape (the exe carries no icon). Create returns an icon
+    // handle the caller frees with Native.DestroyIcon.
+    public static class TrayIcon {
+        public static IntPtr Create(int size, Gdi.Color color) {
+            using (var bmp = new Gdi.Bitmap(size, size, Img.PixelFormat.Format32bppArgb))
+            using (var g = Gdi.Graphics.FromImage(bmp)) {
+                g.SmoothingMode = Gdi.Drawing2D.SmoothingMode.AntiAlias;
+                g.Clear(Gdi.Color.Transparent);
+                float k = size / 20f;
+                using (var pen = new Gdi.Pen(color, Math.Max(1.5f, 1.8f * k)))
+                using (var brush = new Gdi.SolidBrush(color)) {
+                    g.DrawArc(pen, 3.5f * k, 3f * k, 13f * k, 13f * k, 180, 180);
+                    g.FillRectangle(brush, 2.5f * k, 9.5f * k, 3.5f * k, 6f * k);
+                    g.FillRectangle(brush, 14f * k, 9.5f * k, 3.5f * k, 6f * k);
+                }
+                return bmp.GetHicon();
+            }
+        }
+        public static Gdi.Color ColorFor(string state) {
+            if (state == DeviceState.Active) return Gdi.Color.FromArgb(0x1F, 0x9D, 0x55);
+            if (state == DeviceState.Pending) return Gdi.Color.FromArgb(0x25, 0x63, 0xEB);
+            return Gdi.Color.FromArgb(0x5B, 0x64, 0x72);
+        }
+    }
+
+    // --tray: one per signed-in session. The icon opens a small panel near the clock with the PC's name, its mode,
+    // its state and a short local history. It reads everything from the service's status pipe, polling every few
+    // seconds while the panel is open and every minute otherwise, and exits when the uninstall event is set.
+    public sealed class TrayPanel : Window {
+        const double CardWidth = 340, Pad = 16;
+        readonly Palette p;
+        readonly TextBlock nameLine, modeLine, teamOnly, stateLine, noOne, note;
+        readonly StackPanel historyBox, confirmBox;
+        readonly FlatButton allow, confirmYes, confirmNo, uninstall;
+        public event Action AllowConfirmed;
+        public event Action UninstallClicked;
+
+        public TrayPanel(Palette palette) {
+            p = palette;
+            Ui.Transparent(this);
+            Title = "Support"; ShowInTaskbar = false; Topmost = true;
+            Width = CardWidth + 2 * Pad; SizeToContent = SizeToContent.Height; WindowStartupLocation = WindowStartupLocation.Manual;
+            Foreground = p.Ink;
+            Grid inner; var card = Ui.Card(p, CardWidth, out inner);
+            var root = new Grid { Margin = new Thickness(Pad) }; root.Children.Add(card); Content = root;
+            var stack = new StackPanel(); inner.Children.Add(stack);
+            stack.Children.Add(new Border { Height = 3, Background = p.Live });
+            var body = new StackPanel { Margin = new Thickness(16, 12, 16, 14) };
+            var head = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 8) };
+            var glyph = Glyph.Headset().Paint(p.Muted).Sized(16); glyph.Margin = new Thickness(0, 0, 8, 0); head.Children.Add(glyph);
+            head.Children.Add(Ui.Label("Support", 12, FontWeights.SemiBold, p.Muted, Ui.TextFont));
+            body.Children.Add(head);
+            nameLine = Ui.Label("", 15.5, FontWeights.SemiBold, p.Ink, Ui.DisplayFont); body.Children.Add(nameLine);
+            modeLine = Line(13, p.Ink, 6); body.Children.Add(modeLine);
+            teamOnly = Line(12, p.Muted, 2); teamOnly.Text = TrayText.TeamOnly; body.Children.Add(teamOnly);
+            allow = new FlatButton(TrayText.AllowAction, p.Work, p.WorkSoft, p.WorkSoft, p.Work, 30, 0, 12, 6, 12.5, true); allow.Margin = new Thickness(0, 8, 0, 0); allow.HorizontalAlignment = HorizontalAlignment.Left;
+            body.Children.Add(allow);
+            confirmBox = new StackPanel { Margin = new Thickness(0, 8, 0, 0), Visibility = Visibility.Collapsed };
+            confirmBox.Children.Add(Ui.Label(TrayText.AllowConfirm, 12.5, FontWeights.Normal, p.Ink, Ui.TextFont));
+            var confirmButtons = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 8, 0, 0) };
+            confirmNo = new FlatButton("Cancel", p.Ink, p.Surface2, p.Line, p.Work, 30, 72, 12, 6, 12.5, true);
+            confirmYes = new FlatButton("Allow any time", p.Stop, p.StopBg, p.StopBgHover, p.Work, 30, 0, 12, 6, 12.5, true); confirmYes.Margin = new Thickness(8, 0, 0, 0);
+            confirmButtons.Children.Add(confirmNo); confirmButtons.Children.Add(confirmYes);
+            confirmBox.Children.Add(confirmButtons);
+            body.Children.Add(confirmBox);
+            stateLine = Line(13, p.Ink, 10); body.Children.Add(stateLine);
+            noOne = Line(12.5, p.Muted, 4); noOne.Text = TrayText.NoOne; body.Children.Add(noOne);
+            historyBox = new StackPanel { Margin = new Thickness(0, 10, 0, 0) }; body.Children.Add(historyBox);
+            note = Line(12, p.Stop, 8); note.Visibility = Visibility.Collapsed; body.Children.Add(note);
+            uninstall = new FlatButton(TrayText.Uninstall, p.Muted, Brushes.Transparent, p.Surface2, p.Work, 28, 0, 8, 6, 12.5, true); uninstall.Margin = new Thickness(-8, 10, 0, 0); uninstall.HorizontalAlignment = HorizontalAlignment.Left;
+            body.Children.Add(uninstall);
+            stack.Children.Add(body);
+
+            allow.Click += delegate { allow.Visibility = Visibility.Collapsed; confirmBox.Visibility = Visibility.Visible; confirmNo.Focus(); };
+            confirmNo.Click += delegate { confirmBox.Visibility = Visibility.Collapsed; allow.Visibility = Visibility.Visible; };
+            confirmYes.Click += delegate { confirmBox.Visibility = Visibility.Collapsed; var a = AllowConfirmed; if (a != null) a(); };
+            uninstall.Click += delegate { var u = UninstallClicked; if (u != null) u(); };
+            Deactivated += delegate { Hide(); };
+            PreviewKeyDown += delegate(object sender, KeyEventArgs e) { if (e.Key == Key.Escape) { e.Handled = true; Hide(); } };
+            Closing += delegate(object sender, System.ComponentModel.CancelEventArgs e) { if (!quitting) { e.Cancel = true; Hide(); } };
+        }
+        bool quitting;
+        public void Quit() { quitting = true; Close(); }
+        TextBlock Line(double size, Brush color, double top) { var t = Ui.Label("", size, FontWeights.Normal, color, Ui.TextFont); t.Margin = new Thickness(0, top, 0, 0); return t; }
+
+        // Shows a status frame, or null when the service did not answer.
+        public void Render(Dictionary<string, object> status) {
+            if (status == null) {
+                nameLine.Text = "Support"; modeLine.Text = ""; stateLine.Text = TrayText.NotRunning;
+                teamOnly.Visibility = Visibility.Collapsed; allow.Visibility = Visibility.Collapsed; confirmBox.Visibility = Visibility.Collapsed;
+                noOne.Visibility = Visibility.Collapsed; historyBox.Children.Clear();
+                return;
+            }
+            string state = Wire.Text(status, "state"), access = Wire.Text(status, "access");
+            nameLine.Text = Wire.Text(status, "name");
+            modeLine.Text = TrayText.Mode(access);
+            stateLine.Text = TrayText.State(state, Wire.Text(status, "confirm"));
+            teamOnly.Visibility = TrayText.ShowTeamOnly(state, access) ? Visibility.Visible : Visibility.Collapsed;
+            bool canAllow = TrayText.Actions(state, access).Contains("allow_any_time");
+            if (!canAllow) { allow.Visibility = Visibility.Collapsed; confirmBox.Visibility = Visibility.Collapsed; }
+            else if (confirmBox.Visibility != Visibility.Visible) allow.Visibility = Visibility.Visible;
+            noOne.Visibility = Visibility.Visible;
+            historyBox.Children.Clear();
+            object h; status.TryGetValue("history", out h);
+            foreach (string line in TrayText.Recent(h as System.Collections.ArrayList, 4)) {
+                var t = Ui.Label(line, 11.5, FontWeights.Normal, p.Muted, Ui.TextFont); t.Margin = new Thickness(0, 2, 0, 0); historyBox.Children.Add(t);
+            }
+        }
+        public void Note(string text) { note.Text = text ?? ""; note.Visibility = string.IsNullOrEmpty(text) ? Visibility.Collapsed : Visibility.Visible; }
+        // Bottom right of the work area, by the clock.
+        public void Place() {
+            UpdateLayout();
+            Rect area = SystemParameters.WorkArea;
+            Left = area.Right - Width + Pad - 8; Top = area.Bottom - ActualHeight + Pad - 8;
+        }
+    }
+
+    public static class Tray {
+        // One status request to the service. null when it does not answer.
+        public static Dictionary<string, object> Ask(string type) {
+            try {
+                using (var c = Pipes.Client(DeviceService.PipeName)) {
+                    c.Connect(1500); Pipes.Write(c, Wire.Map("type", type));
+                    return Pipes.Read(c, DeviceService.PipeReadMax, UiServer.ReadMs);
+                }
+            } catch (Exception) { return null; }
+        }
+        public static void Run(Application app) {
+            bool first; using (var mutex = new Mutex(true, "Local\\SupportMcpTray", out first)) {
+                if (!first) return;
+                var panel = new TrayPanel(Palette.Detect());
+                string state = ""; IntPtr handle = IntPtr.Zero; Gdi.Icon icon = null;
+                var notify = new WF.NotifyIcon { Text = "Support", Visible = false };
+                Action<string> paint = delegate(string s) {
+                    IntPtr fresh = TrayIcon.Create(16, TrayIcon.ColorFor(s));
+                    var shown = Gdi.Icon.FromHandle(fresh);
+                    notify.Icon = shown;
+                    if (icon != null) icon.Dispose();
+                    if (handle != IntPtr.Zero) Native.DestroyIcon(handle);
+                    icon = shown; handle = fresh;
+                };
+                paint(""); notify.Visible = true;
+                var poll = new DispatcherTimer { Interval = TimeSpan.FromMinutes(1) };
+                var busy = new Busy();
+                Action refresh = delegate {
+                    if (busy.Set) return; busy.Set = true;
+                    ThreadPool.QueueUserWorkItem(delegate {
+                        var st = Ask("status");
+                        panel.Dispatcher.BeginInvoke(new Action(delegate {
+                            busy.Set = false;
+                            panel.Render(st);
+                            string s = st == null ? "" : Wire.Text(st, "state");
+                            notify.Text = TrayText.Tip(st == null ? "" : Wire.Text(st, "name"));
+                            if (s != state) { state = s; paint(s); }
+                        }));
+                    });
+                };
+                poll.Tick += delegate { refresh(); };
+                notify.MouseClick += delegate(object sender, WF.MouseEventArgs e) {
+                    if (e.Button != WF.MouseButtons.Left) return;
+                    if (panel.IsVisible) { panel.Hide(); return; }
+                    panel.Note(null); panel.Show(); panel.Place(); panel.Activate();
+                    poll.Interval = TimeSpan.FromSeconds(4); refresh();
+                };
+                panel.IsVisibleChanged += delegate { if (!panel.IsVisible) poll.Interval = TimeSpan.FromMinutes(1); };
+                panel.AllowConfirmed += delegate {
+                    ThreadPool.QueueUserWorkItem(delegate {
+                        var st = Ask("allow_any_time");
+                        panel.Dispatcher.BeginInvoke(new Action(delegate { if (st == null) panel.Note(TrayText.NotRunning); else panel.Render(st); }));
+                    });
+                };
+                panel.UninstallClicked += delegate {
+                    bool started = false;
+                    try { if (File.Exists(DeviceSetup.Exe)) using (Process.Start(new ProcessStartInfo(DeviceSetup.Exe, "--uninstall") { UseShellExecute = false, WorkingDirectory = Path.GetTempPath() })) { started = true; } } catch (Exception) { }
+                    if (!started) panel.Note(TrayText.UninstallMissing);
+                    else panel.Hide();
+                };
+                // The uninstall event: when the service has created it, watch it; set means quit at once.
+                var watcher = new Thread(delegate() {
+                    while (true) {
+                        var e = DeviceService.WatchUninstall();
+                        if (e != null) { using (e) e.WaitOne(); break; }
+                        Thread.Sleep(30000);
+                    }
+                    try { panel.Dispatcher.BeginInvoke(new Action(delegate { app.Shutdown(); })); } catch (Exception) { }
+                });
+                watcher.IsBackground = true; watcher.Start();
+                poll.Start(); refresh();
+                app.Run();
+                poll.Stop();
+                notify.Visible = false; notify.Dispose();
+                if (icon != null) icon.Dispose();
+                if (handle != IntPtr.Zero) Native.DestroyIcon(handle);
+                panel.Quit();
+            }
+        }
+        // A flag the poll's worker and the UI share; only the UI thread sets it back.
+        sealed class Busy { public volatile bool Set; }
+    }
+
     public static class Program {
         [STAThread] public static void Main(string[] args) {
             string role = args.Length > 0 ? args[0] : "", executable = System.Reflection.Assembly.GetExecutingAssembly().Location;
@@ -4341,6 +4590,10 @@ confirm = exit == DeviceSetup.Pending ? DeviceService.ReadConfirm() : null;
             try {
                 var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
                 if (role == "--window") { RunWindow(app, args); return; }
+                // The installed support.exe carries no footer, so its roles are routed before any footer is read.
+                if (role == "--tray") { Tray.Run(app); return; }
+                // Uninstall is PR 4 step 7; until then it points the owner to Windows Settings instead of failing.
+                if (role == "--uninstall") { WF.MessageBox.Show(TrayText.UninstallMissing, "Support"); return; }
                 // A setup download carries a device footer (kind "device"). It runs the wizard, and is checked before
                 // any session footer is read, so no session role ever runs on it (Wire.ReadConfig refuses it too).
                 byte[] self = File.ReadAllBytes(executable);
