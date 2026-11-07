@@ -49,10 +49,13 @@ to run on unattended customer PCs.
 
 - The one-way rule for access on the PC. Anyone signed in at the PC can switch
   "ask each time" to "any time" from the tray, with no administrator prompt.
-  Nobody at the PC can switch it back. Only the support team can, through the
-  team API. This means any signed-in user, including a standard user or a guest,
-  can turn on unattended access. Nothing can connect to a saved PC yet, but read
-  this before you deploy a release that can.
+  Nothing in the app switches it back; only the support team can, through the
+  team API. The rule is enforced by the app, not the relay, which still takes
+  either mode from a holder of the PC's key (only SYSTEM or an elevated
+  administrator can read it), as pinned earlier. This means any signed-in user,
+  including a standard user or a guest, can turn on unattended access. Nothing
+  can connect to a saved PC yet, but read this before you deploy a release that
+  can.
 - The owner contact of a saved PC is now set by technicians, not by the PC. A
   technician with `devices.manage` sets or clears it with `PATCH .../devices/<id>`
   and `owner_contact` (the team log names the field, never the value).

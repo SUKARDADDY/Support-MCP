@@ -1271,11 +1271,11 @@ one of a valid code or a slug. It refuses a session footer.
 | Role | Runs as | Does |
 |---|---|---|
 | none, with a device footer | the owner | the setup wizard, "Support setup", five steps (code, name, how support connects, how much control, install). Nothing is preselected for the last two. It first checks for the `SupportMcpDevice` service and, if it exists, says "Support is already set up on this PC" and opens the tray. It starts `--device-install` elevated with `ShellExecuteEx` `runas` and reads the exit code. After exit 0 or 10 it starts `support.exe --tray` as the owner |
-| `--device-install <nonce> <answers>` | administrator, through UAC | stages and holds its exe like `--elevate-install`, turns on the safe DLL search, reads its own file and footer once, and goes ahead only if the wizard's named event for `<nonce>` still exists and is not set. `<answers>` is one base64url JSON argument: name (1 to 100 characters), access, control, and either the code or "use the workspace" (at most 1,024 characters; no key). It takes the origin and the workspace from its own footer. Exit codes: 0 active, 10 pending, 20 code invalid, 21 network, 22 refused, 23 already set up. It pairs over `/device/pair`, creates `%ProgramFiles%\SupportMCP` with the locked ACL, writes `support.exe` (the exe without its footer, Users may read and run it), `device.json` and `history.json` (locked), registers the service `SupportMcpDevice` ("Support device service", LocalSystem, automatic, restart on failure, quoted path, `--device-service`), the `HKLM` Run value `SupportMcpTray` and the Apps entry, and starts the service. Any failure after pairing sends `/device/leave` with the new key and removes what it made. It never touches `HKLM\SOFTWARE\SupportMCP` |
+| `--device-install <nonce> <answers>` | administrator, through UAC | stages and holds its exe like `--elevate-install`, turns on the safe DLL search, reads its own file and footer once, and goes ahead only if the wizard's named event for `<nonce>` still exists and is not set. `<answers>` is one base64url JSON argument: name (1 to 100 characters), access, control, and either the code or "use the workspace" (at most 1,024 characters; no key). It takes the origin and the workspace from its own footer. Exit codes: 0 active, 10 pending, 20 code invalid, 21 network, 22 refused, 23 already set up. It pairs over `/device/pair`, creates `%ProgramFiles%\SupportMCP` with the locked ACL, writes `support.exe` (the exe without its footer, Users may read and run it), `device.json` and `history.json` (locked), registers the service `SupportMcpDevice` ("Support device service", LocalSystem, automatic, restart on failure, quoted path, `--device-service`), the `HKLM` Run value `SupportMcpTray` and the Apps entry, and starts the service. Any failure after pairing sends `/device/leave` with the new key and rolls back only what this run made. One install or remove runs at a time, under a `Global` mutex; a second gets "already set up". It never touches `HKLM\SOFTWARE\SupportMCP` |
 | `--device-service` | LocalSystem, session 0 | reads `device.json` and checks in with `/device/hello` at start, then every 5 minutes measured from the last answer plus up to 30 seconds of jitter. After a network error it retries after 1 minute, doubling to 15. A 200 updates the name, access, control and state (active or pending). A 401 means removed (after active) or expired (while pending), and ends check-ins for good. A 426 means the app needs an update and is retried every 6 hours. It keeps the last 50 history lines in `history.json`. It runs no command, takes no screenshot and opens no file for the relay |
 | `--tray` | the signed-in user, started by the `HKLM` Run value at each sign-in | one per session (a `Local` mutex). A notification icon drawn at run time, and a panel with the name, the access mode, the state, "No one is connected.", recent history and "Uninstall Support". It reads the service through the pipe and exits when the uninstall event is set |
 | `--uninstall` | the owner | copies itself to a new Temp folder and runs from there. Confirms, then starts `--device-remove` elevated and shows "Support was removed" |
-| `--device-remove <nonce>` | administrator, through UAC | stages and holds its exe like the install, sends `/device/leave` (a 200 or a 401 both count as done), has the service signal the uninstall event and end every tray, stops and deletes the service, deletes the Run value and the Apps entry, removes the folder with the junction-safe delete and marks anything still locked for deletion at the next restart. If the relay cannot be reached it still removes everything. Exit codes: 0 removed, 10 removed but the relay was unreachable, 20 failed |
+| `--device-remove <nonce>` | administrator, through UAC | runs from the copy the uninstaller staged (it reads `device.json`, not a footer, so it holds no exe of its own), and goes ahead only while the uninstaller's named event for `<nonce>` still exists. It sends `/device/leave` (a 200 or a 401 both count as done), sets the uninstall event so every tray exits, waits a few seconds and ends any tray that remains, stops and deletes the service, deletes the Run value and the Apps entry, and removes the folder: it is renamed aside first (so a reinstall at the original path is never blocked), deleted with the junction-safe walk, and anything still locked is queued for the next restart. If the relay cannot be reached it still removes everything. One install or remove runs at a time, under a `Global` mutex. Exit codes: 0 removed, 10 removed but the relay was unreachable, 20 failed |
 
 The service's pipe is `SupportMcpDevice-ui`. Only SYSTEM can create instances,
 interactive users can read and write data, and it is never open to the network. It
@@ -1284,9 +1284,12 @@ length and UTF-8 JSON. It answers `{"type":"status"}` with `{name, access,
 control, state, confirm?, last_ok_at, history}` (state is `active`, `pending`,
 `expired`, `removed`, `update_needed` or `offline`; `confirm` is the six digits
 while pending), `{"type":"refresh"}` with a check-in now, at most once every 30
-seconds, and `{"type":"allow_any_time"}`, which sends `access: "any"` to
-`/device/update` when the mode is `ask`. No request sets `ask`, and the service
-never sends `ask` on its own. Any other message closes the connection. A saved
+seconds, and `{"type":"allow_any_time"}`, which is answered at once and sends
+`access: "any"` to `/device/update` in the background when the mode is `ask` (the
+change shows on the next status read). No request sets `ask`, and the service
+never sends `ask` on its own. Any other message closes the connection. A removed
+or expired state is kept in `device.json`, so a restart serves it from the pipe
+without checking in again. A saved
 install uses names of its own (the service, the folder, the pipe, the event and the
 mutexes), so it does not collide with a one-off session's.
 
@@ -1350,8 +1353,9 @@ mutexes), so it does not collide with a one-off session's.
   the app. A saved PC stays until its owner uninstalls it, and uninstalling
   removes the PC's key at the relay.
 - The service of a saved PC runs no command, takes no screenshot and opens no
-  file for anyone in this release, and nothing at the PC can turn the access mode
-  from `any` back to `ask`.
+  file for anyone in this release, and nothing in the app turns the access mode
+  from `any` back to `ask` (the relay still accepts either mode from a holder of
+  the key, as pinned earlier).
 - A screenshot, typed text and a secret are never stored by the relay: not in
   the audit log, the Session storage, the registry or the Worker log.
 - `ended` is terminal; no path reopens a session or extends `expires_at`.

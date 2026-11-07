@@ -144,6 +144,7 @@ sealed class FakeDevice : IDisposable {
 
 public static class AppTests {
     static void Assert(bool ok, string detail) { if (!ok) throw new Exception(detail); }
+    static void m3Release(System.Threading.Mutex m) { try { m.ReleaseMutex(); } catch (Exception) { } }
     static string Decode(Dictionary<string, object> r, string key) { return Encoding.UTF8.GetString(Convert.FromBase64String(Wire.Text(r, key))); }
     static Dictionary<string, object> Run(string command, int timeout) { return Wire.Map("type", "run", "command", command, "timeout_s", timeout); }
     static void WaitFile(string path) { var end = DateTime.UtcNow.AddSeconds(10); while (!File.Exists(path) && DateTime.UtcNow < end) Thread.Sleep(50); Assert(File.Exists(path), "Command did not start"); }
@@ -446,7 +447,7 @@ public static class AppTests {
     }
     // Uninstall's pure parts: the removal plan (our names only, never the one-off shared record), the exit-code map,
     // the Temp-copy rule, and that a 401 from leave counts as done.
-    static void UninstallTests() {
+    static void UninstallTests(string dir) {
         var plan = DeviceUninstall.RemovalPlan();
         Assert(plan.Count == 4, "four artifacts");
         Assert(plan[0] == "service SupportMcpDevice", "the service by its exact name");
@@ -474,7 +475,32 @@ public static class AppTests {
         Assert(DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Removed), "401 counts as done");
         Assert(!DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Offline), "a network failure is not reached");
         Assert(DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Refused), "an unexpected refusal still removes locally");
-        Console.WriteLine("PASS uninstall: the removal plan, the exit-code map, the Temp-copy rule, and leave's 401 as done");
+
+        // The real removal on a temp folder whose exe is locked: it is renamed aside, so the original path is free for
+        // a fresh install. This drives the shared DeviceInstall.RemoveFolderAside, not a parallel copy.
+        string root = Path.Combine(dir, "uninst-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(root);
+        string f = Path.Combine(root, "SupportMCP"); Directory.CreateDirectory(f);
+        string fexe = Path.Combine(f, "support.exe"); File.WriteAllText(fexe, "x"); File.WriteAllText(Path.Combine(f, "device.json"), "{}");
+        using (new FileStream(fexe, FileMode.Open, FileAccess.Read, FileShare.Read)) {
+            DeviceUninstall.TestRemoveFolder(f);
+            Assert(!Directory.Exists(f), "a locked install folder is renamed aside, freeing the original path for a reinstall");
+            Assert(Directory.GetDirectories(root, "SupportMCP.removed-*").Length >= 1, "the locked folder is kept under a unique removed name, not at the original path");
+        }
+        foreach (string d in Directory.GetDirectories(root, "SupportMCP.removed-*")) try { Directory.Delete(d, true); } catch (Exception) { }
+        // A plain (unlocked) folder is removed outright, with no leftover.
+        Directory.CreateDirectory(f); File.WriteAllText(Path.Combine(f, "device.json"), "{}");
+        DeviceUninstall.TestRemoveFolder(f);
+        Assert(!Directory.Exists(f) && Directory.GetDirectories(root, "SupportMCP.removed-*").Length == 0, "an unlocked folder is removed with nothing left behind");
+
+        // Two elevated installs or removes at once: the second is refused while the first holds the setup mutex.
+        string mn = "Local\\SupportMcpDeviceSetupTest-" + Guid.NewGuid().ToString("N");
+        using (var m1 = DeviceInstall.SetupMutex(mn)) {
+            Assert(m1.WaitOne(0), "the first elevated install or remove takes the setup mutex");
+            using (var m2 = DeviceInstall.SetupMutex(mn)) Assert(!m2.WaitOne(0), "a second one is refused while the first holds it");
+            m1.ReleaseMutex();
+            using (var m3 = DeviceInstall.SetupMutex(mn)) { Assert(m3.WaitOne(0), "once released, the next one takes it"); m3Release(m3); }
+        }
+        Console.WriteLine("PASS uninstall: the removal plan and exit codes, the rename-aside removal, and the setup mutex refusal");
     }
     // Drives the real service against a fake relay with a real temp folder: a 200 with no device, a team access
     // change, allow_any_time only from "ask" (never sending "ask"), terminal states persisted and not re-checked after
@@ -1711,7 +1737,7 @@ public static class AppTests {
             DeviceInstallTests();
             DeviceServiceTests(dir);
             TrayTests();
-            UninstallTests();
+            UninstallTests(dir);
             DeviceServiceLiveTests(dir);
             // The downloaded PE overlay must be readable by the actual .NET client.
             string overlay = Path.Combine(dir, "overlay.exe"); byte[] cfg = Encoding.UTF8.GetBytes(Wire.Json().Serialize(Wire.Map("sid", new string('a', 64), "key", new string('b', 64), "origin", "https://support.example.com", "startup_expires_at", Client.UnixNow() + 10000)));

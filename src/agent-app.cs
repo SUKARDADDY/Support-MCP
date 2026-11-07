@@ -135,7 +135,7 @@ namespace SupportMcp {
         public static string Kind(byte[] all) { return Text(Parse(all), "kind"); }
         // A setup footer: {"kind":"device","origin":...} with at most one of a technician's pairing code (ABCDE-FGH23)
         // or a team's workspace slug, and nothing else. It carries no session and no key.
-        public const string CodePattern = "^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{5}-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{5}$", SlugPattern = "^[a-z0-9-]{1,40}$";
+        public const string CodePattern = @"^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{5}-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{5}\z", SlugPattern = @"^[a-z0-9-]{1,40}\z";
         public static Dictionary<string, object> ReadDevice(byte[] all) {
             var cfg = Parse(all);
             foreach (string name in cfg.Keys)
@@ -3631,7 +3631,7 @@ namespace SupportMcp {
         }
         // The answers back, checked again, since anyone could start the install step with any argument.
         public static Dictionary<string, object> DecodeAnswers(string arg) {
-            if (arg == null || arg.Length == 0 || arg.Length > MaxAnswers || !System.Text.RegularExpressions.Regex.IsMatch(arg, "^[A-Za-z0-9_-]+$")) throw new InvalidDataException("Invalid setup answers.");
+            if (arg == null || arg.Length == 0 || arg.Length > MaxAnswers || !System.Text.RegularExpressions.Regex.IsMatch(arg, @"^[A-Za-z0-9_-]+\z")) throw new InvalidDataException("Invalid setup answers.");
             string b64 = arg.Replace('-', '+').Replace('_', '/');
             b64 += new string('=', (4 - b64.Length % 4) % 4);
             Dictionary<string, object> m;
@@ -3667,7 +3667,7 @@ namespace SupportMcp {
         public const string UnavailableText = "This Windows account can't install programs. Ask an administrator of this PC to run the setup.";
         // Six digits as the owner reads them: "482 913".
         public static string ShowConfirm(string digits) {
-            return digits != null && System.Text.RegularExpressions.Regex.IsMatch(digits, "^[0-9]{6}$") ? digits.Substring(0, 3) + " " + digits.Substring(3) : null;
+            return digits != null && System.Text.RegularExpressions.Regex.IsMatch(digits, @"^[0-9]{6}\z") ? digits.Substring(0, 3) + " " + digits.Substring(3) : null;
         }
         public static string ModeText(string access) {
             return access == "any" ? "Your support team can connect to this PC any time, even when nobody is at it." : "Support asks you on this PC before each connection.";
@@ -3882,8 +3882,7 @@ namespace SupportMcp {
             screen = screen + 1; Render();
         }
         void OnBack() {
-            if (screen == DeviceSetup.Screen.Install && declined) { declined = false; Render(); return; }
-            if (screen >= DeviceSetup.Screen.Code && screen <= DeviceSetup.Screen.Install) { error.Visibility = Visibility.Collapsed; screen = screen - 1; Render(); }
+            if (screen >= DeviceSetup.Screen.Code && screen <= DeviceSetup.Screen.Install) { declined = false; error.Visibility = Visibility.Collapsed; screen = screen - 1; Render(); }
         }
 
         void BeginInstall() {
@@ -4019,8 +4018,36 @@ namespace SupportMcp {
         // full and nothing inherited. device.json and history.json inherit this; support.exe gets its own ACL below.
         public static DirectorySecurity LockedFolder() { var s = FullAcl.Folder(); s.SetOwner(FullAcl.AdminsSid); return s; }
 
+        // One elevated install or remove at a time across the whole PC. A Global mutex, so sessions share it, with an
+        // ACL that only Administrators and SYSTEM (who run these elevated steps) may take.
+        public const string SetupMutexName = "Global\\SupportMcpDeviceSetup";
+        public static Mutex SetupMutex() { return SetupMutex(SetupMutexName); }
+        internal static Mutex SetupMutex(string name) {
+            var sec = new MutexSecurity();
+            sec.AddAccessRule(new MutexAccessRule(FullAcl.SystemSid, MutexRights.FullControl, AccessControlType.Allow));
+            sec.AddAccessRule(new MutexAccessRule(FullAcl.AdminsSid, MutexRights.FullControl, AccessControlType.Allow));
+            bool created; return new Mutex(false, name, out created, sec);
+        }
+        // Removes the install folder even when a tray still holds support.exe: rename it aside first (a rename works
+        // with a running exe, and frees the original path for a fresh install), delete what is not locked with the
+        // junction-safe walk, and queue anything that remains for the next restart. Only the top level is listed, so
+        // no junction is ever followed.
+        public static void RemoveFolderAside(string folder) {
+            try { if (Directory.Exists(folder)) Native.DeleteTree(folder); } catch (Exception) { }
+            if (!Directory.Exists(folder)) return;
+            string moved = folder + ".removed-" + Guid.NewGuid().ToString("N");
+            try { Directory.Move(folder, moved); } catch (Exception) { moved = folder; }
+            try { Native.DeleteTree(moved); } catch (Exception) { }
+            if (!Directory.Exists(moved)) return;
+            try {
+                foreach (string f in Directory.GetFiles(moved)) try { Native.MoveFileEx(f, null, 4); } catch (Exception) { }
+                foreach (string d in Directory.GetDirectories(moved)) try { Native.MoveFileEx(d, null, 4); } catch (Exception) { }
+                Native.MoveFileEx(moved, null, 4);
+            } catch (Exception) { }
+        }
+
         public static int Install(byte[] self, Dictionary<string, object> footer, string[] args) {
-            if (args.Length != 3 || !System.Text.RegularExpressions.Regex.IsMatch(args[1], "^[0-9a-f]{32}$")) return DeviceSetup.Refused;
+            if (args.Length != 3 || !System.Text.RegularExpressions.Regex.IsMatch(args[1], @"^[0-9a-f]{32}\z")) return DeviceSetup.Refused;
             Dictionary<string, object> answers;
             try { answers = DeviceSetup.DecodeAnswers(args[2]); } catch (Exception) { return DeviceSetup.Refused; }
             // The wizard holds this event open while UAC is asked. Gone means the wizard closed before the Yes: install nothing.
@@ -4029,6 +4056,15 @@ namespace SupportMcp {
             using (want) return Install(self, footer, answers, want);
         }
         static int Install(byte[] self, Dictionary<string, object> footer, Dictionary<string, object> answers, EventWaitHandle want) {
+            // One install or remove at a time across the PC: a second gets "already set up" and touches nothing. The
+            // want handle (Wanted) already refused a late Yes after the wizard closed, so no further want check is needed.
+            Mutex only = null; bool held = false;
+            try { only = SetupMutex(); try { held = only.WaitOne(0); } catch (AbandonedMutexException) { held = true; } } catch (Exception) { }
+            if (!held) { if (only != null) only.Dispose(); return DeviceSetup.AlreadySetUp; }
+            try { return InstallLocked(self, footer, answers); }
+            finally { try { only.ReleaseMutex(); } catch (Exception) { } only.Dispose(); }
+        }
+        static int InstallLocked(byte[] self, Dictionary<string, object> footer, Dictionary<string, object> answers) {
             string origin = Wire.Text(footer, "origin"), folder = DeviceSetup.Folder, exe = DeviceSetup.Exe;
             Leftover action = LeftoverAction(Scm.Status(DeviceSetup.ServiceName) != null, Directory.Exists(folder) || File.Exists(folder));
             if (action == Leftover.AlreadySetUp) return DeviceSetup.AlreadySetUp;
@@ -4044,8 +4080,11 @@ namespace SupportMcp {
             if (!a.Ok) return DeviceSetup.Refused;
             string key = Wire.Text(a.Body, "key"), status = Wire.Text(a.Body, "status");
 
+            // Roll back removes only what this run made, so a concurrent run's artifacts (there are none, under the
+            // mutex, but a crash leftover of this session's own is the only thing that could pre-exist) stay untouched.
+            bool madeFolder = false, madeService = false, madeRegistry = false;
             try {
-                Native.CreateLocked(folder, LockedFolder());
+                Native.CreateLocked(folder, LockedFolder()); madeFolder = true; // CreateLocked fails if the folder exists, so this run made it
                 using (var f = new FileStream(exe, FileMode.CreateNew)) f.Write(self, 0, Wire.Payload(self));
                 File.SetAccessControl(exe, FullAcl.Window()); // users may read and run support.exe, like the one-off window copy
                 var record = Wire.Map("origin", origin, "workspace", Wire.Text(a.Body, "workspace"), "device_id", Wire.Text(a.Body, "device_id"),
@@ -4057,13 +4096,12 @@ namespace SupportMcp {
                 if (status == "pending") history.Add(Wire.Map("at", Client.UnixNow(), "text", "Waiting for your support team to approve this PC."));
                 File.WriteAllText(Path.Combine(folder, "history.json"), Wire.Json().Serialize(history));
 
-                Scm.Create(DeviceSetup.ServiceName, ServiceDisplay, ServiceDescription, ServiceBinary(exe), true);
-                WriteRegistry(exe, Wire.Version, folder, (Wire.Payload(self) + 1023) / 1024);
-                if (want.WaitOne(0)) { RemoveEverything(origin, key, folder); return DeviceSetup.Refused; } // withdrawn while this ran
+                Scm.Create(DeviceSetup.ServiceName, ServiceDisplay, ServiceDescription, ServiceBinary(exe), true); madeService = true;
+                WriteRegistry(exe, Wire.Version, folder, (Wire.Payload(self) + 1023) / 1024); madeRegistry = true;
                 Scm.Start(DeviceSetup.ServiceName);
                 return status == "pending" ? DeviceSetup.Pending : DeviceSetup.Active;
             } catch (Exception) {
-                RemoveEverything(origin, key, folder);
+                RollBack(origin, key, folder, madeService, madeRegistry, madeFolder);
                 return DeviceSetup.Refused;
             }
         }
@@ -4075,19 +4113,19 @@ namespace SupportMcp {
                 var old = ReadDeviceJson(folder);
                 if (old != null) { string key = Wire.Text(old, "key"), origin = Wire.Text(old, "origin"); if (key.Length > 0 && origin.Length > 0) new DeviceLink(origin).Leave(key); }
             } catch (Exception) { }
-            try { Native.DeleteTree(folder); } catch (Exception) { }
+            RemoveFolderAside(folder);
         }
         static Dictionary<string, object> ReadDeviceJson(string folder) {
             try { return Wire.Json().Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(folder, "device.json"))); }
             catch (Exception) { return null; }
         }
-        // Undo a failed install: leave the relay with the new key, stop and delete the service, drop the registry
-        // entries, and remove the folder. Best effort, in that order.
-        static void RemoveEverything(string origin, string key, string folder) {
+        // Undo a failed install, in order, touching only what this run created: leave the relay with the new key,
+        // then the service, the registry entries and the folder it made.
+        static void RollBack(string origin, string key, string folder, bool service, bool registry, bool folderMade) {
             try { if (key != null && key.Length > 0 && origin.Length > 0) new DeviceLink(origin).Leave(key); } catch (Exception) { }
-            try { Scm.Remove(DeviceSetup.ServiceName); } catch (Exception) { }
-            RemoveRegistry();
-            try { if (Directory.Exists(folder)) Native.DeleteTree(folder); } catch (Exception) { }
+            if (service) try { Scm.Remove(DeviceSetup.ServiceName); } catch (Exception) { }
+            if (registry) RemoveRegistry();
+            if (folderMade) RemoveFolderAside(folder);
         }
         static void WriteRegistry(string exe, string version, string folder, int sizeKb) {
             using (var hklm = SasShare.Machine()) {
@@ -4667,10 +4705,15 @@ namespace SupportMcp {
         // stay, stops and deletes the service, drops the registry entries, and removes the folder (locked leftovers go
         // at the next restart). Returns Removed, Unreachable, or Fail when the attempt was withdrawn.
         public static int Remove(string[] args) {
-            if (args.Length != 2 || !System.Text.RegularExpressions.Regex.IsMatch(args[1], "^[0-9a-f]{32}$")) return Fail;
+            if (args.Length != 2 || !System.Text.RegularExpressions.Regex.IsMatch(args[1], @"^[0-9a-f]{32}\z")) return Fail;
             var want = Elevation.Wanted("device-remove", args[1]);
             if (want == null) return Fail;
-            using (want) {
+            // One install or remove at a time across the PC; a second gets Fail and touches nothing.
+            Mutex only = null; bool held = false;
+            try { only = DeviceInstall.SetupMutex(); try { held = only.WaitOne(0); } catch (AbandonedMutexException) { held = true; } } catch (Exception) { }
+            if (!held) { if (only != null) only.Dispose(); want.Dispose(); return Fail; }
+            using (want)
+            try {
                 string folder = DeviceSetup.Folder;
                 // Only an actual leave call counts as reaching the relay; a missing or damaged device.json leaves the
                 // PC on the team's list, so the final window says so.
@@ -4689,7 +4732,7 @@ namespace SupportMcp {
                 DeviceInstall.RemoveRegistry();
                 RemoveFolder(folder);
                 return reached ? Removed : Unreachable;
-            }
+            } finally { try { only.ReleaseMutex(); } catch (Exception) { } only.Dispose(); }
         }
         static void EndTrays() {
             try {
@@ -4700,18 +4743,10 @@ namespace SupportMcp {
                 }
             } catch (Exception) { }
         }
-        // The junction-safe delete; anything still locked (a tray that has not closed) goes at the next restart.
-        static void RemoveFolder(string folder) {
-            try { if (Directory.Exists(folder)) Native.DeleteTree(folder); } catch (Exception) { }
-            if (!Directory.Exists(folder)) return;
-            try {
-                foreach (string f in Directory.GetFiles(folder, "*", SearchOption.AllDirectories)) try { Native.MoveFileEx(f, null, 4); } catch (Exception) { }
-                var dirs = new List<string>(Directory.GetDirectories(folder, "*", SearchOption.AllDirectories));
-                dirs.Sort(); dirs.Reverse(); // deepest first
-                foreach (string d in dirs) try { Native.MoveFileEx(d, null, 4); } catch (Exception) { }
-                Native.MoveFileEx(folder, null, 4);
-            } catch (Exception) { }
-        }
+        // Rename the folder aside so a fresh install at the original path is never blocked, then delete it or queue it
+        // for the next restart (DeviceInstall.RemoveFolderAside, junction-safe and shared with the install's rollback).
+        static void RemoveFolder(string folder) { DeviceInstall.RemoveFolderAside(folder); }
+        internal static void TestRemoveFolder(string folder) { RemoveFolder(folder); }
 
         public static void Run(Application app, string exe) {
             // Run from a Temp copy, so the install folder (support.exe) is not held open while it is removed.

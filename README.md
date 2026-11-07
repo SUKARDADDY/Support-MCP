@@ -442,8 +442,10 @@ is connected.", a few lines of recent local history and "Uninstall Support".
 The access mode changes in one direction only. While it is "ask each time", the
 panel offers "Allow support to connect any time". The button asks for a
 confirmation that says it cannot be undone from this PC. Once it is "any time",
-the panel says "Only your support team can change this." Nobody at the PC can
-turn it back to "ask each time". Only the support team can, through the team API.
+the panel says "Only your support team can change this." Nothing in the app turns
+it back to "ask each time"; only the support team can, through the team API. The
+rule is the app's: the relay still takes either mode from a holder of the PC's
+key (which only SYSTEM or an elevated administrator can read), as PR 3 pinned.
 
 This means **any user signed in at the PC, including a standard user or a guest,
 can turn on unattended access.** Windows asks for no administrator prompt for

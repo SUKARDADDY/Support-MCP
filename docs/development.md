@@ -166,9 +166,17 @@ argument (encode, decode, limits), the exit codes, `DeviceLink` against a fake
 `/device/` relay for every status, the check-in timing and backoff, the state a
 check-in leads to (active, pending to active, removed, expired, needs an update,
 offline), the 50-line history cap, the registry value builders, the folder, file
-and pipe ACLs, the one-way rule (no pipe frame sets `ask`), the tray's state
-text, and the list of what uninstall removes (it must name only our own
-artifacts, never `HKLM\SOFTWARE\SupportMCP`). The relay side is covered by
+and pipe ACLs, the one-way rule (no pipe frame sets `ask`), and the tray's state
+text. They also drive the real service against the fake `/device/` relay with a
+temp folder: a 200 with no `device` object counts as offline and never ends the
+worker, a team mode change applies and is a history line, `allow_any_time` is
+answered at once and sends `any` (never `ask`) in the background, and `removed`
+and `expired` are saved in `device.json` and served from the pipe after a reload
+without a fresh check-in. Uninstall is covered too: what it removes (only our own
+artifacts, never `HKLM\SOFTWARE\SupportMCP`), the rename-aside removal of a
+locked folder (so a reinstall at the original path is not blocked), the setup
+mutex that lets one install or remove run at a time, and a waiter seeing the
+`Global` uninstall event once it is set. The relay side is covered by
 `npm test`: `test/app.test.js` has the `/install` page, the same-origin matrix,
 the refusals and the footer bytes, and `test/devices.test.js`,
 `test/devices-api.test.js` and `test/device-api.test.js` have the pairing `link`
