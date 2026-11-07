@@ -322,6 +322,88 @@ public static class AppTests {
                 && r.InheritanceFlags == (InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit), "only SYSTEM and Administrators, full control, inherited by files and folders");
         Console.WriteLine("PASS the elevated install: the leftover decision, the service and tray command lines, the Apps entry, the paths and the locked folder");
     }
+    // The saved PC service's pure parts: the state map for every wire result, the timing and backoff, the refresh
+    // limit, the history cap, the status frame, and the live pipe (frame vocabulary and the ACL).
+    static void DeviceServiceTests(string dir) {
+        // Classify: a 200 is active or pending (from the body); a 401 is removed from active and expired from pending;
+        // 426 is update_needed; offline and an unexpected refusal keep trying. (DeviceLink already maps each HTTP
+        // status to these results, so this covers every wire status.)
+        DeviceService.Schedule sched;
+        Assert(DeviceService.Classify("active", DeviceLink.DeviceResult.Ok, "active", out sched) == DeviceState.Active && sched == DeviceService.Schedule.Normal, "200 active");
+        Assert(DeviceService.Classify("pending", DeviceLink.DeviceResult.Ok, "pending", out sched) == DeviceState.Pending && sched == DeviceService.Schedule.Normal, "200 still pending");
+        Assert(DeviceService.Classify("pending", DeviceLink.DeviceResult.Ok, "active", out sched) == DeviceState.Active, "200 pending to active");
+        Assert(DeviceService.Classify("active", DeviceLink.DeviceResult.Removed, "", out sched) == DeviceState.Removed && sched == DeviceService.Schedule.Stopped, "401 after active is removed, and stops");
+        Assert(DeviceService.Classify("pending", DeviceLink.DeviceResult.Removed, "", out sched) == DeviceState.Expired && sched == DeviceService.Schedule.Stopped, "401 while pending is expired, and stops");
+        Assert(DeviceService.Classify("active", DeviceLink.DeviceResult.UpdateNeeded, "", out sched) == DeviceState.UpdateNeeded && sched == DeviceService.Schedule.Update, "426 is update_needed, re-checked later");
+        foreach (DeviceLink.DeviceResult r in new DeviceLink.DeviceResult[] { DeviceLink.DeviceResult.Offline, DeviceLink.DeviceResult.Refused }) {
+            Assert(DeviceService.Classify("active", r, "", out sched) == DeviceState.Offline && sched == DeviceService.Schedule.Backoff, "offline or refused keeps trying: " + r);
+        }
+
+        // Backoff: one minute, doubling, capped at fifteen; it resets to one on the next failure after a success (0).
+        long b = 0; var seen = new List<long>();
+        for (int i = 0; i < 6; i++) { b = DeviceService.NextBackoff(b); seen.Add(b); }
+        Assert(seen[0] == 60000 && seen[1] == 120000 && seen[2] == 240000 && seen[3] == 480000 && seen[4] == 900000 && seen[5] == 900000, "backoff 1,2,4,8,15,15 minutes");
+        Assert(DeviceService.NextBackoff(0) == 60000, "a reset backoff starts at one minute");
+
+        // Jitter bounds: five minutes plus up to thirty seconds, never less, never more.
+        var rnd = new Random(1234); long min = long.MaxValue, max = long.MinValue;
+        for (int i = 0; i < 2000; i++) { long d = DeviceService.NextCheckDelay(rnd); if (d < min) min = d; if (d > max) max = d; }
+        Assert(min >= DeviceService.CheckEveryMs && max <= DeviceService.CheckEveryMs + DeviceService.JitterMaxMs && max > DeviceService.CheckEveryMs, "every check-in is 5 minutes plus 0 to 30 seconds");
+        Assert(DeviceService.UpdateEveryMs == 6 * 3600 * 1000L, "an update is re-checked every six hours");
+
+        // The 30-second refresh limit.
+        Assert(DeviceService.RefreshDue(0, DeviceService.RefreshMinMs) && !DeviceService.RefreshDue(0, DeviceService.RefreshMinMs - 1), "a refresh is allowed at most once every 30 seconds");
+
+        // History: the lines a 200 adds, and the cap at 50 newest.
+        Assert(DeviceService.HistoryFor("pending", "ask", "limited", "active", "ask", "limited").Count == 1, "approval alone is one line");
+        Assert(DeviceService.HistoryFor("active", "ask", "full", "active", "any", "full").Count == 1 && DeviceService.HistoryFor("active", "any", "full", "active", "ask", "full").Count == 1, "a team access change, either way, is a line");
+        Assert(DeviceService.HistoryFor("active", "ask", "limited", "active", "ask", "limited").Count == 0, "no change, no line");
+        var hist = new System.Collections.ArrayList();
+        for (int i = 0; i < 60; i++) { hist.Add(Wire.Map("at", (long)i, "text", "line " + i)); DeviceService.TrimHistory(hist); }
+        Assert(hist.Count == DeviceService.HistoryCap && Wire.Text((Dictionary<string, object>)hist[0], "text") == "line 10" && Wire.Text((Dictionary<string, object>)hist[hist.Count - 1], "text") == "line 59", "the last 50 lines are kept, newest last");
+
+        // The status frame: confirm is shown only while pending.
+        var pending = DeviceService.StatusFrame("PC", "ask", "limited", DeviceState.Pending, "482913", 111, new System.Collections.ArrayList());
+        Assert(Wire.Text(pending, "state") == DeviceState.Pending && Wire.Text(pending, "confirm") == "482913" && Wire.Number(pending, "last_ok_at") == 111, "a pending frame carries the six digits");
+        foreach (string st in new string[] { DeviceState.Active, DeviceState.Expired, DeviceState.Removed, DeviceState.Offline }) {
+            Assert(!DeviceService.StatusFrame("PC", "any", "full", st, "482913", 0, new System.Collections.ArrayList()).ContainsKey("confirm"), "no confirm outside pending: " + st);
+        }
+
+        // The pipe vocabulary: exactly status, allow_any_time and refresh; any extra field, or any attempt to set
+        // "ask", is refused (the connection closes).
+        Func<string, Dictionary<string, object>> one = delegate(string json) { return Wire.Json().Deserialize<Dictionary<string, object>>(json); };
+        Assert(Pipes.DeviceRequest(one("{\"type\":\"status\"}")) == "status" && Pipes.DeviceRequest(one("{\"type\":\"allow_any_time\"}")) == "allow_any_time" && Pipes.DeviceRequest(one("{\"type\":\"refresh\"}")) == "refresh", "the three frames");
+        foreach (string json in new string[] { "{}", "{\"type\":\"end\"}", "{\"type\":\"run\"}", "{\"type\":\"ask\"}", "{\"type\":\"allow_any_time\",\"access\":\"ask\"}", "{\"type\":\"set_access\",\"access\":\"ask\"}", "{\"Type\":\"status\"}", "{\"type\":[\"status\"]}" })
+            Assert(Pipes.DeviceRequest(one(json)) == null, "refused: " + json);
+
+        // A live pipe on the device ACL (the test account stands in for SYSTEM, which the tests do not run as): a
+        // modest client gets in and reads status; a client that asks for full access, which includes new instances,
+        // is refused; an unknown frame closes the connection.
+        var me = WindowsIdentity.GetCurrent().User;
+        string pipeName = "SupportMcpDeviceTest-" + Guid.NewGuid().ToString("N").Substring(0, 8);
+        string sddl = "D:P(A;;GA;;;" + me.Value + ")(A;;0x12008B;;;IU)";
+        Func<Dictionary<string, object>, Dictionary<string, object>> handle = delegate(Dictionary<string, object> m) {
+            string req = Pipes.DeviceRequest(m);
+            if (req == null) return null;
+            return DeviceService.StatusFrame("PC", "ask", "limited", DeviceState.Active, "", 7, new System.Collections.ArrayList());
+        };
+        new UiServer(pipeName, handle, delegate(uint ssn) { return true; }, sddl, 1024);
+        using (var greedy = new System.IO.Pipes.NamedPipeClientStream(".", pipeName, System.IO.Pipes.PipeDirection.InOut)) {
+            try { greedy.Connect(2000); throw new Exception("the device pipe gave out full access"); } catch (UnauthorizedAccessException) { }
+        }
+        using (var c = Pipes.Client(pipeName)) {
+            c.Connect(2000);
+            foreach (string t in new string[] { "status", "allow_any_time", "refresh" }) {
+                Pipes.Write(c, Wire.Map("type", t));
+                Assert(Wire.Text(Pipes.Read(c, DeviceService.PipeReadMax, UiServer.ReadMs), "state") == DeviceState.Active, "a valid frame is answered: " + t);
+            }
+        }
+        using (var c = Pipes.Client(pipeName)) {
+            c.Connect(2000); Pipes.Write(c, Wire.Map("type", "set_access", "access", "ask"));
+            try { Pipes.Read(c, DeviceService.PipeReadMax, UiServer.ReadMs); throw new Exception("the service answered a frame it must refuse"); } catch (EndOfStreamException) { } catch (IOException) { }
+        }
+        Console.WriteLine("PASS the saved PC service: the state map, backoff and jitter, the refresh limit, the history cap, the status frame, and the pipe");
+    }
     // The focus the confirm gives back: only to the window that had it, only while the support window still holds it.
     static void FocusReturnTests() {
         Func<IntPtr, bool> ours = delegate(IntPtr w) { return (int)w >= 100; }, here = delegate(IntPtr w) { return (int)w != 7; };
@@ -1474,6 +1556,7 @@ public static class AppTests {
             DeviceLinkTests();
             SetupRuleTests();
             DeviceInstallTests();
+            DeviceServiceTests(dir);
             // The downloaded PE overlay must be readable by the actual .NET client.
             string overlay = Path.Combine(dir, "overlay.exe"); byte[] cfg = Encoding.UTF8.GetBytes(Wire.Json().Serialize(Wire.Map("sid", new string('a', 64), "key", new string('b', 64), "origin", "https://support.example.com", "startup_expires_at", Client.UnixNow() + 10000)));
             using (var f = File.Create(overlay)) { f.WriteByte(77); f.WriteByte(90); f.Write(cfg, 0, cfg.Length); byte[] n = BitConverter.GetBytes(cfg.Length); f.Write(n, 0, n.Length); byte[] footer = Encoding.ASCII.GetBytes(Wire.Footer); f.Write(footer, 0, footer.Length); }

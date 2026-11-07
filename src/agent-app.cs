@@ -1863,6 +1863,12 @@ namespace SupportMcp {
             object t; if (m.Count != 1 || !m.TryGetValue("type", out t)) return null;
             return "status".Equals(t) || "end".Equals(t) ? (string)t : null;
         }
+        // What a saved PC's tray may ask the service: exactly {"type":"status"}, {"type":"allow_any_time"} or
+        // {"type":"refresh"}. Any extra field, or any other type, is null (closed), so nothing can ask for access "ask".
+        public static string DeviceRequest(Dictionary<string, object> m) {
+            object t; if (m.Count != 1 || !m.TryGetValue("type", out t)) return null;
+            return "status".Equals(t) || "allow_any_time".Equals(t) || "refresh".Equals(t) ? (string)t : null;
+        }
     }
 
     public static class FullAcl {
@@ -2551,13 +2557,27 @@ namespace SupportMcp {
     sealed class UiServer {
         const string Sddl = "D:P(A;;GA;;;SY)(A;;0x12008B;;;IU)";
         public const int Instances = 8, ReadMs = 5000, PerProcess = 2;
-        readonly Func<Dictionary<string, object>> status; readonly Action end; readonly Func<uint, bool> allowSession;
+        // handle takes the parsed request and returns the reply to write, or null to close the connection. The
+        // corner-window server (status/end) and the saved PC's server (status/allow_any_time/refresh) are both built on it.
+        readonly Func<Dictionary<string, object>, Dictionary<string, object>> handle; readonly Func<uint, bool> allowSession; readonly int readMax;
         readonly Dictionary<uint, long> seen = new Dictionary<uint, long>(); readonly Dictionary<uint, int> open = new Dictionary<uint, int>();
         public UiServer(string name, Func<Dictionary<string, object>> status, Action end) : this(name, status, end, delegate(uint s) { return s == Native.WTSGetActiveConsoleSessionId(); }, Sddl) { }
         // allowSession and sddl: the tests' own. Only the owner of a pipe's ACL may add instances, and the tests do not run as SYSTEM.
-        internal UiServer(string name, Func<Dictionary<string, object>> status, Action end, Func<uint, bool> allowSession, string sddl) {
-            this.status = status; this.end = end; this.allowSession = allowSession;
+        internal UiServer(string name, Func<Dictionary<string, object>> status, Action end, Func<uint, bool> allowSession, string sddl)
+            : this(name, StatusEnd(status, end), allowSession, sddl, 1024) { }
+        // The general form: a request handler, the session gate and the SDDL. The saved PC's service uses this.
+        internal UiServer(string name, Func<Dictionary<string, object>, Dictionary<string, object>> handle, Func<uint, bool> allowSession, string sddl, int readMax) {
+            this.handle = handle; this.allowSession = allowSession; this.readMax = readMax;
             for (int i = 0; i < Instances; i++) { var pipe = Native.PipeServer(name, sddl, Instances, i == 0, true); var t = new Thread(Serve); t.IsBackground = true; t.Start(pipe); }
+        }
+        // The corner window's vocabulary as a handler: status or end (then status), anything else closes the connection.
+        static Func<Dictionary<string, object>, Dictionary<string, object>> StatusEnd(Func<Dictionary<string, object>> status, Action end) {
+            return delegate(Dictionary<string, object> m) {
+                string request = Pipes.UiRequest(m);
+                if (request == null) return null;
+                if (request == "end") end();
+                return status();
+            };
         }
         void Serve(object o) {
             var pipe = (NamedPipeServerStream)o;
@@ -2568,11 +2588,10 @@ namespace SupportMcp {
                     if (!Native.GetNamedPipeClientProcessId(pipe.SafePipeHandle, out pid) || !Native.GetNamedPipeClientSessionId(pipe.SafePipeHandle, out session) || !allowSession(session)) throw new UnauthorizedAccessException();
                     lock (open) { int n; open.TryGetValue(pid, out n); if (n >= PerProcess) throw new UnauthorizedAccessException(); open[pid] = n + 1; counted = true; }
                     while (true) {
-                        string request = Pipes.UiRequest(Pipes.Read(pipe, 1024, ReadMs));
-                        if (request == null) break;
-                        if (request == "end") end();
+                        Dictionary<string, object> reply = handle(Pipes.Read(pipe, readMax, ReadMs));
+                        if (reply == null) break;
                         lock (seen) seen[session] = PauseClock.Now();
-                        Pipes.Write(pipe, status());
+                        Pipes.Write(pipe, reply);
                     }
                 } catch (Exception) { }
                 if (counted) lock (open) { if (--open[pid] == 0) open.Remove(pid); }
@@ -3891,8 +3910,7 @@ namespace SupportMcp {
             if (wasDeclined) { declined = true; Render(); return; }
             if (exit == DeviceSetup.Active || exit == DeviceSetup.Pending) {
                 DeviceSetup.StartTray();
-                // The six digits of a pending PC come from the service's status pipe (PR 4 step 5); until then none is shown.
-                confirm = null;
+confirm = exit == DeviceSetup.Pending ? DeviceService.ReadConfirm() : null;
             }
             DeviceSetup.Screen nextScreen = DeviceSetup.After(exit);
             string text = DeviceSetup.ExitText(exit);
@@ -4076,20 +4094,234 @@ namespace SupportMcp {
         }
     }
 
-    // --device-service: the saved PC's background service. PR 4 step 5 fills in the check-ins, the local history and
-    // the status pipe; this placeholder only lets the SCM start and stop it, so the install can verify the service runs.
-    public sealed class DeviceServicePlaceholder : ServiceBase {
-        public DeviceServicePlaceholder() { ServiceName = DeviceSetup.ServiceName; CanStop = true; CanShutdown = true; AutoLog = false; }
-        protected override void OnStart(string[] args) { }
-        protected override void OnStop() { }
+    // The display state of a saved PC, as the tray shows it. active and pending are the server's; the rest are local.
+    public static class DeviceState {
+        public const string Active = "active", Pending = "pending", Expired = "expired", Removed = "removed", UpdateNeeded = "update_needed", Offline = "offline";
     }
+
+    // --device-service: the saved PC's background service (LocalSystem). It checks in with the relay over the
+    // /device/ wire, keeps a short local history, and serves a status pipe the tray reads. It runs no command and
+    // takes no screenshot: PR 4 adds only check-ins. The pure parts (the state map, the timing, the status frame and
+    // the history rules) are static so the native tests can drive them without a live service.
+    public sealed class DeviceService : ServiceBase {
+        public const string PipeName = "SupportMcpDevice-ui";
+        // The tray's pipe: SYSTEM creates instances, interactive users read and write data, never the network.
+        const string Sddl = "D:P(A;;GA;;;SY)(A;;0x12008B;;;IU)";
+        // Every tray watches this; the uninstaller sets it (PR 4 step 7). Only SYSTEM creates it.
+        public const string UninstallEvent = "Global\\SupportMcpDeviceUninstall";
+        public const long CheckEveryMs = 300000, JitterMaxMs = 30000, RetryMinMs = 60000, RetryMaxMs = 900000, UpdateEveryMs = 6 * 3600 * 1000L, RefreshMinMs = 30000;
+        public const int HistoryCap = 50, PipeReadMax = 65536;
+
+        // ---- the pure parts --------------------------------------------------------------------------------------
+        public enum Schedule { Normal, Backoff, Update, Stopped }
+        // The next check-in delay on a network error: one minute, doubling each time, capped at fifteen.
+        public static long NextBackoff(long current) { return Math.Min(current <= 0 ? RetryMinMs : current * 2, RetryMaxMs); }
+        // Five minutes from the last answer, with up to thirty seconds of jitter on top.
+        public static long NextCheckDelay(Random r) { return CheckEveryMs + r.Next(0, (int)JitterMaxMs + 1); }
+        // The display state and what to do next, from the status before the call and the wire result. status is the
+        // last server-known status ("active" or "pending"), not the display state, so a 401 is read correctly.
+        public static string Classify(string status, DeviceLink.DeviceResult result, string bodyStatus, out Schedule schedule) {
+            if (result == DeviceLink.DeviceResult.Ok) { schedule = Schedule.Normal; return bodyStatus == DeviceState.Pending ? DeviceState.Pending : DeviceState.Active; }
+            if (result == DeviceLink.DeviceResult.Removed) { schedule = Schedule.Stopped; return status == DeviceState.Pending ? DeviceState.Expired : DeviceState.Removed; }
+            if (result == DeviceLink.DeviceResult.UpdateNeeded) { schedule = Schedule.Update; return DeviceState.UpdateNeeded; }
+            schedule = Schedule.Backoff; return DeviceState.Offline; // offline, or an unexpected refusal: keep trying
+        }
+        // The history lines a 200 adds: approval, and any change the team made to the access or control mode.
+        public static List<string> HistoryFor(string oldStatus, string oldAccess, string oldControl, string newStatus, string newAccess, string newControl) {
+            var lines = new List<string>();
+            if (oldStatus == DeviceState.Pending && newStatus == DeviceState.Active) lines.Add("Your support team approved this PC.");
+            if (oldAccess != newAccess) lines.Add(newAccess == "any" ? "Access set to connect any time." : "Access set to ask each time.");
+            if (oldControl != newControl) lines.Add(newControl == "full" ? "Control set to full control." : "Control set to limited support.");
+            return lines;
+        }
+        // The status frame the tray reads. confirm is shown only while pending.
+        public static Dictionary<string, object> StatusFrame(string name, string access, string control, string state, string confirm, long lastOkAt, object history) {
+            var m = Wire.Map("name", name, "access", access, "control", control, "state", state, "last_ok_at", lastOkAt, "history", history);
+            if (state == DeviceState.Pending && confirm != null && confirm.Length > 0) m["confirm"] = confirm;
+            return m;
+        }
+        // The last HistoryCap lines are kept, newest last.
+        public static void TrimHistory(System.Collections.ArrayList list) { while (list.Count > HistoryCap) list.RemoveAt(0); }
+        // A refresh forces a check-in at most once every thirty seconds.
+        public static bool RefreshDue(long lastRefresh, long now) { return now - lastRefresh >= RefreshMinMs; }
+
+        // ---- the running service ---------------------------------------------------------------------------------
+        readonly string exe, folder;
+        readonly object gate = new object();
+        readonly ManualResetEvent stop = new ManualResetEvent(false);
+        readonly AutoResetEvent wake = new AutoResetEvent(false);
+        readonly Random jitter = new Random();
+        readonly System.Collections.ArrayList history = new System.Collections.ArrayList();
+        DeviceLink link;
+        string origin = "", key = "", deviceId = "", workspace = "";
+        string name = "", access = "ask", control = "limited", status = DeviceState.Active, state = DeviceState.Active, confirm = "";
+        long lastOkAt, lastRefresh = long.MinValue / 2;
+        bool updateLogged;
+        Thread worker; UiServer ui; EventWaitHandle uninstall;
+
+        public DeviceService(string exe) {
+            this.exe = exe; folder = Path.GetDirectoryName(exe);
+            ServiceName = DeviceSetup.ServiceName; CanStop = true; CanShutdown = true; AutoLog = false;
+        }
+        protected override void OnStart(string[] args) { worker = new Thread(Run); worker.IsBackground = true; worker.Start(); }
+        protected override void OnStop() { stop.Set(); wake.Set(); if (worker != null) worker.Join(10000); }
+        protected override void OnShutdown() { stop.Set(); wake.Set(); }
+
+        void Run() {
+            try {
+                if (!Load()) return; // no device.json, or a damaged one: nothing to run
+                link = new DeviceLink(origin);
+                try { uninstall = OpenUninstall(true); } catch (Exception) { uninstall = null; }
+                ui = new UiServer(PipeName, Handle, delegate(uint s) { return true; }, Sddl, 1024); // the SDDL already limits callers to interactive users
+                Loop();
+            } catch (Exception) { }
+        }
+        // device.json, written by the install. Returns false when it is missing or damaged.
+        bool Load() {
+            try {
+                var m = Wire.Json().Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(folder, "device.json")));
+                origin = Wire.Text(m, "origin"); key = Wire.Text(m, "key"); deviceId = Wire.Text(m, "device_id"); workspace = Wire.Text(m, "workspace");
+                name = Wire.Text(m, "name"); access = Wire.Text(m, "access"); control = Wire.Text(m, "control");
+                status = Wire.Text(m, "status"); state = status; confirm = Wire.Text(m, "confirm");
+                if (key.Length == 0 || origin.Length == 0) return false;
+            } catch (Exception) { return false; }
+            LoadHistory();
+            return true;
+        }
+        void LoadHistory() {
+            try {
+                var list = Wire.Json().Deserialize<System.Collections.ArrayList>(File.ReadAllText(Path.Combine(folder, "history.json")));
+                if (list != null) lock (gate) { history.Clear(); history.AddRange(list); Trim(); }
+            } catch (Exception) { }
+        }
+
+        void Loop() {
+            long backoff = 0;
+            while (!stop.WaitOne(0)) {
+                CheckIn(ref backoff);
+                if (stop.WaitOne(0)) break;
+                Schedule sched; lock (gate) sched = lastSchedule;
+                if (sched == Schedule.Stopped) break; // removed or expired: stop checking in for good; the pipe keeps serving
+                long delay = sched == Schedule.Backoff ? backoff : sched == Schedule.Update ? UpdateEveryMs : NextCheckDelay(jitter);
+                // Wait out the delay, but wake at once for a refresh, and stop on service stop or uninstall.
+                var waits = uninstall == null ? new WaitHandle[] { stop, wake } : new WaitHandle[] { stop, wake, uninstall };
+                int which = WaitHandle.WaitAny(waits, (int)Math.Min(delay, int.MaxValue));
+                if (which == 0 || (uninstall != null && which == 2)) break;
+            }
+        }
+        Schedule lastSchedule = Schedule.Normal;
+        void CheckIn(ref long backoff) {
+            DeviceLink.Answer a;
+            try { a = link.Hello(key, Report()); } catch (Exception) { a = new DeviceLink.Answer(DeviceLink.DeviceResult.Offline, 0, null, ""); }
+            Schedule sched;
+            string before; lock (gate) before = status;
+            string newState = Classify(before, a.Result, a.Result == DeviceLink.DeviceResult.Ok ? Wire.Text(a.Body == null ? null : a.Body["device"] as Dictionary<string, object>, "status") : "", out sched);
+            lock (gate) {
+                lastSchedule = sched;
+                if (a.Result == DeviceLink.DeviceResult.Ok) {
+                    backoff = 0; lastOkAt = Client.UnixNow();
+                    var dev = a.Body["device"] as Dictionary<string, object>;
+                    if (dev != null) {
+                        string nn = Wire.Text(dev, "name"), na = Wire.Text(dev, "access"), nc = Wire.Text(dev, "control"), ns = Wire.Text(dev, "status");
+                        foreach (string line in HistoryFor(status, access, control, ns, na, nc)) AddLine(line);
+                        if (nn.Length > 0) name = nn;
+                        access = na; control = nc; status = ns; state = newState;
+                        if (ns == DeviceState.Active) confirm = "";
+                        Save();
+                    }
+                } else if (sched == Schedule.Stopped) {
+                    state = newState;
+                    AddLine(newState == DeviceState.Expired ? "This PC's request was not approved in time." : "Your support team removed this PC.");
+                } else if (sched == Schedule.Update) {
+                    state = newState; backoff = 0;
+                    if (!updateLogged) { updateLogged = true; AddLine("Support needs an update to keep working with your team."); }
+                } else {
+                    state = newState; backoff = NextBackoff(backoff);
+                }
+            }
+        }
+        Dictionary<string, object> Report() { return Wire.Map("os", DeviceSetup.Os(), "machine", Environment.MachineName, "app_version", Wire.Version); }
+
+        // The pipe handler. status, allow_any_time and refresh each answer with the current status; anything else closes.
+        Dictionary<string, object> Handle(Dictionary<string, object> m) {
+            string request = Pipes.DeviceRequest(m);
+            if (request == null) return null;
+            if (request == "allow_any_time") AllowAnyTime();
+            else if (request == "refresh") Refresh();
+            return Snapshot();
+        }
+        Dictionary<string, object> Snapshot() {
+            lock (gate) { var copy = new System.Collections.ArrayList(history); return StatusFrame(name, access, control, state, confirm, lastOkAt, copy); }
+        }
+        // Call 3: any interactive user may turn on "any time", and only when it is "ask". Nothing here ever sends "ask".
+        void AllowAnyTime() {
+            lock (gate) { if (access != "ask" || state == DeviceState.Removed || state == DeviceState.Expired) return; }
+            DeviceLink.Answer a;
+            try { a = link.Update(key, Wire.Map("access", "any")); } catch (Exception) { return; }
+            if (!a.Ok) return;
+            lock (gate) {
+                var dev = a.Body == null ? null : a.Body["device"] as Dictionary<string, object>;
+                access = dev != null ? Wire.Text(dev, "access") : "any";
+                AddLine("You turned on connect any time from this PC.");
+                Save();
+            }
+        }
+        void Refresh() {
+            lock (gate) { long now = PauseClock.Now(); if (!RefreshDue(lastRefresh, now)) return; lastRefresh = now; }
+            wake.Set();
+        }
+
+        // history.json beside device.json, newest last, the last HistoryCap kept. The caller holds the gate.
+        void AddLine(string text) { history.Add(Wire.Map("at", Client.UnixNow(), "text", text)); Trim(); SaveHistory(); }
+        void Trim() { TrimHistory(history); }
+        void SaveHistory() { try { File.WriteAllText(Path.Combine(folder, "history.json"), Wire.Json().Serialize(history)); } catch (Exception) { } }
+        void Save() {
+            try {
+                var m = Wire.Map("origin", origin, "workspace", workspace, "device_id", deviceId, "key", key, "status", status, "name", name, "access", access, "control", control);
+                if (status == DeviceState.Pending && confirm.Length > 0) m["confirm"] = confirm;
+                File.WriteAllText(Path.Combine(folder, "device.json"), Wire.Json().Serialize(m));
+            } catch (Exception) { }
+        }
+
+        // The Global uninstall event, created by the service (SYSTEM) and watched by every tray.
+        static EventWaitHandle OpenUninstall(bool create) {
+            if (!create) { EventWaitHandle e; return EventWaitHandle.TryOpenExisting(UninstallEvent, EventWaitHandleRights.Synchronize, out e) ? e : null; }
+            var sec = new EventWaitHandleSecurity();
+            sec.AddAccessRule(new EventWaitHandleAccessRule(FullAcl.SystemSid, EventWaitHandleRights.FullControl, AccessControlType.Allow));
+            sec.AddAccessRule(new EventWaitHandleAccessRule(FullAcl.AdminsSid, EventWaitHandleRights.FullControl, AccessControlType.Allow));
+            sec.AddAccessRule(new EventWaitHandleAccessRule(FullAcl.UsersSid, EventWaitHandleRights.Synchronize, AccessControlType.Allow));
+            bool created; return new EventWaitHandle(false, EventResetMode.ManualReset, UninstallEvent, out created, sec);
+        }
+        // A tray opens this to watch for uninstall; null when the service has not created it.
+        public static EventWaitHandle WatchUninstall() { try { return OpenUninstall(false); } catch (Exception) { return null; } }
+        // The uninstaller sets the event (PR 4 step 7). Best effort.
+        public static void SignalUninstall() { try { var e = OpenUninstall(false); if (e != null) using (e) e.Set(); } catch (Exception) { } }
+
+        // The wizard reads a pending PC's six digits from the status pipe once the service is running.
+        public static string ReadConfirm() {
+            for (int i = 0; i < 10; i++) {
+                try {
+                    using (var c = Pipes.Client(PipeName)) {
+                        c.Connect(1000); Pipes.Write(c, Wire.Map("type", "status"));
+                        var r = Pipes.Read(c, PipeReadMax, UiServer.ReadMs);
+                        string s = Wire.Text(r, "state");
+                        if (s == DeviceState.Pending) return Wire.Text(r, "confirm");
+                        if (s.Length > 0) return null;
+                    }
+                } catch (Exception) { }
+                Thread.Sleep(500);
+            }
+            return null;
+        }
+    }
+
 
     public static class Program {
         [STAThread] public static void Main(string[] args) {
             string role = args.Length > 0 ? args[0] : "", executable = System.Reflection.Assembly.GetExecutingAssembly().Location;
             // The roles that run elevated or as SYSTEM show nothing at all: no window, no message box.
             if (role == "--service") { try { ServiceBase.Run(new SupportService(executable, Wire.ReadConfig(executable))); } catch (Exception) { } return; }
-            if (role == "--device-service") { try { ServiceBase.Run(new DeviceServicePlaceholder()); } catch (Exception) { } return; }
+            if (role == "--device-service") { try { ServiceBase.Run(new DeviceService(executable)); } catch (Exception) { } return; }
             if (role == "--helper") { try { Helper.Run(executable, args); } catch (Exception) { } Environment.Exit(0); }
             if (role == "--elevate-install") {
                 Native.SafeDllSearch(); int code = 1; FileStream held = null;
