@@ -7,6 +7,78 @@ to run on unattended customer PCs.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-07
+
+### Added
+
+- A saved PC. The Windows app can now be installed permanently on a PC by its
+  owner, through a setup wizard. The owner enters a pairing code (prefilled when
+  they start from a technician's link) or joins from the team's install link,
+  names the PC, chooses how support may connect ("ask each time" or "any time")
+  and how much control (full control or limited support), then answers one
+  Windows permission prompt. Nothing is preselected for the last two choices. A
+  PC that joined without a code shows a six-digit number until a technician
+  approves it.
+- What the install puts on the PC. `%ProgramFiles%\SupportMCP` holds the app
+  (`support.exe`, which users can read and run) and a device record with the
+  PC's key and a short local history (readable only by SYSTEM and
+  administrators). A Windows service, "Support device service"
+  (`SupportMcpDevice`, LocalSystem, starts automatically, restarts on failure),
+  checks in with the relay every few minutes. In this release it runs no
+  commands, takes no screenshots and opens no files for anyone. A tray icon
+  starts at each sign-in, and an entry in Windows Settings > Apps lets the owner
+  uninstall.
+- The tray shows the PC's name, its access mode, its state ("No one is
+  connected.") and recent local history, and has "Uninstall Support".
+- Uninstall, from Settings > Apps or the tray. After one Windows permission
+  prompt, the relay forgets the PC (its key stops working), the tray closes, and
+  the service, the startup entry, the Apps entry and the folder are removed.
+  Anything locked is deleted at the next restart. If the relay cannot be reached,
+  everything is still removed on the PC, and the team must remove the PC from
+  their list.
+- A public install page at `/install`. `GET` shows a page with a download
+  button. `POST` downloads the Windows app with a small "device" footer that
+  names the relay and either a pairing code (`?code=`) or a workspace
+  (`?workspace=`). A chat app's link preview only fetches the page, so it
+  downloads nothing. `/install` stays outside Cloudflare Access, like `/j/` and
+  `/device/`.
+- The team API's pairing answer includes a ready-to-send `link`, the install
+  link with the new code.
+
+### Changed
+
+- The one-way rule for access on the PC. Anyone signed in at the PC can switch
+  "ask each time" to "any time" from the tray, with no administrator prompt.
+  Nobody at the PC can switch it back. Only the support team can, through the
+  team API. This means any signed-in user, including a standard user or a guest,
+  can turn on unattended access. Nothing can connect to a saved PC yet, but read
+  this before you deploy a release that can.
+- The owner contact of a saved PC is now set by technicians, not by the PC. A
+  technician with `devices.manage` sets or clears it with `PATCH .../devices/<id>`
+  and `owner_contact` (the team log names the field, never the value).
+  `/device/pair` and `/device/update` now answer 400 `bad_request` when the body
+  has `owner_contact`.
+- Full control still removes itself, and a one-off session still leaves no
+  uninstall entry. Both statements now apply to one-off sessions only. A saved PC
+  stays installed until its owner uninstalls it.
+
+### Security
+
+- A technician's install link carries a working pairing code. It can land in
+  browser history, chat link previews and the relay's request logs, so whoever
+  uses the link first within its 10 minutes gets the PC. Send it over a channel
+  you trust.
+- Only SYSTEM or an elevated administrator process can hold a saved PC's key.
+  The install, the key file and the history file are readable only by SYSTEM and
+  administrators.
+
+### Not yet
+
+- Nobody can connect to a saved PC. That comes in a later release.
+- Do not install a saved PC on a real customer's unattended machine. Wait for
+  the release that enforces rules about who may connect and when.
+- The one-off support link flow is unchanged.
+
 ## [0.3.0] - 2026-11-07
 
 ### Added

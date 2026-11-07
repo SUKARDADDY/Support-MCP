@@ -156,6 +156,25 @@ they cannot catch a method that is missing at run time on 4.5.2 by themselves;
 the reference assembly build does that. The first connection from a real
 Windows 7 PC was checked live (see [Limits](../README.md#limits)).
 
+The saved PC roles (the setup wizard, `--device-install`, `--device-service`,
+`--tray`, `--uninstall` and `--device-remove`) are built in `src/agent-app.cs`
+beside the one-off roles and share its helpers (`Elevation`, `FullAcl`, `Pipes`,
+`Scm`, `UiServer`). The native tests cover the parts that need no administrator
+and no second user: the device footer reader and its refusals (`ReadConfig` throws
+on any footer with a `kind`, `ReadDevice` refuses a session footer), the answers
+argument (encode, decode, limits), the exit codes, `DeviceLink` against a fake
+`/device/` relay for every status, the check-in timing and backoff, the state a
+check-in leads to (active, pending to active, removed, expired, needs an update,
+offline), the 50-line history cap, the registry value builders, the folder, file
+and pipe ACLs, the one-way rule (no pipe frame sets `ask`), the tray's state
+text, and the list of what uninstall removes (it must name only our own
+artifacts, never `HKLM\SOFTWARE\SupportMCP`). The relay side is covered by
+`npm test`: `test/app.test.js` has the `/install` page, the same-origin matrix,
+the refusals and the footer bytes, and `test/devices.test.js`,
+`test/devices-api.test.js` and `test/device-api.test.js` have the pairing `link`
+and the owner contact. The last native check must stay "PASS executable session
+overlay".
+
 The service, the helper and the install need administrator rights and a real
 console session, so the native tests do not run them. Check them by hand on a
 Windows 11 PC or VM with UAC on, against `wrangler dev` (see below; raise
@@ -347,6 +366,68 @@ binding that records every call.
 
 `test/app.test.js` covers the app: the bundle's hashes, the download flow and
 its security headers, the polling transport, and the default mode and aliases.
+
+### Installing a saved PC on a test machine
+
+The native tests do not install the service, so check a saved PC by hand on a
+Windows test machine, ideally a Windows 11 VM with UAC on, and also on Windows 7
+if you support it. You need a relay the machine can reach, with a database and a
+team admin.
+
+1. On your computer, set up the relay as in [Pairing a PC locally](#pairing-a-pc-locally):
+   apply the migrations to the local D1 database, put `AUTH_SECRET` (at least 32
+   characters) in `.dev.vars`, and run `npx wrangler dev --port 8787` on loopback.
+   Make `local-dev` the first admin of `default`. `/install` answers 404 until
+   `src/app-bundle.json` holds an app, so rebuild the bundle first if you changed
+   the app (see [Build the app](#build-the-app)).
+2. Let the test machine reach the relay at `127.0.0.1:8787`. The app accepts
+   plain http only on loopback, so in the VM forward the port with `netsh
+   interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=8787
+   connectaddress=<host> connectport=8787`, as for a session.
+3. Ask for a pairing code from your computer with the address the VM will use, so
+   the `link` in the answer is right for it:
+   `curl -s 127.0.0.1:8787/api/v1/w/default/pairing -H 'content-type: application/json' -d '{}'`.
+   The answer carries `code` and `link`. For the owner-started path, use
+   `http://127.0.0.1:8787/install?workspace=default` instead.
+4. In the VM's browser, open the link. The page must download nothing until you
+   click the button. Download, open `support-setup.exe`, and step through the
+   wizard. Check that nothing is preselected for access or control, answer the
+   Windows permission prompt, and wait for "ready". For the owner-started path,
+   the wizard shows six digits. Approve with `PATCH .../devices/<id>` and
+   `{"approve":{"confirm":"<digits>"}}`.
+5. Check the install. `sc query SupportMcpDevice` shows RUNNING, the tray icon is
+   in the notification area (Windows 11 puts new icons in the overflow),
+   `GET .../devices` lists the PC with its name, access and control, and a standard
+   user cannot read `device.json` in `%ProgramFiles%\SupportMCP`.
+6. Check the one-way rule. As a standard user, turn on "any time" from the tray.
+   The tray then offers no way back. A technician's `PATCH .../devices/<id>` with
+   `{"access":"ask"}` puts the PC back to asking, and the tray shows it after the
+   next check-in. Set an owner contact with `{"owner_contact":"..."}`, and send
+   `owner_contact` to `/device/update` with the PC's key to see the 400.
+7. Uninstall from Settings > Apps, and again from the tray. Then run the leftover
+   checklist below.
+
+Leftover checklist after an uninstall. Each of these must find nothing, and the
+last must be unchanged from before you installed:
+
+- the service: `sc query SupportMcpDevice` says the service does not exist
+- the folder: `Test-Path "$env:ProgramFiles\SupportMCP"` is False (if a file was
+  locked, restart the machine and check again)
+- the tray's startup value: `reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run /v SupportMcpTray /reg:64`
+  finds nothing
+- the Apps entry: `reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\SupportMcpDevice /reg:64`
+  finds nothing
+- the pipe: `[IO.Directory]::GetFiles('\\.\pipe\') | Select-String SupportMcpDevice`
+  finds nothing
+- `reg query HKLM\SOFTWARE\SupportMCP` is untouched. It belongs to one-off
+  sessions. Compare its output before the install and after the uninstall.
+
+Also check that `GET .../devices` no longer lists the PC and that its old key
+answers 401 on `/device/hello`. Stop the relay and uninstall once more on a new
+install: everything must still go from the PC, and the last window must say the
+team will still see the PC until they remove it. Finally, start a one-off
+full-control session on a paired PC and check both work and clean up
+independently.
 
 ### OAuth locally
 
