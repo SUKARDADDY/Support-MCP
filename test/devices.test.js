@@ -940,8 +940,9 @@ test('approve checks the number and the expiry again at commit', async () => {
   assert.equal(rows(db, 'SELECT status FROM devices WHERE id = ?', first.device_id)[0].status, 'pending');
   assert.equal((await kinds(team)).length, log);
   const second = await devs.requestJoin({ protocol: 1, workspace: W, name: 'Two' });
-  // The wait runs out between the plan and the batch.
-  sneakBeforeBatch(db, () => db.sqlite.prepare('UPDATE devices SET expires_at = ? WHERE id = ?').run(Date.now() - 1, second.device_id));
+  // The wait runs out between the plan and the batch. A minute back, so it has expired by the plan's clock too,
+  // however many milliseconds pass between the plan and this update.
+  sneakBeforeBatch(db, () => db.sqlite.prepare('UPDATE devices SET expires_at = ? WHERE id = ?').run(Date.now() - 60000, second.device_id));
   await assert.rejects(devs.updateDevice(W, TECH, second.device_id, { approve: { confirm: second.confirm } }), refused(404, 'not_found'));
   assert.equal(rows(db, "SELECT COUNT(*) AS n FROM devices WHERE status = 'active'")[0].n, 0, 'nothing was approved');
   assert.equal((await kinds(team)).includes('device_approved'), false);
