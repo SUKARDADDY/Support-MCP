@@ -1136,7 +1136,13 @@ public static class AppTests {
                 Action<string, string, string> openTrial = delegate(string folder, string from, string to) {
                     var st = UpdateState.Load(folder); st.Phase = UpdateState.Trial; st.From = from; st.FromVersion = "0.4.0"; st.To = to; st.Version = "99.0.0"; st.Deadline = Client.UnixNow() + 240000; st.Save(folder);
                 };
-                Func<string, string> history = delegate(string folder) { return File.Exists(Path.Combine(folder, "history.json")) ? File.ReadAllText(Path.Combine(folder, "history.json")) : ""; };
+                // Decoded, not raw: the JSON writer stores an apostrophe as \u0027.
+                Func<string, string> history = delegate(string folder) {
+                    string path = Path.Combine(folder, "history.json"); if (!File.Exists(path)) return "";
+                    var lines = Wire.Json().Deserialize<System.Collections.ArrayList>(File.ReadAllText(path)); var sb = new StringBuilder();
+                    if (lines != null) foreach (object o in lines) { var m = o as Dictionary<string, object>; if (m != null) sb.Append(Wire.Text(m, "text")).Append('\n'); }
+                    return sb.ToString();
+                };
 
                 // A trial nobody commits: the switch rolls back at the deadline, and the version is never taken again.
                 {
