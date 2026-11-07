@@ -7,6 +7,65 @@ to run on unattended customer PCs.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-08
+
+### Added
+
+- Saved PCs update themselves. At a check-in the relay may offer its current
+  release in a new `update` field of the `/device/hello` answer. The PC takes it
+  only when the release note is signed with the project's release key (ECDSA
+  P-256, built into the app), the version is newer than its own and has not failed
+  on this PC, and the app it downloads has the size and SHA-256 the note names.
+  It all runs in the background: no prompt and no window, only history lines.
+- Staged rollout. A release reaches 10% of PCs for a day, then half for a day,
+  then all, by a group worked out from the release and each PC's id. Waiting PCs
+  are never offered one. Nothing new is stored: no migration.
+- Trial and rollback. Each version is kept as its own file,
+  `support-<version>-<8 hex>.exe`, in `%ProgramFiles%\SupportMCP`. The service,
+  the tray's startup entry and the Apps entry are pointed at the new file, which
+  runs on trial. A crash or a failed start puts the old version back, also after
+  a restart, and so do a protocol refusal and a first check-in not finished
+  within 4 minutes. That version is never tried again. Old files are deleted once nothing uses
+  them, or at the next restart.
+- Three deploy settings: `RELEASE_SIGNATURE` and `RELEASE_SIGNED_AT`, made at
+  deploy time by `scripts/sign-release.mjs`, and `UPDATE_ROLLOUT` (empty for the
+  stages, `pause`, or a share from 0 to 100). Without a signature the relay
+  offers nothing.
+- `scripts/release-key.mjs` makes the release key in memory and prints the
+  private key only to stdout, for a secrets manager. `release-key.pub` holds the
+  public key, and a test keeps it equal to the app's.
+- The tray shows the app's version, and the status pipe's answer carries it.
+
+### Changed
+
+- A protocol refusal (426) from `/device/` carries the signed release too,
+  unless the rollout is paused, so a PC on an older protocol can update itself.
+- The PC downloads updates from `/install`, with the same `POST` and `Origin` as
+  the setup page's button.
+- Uninstall ends trays started from any version of the app in the install
+  folder, removes every version file and the update record, and answers "busy,
+  try again in a few minutes" (exit 21) while an update is on trial.
+- Everything that starts the installed app (the tray at sign-in, the setup
+  wizard's "Open Support", the tray's "Uninstall Support") uses the file the
+  service runs.
+
+### Security
+
+- The service of a saved PC now installs new versions of itself, but only
+  releases signed with the project's release key. The private key is kept
+  offline and read only at deploy time; the relay, Cloudflare and CI never hold
+  it. A relay can offer a release or hold one back, but cannot make a PC run
+  anything else or go back to an older version. It can make a new version fail
+  its trial by refusing its protocol; that version is then skipped until a newer
+  one.
+- The apps stay unsigned for Windows. The release key signs only the release
+  note, which only a saved PC's update check reads.
+
+### Not yet
+
+- PCs on 0.4.0 have no updater and need a reinstall to reach 0.5.0.
+- A failed update is recorded on the PC only. A team view comes later.
+
 ## [0.4.0] - 2026-11-07
 
 ### Added

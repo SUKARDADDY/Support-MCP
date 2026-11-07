@@ -77,7 +77,7 @@ work in the request path; use the WebSocket Hibernation API
 | `GET /j/<code>` | public | **GET only, https only.** The code is consumed only for a request whose `User-Agent` contains `PowerShell/` (`irm` sends `WindowsPowerShell/5.1.x` or `PowerShell/7.x`). Code valid+unused → 200 `text/plain` agent script with placeholders filled, code consumed; else 404 `text/plain` `Write-Host 'This support link is invalid or expired.'` (runnable, harmless). Any other `User-Agent` (a chat link preview, a browser) → 200 `text/plain`, `Cache-Control: no-store`, a one-line `Write-Host` telling the reader to paste the command into PowerShell, and the Durable Object is **not** touched. Over plain `http:` on any host except `localhost` / `127.0.0.1` → 200 `text/plain` `Write-Host` line asking for the https link, code **not** consumed. Any other method → 405 `text/plain` (harmless one-liner, `Allow: GET`) and the code is **not** consumed. Malformed percent-encoding → the same harmless 404 script, never 500. The `User-Agent` test keeps previews from burning the code. It is not a security control, since any client can send the header. |
 | `GET /j/<code>?client=app` | public | The downloaded app. `legacy` is an alias for `app`; any other `client` value → 404. **https only**: over plain `http:` on any host except `localhost` / `127.0.0.1` → 403 `text/plain`, code **not** consumed. `GET` serves the download page (200 `text/html`, `Cache-Control: no-store`, `Referrer-Policy: same-origin`, a CSP with `default-src 'none'` and `form-action 'self'`) and **never consumes the code**, however often the page is opened or refreshed. Only a `POST` from the page's button consumes it. If the request has an `Origin` header it must equal the relay's own origin exactly. If it has none (IE11 on Windows 7 can omit it on a same-origin form POST), its `Referer` must start with `<origin>/j/`, which the page's `Referrer-Policy: same-origin` keeps on the click. A foreign `Origin`, a foreign or missing `Referer` without an `Origin`, or neither header → 403, code unused. A first valid `POST` returns 200 `application/octet-stream` with `Content-Disposition: attachment; filename="remote-support-<sid8>.exe"`: the compiled app followed by the session configuration (below). The code is single use: a repeat after the download shows "Check your downloads" (409), an expired or ended one shows "This support link has expired" (410). A code made for a `powershell` session shows the expired page and stays unused. `HEAD` and every other method → 405 (`Allow: GET, POST`). |
 | `POST /agent?sid=<sid>` + `X-Attach-Key: <key>` | attach key | The app's transport, JSON in and out; below. 403 over plain `http:` on any host except `localhost` / `127.0.0.1`, 403 on any `Origin` header or a `key` query param, 405 on other methods, 415 on a non-JSON body, 413 over 750,000 characters (checked against `Content-Length` before the body is read, and again after it is read when there is no `Content-Length`), 401 on a bad sid, bad key, a `powershell` session or a session that is still `pending`, 409 on a stale generation, 410 when the session has ended. |
-| `GET /install[?code=<code>\|?workspace=<slug>]`, `POST /install[...]` | public | The setup download for a saved PC ([below](#the-install-page-install)). `GET` shows the page and never downloads. `POST` from the page returns `support-setup.exe` with a device footer. Not under any Access app |
+| `GET /install[?code=<code>\|?workspace=<slug>]`, `POST /install[...]` | public | The setup download for a saved PC ([below](#the-install-page-install)). `GET` shows the page and never downloads. `POST` from the page returns `support-setup.exe` with a device footer. A saved PC downloads its updates here too, with the same `POST`. Not under any Access app |
 | `GET /ws?sid=<sid>` + `X-Attach-Key: <key>` | attach key | WebSocket upgrade for the agent; 403 over plain `http:` on any host except `localhost` / `127.0.0.1`; 401 on bad/missing key, on a `key` query param, on a bad sid, or on an `app` session; 410 if session ended/expired |
 | `POST /mcp` | Access JWT or OAuth token | MCP JSON-RPC 2.0 for the `default` workspace. `tools/call` checks the caller's role first (below) |
 | `POST /w/<slug>/mcp` | Access JWT or OAuth token | the same endpoint for workspace `<slug>` (`[a-z0-9-]{1,40}`). Any other shape of path is 404 |
@@ -481,6 +481,12 @@ app bundle the answer is 404.
   filename="support-setup.exe"`, `Cache-Control: no-store`: the compiled app
   followed by the device footer.
 
+A saved PC downloads an update from the same address, as the page's button
+does: `POST <origin>/install` with no query, the header `Origin: <origin>` and an
+empty body. It carries no key. It strips the footer and checks the exe's size and
+SHA-256 against the signed release note ([Updates](#updates)), so the download
+itself needs no other protection.
+
 The device footer uses the app's footer layout (the configuration bytes, their
 length as a little-endian `uint32`, then `SUPPORTMCPCFG1`). Its JSON is
 `{"kind":"device","origin":"https://...","code"?:"ABCDE-FGH23","workspace"?:"<slug>"}`
@@ -515,6 +521,11 @@ missing or not a whole number, 400 `bad_request`; a `protocol` outside 1 to 1 42
 {"protocol":1,"error":{"code":"protocol_unsupported","message":"..."},"supported":{"min":1,"max":1}}
 ```
 
+When the relay has a signed release and `UPDATE_ROLLOUT` is not `pause` or `0`,
+the 426 also carries `"update"` ([Updates](#updates)), on every address and
+without a key check, so a PC that speaks an older protocol can update itself. A
+prerelease goes into a 426 only when `UPDATE_ROLLOUT` pins a number.
+
 A device key is `smd1.<workspace>.<device id>.<secret>`, sent as
 `Authorization: Bearer smd1...`. It must match
 `^smd1\.([a-z0-9-]{1,40})\.([a-z2-7]{20})\.([A-Za-z0-9_-]{43})$`; a mismatch, a
@@ -548,10 +559,12 @@ row and the code unused. A good one writes the device, the `device_paired` (or
 `device_requested`) row and, for a code, marks it used, in one batch.
 
 `POST /device/hello`, key: `{"protocol":1,"os"?,"machine"?,"app_version"?}` answers
-200 `{"protocol":1,"device":{"id","workspace","status":"active"|"pending","name","access","control","site_id"}}`.
+200 `{"protocol":1,"device":{"id","workspace","status":"active"|"pending","name","access","control","site_id"},"update"?:{...}}`.
 Allowed while pending. The reported details are written at most every 5 minutes,
 or once a minute when one changed (a changed value inside that minute is dropped
-and sent again at the next check-in), and are not logged. Errors: 400, 401, 426.
+and sent again at the next check-in), and are not logged. `update` is there only
+when the relay offers this PC its signed release ([Updates](#updates)); without
+it the answer is exactly as before. Errors: 400, 401, 426.
 
 `POST /device/update`, key: `{"protocol":1,"name"?,"access"?,"control"?}`
 with at least one key answers 200 with the same `device`. Logged as
@@ -564,6 +577,67 @@ the key's holder set either mode.
 `POST /device/leave`, key: `{"protocol":1}` answers 200
 `{"protocol":1,"removed":true}`, deletes the row and so the key, and logs
 `device_left` (also for a waiting PC). Afterwards the key is 401. Errors: 401, 426.
+
+### Updates
+
+A saved PC updates itself to a release signed with the project's release key.
+The relay can offer a release or hold it back, but cannot make one: it never
+holds the private key and never checks a signature. The PC does.
+
+The release is the relay's own app bundle. Its note is exactly five lines, UTF-8,
+each ending in LF, in this order and nothing else:
+
+```text
+support-mcp-release 1
+version 0.5.1
+sha256 <64 lowercase hex: SHA-256 of the exe without a footer>
+size <the exe's size in bytes, decimal>
+released <unix seconds>
+```
+
+The signature is ECDSA P-256 over SHA-256 of those bytes, 64 bytes `r||s`
+(IEEE P1363), in standard base64. The public key is the 64-byte `X||Y` in
+standard base64: one line in `release-key.pub` and the constant
+`ReleaseKey.ProjectKey` in the app, which a test keeps equal.
+
+Three deploy settings drive it (`wrangler.toml` `[vars]`, empty by default):
+
+| Setting | Holds |
+|---|---|
+| `RELEASE_SIGNATURE` | the note's signature, base64 of 64 bytes, from `scripts/sign-release.mjs` |
+| `RELEASE_SIGNED_AT` | the note's `released` time, unix seconds, from the same run |
+| `UPDATE_ROLLOUT` | empty: follow the stages; `pause`: offer nothing; a whole number 0 to 100: that share of PCs. Anything else counts as `pause` |
+
+The relay rebuilds the note from `VERSION`, the SHA-256 and size of the bundle's
+exe (computed once per isolate) and `RELEASE_SIGNED_AT`, and passes
+`RELEASE_SIGNATURE` on. Either signature setting missing or malformed means no
+release. A signature made for other bytes (another exe, date or version) is still
+passed on, and every PC refuses it.
+
+The `update` object, in a hello's answer or a 426:
+
+```json
+{"version":"0.5.1","note":"support-mcp-release 1\nversion 0.5.1\n...","signature":"<base64>"}
+```
+
+A hello offers it when all of these hold. The PC is active (a waiting PC is never
+offered one). Its version, the request's `app_version` or else the stored one, is
+a valid version and below the release by SemVer precedence, with build metadata
+ignored. The release is not a prerelease, unless `UPDATE_ROLLOUT` pins a number.
+The PC's group is below the stage. The group is the first 4 bytes of SHA-256 of
+`<release version>:<workspace>:<device id>`, read big-endian, mod 100, so the same
+PCs go first within one release and others go first in the next. The stage counts
+from `RELEASE_SIGNED_AT`: 10 for the first 24 hours, 50 until 48 hours, then 100.
+A pinned `UPDATE_ROLLOUT` replaces the stage. Working out the offer reads and
+writes nothing more in the database than a hello without one.
+
+The PC ignores the outer `version` for its decision and uses the note's; an
+outer `version` that differs from the note's is refused. It takes the release
+only when the signature verifies against its built-in key, the note has exactly
+the form above, the version is newer than its own and has not failed on this PC
+before, and the size is at most 2 MB. It then downloads the app from `/install`
+([above](#the-install-page-install)), strips the footer, and checks the size and
+SHA-256 against the note before it keeps a byte.
 
 ## Sign-in (`/auth/*` and `/account`)
 
@@ -1270,18 +1344,21 @@ one of a valid code or a slug. It refuses a session footer.
 
 | Role | Runs as | Does |
 |---|---|---|
-| none, with a device footer | the owner | the setup wizard, "Support setup", five steps (code, name, how support connects, how much control, install). Nothing is preselected for the last two. It first checks for the `SupportMcpDevice` service and, if it exists, says "Support is already set up on this PC" and opens the tray. It starts `--device-install` elevated with `ShellExecuteEx` `runas` and reads the exit code. After exit 0 or 10 it starts `support.exe --tray` as the owner |
+| none, with a device footer | the owner | the setup wizard, "Support setup", five steps (code, name, how support connects, how much control, install). Nothing is preselected for the last two. It first checks for the `SupportMcpDevice` service and, if it exists, says "Support is already set up on this PC" and opens the tray. It starts `--device-install` elevated with `ShellExecuteEx` `runas` and reads the exit code. After exit 0 or 10 it starts the installed exe with `--tray` as the owner |
 | `--device-install <nonce> <answers>` | administrator, through UAC | stages and holds its exe like `--elevate-install`, turns on the safe DLL search, reads its own file and footer once, and goes ahead only if the wizard's named event for `<nonce>` still exists and is not set. `<answers>` is one base64url JSON argument: name (1 to 100 characters), access, control, and either the code or "use the workspace" (at most 1,024 characters; no key). It takes the origin and the workspace from its own footer. Exit codes: 0 active, 10 pending, 20 code invalid, 21 network, 22 refused, 23 already set up. It pairs over `/device/pair`, creates `%ProgramFiles%\SupportMCP` with the locked ACL, writes `support.exe` (the exe without its footer, Users may read and run it), `device.json` and `history.json` (locked), registers the service `SupportMcpDevice` ("Support device service", LocalSystem, automatic, restart on failure, quoted path, `--device-service`), the `HKLM` Run value `SupportMcpTray` and the Apps entry, and starts the service. Any failure after pairing sends `/device/leave` with the new key and rolls back only what this run made. One install or remove runs at a time, under a `Global` mutex; a second gets "already set up". It never touches `HKLM\SOFTWARE\SupportMCP` |
-| `--device-service` | LocalSystem, session 0 | reads `device.json` and checks in with `/device/hello` at start, then every 5 minutes measured from the last answer plus up to 30 seconds of jitter. After a network error it retries after 1 minute, doubling to 15. A 200 updates the name, access, control and state (active or pending). A 401 means removed (after active) or expired (while pending), and ends check-ins for good. A 426 means the app needs an update and is retried every 6 hours. It keeps the last 50 history lines in `history.json`. It runs no command, takes no screenshot and opens no file for the relay |
-| `--tray` | the signed-in user, started by the `HKLM` Run value at each sign-in | one per session (a `Local` mutex). A notification icon drawn at run time, and a panel with the name, the access mode, the state, "No one is connected.", recent history and "Uninstall Support". It reads the service through the pipe and exits when the uninstall event is set |
+| `--device-service` | LocalSystem, session 0 | reads `device.json` and checks in with `/device/hello` at start, then every 5 minutes measured from the last answer plus up to 30 seconds of jitter. After a network error it retries after 1 minute, doubling to 15. A 200 updates the name, access, control and state (active or pending). A 401 means removed (after active) or expired (while pending), and ends check-ins for good. A 426 means the app needs an update and is retried every 6 hours. It keeps the last 50 history lines in `history.json`. It runs no command, takes no screenshot and opens no file for the relay. When an answer carries `update` and the checks in [Updates](#updates) pass, it downloads the release, writes it as `support-<version>-<8 hex>.exe` in the install folder with the app's ACL from the moment it exists, reads it back and hashes it through a handle that denies writing (held until it stops), records it in `update.json`, and starts its own exe with `--device-update <file>`. A release whose download or checks failed is tried again an hour later at the earliest. On trial (below) it ends its first check-in pass by committing: any answer, a 401, a refusal or no network counts as healthy; on a 426 it starts `--device-update-rollback` from the old exe instead. Outside a trial it deletes every version file but its own and the previous one, or queues one a tray still runs for the next restart |
+| `--device-update <file>` | LocalSystem, session 0, a child of the service | the switch. It takes the setup mutex (busy: exit 30), checks that `<file>` is the version file the service recorded in `update.json` and hashes it again through a handle that denies writing (refused: exit 31), and writes the trial (`from`, `to`, both versions, a 4-minute deadline). It sets the service's failure actions to run `"<old exe>" --device-update-rollback` on every failure, crashes and stops with an error alike; stops the service (stopped or stopping already is fine); points the service's command line, the `HKLM` Run value and the Apps entry's `UninstallString`, `DisplayVersion` and `EstimatedSize` at the new file; and starts it. It then watches `update.json` and rolls back itself if the trial is still open after 4 minutes (exit 32), else exits 0 |
+| `--device-update-rollback` | LocalSystem, the failure action or a child of the new service | records the version as failed (never taken again), stops the service, points everything back at the old file with its own version and size, puts back the normal failure actions (restart twice, a minute apart), adds a history line, closes the trial and starts the service. With no trial open it only puts back the normal failure actions and starts the service |
+| `--tray` | the signed-in user, started by the `HKLM` Run value at each sign-in | one per session (a `Local` mutex). A notification icon drawn at run time, and a panel with the name, the access mode, the state, "No one is connected.", recent history, "Uninstall Support" and a small "Version x.y.z" line (the service's version; hidden when an older service sends none). It reads the service through the pipe and exits when the uninstall event is set. A tray keeps running the file it started from until the next sign-in, after an update too |
 | `--uninstall` | the owner | copies itself to a new Temp folder and runs from there. Confirms, then starts `--device-remove` elevated and shows "Support was removed" |
-| `--device-remove <nonce>` | administrator, through UAC | runs from the copy the uninstaller staged (it reads `device.json`, not a footer, so it holds no exe of its own), and goes ahead only while the uninstaller's named event for `<nonce>` still exists. It sends `/device/leave` (a 200 or a 401 both count as done), sets the uninstall event so every tray exits, waits a few seconds and ends any tray that remains, stops and deletes the service, deletes the Run value and the Apps entry, and removes the folder: it is renamed aside first (so a reinstall at the original path is never blocked), deleted with the junction-safe walk, and anything still locked is queued for the next restart. If the relay cannot be reached, or answers anything else (a refusal or a server error), it still removes everything and the owner is told the team must remove the PC. One install or remove runs at a time, under a `Global` mutex. Exit codes: 0 removed, 10 removed but the relay did not confirm, 20 failed |
+| `--device-remove <nonce>` | administrator, through UAC | runs from the copy the uninstaller staged (it reads `device.json`, not a footer, so it holds no exe of its own), and goes ahead only while the uninstaller's named event for `<nonce>` still exists. It sends `/device/leave` (a 200 or a 401 both count as done), sets the uninstall event so every tray exits, waits a few seconds and ends any tray that remains, stops and deletes the service, deletes the Run value and the Apps entry, and removes the folder: it is renamed aside first (so a reinstall at the original path is never blocked), deleted with the junction-safe walk, and anything still locked is queued for the next restart. If the relay cannot be reached, or answers anything else (a refusal or a server error), it still removes everything and the owner is told the team must remove the PC. It ends trays started from any exe in the install folder (`support.exe` or a version file), and the folder removal takes every version file and `update.json` with it. One install, remove or update switch runs at a time, under a `Global` mutex. Exit codes: 0 removed, 10 removed but the relay did not confirm, 20 failed, 21 busy (the mutex is held, or an update's trial is open and less than 10 minutes past its deadline), and then the window says to try again in a few minutes |
 
 The service's pipe is `SupportMcpDevice-ui`. Only SYSTEM can create instances,
 interactive users can read and write data, and it is never open to the network. It
 serves every interactive session, with a cap per process. Messages are a 4-byte
 length and UTF-8 JSON. It answers `{"type":"status"}` with `{name, access,
-control, state, confirm?, last_ok_at, history}` (state is `active`, `pending`,
+control, state, confirm?, last_ok_at, history, version}` (`version` is the
+running service's own; state is `active`, `pending`,
 `expired`, `removed`, `update_needed` or `offline`; `confirm` is the six digits
 while pending), `{"type":"refresh"}` with a check-in now, at most once every 30
 seconds, and `{"type":"allow_any_time"}`, which is answered at once and sends
@@ -1292,6 +1369,16 @@ or expired state is kept in `device.json`, so a restart serves it from the pipe
 without checking in again. A saved
 install uses names of its own (the service, the folder, the pipe, the event and the
 mutexes), so it does not collide with a one-off session's.
+
+Whatever starts or names the installed app (the tray at sign-in, the wizard's
+"Open Support", the tray's "Uninstall Support", the Apps entry) uses the exe in the
+service's command line when it is a version file in the install folder, and
+`support.exe` otherwise. A fresh install always writes `support.exe`.
+`update.json` in the install folder (locked like `device.json`) holds the
+versions that failed their trial, the previous version's file, the staged file
+with its size and SHA-256, and an open trial. A service that starts while a trial
+it is the old side of is still open (a restart midway) puts itself back and
+records the version as failed. One-off session apps never update themselves.
 
 ## Acceptance (each names its check)
 
@@ -1355,7 +1442,11 @@ mutexes), so it does not collide with a one-off session's.
 - The service of a saved PC runs no command, takes no screenshot and opens no
   file for anyone in this release, and nothing in the app turns the access mode
   from `any` back to `ask` (the relay still accepts either mode from a holder of
-  the key, as pinned earlier).
+  the key, as pinned earlier). It installs releases signed with the project's
+  release key and nothing else, never a version lower than or equal to its own,
+  and never bytes whose size or SHA-256 differ from the signed note.
+- The relay never holds the release private key and never needs it; CI holds
+  none either.
 - A screenshot, typed text and a secret are never stored by the relay: not in
   the audit log, the Session storage, the registry or the Worker log.
 - `ended` is terminal; no path reopens a session or extends `expires_at`.
