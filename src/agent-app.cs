@@ -2111,14 +2111,37 @@ namespace SupportMcp {
         [DllImport("advapi32.dll", SetLastError = true)] static extern bool CloseServiceHandle(IntPtr h);
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct Description { public string Text; }
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool ChangeServiceConfig2(IntPtr service, uint level, ref Description info);
-        // Own process, auto start, LocalSystem.
-        public static void Create(string name, string binary) {
+        // SERVICE_FAILURE_ACTIONS (level 2): restart on the first two failures, then leave it. ResetPeriod is a day,
+        // so unrelated failures far apart do not count together. The actions array is pinned in memory while the call runs.
+        [StructLayout(LayoutKind.Sequential)] struct ScAction { public int Type; public uint Delay; }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct FailureActions {
+            public uint ResetPeriod; public string RebootMessage, Command; public uint Count; public IntPtr Actions;
+        }
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool ChangeServiceConfig2(IntPtr service, uint level, ref FailureActions info);
+        // Own process, auto start, LocalSystem. display and description are the service's text; restartOnFailure adds the
+        // level-2 failure actions. The one-off full-control service keeps its exact text (see the single-argument call below).
+        public static void Create(string name, string binary) { Create(name, "Remote support session", "Gives remote support full control of this PC for one session, and removes itself when the session ends.", binary, false); }
+        public static void Create(string name, string display, string description, string binary, bool restartOnFailure) {
             IntPtr scm = OpenSCManager(null, null, 0x0003); if (scm == IntPtr.Zero) throw new Win32Exception();
             try {
-                IntPtr s = CreateService(scm, name, "Remote support session", 0xF01FF, 0x10, 2, 1, binary, null, IntPtr.Zero, null, null, null);
+                IntPtr s = CreateService(scm, name, display, 0xF01FF, 0x10, 2, 1, binary, null, IntPtr.Zero, null, null, null);
                 if (s == IntPtr.Zero) throw new Win32Exception();
-                var d = new Description { Text = "Gives remote support full control of this PC for one session, and removes itself when the session ends." };
-                ChangeServiceConfig2(s, 1, ref d); CloseServiceHandle(s);
+                try {
+                    var d = new Description { Text = description };
+                    ChangeServiceConfig2(s, 1, ref d);
+                    if (restartOnFailure) {
+                        // Two restarts after a one-minute wait, then no more. SC_ACTION_RESTART is 1, SC_ACTION_NONE is 0.
+                        var actions = new ScAction[3];
+                        actions[0].Type = 1; actions[0].Delay = 60000;
+                        actions[1].Type = 1; actions[1].Delay = 60000;
+                        actions[2].Type = 0; actions[2].Delay = 0;
+                        var pin = GCHandle.Alloc(actions, GCHandleType.Pinned);
+                        try {
+                            var fa = new FailureActions { ResetPeriod = 86400, RebootMessage = null, Command = null, Count = (uint)actions.Length, Actions = pin.AddrOfPinnedObject() };
+                            ChangeServiceConfig2(s, 2, ref fa);
+                        } finally { pin.Free(); }
+                    }
+                } finally { CloseServiceHandle(s); }
             } finally { CloseServiceHandle(scm); }
         }
         public static ServiceControllerStatus? Status(string name) { try { using (var c = new ServiceController(name)) return c.Status; } catch (InvalidOperationException) { return null; } }
@@ -3625,6 +3648,8 @@ namespace SupportMcp {
         }
         public const string UninstallText = "To remove Support, open Settings, then Apps, and uninstall Support.";
 
+        // A short description of this Windows, reported to the relay. Never fails the install.
+        public static string Os() { try { return Environment.OSVersion.VersionString; } catch (Exception) { return "Windows"; } }
         // Starts the tray as the signed-in user, when it is installed. A failure is not an error: it starts at the next sign-in.
         public static void StartTray() {
             try { if (File.Exists(Exe)) using (Process.Start(new ProcessStartInfo(Exe, "--tray") { UseShellExecute = false, WorkingDirectory = Folder })) { } } catch (Exception) { }
@@ -3847,8 +3872,10 @@ namespace SupportMcp {
                     Consent path = ConsentPath.Detect();
                     if (path == Consent.Unavailable) unavailable = true;
                     else {
-                        string staged = Elevation.Stage(exe);
-                        try { exit = Native.RunElevated(staged, "--device-install " + Elevation.Nonce() + " " + answers, owner, delegate { }); }
+                        string nonce = Elevation.Nonce(); string staged = Elevation.Stage(exe);
+                        // Want is held open for the whole elevated run; the installer opens it (Wanted) and refuses once it is gone.
+                        using (var want = Elevation.Want("device", nonce))
+                        try { exit = Native.RunElevated(staged, "--device-install " + nonce + " " + answers, owner, delegate { }); }
                         finally { try { Elevation.DeleteTree(Path.GetDirectoryName(staged)); } catch (Exception) { } }
                         if (exit == -1223) wasDeclined = true;
                     }
@@ -3922,11 +3949,147 @@ namespace SupportMcp {
         public void Finish() { var t = worker; if (t != null) t.Join(120000); }
     }
 
+    // --device-install <nonce> <answers>: the elevated step of the setup wizard, for a saved PC. It starts like the
+    // one-off full-control install: the DLL search is narrowed first (Program.Main), the exe runs from a staged, held
+    // copy, and the exe and its device footer are read once through that held handle (FullInstall.ReadSelf). The
+    // Want/Wanted nonce means a Yes the customer gives after the wizard has closed installs nothing. The install
+    // pairs over the /device/ wire, lays down %ProgramFiles%\SupportMCP, writes support.exe (the exe without its
+    // footer) that users may read and run and device.json plus history.json that only SYSTEM and administrators can,
+    // registers the SupportMcpDevice service, the tray's startup value and the Apps uninstall entry, and starts the
+    // service. On any failure after pairing it leaves the relay with the new key and removes everything it made. It
+    // never touches HKLM\SOFTWARE\SupportMCP (the one-off sessions' shared record). Only SYSTEM or an elevated
+    // administrator process ever holds the key.
+    public static class DeviceInstall {
+        public const string DisplayName = "Support", Publisher = "Support-MCP";
+        public const string ServiceDisplay = "Support device service";
+        public const string ServiceDescription = "Lets this PC's support team see it on their list and connect when you allow it. Uninstalling Support from Windows Settings removes this service.";
+        const string RunKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", TrayValueName = "SupportMcpTray";
+        const string AppsKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\SupportMcpDevice";
+
+        // What to do about what is already on the PC: a running service means Support is set up (exit 23); the folder
+        // without a service is a crash leftover to clean before a fresh install; nothing means a clean install.
+        public enum Leftover { Proceed, Clean, AlreadySetUp }
+        public static Leftover LeftoverAction(bool serviceExists, bool folderExists) {
+            if (serviceExists) return Leftover.AlreadySetUp;
+            if (folderExists) return Leftover.Clean;
+            return Leftover.Proceed;
+        }
+        // The service's binary path (quoted, because %ProgramFiles% has a space) and the tray's startup command.
+        public static string ServiceBinary(string exe) { return "\"" + exe + "\" --device-service"; }
+        public static string TrayRunValue(string exe) { return "\"" + exe + "\" --tray"; }
+        // The Apps-list entry's values. A string is written as a REG_SZ, a whole number as a REG_DWORD. There is no
+        // DisplayIcon: the exe carries no icon (the tray draws its own at run time).
+        public static Dictionary<string, object> AppsValues(string version, string folder, string exe, int estimatedSizeKb) {
+            return Wire.Map("DisplayName", DisplayName, "DisplayVersion", version, "Publisher", Publisher,
+                "InstallLocation", folder, "UninstallString", "\"" + exe + "\" --uninstall",
+                "NoModify", 1, "NoRepair", 1, "EstimatedSize", estimatedSizeKb);
+        }
+        // The install folder: created by an elevated administrator, owned by Administrators, SYSTEM and Administrators
+        // full and nothing inherited. device.json and history.json inherit this; support.exe gets its own ACL below.
+        public static DirectorySecurity LockedFolder() { var s = FullAcl.Folder(); s.SetOwner(FullAcl.AdminsSid); return s; }
+
+        public static int Install(byte[] self, Dictionary<string, object> footer, string[] args) {
+            if (args.Length != 3 || !System.Text.RegularExpressions.Regex.IsMatch(args[1], "^[0-9a-f]{32}$")) return DeviceSetup.Refused;
+            Dictionary<string, object> answers;
+            try { answers = DeviceSetup.DecodeAnswers(args[2]); } catch (Exception) { return DeviceSetup.Refused; }
+            // The wizard holds this event open while UAC is asked. Gone means the wizard closed before the Yes: install nothing.
+            var want = Elevation.Wanted("device", args[1]);
+            if (want == null) return DeviceSetup.Refused;
+            using (want) return Install(self, footer, answers, want);
+        }
+        static int Install(byte[] self, Dictionary<string, object> footer, Dictionary<string, object> answers, EventWaitHandle want) {
+            string origin = Wire.Text(footer, "origin"), folder = DeviceSetup.Folder, exe = DeviceSetup.Exe;
+            Leftover action = LeftoverAction(Scm.Status(DeviceSetup.ServiceName) != null, Directory.Exists(folder) || File.Exists(folder));
+            if (action == Leftover.AlreadySetUp) return DeviceSetup.AlreadySetUp;
+            if (action == Leftover.Clean) CleanLeftover(folder);
+            if (Scm.Status(DeviceSetup.ServiceName) != null || Directory.Exists(folder) || File.Exists(folder)) return DeviceSetup.AlreadySetUp;
+
+            string name = Wire.Text(answers, "name"), access = Wire.Text(answers, "access"), control = Wire.Text(answers, "control");
+            var body = Wire.Map("name", name, "access", access, "control", control, "os", DeviceSetup.Os(), "machine", Environment.MachineName, "app_version", Wire.Version);
+            if (answers.ContainsKey("code")) body["code"] = Wire.Text(answers, "code"); else body["workspace"] = Wire.Text(footer, "workspace");
+            DeviceLink.Answer a = new DeviceLink(origin).Pair(body);
+            if (a.Result == DeviceLink.DeviceResult.Offline) return DeviceSetup.Network;
+            if (a.Result == DeviceLink.DeviceResult.CodeInvalid) return DeviceSetup.CodeInvalid;
+            if (!a.Ok) return DeviceSetup.Refused;
+            string key = Wire.Text(a.Body, "key"), status = Wire.Text(a.Body, "status");
+
+            try {
+                Native.CreateLocked(folder, LockedFolder());
+                using (var f = new FileStream(exe, FileMode.CreateNew)) f.Write(self, 0, Wire.Payload(self));
+                File.SetAccessControl(exe, FullAcl.Window()); // users may read and run support.exe, like the one-off window copy
+                var record = Wire.Map("origin", origin, "workspace", Wire.Text(a.Body, "workspace"), "device_id", Wire.Text(a.Body, "device_id"),
+                    "key", key, "status", status, "name", name, "access", access, "control", control);
+                if (status == "pending") record["confirm"] = Wire.Text(a.Body, "confirm");
+                File.WriteAllText(Path.Combine(folder, "device.json"), Wire.Json().Serialize(record)); // inherits the locked folder ACL
+                var history = new System.Collections.ArrayList();
+                history.Add(Wire.Map("at", Client.UnixNow(), "text", "Support was set up on this PC."));
+                if (status == "pending") history.Add(Wire.Map("at", Client.UnixNow(), "text", "Waiting for your support team to approve this PC."));
+                File.WriteAllText(Path.Combine(folder, "history.json"), Wire.Json().Serialize(history));
+
+                Scm.Create(DeviceSetup.ServiceName, ServiceDisplay, ServiceDescription, ServiceBinary(exe), true);
+                WriteRegistry(exe, Wire.Version, folder, (Wire.Payload(self) + 1023) / 1024);
+                if (want.WaitOne(0)) { RemoveEverything(origin, key, folder); return DeviceSetup.Refused; } // withdrawn while this ran
+                Scm.Start(DeviceSetup.ServiceName);
+                return status == "pending" ? DeviceSetup.Pending : DeviceSetup.Active;
+            } catch (Exception) {
+                RemoveEverything(origin, key, folder);
+                return DeviceSetup.Refused;
+            }
+        }
+
+        // A crash leftover: tell the relay to forget the PC with any key still in device.json, then remove the folder
+        // through handles, so a junction swapped in is removed and never followed.
+        static void CleanLeftover(string folder) {
+            try {
+                var old = ReadDeviceJson(folder);
+                if (old != null) { string key = Wire.Text(old, "key"), origin = Wire.Text(old, "origin"); if (key.Length > 0 && origin.Length > 0) new DeviceLink(origin).Leave(key); }
+            } catch (Exception) { }
+            try { Native.DeleteTree(folder); } catch (Exception) { }
+        }
+        static Dictionary<string, object> ReadDeviceJson(string folder) {
+            try { return Wire.Json().Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(folder, "device.json"))); }
+            catch (Exception) { return null; }
+        }
+        // Undo a failed install: leave the relay with the new key, stop and delete the service, drop the registry
+        // entries, and remove the folder. Best effort, in that order.
+        static void RemoveEverything(string origin, string key, string folder) {
+            try { if (key != null && key.Length > 0 && origin.Length > 0) new DeviceLink(origin).Leave(key); } catch (Exception) { }
+            try { Scm.Remove(DeviceSetup.ServiceName); } catch (Exception) { }
+            RemoveRegistry();
+            try { if (Directory.Exists(folder)) Native.DeleteTree(folder); } catch (Exception) { }
+        }
+        static void WriteRegistry(string exe, string version, string folder, int sizeKb) {
+            using (var hklm = SasShare.Machine()) {
+                using (var run = hklm.CreateSubKey(RunKey)) run.SetValue(TrayValueName, TrayRunValue(exe), Microsoft.Win32.RegistryValueKind.String);
+                using (var app = hklm.CreateSubKey(AppsKey))
+                    foreach (var kv in AppsValues(version, folder, exe, sizeKb))
+                        app.SetValue(kv.Key, kv.Value, kv.Value is int ? Microsoft.Win32.RegistryValueKind.DWord : Microsoft.Win32.RegistryValueKind.String);
+            }
+        }
+        public static void RemoveRegistry() {
+            try {
+                using (var hklm = SasShare.Machine()) {
+                    using (var run = hklm.OpenSubKey(RunKey, true)) if (run != null) run.DeleteValue(TrayValueName, false);
+                    hklm.DeleteSubKeyTree(AppsKey, false);
+                }
+            } catch (Exception) { }
+        }
+    }
+
+    // --device-service: the saved PC's background service. PR 4 step 5 fills in the check-ins, the local history and
+    // the status pipe; this placeholder only lets the SCM start and stop it, so the install can verify the service runs.
+    public sealed class DeviceServicePlaceholder : ServiceBase {
+        public DeviceServicePlaceholder() { ServiceName = DeviceSetup.ServiceName; CanStop = true; CanShutdown = true; AutoLog = false; }
+        protected override void OnStart(string[] args) { }
+        protected override void OnStop() { }
+    }
+
     public static class Program {
         [STAThread] public static void Main(string[] args) {
             string role = args.Length > 0 ? args[0] : "", executable = System.Reflection.Assembly.GetExecutingAssembly().Location;
             // The roles that run elevated or as SYSTEM show nothing at all: no window, no message box.
             if (role == "--service") { try { ServiceBase.Run(new SupportService(executable, Wire.ReadConfig(executable))); } catch (Exception) { } return; }
+            if (role == "--device-service") { try { ServiceBase.Run(new DeviceServicePlaceholder()); } catch (Exception) { } return; }
             if (role == "--helper") { try { Helper.Run(executable, args); } catch (Exception) { } Environment.Exit(0); }
             if (role == "--elevate-install") {
                 Native.SafeDllSearch(); int code = 1; FileStream held = null;
@@ -3934,9 +4097,14 @@ namespace SupportMcp {
                 finally { if (held != null) held.Dispose(); }
                 Environment.Exit(code);
             }
-            // The elevated install step of a saved PC. Its body is PR 4 step 4; until then it refuses cleanly, so the
-            // wizard shows "try again" instead of a stray dialog from a role that reads a device footer as a session.
-            if (role == "--device-install") { Native.SafeDllSearch(); Environment.Exit(DeviceSetup.Refused); }
+            // The elevated install step of a saved PC: reads its own exe and device footer once through a held handle,
+            // like --elevate-install, then installs. Anything other than exit 0 or 10 leaves nothing of this run.
+            if (role == "--device-install") {
+                Native.SafeDllSearch(); int code = DeviceSetup.Refused; FileStream held = null;
+                try { byte[] self = FullInstall.ReadSelf(executable, out held); code = DeviceInstall.Install(self, Wire.ReadDevice(self), args); } catch (Exception) { }
+                finally { if (held != null) held.Dispose(); }
+                Environment.Exit(code);
+            }
             WF.Application.EnableVisualStyles();
             try {
                 var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };

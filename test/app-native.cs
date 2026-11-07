@@ -292,6 +292,36 @@ public static class AppTests {
         Assert(DeviceSetup.ModeText("any").Contains("any time") && DeviceSetup.ModeText("ask").Contains("asks you") && DeviceSetup.Folder.EndsWith("SupportMCP") && DeviceSetup.Exe.EndsWith("support.exe"), "the mode text and the install paths");
         Console.WriteLine("PASS the setup wizard rules: code format, step validation, the answers argument, and the exit-code map");
     }
+    // The elevated install's pure parts: the leftover decision, the service command line, the registry builders, the
+    // Apps entry values, the install paths and the locked-folder ACL (read back as the FullControl tests do).
+    static void DeviceInstallTests() {
+        Assert(DeviceInstall.LeftoverAction(true, false) == DeviceInstall.Leftover.AlreadySetUp && DeviceInstall.LeftoverAction(true, true) == DeviceInstall.Leftover.AlreadySetUp, "a running service means Support is already set up");
+        Assert(DeviceInstall.LeftoverAction(false, true) == DeviceInstall.Leftover.Clean, "the folder with no service is a crash leftover to clean");
+        Assert(DeviceInstall.LeftoverAction(false, false) == DeviceInstall.Leftover.Proceed, "nothing installed means a clean install");
+
+        string exe = @"C:\Program Files\SupportMCP\support.exe";
+        Assert(DeviceInstall.ServiceBinary(exe) == "\"C:\\Program Files\\SupportMCP\\support.exe\" --device-service", "the service path is quoted, with --device-service");
+        Assert(DeviceInstall.TrayRunValue(exe) == "\"C:\\Program Files\\SupportMCP\\support.exe\" --tray", "the tray startup value is quoted, with --tray");
+
+        var apps = DeviceInstall.AppsValues("0.4.0", @"C:\Program Files\SupportMCP", exe, 512);
+        Assert(Wire.Text(apps, "DisplayName") == "Support" && Wire.Text(apps, "DisplayVersion") == "0.4.0" && Wire.Text(apps, "Publisher") == "Support-MCP", "the Apps entry names the app, its version and publisher");
+        Assert(Wire.Text(apps, "InstallLocation") == @"C:\Program Files\SupportMCP" && Wire.Text(apps, "UninstallString") == "\"" + exe + "\" --uninstall", "the Apps entry says where it is and how to uninstall it");
+        Assert(apps["NoModify"] is int && (int)apps["NoModify"] == 1 && apps["NoRepair"] is int && (int)apps["NoRepair"] == 1 && apps["EstimatedSize"] is int && (int)apps["EstimatedSize"] == 512, "NoModify, NoRepair and EstimatedSize are whole numbers");
+        Assert(!apps.ContainsKey("DisplayIcon"), "there is no DisplayIcon: the exe carries no icon");
+
+        Assert(DeviceSetup.Folder.EndsWith("\\SupportMCP") && DeviceSetup.Exe == Path.Combine(DeviceSetup.Folder, "support.exe") && Directory.Exists(FullInstall.Root), "the install folder is under %ProgramFiles%\\SupportMCP and the app is support.exe in it");
+
+        // The locked folder: owner Administrators, SYSTEM and Administrators full, nothing inherited (as FullAcl.Folder,
+        // which the one-off tests already check on disk, plus the owner this install sets).
+        var locked = DeviceInstall.LockedFolder();
+        Assert(locked.AreAccessRulesProtected && ((SecurityIdentifier)locked.GetOwner(typeof(SecurityIdentifier))).Equals(FullAcl.AdminsSid), "the locked folder is owned by Administrators and does not inherit");
+        var rules = locked.GetAccessRules(true, true, typeof(SecurityIdentifier));
+        Assert(rules.Count == 2, "two rules: " + rules.Count);
+        foreach (FileSystemAccessRule r in rules)
+            Assert((r.IdentityReference.Equals(FullAcl.SystemSid) || r.IdentityReference.Equals(FullAcl.AdminsSid)) && r.FileSystemRights == FileSystemRights.FullControl && !r.IsInherited
+                && r.InheritanceFlags == (InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit), "only SYSTEM and Administrators, full control, inherited by files and folders");
+        Console.WriteLine("PASS the elevated install: the leftover decision, the service and tray command lines, the Apps entry, the paths and the locked folder");
+    }
     // The focus the confirm gives back: only to the window that had it, only while the support window still holds it.
     static void FocusReturnTests() {
         Func<IntPtr, bool> ours = delegate(IntPtr w) { return (int)w >= 100; }, here = delegate(IntPtr w) { return (int)w != 7; };
@@ -1443,6 +1473,7 @@ public static class AppTests {
             FooterReaderTests();
             DeviceLinkTests();
             SetupRuleTests();
+            DeviceInstallTests();
             // The downloaded PE overlay must be readable by the actual .NET client.
             string overlay = Path.Combine(dir, "overlay.exe"); byte[] cfg = Encoding.UTF8.GetBytes(Wire.Json().Serialize(Wire.Map("sid", new string('a', 64), "key", new string('b', 64), "origin", "https://support.example.com", "startup_expires_at", Client.UnixNow() + 10000)));
             using (var f = File.Create(overlay)) { f.WriteByte(77); f.WriteByte(90); f.Write(cfg, 0, cfg.Length); byte[] n = BitConverter.GetBytes(cfg.Length); f.Write(n, 0, n.Length); byte[] footer = Encoding.ASCII.GetBytes(Wire.Footer); f.Write(footer, 0, footer.Length); }
