@@ -476,6 +476,87 @@ public static class AppTests {
         Assert(DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Refused), "an unexpected refusal still removes locally");
         Console.WriteLine("PASS uninstall: the removal plan, the exit-code map, the Temp-copy rule, and leave's 401 as done");
     }
+    // Drives the real service against a fake relay with a real temp folder: a 200 with no device, a team access
+    // change, allow_any_time only from "ask" (never sending "ask"), terminal states persisted and not re-checked after
+    // a reload, and the uninstall event opened with Modify so a waiter sees the signal.
+    static void DeviceServiceLiveTests(string dir) {
+        string folder = Path.Combine(dir, "svc-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(folder);
+        string exe = Path.Combine(folder, "support.exe");
+        Func<string, string, string, string, string> dev = delegate(string st, string nm, string ac, string ct) {
+            return Wire.Json().Serialize(Wire.Map("protocol", 1, "device", Wire.Map("id", "d", "workspace", "default", "status", st, "name", nm, "access", ac, "control", ct, "site_id", null)));
+        };
+        Action<string> writeJson = delegate(string json) { File.WriteAllText(Path.Combine(folder, "device.json"), json); };
+        Func<DeviceService, int> histCount = delegate(DeviceService svc) { var h = svc.TestStatus()["history"] as System.Collections.ArrayList; return h == null ? 0 : h.Count; };
+
+        using (var relay = new FakeDevice()) {
+            writeJson(Wire.Json().Serialize(Wire.Map("origin", relay.Origin, "workspace", "default", "device_id", "d", "key", "smd1.default.id.secret", "status", "active", "name", "PC", "access", "ask", "control", "limited")));
+            var svc = new DeviceService(exe);
+            Assert(svc.TestInit(), "the service loads device.json");
+            relay.Status = 200; relay.Body = dev("active", "Front desk", "ask", "limited");
+            svc.TestCheckInOnce();
+            Assert(Wire.Text(svc.TestStatus(), "state") == DeviceState.Active && Wire.Text(svc.TestStatus(), "name") == "Front desk", "a 200 updates name and state from the device");
+            // A 200 with no "device" is treated as offline, not a crash that ends the loop.
+            relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1));
+            svc.TestCheckInOnce();
+            Assert(Wire.Text(svc.TestStatus(), "state") == DeviceState.Offline, "a 200 with no device is offline, not a crash");
+            // The team flips access to any: a history line is added.
+            int before = histCount(svc);
+            relay.Body = dev("active", "Front desk", "any", "limited");
+            svc.TestCheckInOnce();
+            Assert(Wire.Text(svc.TestStatus(), "access") == "any" && histCount(svc) == before + 1, "a team access change applies and is a history line");
+            // Back to ask (the team turned it off), so allow_any_time becomes possible again.
+            relay.Body = dev("active", "Front desk", "ask", "limited");
+            svc.TestCheckInOnce();
+            Assert(Wire.Text(svc.TestStatus(), "access") == "ask", "the team can set it back to ask");
+            // allow_any_time: the pipe answers at once, and the update runs in the background and only ever sends "any".
+            relay.Body = dev("active", "Front desk", "any", "limited"); relay.LastJson = ""; relay.LastPath = "";
+            var reply = svc.TestHandle(Wire.Map("type", "allow_any_time"));
+            Assert(reply != null && Wire.Text(reply, "state").Length > 0, "allow_any_time is answered at once");
+            bool went = false;
+            for (int i = 0; i < 100 && !went; i++) { if (Wire.Text(svc.TestStatus(), "access") == "any") went = true; else Thread.Sleep(50); }
+            Assert(went, "allow_any_time turned on any in the background");
+            Assert(relay.LastPath == "/device/update" && Wire.Text(relay.Sent(), "access") == "any", "it sent access any, never ask");
+            // A second allow_any_time while already any sends nothing (and so can never send ask).
+            relay.LastJson = ""; relay.LastPath = "";
+            svc.TestHandle(Wire.Map("type", "allow_any_time")); Thread.Sleep(300);
+            Assert(relay.LastJson == "", "allow_any_time does nothing once the mode is any");
+        }
+
+        // Terminal states are persisted and a reload serves them without a fresh check-in or a duplicate history line.
+        foreach (string[] pair in new string[][] { new string[] { "active", DeviceState.Removed }, new string[] { "pending", DeviceState.Expired } }) {
+            string folder2 = Path.Combine(dir, "term-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(folder2);
+            string exe2 = Path.Combine(folder2, "support.exe");
+            using (var relay = new FakeDevice()) {
+                var start = Wire.Map("origin", relay.Origin, "workspace", "default", "device_id", "d", "key", "smd1.default.id.secret", "status", pair[0], "name", "PC", "access", "ask", "control", "limited");
+                if (pair[0] == "pending") start["confirm"] = "482913";
+                File.WriteAllText(Path.Combine(folder2, "device.json"), Wire.Json().Serialize(start));
+                var svc = new DeviceService(exe2); Assert(svc.TestInit(), "init " + pair[1]);
+                relay.Status = 401; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "error", Wire.Map("code", "device_unknown", "message", "x")));
+                svc.TestCheckInOnce();
+                Assert(Wire.Text(svc.TestStatus(), "state") == pair[1] && svc.TestTerminal, "401 gives " + pair[1] + " and is terminal");
+                var stored = Wire.Json().Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(folder2, "device.json")));
+                Assert(Wire.Text(stored, "state") == pair[1], pair[1] + " is persisted to device.json");
+                int lines = histCount(svc);
+                // A reload serves the terminal state, stays terminal, and adds no duplicate history line at boot.
+                var reloaded = new DeviceService(exe2); Assert(reloaded.TestInit(), "reload " + pair[1]);
+                Assert(Wire.Text(reloaded.TestStatus(), "state") == pair[1] && reloaded.TestTerminal, "a reload serves " + pair[1] + " without a check-in");
+                Assert(histCount(reloaded) == lines, "no duplicate " + pair[1] + " line at boot");
+            }
+        }
+
+        // The uninstall event opened with Modify can be set, and a waiter sees it (the bug was Synchronize-only).
+        string en = "Local\\SupportMcpTestUninstall-" + Guid.NewGuid().ToString("N");
+        using (var created = DeviceService.TestCreateEvent(en)) {
+            var got = new ManualResetEvent(false);
+            var w = new Thread(delegate() { var we = DeviceService.TestOpenEvent(en, EventWaitHandleRights.Synchronize); if (we != null) using (we) if (we.WaitOne(5000)) got.Set(); });
+            w.IsBackground = true; w.Start(); Thread.Sleep(200);
+            var signaller = DeviceService.TestOpenEvent(en, EventWaitHandleRights.Synchronize | EventWaitHandleRights.Modify);
+            Assert(signaller != null && signaller.Set(), "the event opens with Modify and sets");
+            if (signaller != null) signaller.Dispose();
+            Assert(got.WaitOne(5000), "a waiter sees the uninstall signal");
+        }
+        Console.WriteLine("PASS the live service: a 200 with no device, a team mode change, allow_any_time one-way and async, terminal persistence across a reload, and the uninstall event");
+    }
     // The focus the confirm gives back: only to the window that had it, only while the support window still holds it.
     static void FocusReturnTests() {
         Func<IntPtr, bool> ours = delegate(IntPtr w) { return (int)w >= 100; }, here = delegate(IntPtr w) { return (int)w != 7; };
@@ -1631,6 +1712,7 @@ public static class AppTests {
             DeviceServiceTests(dir);
             TrayTests();
             UninstallTests();
+            DeviceServiceLiveTests(dir);
             // The downloaded PE overlay must be readable by the actual .NET client.
             string overlay = Path.Combine(dir, "overlay.exe"); byte[] cfg = Encoding.UTF8.GetBytes(Wire.Json().Serialize(Wire.Map("sid", new string('a', 64), "key", new string('b', 64), "origin", "https://support.example.com", "startup_expires_at", Client.UnixNow() + 10000)));
             using (var f = File.Create(overlay)) { f.WriteByte(77); f.WriteByte(90); f.Write(cfg, 0, cfg.Length); byte[] n = BitConverter.GetBytes(cfg.Length); f.Write(n, 0, n.Length); byte[] footer = Encoding.ASCII.GetBytes(Wire.Footer); f.Write(footer, 0, footer.Length); }
