@@ -234,6 +234,64 @@ public static class AppTests {
         }
         Console.WriteLine("PASS the device client speaks the /device/ wire: pair, check-in, update and leave, with status mapping and offline");
     }
+    // The setup wizard's pure rules: code normalisation, step validation, the answers argument and the exit-code map.
+    static void SetupRuleTests() {
+        // A code is normalised to ABCDE-FGH23 whatever the case, spaces or hyphens; 0, 1, I and O are not in the alphabet.
+        Assert(DeviceSetup.NormalizeCode("abcde-fgh23") == "ABCDE-FGH23", "lower case");
+        Assert(DeviceSetup.NormalizeCode("ABCDEFGH23") == "ABCDE-FGH23", "no hyphen");
+        Assert(DeviceSetup.NormalizeCode(" abc de-fg h23 ") == "ABCDE-FGH23", "spaces");
+        foreach (string bad in new string[] { "", "ABCDE-FGH2", "ABCDE-FGH234", "ABCDE-FGH2I", "ABCDE-FGH2O", "ABCDE FGH2!", "11111-11111" })
+            Assert(DeviceSetup.NormalizeCode(bad) == null, "a bad code is null: " + bad);
+        Assert(DeviceSetup.CodeCharsOk("ABCDE-FGH") && DeviceSetup.CodeCharsOk("") && !DeviceSetup.CodeCharsOk("ABCDEFGHJKL") && !DeviceSetup.CodeCharsOk("ABC!"), "as typed: only the alphabet, at most ten");
+
+        // A name is required, trimmed, at most 100 characters, no control characters.
+        Assert(DeviceSetup.CheckName("Front desk") == "" && DeviceSetup.CheckName("  x  ") == "", "a plain name is fine");
+        Assert(DeviceSetup.CheckName("") != "" && DeviceSetup.CheckName("   ") != "" && DeviceSetup.CheckName(new string('x', 101)) != "" && DeviceSetup.CheckName("a\tb") != "", "bad names are refused");
+
+        // Step validation: nothing is preselected, so each choice must be made; a workspace install needs no code.
+        Assert(DeviceSetup.Missing(DeviceSetup.Screen.Code, "", false, "", null, null) != "", "a missing code stops the code step");
+        Assert(DeviceSetup.Missing(DeviceSetup.Screen.Code, "", true, "", null, null) == "", "a workspace install needs no code");
+        Assert(DeviceSetup.Missing(DeviceSetup.Screen.Code, "abcde-fgh23", false, "", null, null) == "", "a good code passes the code step");
+        Assert(DeviceSetup.Missing(DeviceSetup.Screen.Name, "", false, "", null, null) != "" && DeviceSetup.Missing(DeviceSetup.Screen.Name, "", false, "PC", null, null) == "", "the name step");
+        Assert(DeviceSetup.Missing(DeviceSetup.Screen.Access, "", false, "PC", null, null) != "" && DeviceSetup.Missing(DeviceSetup.Screen.Access, "", false, "PC", "ask", null) == "" && DeviceSetup.Missing(DeviceSetup.Screen.Access, "", false, "PC", "any", null) == "", "the access step needs a choice");
+        Assert(DeviceSetup.Missing(DeviceSetup.Screen.Control, "", false, "PC", "ask", null) != "" && DeviceSetup.Missing(DeviceSetup.Screen.Control, "", false, "PC", "ask", "full") == "" && DeviceSetup.Missing(DeviceSetup.Screen.Control, "", false, "PC", "ask", "limited") == "", "the control step needs a choice");
+        Assert(DeviceSetup.StepOf(DeviceSetup.Screen.Code) == 1 && DeviceSetup.StepOf(DeviceSetup.Screen.Install) == 5 && DeviceSetup.StepOf(DeviceSetup.Screen.Intro) == 0 && DeviceSetup.StepOf(DeviceSetup.Screen.Done) == 0, "steps 1 to 5 are code to install");
+
+        // The answers argument: base64url JSON, decoded and checked again. No owner contact (call 7).
+        string withCode = DeviceSetup.EncodeAnswers(" Front desk ", "any", "full", "ABCDE-FGH23");
+        Assert(System.Text.RegularExpressions.Regex.IsMatch(withCode, "^[A-Za-z0-9_-]+$"), "the argument is base64url with no padding");
+        var back = DeviceSetup.DecodeAnswers(withCode);
+        Assert(Wire.Text(back, "name") == "Front desk" && Wire.Text(back, "access") == "any" && Wire.Text(back, "control") == "full" && Wire.Text(back, "code") == "ABCDE-FGH23" && !back.ContainsKey("workspace"), "a code's answers round-trip, trimmed");
+        var ws = DeviceSetup.DecodeAnswers(DeviceSetup.EncodeAnswers("PC", "ask", "limited", null));
+        Assert(Wire.Flag(ws, "workspace") && !ws.ContainsKey("code") && Wire.Text(ws, "access") == "ask", "a workspace install carries workspace true, no code");
+        Assert(!back.ContainsKey("owner_contact") && !ws.ContainsKey("owner_contact"), "the answers never carry an owner contact");
+        foreach (string arg in new string[] { "", "not base64url!!", "====" })
+            ThrowsData(delegate { DeviceSetup.DecodeAnswers(arg); }, "junk: " + arg);
+        // Tampered JSON is refused: a bad access, a missing field, both a code and a workspace, an over-long argument.
+        Func<Dictionary<string, object>, string> enc = delegate(Dictionary<string, object> m) {
+            string b = Convert.ToBase64String(Encoding.UTF8.GetBytes(Wire.Json().Serialize(m)));
+            return b.TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        };
+        foreach (Dictionary<string, object> bad in new List<Dictionary<string, object>> {
+            Wire.Map("name", "PC", "access", "sometimes", "control", "full", "code", "ABCDE-FGH23"),
+            Wire.Map("name", "PC", "access", "ask", "control", "other", "code", "ABCDE-FGH23"),
+            Wire.Map("name", "", "access", "ask", "control", "full", "code", "ABCDE-FGH23"),
+            Wire.Map("name", "PC", "access", "ask", "control", "full", "code", "abcde-fgh23"),
+            Wire.Map("name", "PC", "access", "ask", "control", "full", "code", "ABCDE-FGH23", "workspace", true),
+            Wire.Map("name", "PC", "access", "ask", "control", "full"),
+            Wire.Map("name", "PC", "access", "ask", "control", "full", "owner_contact", "x", "code", "ABCDE-FGH23"),
+        }) ThrowsData(delegate { DeviceSetup.DecodeAnswers(enc(bad)); }, Wire.Json().Serialize(bad));
+        ThrowsData(delegate { DeviceSetup.DecodeAnswers(new string('A', DeviceSetup.MaxAnswers + 1)); }, "too long");
+
+        // The exit-code map: where the wizard goes and what it says.
+        Assert(DeviceSetup.After(DeviceSetup.Active) == DeviceSetup.Screen.Done && DeviceSetup.After(DeviceSetup.Pending) == DeviceSetup.Screen.Waiting && DeviceSetup.After(DeviceSetup.CodeInvalid) == DeviceSetup.Screen.Code && DeviceSetup.After(DeviceSetup.AlreadySetUp) == DeviceSetup.Screen.Already, "each exit code goes to its screen");
+        Assert(DeviceSetup.After(DeviceSetup.Network) == DeviceSetup.Screen.Install && DeviceSetup.After(DeviceSetup.Refused) == DeviceSetup.Screen.Install && DeviceSetup.After(999) == DeviceSetup.Screen.Install, "network, refused and anything unknown go back to the install step");
+        Assert(DeviceSetup.ExitText(DeviceSetup.Active) == "" && DeviceSetup.ExitText(DeviceSetup.Pending) == "" && DeviceSetup.ExitText(DeviceSetup.AlreadySetUp) == "", "the success screens carry no error");
+        Assert(DeviceSetup.ExitText(DeviceSetup.CodeInvalid).Contains("code") && DeviceSetup.ExitText(DeviceSetup.Network).Contains("reach") && DeviceSetup.ExitText(DeviceSetup.Refused).Contains("refused"), "code, network and refused each say what happened");
+        Assert(DeviceSetup.ShowConfirm("482913") == "482 913" && DeviceSetup.ShowConfirm("abc") == null && DeviceSetup.ShowConfirm(null) == null, "six digits show as two groups");
+        Assert(DeviceSetup.ModeText("any").Contains("any time") && DeviceSetup.ModeText("ask").Contains("asks you") && DeviceSetup.Folder.EndsWith("SupportMCP") && DeviceSetup.Exe.EndsWith("support.exe"), "the mode text and the install paths");
+        Console.WriteLine("PASS the setup wizard rules: code format, step validation, the answers argument, and the exit-code map");
+    }
     // The focus the confirm gives back: only to the window that had it, only while the support window still holds it.
     static void FocusReturnTests() {
         Func<IntPtr, bool> ours = delegate(IntPtr w) { return (int)w >= 100; }, here = delegate(IntPtr w) { return (int)w != 7; };
@@ -1384,6 +1442,7 @@ public static class AppTests {
             LiveScreenTests();
             FooterReaderTests();
             DeviceLinkTests();
+            SetupRuleTests();
             // The downloaded PE overlay must be readable by the actual .NET client.
             string overlay = Path.Combine(dir, "overlay.exe"); byte[] cfg = Encoding.UTF8.GetBytes(Wire.Json().Serialize(Wire.Map("sid", new string('a', 64), "key", new string('b', 64), "origin", "https://support.example.com", "startup_expires_at", Client.UnixNow() + 10000)));
             using (var f = File.Create(overlay)) { f.WriteByte(77); f.WriteByte(90); f.Write(cfg, 0, cfg.Length); byte[] n = BitConverter.GetBytes(cfg.Length); f.Write(n, 0, n.Length); byte[] footer = Encoding.ASCII.GetBytes(Wire.Footer); f.Write(footer, 0, footer.Length); }

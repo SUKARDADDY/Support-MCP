@@ -3517,6 +3517,411 @@ namespace SupportMcp {
         }
     }
 
+    // ---- Saved PC: setup --------------------------------------------------------------------------------------
+    // The rules of the setup wizard, kept apart from its window so the native tests can check them. The wizard runs
+    // as the signed-in user and never holds a key. It hands its answers to the elevated install step as one argument
+    // (base64url JSON) and reads the outcome from that step's exit code; no file passes between the two.
+    public static class DeviceSetup {
+        public const string ServiceName = "SupportMcpDevice";
+        // The elevated step's exit codes.
+        public const int Active = 0, Pending = 10, CodeInvalid = 20, Network = 21, Refused = 22, AlreadySetUp = 23;
+        public const int MaxName = 100, MaxAnswers = 1024;
+        const string Alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        // The install folder and the app in it, under %ProgramFiles% read from HKLM (FullInstall.Root).
+        public static string Folder { get { return Path.Combine(FullInstall.Root, "SupportMCP"); } }
+        public static string Exe { get { return Path.Combine(Folder, "support.exe"); } }
+        // The wizard's screens. Code to Install are steps 1 to 5.
+        public enum Screen { Intro, Code, Name, Access, Control, Install, Done, Waiting, Already, Unavailable }
+        public static int StepOf(Screen s) { return s >= Screen.Code && s <= Screen.Install ? (int)s : 0; }
+
+        // A typed code in the form the team shows (ABCDE-FGH23), or null. Case, spaces and hyphens do not matter.
+        public static string NormalizeCode(string typed) {
+            var plain = new StringBuilder();
+            foreach (char c in typed ?? "") { if (c == '-' || c == ' ') continue; plain.Append(char.ToUpperInvariant(c)); }
+            string code = plain.ToString();
+            if (code.Length != 10 || !CodeCharsOk(code)) return null;
+            return code.Substring(0, 5) + "-" + code.Substring(5);
+        }
+        // True while what is typed so far could still become a code: only the code's letters and digits, spaces and
+        // hyphens, and at most 10 of the letters and digits.
+        public static bool CodeCharsOk(string typed) {
+            int n = 0;
+            foreach (char c in typed ?? "") {
+                if (c == '-' || c == ' ') continue;
+                if (Alphabet.IndexOf(char.ToUpperInvariant(c)) < 0) return false;
+                n++;
+            }
+            return n <= 10;
+        }
+        // An error text for a PC name, or "" when it is good. The relay allows 100 characters with no control characters.
+        public static string CheckName(string name) {
+            string t = (name ?? "").Trim();
+            if (t.Length == 0) return "Give this PC a name your support team will recognise.";
+            if (t.Length > MaxName) return "Use at most " + MaxName + " characters.";
+            foreach (char c in t) if (char.IsControl(c)) return "Use letters, digits and spaces only.";
+            return "";
+        }
+        // What stops the wizard from leaving a screen, or "" when nothing does. access and control are null until chosen:
+        // nothing is preselected.
+        public static string Missing(Screen s, string code, bool useWorkspace, string name, string access, string control) {
+            if (s == Screen.Code && !useWorkspace && NormalizeCode(code) == null) return "Type the code from your support team, like ABCDE-FGH23.";
+            if (s == Screen.Name) return CheckName(name);
+            if (s == Screen.Access && access != "ask" && access != "any") return "Choose how support may connect.";
+            if (s == Screen.Control && control != "full" && control != "limited") return "Choose how much support can do.";
+            return "";
+        }
+
+        // The answers argument: base64url of {"name","access","control"} plus "code" (a technician's code) or
+        // "workspace": true (an install the owner starts, with the workspace from the install step's own footer). No
+        // owner contact: the team keeps it. Nothing secret beyond the code the owner typed.
+        public static string EncodeAnswers(string name, string access, string control, string code) {
+            var m = Wire.Map("name", (name ?? "").Trim(), "access", access, "control", control);
+            if (code == null) m["workspace"] = true; else m["code"] = code;
+            string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(Wire.Json().Serialize(m)));
+            return b64.TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        }
+        // The answers back, checked again, since anyone could start the install step with any argument.
+        public static Dictionary<string, object> DecodeAnswers(string arg) {
+            if (arg == null || arg.Length == 0 || arg.Length > MaxAnswers || !System.Text.RegularExpressions.Regex.IsMatch(arg, "^[A-Za-z0-9_-]+$")) throw new InvalidDataException("Invalid setup answers.");
+            string b64 = arg.Replace('-', '+').Replace('_', '/');
+            b64 += new string('=', (4 - b64.Length % 4) % 4);
+            Dictionary<string, object> m;
+            try { m = Wire.Json().Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(Convert.FromBase64String(b64))); }
+            catch (Exception) { throw new InvalidDataException("Invalid setup answers."); }
+            if (m == null || m.Count != 4) throw new InvalidDataException("Invalid setup answers.");
+            object name, access, control, code, workspace;
+            bool hasCode = m.TryGetValue("code", out code), hasWorkspace = m.TryGetValue("workspace", out workspace);
+            if (!m.TryGetValue("name", out name) || !(name is string) || CheckName((string)name) != "" || ((string)name).Trim() != (string)name
+                || !m.TryGetValue("access", out access) || !("ask".Equals(access) || "any".Equals(access))
+                || !m.TryGetValue("control", out control) || !("full".Equals(control) || "limited".Equals(control))
+                || hasCode == hasWorkspace
+                || (hasCode && !(code is string && NormalizeCode((string)code) == (string)code))
+                || (hasWorkspace && !true.Equals(workspace))) throw new InvalidDataException("Invalid setup answers.");
+            return m;
+        }
+
+        // Where the wizard goes after the install step's exit code, and what it says there.
+        public static Screen After(int exit) {
+            if (exit == Active) return Screen.Done;
+            if (exit == Pending) return Screen.Waiting;
+            if (exit == CodeInvalid) return Screen.Code;
+            if (exit == AlreadySetUp) return Screen.Already;
+            return Screen.Install; // network, refused, or anything unknown: try again from the install step
+        }
+        public static string ExitText(int exit) {
+            if (exit == Active || exit == Pending || exit == AlreadySetUp) return "";
+            if (exit == CodeInvalid) return "That code didn't work. It may be used or expired. Ask your support team for a new one.";
+            if (exit == Network) return "Can't reach your support team right now. Check the internet connection, then try again.";
+            return "Setup didn't finish. Your support team's server refused it. Try again, or ask your support team for help.";
+        }
+        public const string DeclinedText = "Windows didn't get permission, so nothing was installed. Click Try again to ask once more.";
+        public const string UnavailableText = "This Windows account can't install programs. Ask an administrator of this PC to run the setup.";
+        // Six digits as the owner reads them: "482 913".
+        public static string ShowConfirm(string digits) {
+            return digits != null && System.Text.RegularExpressions.Regex.IsMatch(digits, "^[0-9]{6}$") ? digits.Substring(0, 3) + " " + digits.Substring(3) : null;
+        }
+        public static string ModeText(string access) {
+            return access == "any" ? "Your support team can connect to this PC any time, even when nobody is at it." : "Support asks you on this PC before each connection.";
+        }
+        public const string UninstallText = "To remove Support, open Settings, then Apps, and uninstall Support.";
+
+        // Starts the tray as the signed-in user, when it is installed. A failure is not an error: it starts at the next sign-in.
+        public static void StartTray() {
+            try { if (File.Exists(Exe)) using (Process.Start(new ProcessStartInfo(Exe, "--tray") { UseShellExecute = false, WorkingDirectory = Folder })) { } } catch (Exception) { }
+        }
+        // The wizard, one per session.
+        public static void Run(Application app, Dictionary<string, object> footer, string exe) {
+            bool first; using (var mutex = new Mutex(true, "Local\\SupportMcpSetup", out first)) {
+                if (!first) return;
+                var window = new SetupWindow(Palette.Detect(), footer, exe);
+                window.Closed += delegate { app.Shutdown(); };
+                app.Run(window);
+                window.Finish();
+            }
+        }
+    }
+
+    // The setup wizard, shown as the signed-in user from a /install download. One window, five steps (code, name,
+    // access, control, install), in the app's palette. It holds no key: it hands its answers to the elevated install
+    // step as one base64url argument and reads the outcome from that step's exit code (DeviceSetup).
+    public sealed class SetupWindow : Window {
+        const double CardWidth = 460, Pad = 20;
+        readonly Palette p;
+        readonly Dictionary<string, object> footer;
+        readonly string exe, prefilledCode, workspace;
+        readonly bool offersWorkspace;
+        DeviceSetup.Screen screen;
+        volatile bool installing, declined;
+        string confirm;
+        Thread worker;
+
+        readonly Border bodyHost;
+        readonly TextBlock heading, stepLine, error;
+        readonly FlatButton back, next, cancel;
+        readonly Dictionary<DeviceSetup.Screen, FrameworkElement> panels = new Dictionary<DeviceSetup.Screen, FrameworkElement>();
+        TextBox codeBox, nameBox;
+        CheckBox noCode;
+        RadioButton askRadio, anyRadio, fullRadio, limitedRadio;
+        readonly TextBlock terminalHead, terminalBody;
+
+        public SetupWindow(Palette palette, Dictionary<string, object> footer, string exe) {
+            this.p = palette; this.footer = footer; this.exe = exe;
+            prefilledCode = Wire.Text(footer, "code");
+            workspace = Wire.Text(footer, "workspace");
+            offersWorkspace = workspace.Length > 0;
+            screen = Scm.Status(DeviceSetup.ServiceName) != null ? DeviceSetup.Screen.Already : DeviceSetup.Screen.Intro;
+
+            Ui.Transparent(this);
+            Topmost = false; ShowInTaskbar = true; Title = "Support setup";
+            Width = CardWidth + 2 * Pad; SizeToContent = SizeToContent.Height; WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            Foreground = p.Ink;
+            Grid inner; var card = Ui.Card(p, CardWidth, out inner);
+            var root = new Grid { Margin = new Thickness(Pad) }; root.Children.Add(card); Content = root;
+            var stack = new StackPanel(); inner.Children.Add(stack);
+            stack.Children.Add(new Border { Height = 3, Background = p.Work });
+
+            var header = new Grid { Height = 36, Margin = new Thickness(14, 0, 14, 0), Background = Brushes.Transparent };
+            var title = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            var screenGlyph = Glyph.Screen().Paint(p.Muted).Sized(16); screenGlyph.Margin = new Thickness(0, 0, 8, 0);
+            title.Children.Add(screenGlyph);
+            title.Children.Add(Lbl("Support setup", 12, FontWeights.SemiBold, p.Muted, Ui.TextFont, VerticalAlignment.Center));
+            header.Children.Add(title);
+            stepLine = Lbl("", 12, FontWeights.Normal, p.Muted, Ui.TextFont, VerticalAlignment.Center); stepLine.HorizontalAlignment = HorizontalAlignment.Right;
+            header.Children.Add(stepLine);
+            Ui.Drag(this, header);
+            stack.Children.Add(header);
+
+            var bodyWrap = new StackPanel { Margin = new Thickness(20, 6, 20, 4) };
+            heading = Lbl("", 17, FontWeights.SemiBold, p.Ink, Ui.DisplayFont, VerticalAlignment.Top); heading.Margin = new Thickness(0, 0, 0, 10); heading.LineHeight = 22;
+            bodyWrap.Children.Add(heading);
+            bodyHost = new Border(); bodyWrap.Children.Add(bodyHost);
+            error = Lbl("", 12.5, FontWeights.Normal, p.Stop, Ui.TextFont, VerticalAlignment.Top); error.Margin = new Thickness(0, 10, 0, 0); error.Visibility = Visibility.Collapsed;
+            bodyWrap.Children.Add(error);
+            terminalHead = Lbl("", 15.5, FontWeights.SemiBold, p.Ink, Ui.DisplayFont, VerticalAlignment.Top); terminalHead.Margin = new Thickness(0, 0, 0, 8); terminalHead.LineHeight = 21;
+            terminalBody = Lbl("", 13, FontWeights.Normal, p.Muted, Ui.TextFont, VerticalAlignment.Top); terminalBody.LineHeight = 19;
+            stack.Children.Add(bodyWrap);
+
+            var foot = new Border { BorderBrush = p.Line, BorderThickness = new Thickness(0, 1, 0, 0), Padding = new Thickness(12, 10, 12, 12), Margin = new Thickness(0, 10, 0, 0) };
+            var footGrid = new Grid();
+            footGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            footGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            footGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            cancel = new FlatButton("Cancel", p.Ink, p.Surface2, p.Line, p.Work, 34, 88, 14, 6, 13, true);
+            cancel.Click += delegate { Close(); };
+            footGrid.Children.Add(cancel);
+            back = new FlatButton("Back", p.Ink, p.Surface2, p.Line, p.Work, 34, 88, 14, 6, 13, true);
+            back.Click += delegate { OnBack(); };
+            Grid.SetColumn(back, 0); footGrid.Children.Add(back);
+            next = new FlatButton("Next", Brushes.White, p.Work, p.Work, p.Ink, 34, 120, 16, 6, 13, true);
+            next.Click += delegate { OnNext(); };
+            Grid.SetColumn(next, 2); footGrid.Children.Add(next);
+            foot.Child = footGrid; stack.Children.Add(foot);
+
+            BuildPanels();
+            PreviewKeyDown += delegate(object sender, KeyEventArgs e) {
+                if (e.Key == Key.Escape && !installing) { e.Handled = true; Close(); }
+                else if (e.Key == Key.Enter && next.IsEnabled && next.Visibility == Visibility.Visible) { e.Handled = true; OnNext(); }
+            };
+            Closing += delegate(object sender, System.ComponentModel.CancelEventArgs e) { if (installing) e.Cancel = true; };
+            Loaded += delegate { Render(); };
+        }
+
+        TextBlock Lbl(string text, double size, FontWeight weight, Brush color, string font, VerticalAlignment valign) {
+            var t = Ui.Label(text, size, weight, color, font); t.VerticalAlignment = valign; return t;
+        }
+
+        void BuildPanels() {
+            // Intro.
+            panels[DeviceSetup.Screen.Intro] = Para("Support keeps this PC on your support team's list so they can help when you ask. This short setup asks how they may connect. You stay in control: remove Support any time from Settings, then Apps.");
+
+            // Code.
+            var codePanel = new StackPanel();
+            codePanel.Children.Add(Para("Enter the code your support team sent you. It looks like ABCDE-FGH23."));
+            codeBox = Field(prefilledCode.Length > 0 ? prefilledCode : "", "ABCDE-FGH23");
+            codeBox.CharacterCasing = CharacterCasing.Upper;
+            codeBox.TextChanged += delegate { if (error.Visibility == Visibility.Visible) { error.Visibility = Visibility.Collapsed; } };
+            codePanel.Children.Add(codeBox);
+            if (offersWorkspace) {
+                noCode = new CheckBox { Content = "I don't have a code", Foreground = p.Ink, Margin = new Thickness(0, 12, 0, 0), FontSize = 13 };
+                noCode.Checked += delegate { codeBox.IsEnabled = false; error.Visibility = Visibility.Collapsed; };
+                noCode.Unchecked += delegate { codeBox.IsEnabled = true; };
+                codePanel.Children.Add(noCode);
+                codePanel.Children.Add(Sub("Without a code, this PC joins your team and waits for a technician to approve it. The setup shows a number to read out."));
+            }
+            panels[DeviceSetup.Screen.Code] = codePanel;
+
+            // Name.
+            var namePanel = new StackPanel();
+            namePanel.Children.Add(Para("Give this PC a name your support team will recognise."));
+            nameBox = Field("", "Front desk"); namePanel.Children.Add(nameBox);
+            var chips = new WrapPanel { Margin = new Thickness(0, 10, 0, 0) };
+            foreach (string suggestion in Suggestions()) {
+                string value = suggestion;
+                var chip = new FlatButton(value, p.Ink, p.Surface2, p.Line, p.Work, 28, 0, 12, 14, 12.5, true); chip.Margin = new Thickness(0, 0, 8, 8);
+                chip.Click += delegate { nameBox.Text = value; nameBox.CaretIndex = value.Length; error.Visibility = Visibility.Collapsed; };
+                chips.Children.Add(chip);
+            }
+            namePanel.Children.Add(chips);
+            panels[DeviceSetup.Screen.Name] = namePanel;
+
+            // Access. Nothing is preselected.
+            var accessPanel = new StackPanel();
+            askRadio = Choice("access", "Ask me each time", "Support asks you here, on this PC, before each connection.");
+            anyRadio = Choice("access", "Connect any time (unattended)", "Your support team can connect even when nobody is at this PC. You can turn this on later, but only your team can turn it back off.");
+            accessPanel.Children.Add(askRadio); accessPanel.Children.Add(anyRadio);
+            panels[DeviceSetup.Screen.Access] = accessPanel;
+
+            // Control. Nothing is preselected.
+            var controlPanel = new StackPanel();
+            fullRadio = Choice("control", "Full control", "Also works through Windows security prompts and the sign-in screen.");
+            limitedRadio = Choice("control", "Limited support", "Works as the signed-in user only, not Windows security prompts.");
+            controlPanel.Children.Add(fullRadio); controlPanel.Children.Add(limitedRadio);
+            panels[DeviceSetup.Screen.Control] = controlPanel;
+
+            // Install.
+            panels[DeviceSetup.Screen.Install] = Para("Windows will ask for permission to install Support. Click Install, then Yes when Windows asks.");
+
+            // The terminal screens share one message panel.
+            var terminal = new StackPanel(); terminal.Children.Add(terminalHead); terminal.Children.Add(terminalBody);
+            panels[DeviceSetup.Screen.Done] = terminal;
+            panels[DeviceSetup.Screen.Waiting] = terminal;
+            panels[DeviceSetup.Screen.Already] = terminal;
+            panels[DeviceSetup.Screen.Unavailable] = terminal;
+        }
+
+        List<string> Suggestions() {
+            var list = new List<string>();
+            string machine = Environment.MachineName;
+            if (machine.Length > 0 && machine.Length <= DeviceSetup.MaxName) list.Add(machine);
+            foreach (string s in Common()) if (!list.Contains(s)) list.Add(s);
+            return list;
+        }
+        static IEnumerable<string> Common() { yield return "Front desk"; yield return "Reception"; yield return "Office PC"; }
+
+        TextBox Field(string text, string hint) {
+            var box = new TextBox {
+                Text = text, FontSize = 14, FontFamily = new FontFamily(Ui.TextFont), Foreground = p.Ink, CaretBrush = p.Ink,
+                Background = p.Surface2, BorderBrush = p.Line, BorderThickness = new Thickness(1), Padding = new Thickness(10, 7, 10, 7),
+            };
+            box.ToolTip = hint;
+            return box;
+        }
+        RadioButton Choice(string group, string title, string detail) {
+            var text = new StackPanel();
+            text.Children.Add(Ui.Label(title, 13.5, FontWeights.SemiBold, p.Ink, Ui.TextFont));
+            var sub = Ui.Label(detail, 12, FontWeights.Normal, p.Muted, Ui.TextFont); sub.Margin = new Thickness(0, 2, 0, 0);
+            text.Children.Add(sub);
+            var radio = new RadioButton { GroupName = group, Content = text, Foreground = p.Ink, Margin = new Thickness(0, 0, 0, 12), Padding = new Thickness(6, 0, 0, 0) };
+            radio.Checked += delegate { error.Visibility = Visibility.Collapsed; };
+            return radio;
+        }
+        StackPanel Para(string text) { var s = new StackPanel(); s.Children.Add(Ui.Label(text, 13, FontWeights.Normal, p.Muted, Ui.TextFont)); return s; }
+        FrameworkElement Sub(string text) { var t = Ui.Label(text, 12, FontWeights.Normal, p.Muted, Ui.TextFont); t.Margin = new Thickness(0, 8, 0, 0); return t; }
+
+        string Access() { return anyRadio.IsChecked == true ? "any" : askRadio.IsChecked == true ? "ask" : null; }
+        string Control() { return fullRadio.IsChecked == true ? "full" : limitedRadio.IsChecked == true ? "limited" : null; }
+        bool UseWorkspace() { return offersWorkspace && noCode != null && noCode.IsChecked == true; }
+
+        void OnNext() {
+            if (screen >= DeviceSetup.Screen.Done) { if (screen == DeviceSetup.Screen.Already) DeviceSetup.StartTray(); Close(); return; }
+            if (screen == DeviceSetup.Screen.Install) { BeginInstall(); return; }
+            string miss = DeviceSetup.Missing(screen, codeBox != null ? codeBox.Text : "", UseWorkspace(), nameBox != null ? nameBox.Text : "", Access(), Control());
+            if (miss != "") { error.Text = miss; error.Visibility = Visibility.Visible; return; }
+            error.Visibility = Visibility.Collapsed;
+            screen = screen + 1; Render();
+        }
+        void OnBack() {
+            if (screen == DeviceSetup.Screen.Install && declined) { declined = false; Render(); return; }
+            if (screen >= DeviceSetup.Screen.Code && screen <= DeviceSetup.Screen.Install) { error.Visibility = Visibility.Collapsed; screen = screen - 1; Render(); }
+        }
+
+        void BeginInstall() {
+            if (installing) return;
+            installing = true; declined = false; error.Visibility = Visibility.Collapsed;
+            string answers = DeviceSetup.EncodeAnswers(nameBox.Text, Access(), Control(), UseWorkspace() ? null : DeviceSetup.NormalizeCode(codeBox.Text));
+            IntPtr owner = new WindowInteropHelper(this).Handle;
+            Render();
+            worker = new Thread(delegate() {
+                int exit = DeviceSetup.Refused; bool unavailable = false, wasDeclined = false;
+                try {
+                    Consent path = ConsentPath.Detect();
+                    if (path == Consent.Unavailable) unavailable = true;
+                    else {
+                        string staged = Elevation.Stage(exe);
+                        try { exit = Native.RunElevated(staged, "--device-install " + Elevation.Nonce() + " " + answers, owner, delegate { }); }
+                        finally { try { Elevation.DeleteTree(Path.GetDirectoryName(staged)); } catch (Exception) { } }
+                        if (exit == -1223) wasDeclined = true;
+                    }
+                } catch (Exception) { exit = DeviceSetup.Refused; }
+                bool un = unavailable, dec = wasDeclined; int code = exit;
+                Post(delegate { FinishInstall(un, dec, code); });
+            });
+            worker.SetApartmentState(ApartmentState.STA); worker.IsBackground = true; worker.Start();
+        }
+        void FinishInstall(bool unavailable, bool wasDeclined, int exit) {
+            installing = false;
+            if (unavailable) { screen = DeviceSetup.Screen.Unavailable; Render(); return; }
+            if (wasDeclined) { declined = true; Render(); return; }
+            if (exit == DeviceSetup.Active || exit == DeviceSetup.Pending) {
+                DeviceSetup.StartTray();
+                // The six digits of a pending PC come from the service's status pipe (PR 4 step 5); until then none is shown.
+                confirm = null;
+            }
+            DeviceSetup.Screen nextScreen = DeviceSetup.After(exit);
+            string text = DeviceSetup.ExitText(exit);
+            if (nextScreen == DeviceSetup.Screen.Code || nextScreen == DeviceSetup.Screen.Install) { if (text.Length > 0) { error.Text = text; error.Visibility = Visibility.Visible; } }
+            screen = nextScreen; Render();
+        }
+
+        void Post(Action a) { Dispatcher.BeginInvoke(DispatcherPriority.Normal, a); }
+
+        void Render() {
+            bool terminal = screen >= DeviceSetup.Screen.Done;
+            int step = DeviceSetup.StepOf(screen);
+            stepLine.Text = step > 0 ? "Step " + step + " of 5" : "";
+            bodyHost.Child = panels.ContainsKey(screen) ? panels[screen] : null;
+
+            if (screen == DeviceSetup.Screen.Intro) heading.Text = "Set up Support on this PC";
+            else if (screen == DeviceSetup.Screen.Code) heading.Text = "Your support code";
+            else if (screen == DeviceSetup.Screen.Name) heading.Text = "Name this PC";
+            else if (screen == DeviceSetup.Screen.Access) heading.Text = "How may support connect?";
+            else if (screen == DeviceSetup.Screen.Control) heading.Text = "How much can support do?";
+            else if (screen == DeviceSetup.Screen.Install) heading.Text = installing ? "Setting up..." : "Ready to install";
+            heading.Visibility = terminal ? Visibility.Collapsed : Visibility.Visible;
+
+            if (terminal) {
+                if (screen == DeviceSetup.Screen.Done) {
+                    terminalHead.Text = (nameBox != null ? nameBox.Text.Trim() : "This PC") + " is ready";
+                    terminalBody.Text = "Your support team now sees this PC in their list. " + DeviceSetup.ModeText(Access()) + " " + DeviceSetup.UninstallText;
+                } else if (screen == DeviceSetup.Screen.Waiting) {
+                    string digits = DeviceSetup.ShowConfirm(confirm);
+                    terminalHead.Text = "Almost there";
+                    terminalBody.Text = (digits != null ? "Read this number to your support team: " + digits + ". " : "Your request is waiting for your support team to approve it. ") + "This PC waits for up to 24 hours. You can close this window; the tray icon shows its state.";
+                } else if (screen == DeviceSetup.Screen.Already) {
+                    terminalHead.Text = "Support is already set up on this PC";
+                    terminalBody.Text = "Open Support to see its state, or remove it from Settings, then Apps.";
+                } else {
+                    terminalHead.Text = "Can't install on this account";
+                    terminalBody.Text = DeviceSetup.UnavailableText;
+                }
+            } else if (screen == DeviceSetup.Screen.Install && declined) {
+                error.Text = DeviceSetup.DeclinedText; error.Visibility = Visibility.Visible;
+            }
+
+            back.Visibility = (!terminal && !installing && screen > DeviceSetup.Screen.Intro) ? Visibility.Visible : Visibility.Collapsed;
+            cancel.Visibility = (!terminal && !installing && screen == DeviceSetup.Screen.Intro) ? Visibility.Visible : Visibility.Collapsed;
+            next.IsEnabled = !installing;
+            next.Visibility = installing ? Visibility.Collapsed : Visibility.Visible;
+            if (screen == DeviceSetup.Screen.Already) next.Content = "Open Support";
+            else if (terminal) next.Content = screen == DeviceSetup.Screen.Done ? "Finish" : "Close";
+            else if (screen == DeviceSetup.Screen.Install) next.Content = declined ? "Try again" : "Install";
+            else if (screen == DeviceSetup.Screen.Control) next.Content = "Next";
+            else next.Content = "Next";
+        }
+
+        public void Finish() { var t = worker; if (t != null) t.Join(120000); }
+    }
+
     public static class Program {
         [STAThread] public static void Main(string[] args) {
             string role = args.Length > 0 ? args[0] : "", executable = System.Reflection.Assembly.GetExecutingAssembly().Location;
@@ -3529,10 +3934,17 @@ namespace SupportMcp {
                 finally { if (held != null) held.Dispose(); }
                 Environment.Exit(code);
             }
+            // The elevated install step of a saved PC. Its body is PR 4 step 4; until then it refuses cleanly, so the
+            // wizard shows "try again" instead of a stray dialog from a role that reads a device footer as a session.
+            if (role == "--device-install") { Native.SafeDllSearch(); Environment.Exit(DeviceSetup.Refused); }
             WF.Application.EnableVisualStyles();
             try {
                 var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
                 if (role == "--window") { RunWindow(app, args); return; }
+                // A setup download carries a device footer (kind "device"). It runs the wizard, and is checked before
+                // any session footer is read, so no session role ever runs on it (Wire.ReadConfig refuses it too).
+                byte[] self = File.ReadAllBytes(executable);
+                if (Wire.Kind(self) == "device") { DeviceSetup.Run(app, Wire.ReadDevice(self), executable); return; }
                 bool administrator = SupportAccess.IsAdministrator();
                 var config = Wire.ReadConfig(executable);
                 bool requestedResume = args.Length == 1 && (args[0] == "--prepare-restart" || args[0] == "--resume");
