@@ -1606,6 +1606,8 @@ namespace SupportMcp {
         [DllImport("user32.dll", SetLastError = true)] public static extern bool BlockInput(bool block);
         // Frees an icon handle made by Bitmap.GetHicon (the tray's icon, drawn at run time).
         [DllImport("user32.dll", SetLastError = true)] public static extern bool DestroyIcon(IntPtr icon);
+        // Lets the process that gets the call take the foreground (-1 is ASFW_ANY): a second start hands this over so the running tray's panel gets focus.
+        [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int pid);
         [DllImport("sas.dll")] static extern void SendSAS(bool asUser);
         [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetDefaultDllDirectories(uint flags);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern bool MoveFileEx(string from, string to, uint flags);
@@ -2562,7 +2564,7 @@ namespace SupportMcp {
     // user switching, Remote Desktop) cannot take the 8 instances. A request is {"type":"status"} or {"type":"end"};
     // anything else, or nothing for 5 s, closes the connection.
     sealed class UiServer {
-        const string Sddl = "D:P(A;;GA;;;SY)(A;;0x12008B;;;IU)";
+        internal const string Sddl = "D:P(A;;GA;;;SY)(A;;0x12008B;;;IU)";
         public const int Instances = 8, ReadMs = 5000, PerProcess = 2;
         // handle takes the parsed request and returns the reply to write, or null to close the connection. The
         // corner-window server (status/end) and the saved PC's server (status/allow_any_time/refresh) are both built on it.
@@ -3682,7 +3684,8 @@ namespace SupportMcp {
                     int build; if (k != null && Int32.TryParse(k.GetValue("CurrentBuildNumber") as string, out build)) return build >= 10240;
                 }
             } catch (Exception) { }
-            return Environment.OSVersion.Version >= new Version(6, 2);
+            // Without a manifest Windows 8 to 11 all report 6.2, so an unreadable registry means Control Panel, which every build has.
+            return false;
         }
 
         // A short description of this Windows, reported to the relay. Never fails the install.
@@ -3711,8 +3714,11 @@ namespace SupportMcp {
         }
         // Starts the tray as the signed-in user, when it is installed. A failure is not an error: it starts at the next sign-in.
         public static void StartTray() {
-            try { if (File.Exists(Exe)) using (Process.Start(new ProcessStartInfo(Exe, "--tray") { UseShellExecute = false, WorkingDirectory = Folder })) { } } catch (Exception) { }
+            try { if (File.Exists(Exe)) using (Process.Start(TrayStart())) { } } catch (Exception) { }
         }
+        // The tray starts in the system folder: a process's current directory blocks renaming it, and the install folder
+        // must stay free to rename aside when the PC is removed.
+        internal static ProcessStartInfo TrayStart() { return new ProcessStartInfo(Exe, "--tray") { UseShellExecute = false, WorkingDirectory = Environment.SystemDirectory }; }
         // The wizard, one per session.
         public static void Run(Application app, Dictionary<string, object> footer, string exe) {
             bool first; using (var mutex = new Mutex(true, "Local\\SupportMcpSetup", out first)) {
@@ -4210,7 +4216,7 @@ namespace SupportMcp {
     public sealed class DeviceService : ServiceBase {
         public const string PipeName = "SupportMcpDevice-ui";
         // The tray's pipe: SYSTEM creates instances, interactive users read and write data, never the network.
-        const string Sddl = "D:P(A;;GA;;;SY)(A;;0x12008B;;;IU)";
+        internal const string Sddl = "D:P(A;;GA;;;SY)(A;;0x12008B;;;IU)";
         // Every tray watches this; the uninstaller sets it (PR 4 step 7). Only SYSTEM creates it.
         public const string UninstallEvent = "Global\\SupportMcpDeviceUninstall";
         public const long CheckEveryMs = 300000, JitterMaxMs = 30000, RetryMinMs = 60000, RetryMaxMs = 900000, UpdateEveryMs = 6 * 3600 * 1000L, RefreshMinMs = 30000;
@@ -4656,7 +4662,10 @@ namespace SupportMcp {
         const string ShowEvent = "Local\\SupportMcpTrayShow";
         public static void Run(Application app) {
             bool first; using (var mutex = new Mutex(true, "Local\\SupportMcpTray", out first)) {
-                if (!first) { try { using (var show = EventWaitHandle.OpenExisting(ShowEvent)) show.Set(); } catch (Exception) { } return; }
+                if (!first) { try { using (var show = EventWaitHandle.OpenExisting(ShowEvent)) { Native.AllowSetForegroundWindow(-1); show.Set(); } } catch (Exception) { } return; }
+                // Created first, so a second start during the icon and panel setup is not dropped. It stays null when another object holds the name.
+                EventWaitHandle showRequests = null;
+                try { showRequests = new EventWaitHandle(false, EventResetMode.AutoReset, ShowEvent); } catch (Exception) { }
                 var panel = new TrayPanel(Palette.Detect());
                 string state = ""; IntPtr handle = IntPtr.Zero; Gdi.Icon icon = null;
                 var notify = new WF.NotifyIcon { Text = "Support", Visible = false };
@@ -4694,11 +4703,12 @@ namespace SupportMcp {
                     if (panel.IsVisible) { panel.Hide(); return; }
                     open();
                 };
-                var showRequests = new EventWaitHandle(false, EventResetMode.AutoReset, ShowEvent);
-                var shower = new Thread(delegate() {
-                    while (true) { showRequests.WaitOne(); try { panel.Dispatcher.BeginInvoke(new Action(delegate { if (!panel.IsVisible) open(); })); } catch (Exception) { return; } }
-                });
-                shower.IsBackground = true; shower.Start();
+                if (showRequests != null) {
+                    var shower = new Thread(delegate() {
+                        while (true) { showRequests.WaitOne(); try { panel.Dispatcher.BeginInvoke(new Action(delegate { if (!panel.IsVisible) open(); })); } catch (Exception) { return; } }
+                    });
+                    shower.IsBackground = true; shower.Start();
+                }
                 panel.IsVisibleChanged += delegate { if (!panel.IsVisible) poll.Interval = TimeSpan.FromMinutes(1); };
                 panel.AllowConfirmed += delegate {
                     ThreadPool.QueueUserWorkItem(delegate {
@@ -4827,7 +4837,19 @@ namespace SupportMcp {
                 window.Closed += delegate { app.Shutdown(); };
                 app.Run(window);
                 window.Finish();
+                string stage = StagedFolder(exe); if (stage != null) FullInstall.RemoveLater(new List<string>(), stage);
             }
+        }
+        // The folder to remove after this run: the folder of a staged copy (SupportMcpStage-* directly under Temp), else
+        // null. Anything else, the install folder included, is never a candidate.
+        internal static string StagedFolder(string exePath) { return StagedFolder(exePath, Path.GetTempPath()); }
+        internal static string StagedFolder(string exePath, string temp) {
+            try {
+                string dir = Path.GetDirectoryName(Path.GetFullPath(exePath)), parent = Path.GetDirectoryName(dir);
+                if (dir == null || parent == null || NeedsRestage(exePath)) return null;
+                bool direct = string.Equals(parent.TrimEnd('\\'), Path.GetFullPath(temp).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+                return direct && Path.GetFileName(dir).StartsWith(Elevation.StagePrefix, StringComparison.OrdinalIgnoreCase) ? dir : null;
+            } catch (Exception) { return null; }
         }
     }
 
@@ -4878,7 +4900,7 @@ namespace SupportMcp {
             go.Click += delegate { OnGo(); };
             PreviewKeyDown += delegate(object sender, KeyEventArgs e) { if (e.Key == Key.Escape && screen != Screen.Removing) { e.Handled = true; Close(); } };
             Closing += delegate(object sender, System.ComponentModel.CancelEventArgs e) { if (screen == Screen.Removing) e.Cancel = true; };
-            Loaded += delegate { Render(); };
+            Loaded += delegate { Render(); Activate(); };
         }
 
         void OnGo() {
@@ -4908,13 +4930,14 @@ namespace SupportMcp {
             worker.SetApartmentState(ApartmentState.STA); worker.IsBackground = true; worker.Start();
         }
         void Finish(bool unavailable, bool declined, int exit) {
-            if (unavailable) { screen = Screen.Unavailable; Render(); return; }
-            if (declined) { screen = Screen.Confirm; note = "Windows didn't get permission, so nothing was removed. Click Uninstall to try again."; Render(); return; }
+            // The elevated step leaves another window in front (on Windows 7 the result sat behind Programs and Features), so each outcome takes focus back.
+            if (unavailable) { screen = Screen.Unavailable; Render(); Activate(); return; }
+            if (declined) { screen = Screen.Confirm; note = "Windows didn't get permission, so nothing was removed. Click Uninstall to try again."; Render(); Activate(); return; }
             DeviceUninstall.Outcome outcome = DeviceUninstall.Map(exit);
             if (outcome == DeviceUninstall.Outcome.Removed) screen = Screen.Done;
             else if (outcome == DeviceUninstall.Outcome.RemovedUnreachable) screen = Screen.DoneUnreachable;
             else { screen = Screen.Confirm; note = "Support couldn't be removed. Try again, or ask your support team for help."; }
-            Render();
+            Render(); Activate();
         }
         void Post(Action a) { Dispatcher.BeginInvoke(DispatcherPriority.Normal, a); }
 

@@ -571,7 +571,7 @@ test('/install shows a self-contained bilingual setup page that downloads nothin
   assert.match(html, /<form method="post" action="\/install\?code=ABCDE-FGH23"><button type="submit">Download Support/);
   assert.equal((html.match(/<form/g) || []).length, 1);
   assert.ok(html.includes('This link carries a setup code that works once, for 10 minutes.'));
-  assert.ok(html.includes('Support stays on this PC until you uninstall it from Windows Settings (Control Panel on Windows 7).'));
+  assert.ok(html.includes('Support stays on this PC until you uninstall it from Windows Settings (Control Panel on Windows 7 and 8.1).'));
   assert.ok((html.match(/lang="he" dir="rtl"/g) || []).length >= 7);
   assert.ok(!/<script|https?:\/\/|src=|<link|@import|url\(/.test(html), 'no scripts or external requests');
   // A team's link for an owner-started install, and a plain link, carry no code note.

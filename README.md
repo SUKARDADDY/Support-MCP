@@ -429,7 +429,7 @@ The install puts these on the PC:
   screenshots and opens no files for anyone.
 - **A tray icon** starts at each sign-in.
 - **An entry in Windows Settings > Apps** (Control Panel > Programs and
-  Features on Windows 7), named "Support", is how the owner uninstalls.
+  Features on Windows 7 and 8.1), named "Support", is how the owner uninstalls.
 
 Running the wizard on a PC that is already set up says so and opens the tray.
 

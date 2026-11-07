@@ -317,6 +317,10 @@ public static class AppTests {
         Assert(!apps.ContainsKey("DisplayIcon"), "there is no DisplayIcon: the exe carries no icon");
 
         Assert(DeviceSetup.Folder.EndsWith("\\SupportMCP") && DeviceSetup.Exe == Path.Combine(DeviceSetup.Folder, "support.exe") && Directory.Exists(FullInstall.Root), "the install folder is under %ProgramFiles%\\SupportMCP and the app is support.exe in it");
+        // A tray the wizard starts must not hold the install folder as its current directory, or it cannot be renamed aside.
+        var trayStart = DeviceSetup.TrayStart(); string trayDir = Path.GetFullPath(trayStart.WorkingDirectory).TrimEnd('\\');
+        Assert(trayStart.FileName == DeviceSetup.Exe && trayStart.Arguments == "--tray" && !trayStart.UseShellExecute, "the wizard starts the installed exe with --tray");
+        Assert(trayDir.Length > 0 && !(trayDir + "\\").StartsWith(DeviceSetup.Folder.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase), "the tray's working directory is not inside the install folder");
 
         // The locked folder: owner Administrators, SYSTEM and Administrators full, nothing inherited (as FullAcl.Folder,
         // which the one-off tests already check on disk, plus the owner this install sets).
@@ -397,10 +401,19 @@ public static class AppTests {
         new UiServer(pipeName, handle, delegate(uint ssn) { return true; }, sddl, 1024);
         // The greedy client is checked on one instance with the service's real ACL: this account holds full access on
         // the test pipe above, so a client running as it would always get in there.
-        using (var real = Native.PipeServer(pipeName + "-acl", "D:P(A;;GA;;;SY)(A;;0x12008B;;;IU)", 1, true)) {
+        using (var real = Native.PipeServer(pipeName + "-acl", DeviceService.Sddl, 1, true)) {
             using (var greedy = new System.IO.Pipes.NamedPipeClientStream(".", pipeName + "-acl", System.IO.Pipes.PipeDirection.InOut)) {
                 try { greedy.Connect(2000); throw new Exception("the device pipe gave out full access"); } catch (UnauthorizedAccessException) { }
             }
+            // The refusal must come from the access mask, so a modest client on the same instance gets in. That holds only when
+            // this token has the INTERACTIVE group (S-1-5-4) the ACL grants; a service or batch account does not.
+            bool interactive = false;
+            foreach (var g in WindowsIdentity.GetCurrent().Groups) if (g.Value == "S-1-5-4") interactive = true;
+            if (interactive) {
+                var accepting = new Thread(delegate() { try { real.WaitForConnection(); } catch (Exception) { } }); accepting.Start();
+                using (var modest = Pipes.Client(pipeName + "-acl")) { modest.Connect(2000); Assert(modest.IsConnected, "a modest client gets in on the same instance, so the greedy one was refused by the access mask"); }
+                accepting.Join(3000);
+            } else Console.WriteLine("SKIP the modest client on the device ACL: this token lacks the INTERACTIVE group (S-1-5-4)");
         }
         using (var c = Pipes.Client(pipeName)) {
             c.Connect(2000);
@@ -480,6 +493,12 @@ public static class AppTests {
         // The Temp-copy rule: run from the install folder restages; run from anywhere else proceeds.
         Assert(DeviceUninstall.NeedsRestage(DeviceSetup.Exe), "the installed support.exe restages itself");
         Assert(!DeviceUninstall.NeedsRestage(Path.Combine(Path.GetTempPath(), "SupportMcpStage-x\\support.exe")), "a Temp copy proceeds");
+        // The staged copy's folder is removed after the run, and only a SupportMcpStage-* folder directly under Temp is ever named.
+        string tmp = Path.Combine(Path.GetTempPath(), "SupportMcpStage-" + Guid.NewGuid().ToString("N")), tmpExe = Path.Combine(tmp, "support.exe");
+        Assert(DeviceUninstall.StagedFolder(tmpExe) == tmp, "a staged copy names its own folder");
+        Assert(DeviceUninstall.StagedFolder(DeviceSetup.Exe) == null, "the installed exe names no folder");
+        Assert(DeviceUninstall.StagedFolder(Path.Combine(Path.GetTempPath(), "other\\support.exe")) == null && DeviceUninstall.StagedFolder(Path.Combine(Path.GetTempPath(), "support.exe")) == null, "an arbitrary folder, or Temp itself, names no folder");
+        Assert(DeviceUninstall.StagedFolder(Path.Combine(tmp, "deeper\\support.exe")) == null && DeviceUninstall.StagedFolder("support.exe", "C:\\Other") == null, "a folder not directly under Temp names nothing");
 
         // leave: a 200 or a 401 both count as done (reached); only a network failure leaves the PC on the list.
         Assert(DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Ok), "200 counts as done");
@@ -514,8 +533,10 @@ public static class AppTests {
         bool elevated = new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator);
         using (var m1 = DeviceInstall.SetupMutex(mn)) {
             Assert(m1.WaitOne(0), "the first elevated install or remove takes the setup mutex");
+            // A Win32 mutex is re-entrant for the thread that owns it, so the second taker always runs on another thread.
             if (elevated) {
-                using (var m2 = DeviceInstall.SetupMutex(mn)) Assert(!m2.WaitOne(0), "a second one is refused while the first holds it");
+                bool second = true; var other = new Thread(delegate() { using (var m2 = DeviceInstall.SetupMutex(mn)) { second = m2.WaitOne(0); if (second) m2.ReleaseMutex(); } }); other.Start(); other.Join();
+                Assert(!second, "a second one is refused while the first holds it");
                 m1.ReleaseMutex();
                 using (var m3 = DeviceInstall.SetupMutex(mn)) { Assert(m3.WaitOne(0), "once released, the next one takes it"); m3Release(m3); }
             } else {
@@ -1270,7 +1291,7 @@ public static class AppTests {
         Assert(ServiceLink.Running(sid8) && !ServiceLink.Running(Guid.NewGuid().ToString("N").Substring(0, 8)), "Running finds the service of this session only");
         // A client that asks for full access (which includes making a new pipe instance) is refused.
         // (The service's real ACL, on one instance this test account did not need rights to create.)
-        using (var real = Native.PipeServer("SupportMcpTest-acl-" + sid8, "D:P(A;;GA;;;SY)(A;;0x12008B;;;IU)", 1, true)) {
+        using (var real = Native.PipeServer("SupportMcpTest-acl-" + sid8, UiServer.Sddl, 1, true)) {
             using (var greedy = new System.IO.Pipes.NamedPipeClientStream(".", "SupportMcpTest-acl-" + sid8, System.IO.Pipes.PipeDirection.InOut)) {
                 try { greedy.Connect(2000); throw new Exception("the window pipe gave out write access that includes new instances"); } catch (UnauthorizedAccessException) { }
             }

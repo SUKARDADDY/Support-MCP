@@ -448,7 +448,7 @@ apply to only one client say which.
     restart on failure, a quoted path), a tray startup value `SupportMcpTray`
     under `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`, and an entry
     under `...\Uninstall\SupportMcpDevice` that Windows Settings > Apps (Control
-    Panel on Windows 7) shows.
+    Panel on Windows 7 and 8.1) shows.
     It does not touch `HKLM\SOFTWARE\SupportMCP`, which one-off sessions share,
     and it uses names different from theirs, so a saved install and a one-off
     session on the same PC do not step on each other.
