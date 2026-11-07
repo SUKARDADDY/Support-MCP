@@ -3,23 +3,27 @@
 // tests send no Access token anywhere.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { openD1 } from './d1-fake.js';
 import { createHandler } from '../src/app.js';
 import { teamStore } from '../src/workspace.js';
 import { deviceStore } from '../src/devices.js';
+import { VERSION } from '../src/version.js';
+import { buildNote, groupOf } from '../src/release.js';
+import { fixtureBundle, signNote, throwawayKey, verifies } from './release-fixture.js';
 
 const HOST = 'https://support.example.com';
 const SECRET = 'a-deployment-secret-of-at-least-32-characters';
 const BOSS = 'boss@example.com';
 const KEY_PATTERN = /^smd1\.default\.[a-z2-7]{20}\.[A-Za-z0-9_-]{43}$/;
 
-async function wire(extra = {}) {
+async function wire(extra = {}, appBundle = null) {
   const db = openD1();
   const env = { DB: db, AUTH_SECRET: SECRET, ...extra };
   const team = teamStore(db);
   const devs = deviceStore(db, team, { authSecret: SECRET });
   await team.addMember('default', BOSS, { identity: BOSS, role_id: 'admin' });
-  const handler = createHandler('powershell agent');
+  const handler = createHandler('powershell agent', appBundle);
   // A request to the wire. body undefined sends none; init overrides the defaults.
   const send = async (path, body, { method = 'POST', headers = {}, base = HOST, search = '' } = {}) => {
     const init = { method, headers: { 'content-type': 'application/json', ...headers } };
@@ -303,4 +307,124 @@ test('without a database the wire answers 503 in its own envelope', async () => 
   assert.equal(res.status, 503);
   assert.equal(res.body.protocol, 1);
   assert.equal(res.headers.get('retry-after'), '1');
+});
+
+// ---- the update offer ---------------------------------------------------------------------
+// A relay with a fixture bundle and the deploy settings of a release signed by a throwaway key. signedAgoMs sets
+// RELEASE_SIGNED_AT that long before now; rollout is UPDATE_ROLLOUT.
+async function releaseWire({ rollout = '', signedAgoMs = 72 * 3600_000, signature, extra = {} } = {}) {
+  const key = throwawayKey();
+  const bundle = fixtureBundle();
+  const exe = Buffer.from(bundle.exe_b64, 'base64');
+  const signedAt = Math.floor((Date.now() - signedAgoMs) / 1000);
+  const note = buildNote({ version: VERSION, sha256: createHash('sha256').update(exe).digest('hex'), size: exe.length, released: signedAt });
+  const env = { RELEASE_SIGNATURE: signature ?? signNote(key, note), RELEASE_SIGNED_AT: String(signedAt), UPDATE_ROLLOUT: rollout, ...extra };
+  const w = await wire(env, bundle);
+  return { ...w, key, note };
+}
+const OLDER = '0.0.1';
+
+test('a hello offers the signed release to an active PC on an older version, and the note verifies', async () => {
+  const w = await releaseWire();
+  const paired = await w.send('pair', { protocol: 1, code: await w.code(), name: 'Till', app_version: OLDER });
+  const hello = await w.send('hello', { protocol: 1, app_version: OLDER }, { headers: w.bearer(paired.body.key) });
+  assert.equal(hello.status, 200);
+  assert.deepEqual(Object.keys(hello.body).sort(), ['device', 'protocol', 'update']);
+  assert.deepEqual(hello.body.update, { version: VERSION, note: w.note, signature: w.env.RELEASE_SIGNATURE });
+  assert.ok(verifies(w.key.xy, hello.body.update.note, hello.body.update.signature), 'the PC can verify what it is offered');
+  // Without app_version in the request, the stored version decides.
+  assert.ok((await w.send('hello', { protocol: 1 }, { headers: w.bearer(paired.body.key) })).body.update);
+});
+
+test('the offer matrix: version, status, rollout, group and the deploy settings', async () => {
+  const offered = async (w, pairBody, helloBody) => {
+    const paired = await w.send('pair', { protocol: 1, ...pairBody });
+    const hello = await w.send('hello', { protocol: 1, ...helloBody }, { headers: w.bearer(paired.body.key) });
+    assert.equal(hello.status, 200, hello.text);
+    return { offered: Object.hasOwn(hello.body, 'update'), id: paired.body.device_id };
+  };
+  const w = await releaseWire();
+  const active = async (version) => (await offered(w, { code: await w.code(), name: 'x' }, { app_version: version })).offered;
+  assert.equal(await active(OLDER), true, 'older');
+  assert.equal(await active(VERSION), false, 'equal');
+  assert.equal(await active(`${VERSION}+build.9`), false, 'equal with build metadata');
+  assert.equal(await active('99.0.0'), false, 'higher');
+  assert.equal(await active('not a version'), false, 'unparseable');
+  assert.equal((await offered(w, { workspace: 'default', name: 'x' }, { app_version: OLDER })).offered, false, 'a pending PC is never offered one');
+
+  for (const rollout of ['pause', '0', 'sometimes']) {
+    const r = await releaseWire({ rollout });
+    assert.equal((await offered(r, { code: await r.code(), name: 'x' }, { app_version: OLDER })).offered, false, `rollout ${rollout}`);
+  }
+  // A pinned percentage takes PCs whose group is below it.
+  const probe = await releaseWire({ rollout: '100' });
+  const { id } = await offered(probe, { code: await probe.code(), name: 'x' }, { app_version: OLDER });
+  const group = await groupOf(VERSION, 'default', id);
+  for (const [pin, want] of [[group, false], [group + 1, true]]) {
+    const r = await releaseWire({ rollout: String(pin) });
+    const paired = await r.send('pair', { protocol: 1, code: await r.code(), name: 'x' });
+    // Same group: move the PC to the probe's id, which keeps its key hash.
+    r.db.sqlite.prepare('UPDATE devices SET id = ? WHERE id = ?').run(id, paired.body.device_id);
+    const key = paired.body.key.replace(paired.body.device_id, id);
+    const hello = await r.send('hello', { protocol: 1, app_version: OLDER }, { headers: r.bearer(key) });
+    assert.equal(Object.hasOwn(hello.body, 'update'), want, `group ${group} with the rollout pinned at ${pin}`);
+  }
+  // On the schedule a fresh release reaches groups 0 to 9 only.
+  const fresh = await releaseWire({ signedAgoMs: 0 });
+  const paired = await fresh.send('pair', { protocol: 1, code: await fresh.code(), name: 'x' });
+  fresh.db.sqlite.prepare('UPDATE devices SET id = ? WHERE id = ?').run(id, paired.body.device_id);
+  const hello = await fresh.send('hello', { protocol: 1, app_version: OLDER }, { headers: fresh.bearer(paired.body.key.replace(paired.body.device_id, id)) });
+  assert.equal(Object.hasOwn(hello.body, 'update'), group < 10, `a fresh release and group ${group}`);
+
+  // Missing or malformed settings mean no release.
+  for (const extra of [{ RELEASE_SIGNATURE: '' }, { RELEASE_SIGNED_AT: '' }, { RELEASE_SIGNATURE: 'abc' }, { RELEASE_SIGNED_AT: 'yesterday' }]) {
+    const r = await releaseWire({ extra });
+    assert.equal((await offered(r, { code: await r.code(), name: 'x' }, { app_version: OLDER })).offered, false, JSON.stringify(extra));
+  }
+});
+
+test('a relay with no app bundle offers nothing, and the hello answer is unchanged', async () => {
+  const signature = Buffer.alloc(64, 1).toString('base64');
+  const w = await wire({ RELEASE_SIGNATURE: signature, RELEASE_SIGNED_AT: '1794000000', UPDATE_ROLLOUT: '100' });
+  const paired = await w.send('pair', { protocol: 1, code: await w.code(), name: 'x' });
+  const hello = await w.send('hello', { protocol: 1, app_version: OLDER }, { headers: w.bearer(paired.body.key) });
+  assert.deepEqual(Object.keys(hello.body).sort(), ['device', 'protocol']);
+});
+
+test('working out the offer reads and writes nothing more in the database', async () => {
+  const count = async (w) => {
+    const paired = await w.send('pair', { protocol: 1, code: await w.code(), name: 'x' });
+    const before = w.db.seen.length;
+    const hello = await w.send('hello', { protocol: 1, app_version: OLDER }, { headers: w.bearer(paired.body.key) });
+    return [Object.hasOwn(hello.body, 'update'), w.db.seen.length - before];
+  };
+  const [offeredOne, withRelease] = await count(await releaseWire({ rollout: '100' }));
+  const [offeredNone, without] = await count(await wire());
+  assert.deepEqual([offeredOne, offeredNone], [true, false]);
+  assert.equal(withRelease, without, 'the same statements with and without an offer');
+});
+
+test('a 426 carries the signed release unless the rollout is paused or 0, on every address', async () => {
+  const w = await releaseWire({ signedAgoMs: 0 });
+  const paired = await w.send('pair', { protocol: 1, code: await w.code(), name: 'x' });
+  for (const name of ['pair', 'hello', 'update', 'leave']) {
+    const res = await w.send(name, { protocol: 2, name: 'x' }, { headers: w.bearer(paired.body.key) });
+    assert.equal(res.status, 426);
+    assert.deepEqual(res.body, {
+      protocol: 1,
+      error: { code: 'protocol_unsupported', message: res.body.error.message },
+      supported: { min: 1, max: 1 },
+      update: { version: VERSION, note: w.note, signature: w.env.RELEASE_SIGNATURE },
+    }, name);
+  }
+  // No key is needed: a PC cut off by protocol may not even reach the key check.
+  assert.ok((await w.send('hello', { protocol: 2 })).body.update);
+  for (const rollout of ['pause', '0']) {
+    const r = await releaseWire({ rollout });
+    const res = await r.send('hello', { protocol: 2 });
+    assert.equal(res.status, 426);
+    assert.equal(Object.hasOwn(res.body, 'update'), false, rollout);
+  }
+  const none = await releaseWire({ extra: { RELEASE_SIGNATURE: '' } });
+  assert.equal(Object.hasOwn((await none.send('hello', { protocol: 2 })).body, 'update'), false, 'no release, no update');
 });

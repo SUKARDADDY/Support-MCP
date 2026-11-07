@@ -730,8 +730,10 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
   }
 
   // A PC checks in. What it reports is written at most every 5 minutes, or every
-  // minute when a value changed. Unlogged, like the callers table.
-  async function checkIn(key, body) {
+  // minute when a value changed. Unlogged, like the callers table. Returns the
+  // device for the PC and, for the relay's own use (the update offer), the
+  // version it runs: the one this request reports, else the stored one.
+  async function checkInFull(key, body) {
     const dev = await authenticate(key);
     if (!dev) throw unknownDevice();
     const report = {};
@@ -747,8 +749,9 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
       await q('UPDATE devices SET os = ?, machine = ?, app_version = ?, protocol = 1, last_seen = ? WHERE workspace = ? AND id = ? AND key_hash = ? AND last_seen <= ?',
         next.os, next.machine, next.app_version, now, key.workspace, key.id, dev.key_hash, now - minAge).run();
     }
-    return pcOut(dev);
+    return { device: pcOut(dev), app_version: next.app_version };
   }
+  const checkIn = async (key, body) => (await checkInFull(key, body)).device;
 
   // The owner's changes from the PC itself: name, access, control. Logged as
   // device_changed by "pc <id>". A waiting PC may not (403 pending).
@@ -802,7 +805,7 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
     listFields, addField, updateField, removeField,
     listDevices, getDevice, updateDevice, removeDevice,
     createPairingCode, listPairingCodes, revokePairingCode,
-    redeemCode, requestJoin, authenticate, checkIn, updateOwn, leave,
+    redeemCode, requestJoin, authenticate, checkIn, checkInFull, updateOwn, leave,
   };
 }
 

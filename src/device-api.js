@@ -9,9 +9,14 @@
 // already paired. A protocol outside the range this relay speaks is 426 with the
 // range. The status and code of every refusal are pinned in
 // docs/relay-v1-spec.md.
+//
+// A hello's answer, and a 426, may carry "update": the signed release this relay
+// offers (src/release.js). The relay only passes the signature on; the PC checks
+// it. Working out the offer reads nothing more from the database.
 import { readTextCapped } from './body.js';
 import { TeamError } from './workspace.js';
 import { devicesFromEnv, parseDeviceKey } from './devices.js';
+import { offerAtCheckIn, offerOnRefusal, releaseFrom, updateField } from './release.js';
 
 export const PROTOCOL = 1;
 const SUPPORTED = Object.freeze({ min: 1, max: 1 });
@@ -30,8 +35,8 @@ function keyOf(request) {
   return key;
 }
 
-// What each address does, given the store, the body and the request. Each
-// returns [status, answer].
+// What each address does, given the store, the body, the request and
+// { env, appBundle }. Each returns [status, answer].
 const ROUTES = Object.freeze({
   async pair(devs, body) {
     const hasCode = Object.hasOwn(body, 'code');
@@ -43,8 +48,11 @@ const ROUTES = Object.freeze({
     }
     return [202, await devs.requestJoin(body)];
   },
-  async hello(devs, body, request) {
-    return [200, { device: await devs.checkIn(keyOf(request), body) }];
+  async hello(devs, body, request, { env, appBundle }) {
+    const { device, app_version } = await devs.checkInFull(keyOf(request), body);
+    const release = await releaseFrom(appBundle, env);
+    const offered = release && await offerAtCheckIn(release, { ...device, app_version }, env?.UPDATE_ROLLOUT);
+    return [200, offered ? { device, update: updateField(release) } : { device }];
   },
   async update(devs, body, request) {
     return [200, { device: await devs.updateOwn(keyOf(request), body) }];
@@ -54,8 +62,9 @@ const ROUTES = Object.freeze({
   },
 });
 
-// deps: { isLoopback(hostname) -> bool, isJsonContentType(request) -> bool } from app.js.
-export async function handleDevice(request, env, url, { isLoopback, isJsonContentType }) {
+// deps: { isLoopback(hostname) -> bool, isJsonContentType(request) -> bool } from app.js, and appBundle, the
+// app this relay serves (null when it serves none, and then it offers no update).
+export async function handleDevice(request, env, url, { isLoopback, isJsonContentType, appBundle = null }) {
   if (url.protocol !== 'https:' && !isLoopback(url.hostname)) return fail(403, 'https_required', 'use https');
   const name = url.pathname.slice('/device/'.length);
   if (!Object.hasOwn(ROUTES, name)) return fail(404, 'not_found', 'not found');
@@ -72,10 +81,14 @@ export async function handleDevice(request, env, url, { isLoopback, isJsonConten
   if (!body || typeof body !== 'object' || Array.isArray(body)) return fail(400, 'bad_request', 'the body must be a JSON object');
   if (!Number.isInteger(body.protocol)) return fail(400, 'bad_request', 'protocol must be a whole number');
   if (body.protocol < SUPPORTED.min || body.protocol > SUPPORTED.max) {
-    return reply({ error: { code: 'protocol_unsupported', message: `this relay speaks protocol ${SUPPORTED.min} to ${SUPPORTED.max}` }, supported: SUPPORTED }, 426);
+    // A PC cut off by protocol can do nothing else, so it gets the release whenever there is one and the rollout
+    // is not paused, without a group check or a key.
+    const release = await releaseFrom(appBundle, env);
+    const update = offerOnRefusal(release, env?.UPDATE_ROLLOUT) ? { update: updateField(release) } : {};
+    return reply({ error: { code: 'protocol_unsupported', message: `this relay speaks protocol ${SUPPORTED.min} to ${SUPPORTED.max}` }, supported: SUPPORTED, ...update }, 426);
   }
   try {
-    const [status, answer] = await ROUTES[name](devicesFromEnv(env), body, request);
+    const [status, answer] = await ROUTES[name](devicesFromEnv(env), body, request, { env, appBundle });
     return reply(answer, status);
   } catch (e) {
     if (e instanceof TeamError) return fail(e.status, e.code, e.message, e.status === 503 ? { 'retry-after': '1' } : {});

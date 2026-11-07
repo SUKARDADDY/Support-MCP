@@ -3,13 +3,14 @@
 // signing scripts. Every key here is made at run time; none is committed.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash, createPublicKey, generateKeyPairSync, sign, verify } from 'node:crypto';
+import { createHash, createPublicKey } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VERSION } from '../src/version.js';
+import { fixtureBundle, signNote, throwawayKey, verifies } from './release-fixture.js';
 import {
   buildNote, bundleDigest, compareVersions, groupOf, isPrerelease, offerAtCheckIn, offerOnRefusal, parseNote, parseReleaseSettings,
   parseRollout, releaseFrom, scheduledStage, validVersion,
@@ -18,26 +19,6 @@ import {
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const HOUR = 3600_000;
 const SHA = 'ab'.repeat(32);
-
-// A throwaway P-256 key: the private key object and the public key as X||Y base64, the form the app and release-key.pub carry.
-export function throwawayKey() {
-  const { publicKey, privateKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
-  const jwk = publicKey.export({ format: 'jwk' });
-  const xy = Buffer.concat([Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]).toString('base64');
-  return { privateKey, publicKey, xy };
-}
-const signNote = (key, note) => sign('sha256', Buffer.from(note), { key: key.privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64');
-const verifies = (xy, note, signature) => {
-  const raw = Buffer.from(xy, 'base64');
-  const key = createPublicKey({ key: { kty: 'EC', crv: 'P-256', x: raw.subarray(0, 32).toString('base64url'), y: raw.subarray(32).toString('base64url') }, format: 'jwk' });
-  return verify('sha256', Buffer.from(note), { key, dsaEncoding: 'ieee-p1363' }, Buffer.from(signature, 'base64'));
-};
-
-// A fixture bundle: built (as far as the signer can tell) from this source, its exe carrying VERSION.
-export function fixtureBundle(extra = 'fixture') {
-  const exe = Buffer.concat([Buffer.from('MZ'), Buffer.from(VERSION, 'utf16le'), Buffer.from(extra)]);
-  return { source_sha256: createHash('sha256').update(readFileSync(join(ROOT, 'src', 'agent-app.cs'))).digest('hex'), exe_b64: exe.toString('base64') };
-}
 
 // ---- the note --------------------------------------------------------------------
 test('the release note is exactly five LF lines, and the parser takes nothing else', () => {
