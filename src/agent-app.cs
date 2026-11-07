@@ -4959,6 +4959,9 @@ namespace SupportMcp {
             cancel.Visibility = (screen == Screen.Confirm) ? Visibility.Visible : Visibility.Collapsed;
             go.Visibility = screen == Screen.Removing ? Visibility.Collapsed : Visibility.Visible;
             go.Content = terminal ? "Close" : "Uninstall";
+            // Keyboard: the safe choice has the focus while it asks, Close once it is done.
+            FlatButton target = screen == Screen.Confirm ? cancel : terminal ? go : null;
+            if (target != null) Dispatcher.BeginInvoke(DispatcherPriority.Input, (Action)delegate { target.Focus(); Keyboard.Focus(target); });
         }
         public void Finish() { var t = worker; if (t != null) t.Join(120000); }
     }
