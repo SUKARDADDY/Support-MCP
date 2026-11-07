@@ -6,7 +6,7 @@ import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { Session } from '../src/session.js';
 import { createHandler } from '../src/app.js';
-import { buildAppDownload, normalizeWindowsMode, clientMode } from '../src/template.js';
+import { buildAppDownload, buildDeviceDownload, normalizeWindowsMode, clientMode } from '../src/template.js';
 import { openD1 } from './d1-fake.js';
 
 const SID = 'a'.repeat(64), KEY = 'b'.repeat(64), ORIGIN = 'https://support.example.com';
@@ -544,4 +544,130 @@ test('/agent refuses a declared oversize body before reading any of it', async (
   // A body with no Content-Length is still checked after it is read.
   const unsized = await handler.fetch(agentRequest(`https://support.example.com/agent?sid=${SID}`, { body: 'x'.repeat(750001) }), env);
   assert.equal(unsized.status, 413);
+});
+
+// ---- /install: the saved PC's setup download ------------------------------------
+const INSTALL = `${ORIGIN}/install`;
+const footerOf = (buf) => {
+  const tail = Buffer.byteLength('SUPPORTMCPCFG1') + 4;
+  const n = buf.readUInt32LE(buf.length - tail);
+  return { config: JSON.parse(buf.subarray(buf.length - tail - n, buf.length - tail)), exe: buf.subarray(0, buf.length - tail - n) };
+};
+
+test('/install shows a self-contained bilingual setup page that downloads nothing and posts the same query back', async () => {
+  const handler = newHandler();
+  const page = await handler.fetch(new Request(`${INSTALL}?code=abcdefgh23`), {});
+  const html = await page.text();
+  assert.equal(page.status, 200);
+  assert.match(page.headers.get('content-type'), /^text\/html/);
+  assert.equal(page.headers.get('cache-control'), 'no-store');
+  assert.equal(page.headers.get('referrer-policy'), 'same-origin');
+  assert.equal(page.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(page.headers.get('content-security-policy'), "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+  assert.match(html, /<title>Remote support<\/title>/);
+  assert.match(html, /<span>Remote support<\/span>/);
+  assert.match(html, /<h1>Set up Support on this PC<\/h1>/);
+  // The code is normalised to the form the technician sees, ABCDE-FGH23.
+  assert.match(html, /<form method="post" action="\/install\?code=ABCDE-FGH23"><button type="submit">Download Support/);
+  assert.equal((html.match(/<form/g) || []).length, 1);
+  assert.ok(html.includes('This link carries a setup code that works once, for 10 minutes.'));
+  assert.ok(html.includes('Support stays on this PC until you uninstall it from Windows Settings.'));
+  assert.ok((html.match(/lang="he" dir="rtl"/g) || []).length >= 7);
+  assert.ok(!/<script|https?:\/\/|src=|<link|@import|url\(/.test(html), 'no scripts or external requests');
+  // A team's link for an owner-started install, and a plain link, carry no code note.
+  const team = await (await handler.fetch(new Request(`${INSTALL}?workspace=acme-1`), {})).text();
+  assert.match(team, /action="\/install\?workspace=acme-1"/);
+  assert.ok(!team.includes('setup code'));
+  const plain = await handler.fetch(new Request(INSTALL), {});
+  assert.equal(plain.status, 200);
+  assert.match(await plain.text(), /action="\/install">/);
+  // The page never checks the code: an unknown one shows the same page, and nothing is read or used up.
+  assert.equal((await handler.fetch(new Request(`${INSTALL}?code=ZZZZZ-ZZZZZ`), {})).status, 200);
+});
+
+test('/install refuses both values, bad values, other or repeated parameters, plain http and other methods', async () => {
+  const handler = newHandler();
+  for (const q of ['?code=ABCDE-FGH23&workspace=acme', '?code=ABCDE-FGH2', '?code=ABCDE-FGH234', '?code=ABCDE-FGH0I', '?code=ABC-DEFGH23', '?code=', '?code=ABCDE-FGH23&code=ABCDE-FGH23',
+    '?workspace=Acme', '?workspace=', `?workspace=${'a'.repeat(41)}`, '?workspace=a/b', '?client=app', '?sid=x', '?code=ABCDE-FGH23&x=1']) {
+    for (const method of ['GET', 'POST']) {
+      const r = await handler.fetch(new Request(`${INSTALL}${q}`, { method, headers: { origin: ORIGIN } }), {});
+      assert.equal(r.status, 400, `${method} ${q}`);
+      assert.match(await r.text(), /not valid/);
+    }
+  }
+  for (const method of ['GET', 'POST']) {
+    const r = await handler.fetch(new Request('http://support.example.com/install?code=ABCDE-FGH23', { method, headers: { origin: 'http://support.example.com' } }), {});
+    assert.equal(r.status, 403, method);
+    assert.match(await r.text(), /must use https/);
+  }
+  for (const method of ['HEAD', 'PUT', 'DELETE']) {
+    const r = await handler.fetch(new Request(INSTALL, { method }), {});
+    assert.equal(r.status, 405, method);
+    assert.equal(r.headers.get('allow'), 'GET, POST');
+  }
+  // Without the app bundle there is nothing to download.
+  assert.equal((await createHandler('powershell agent').fetch(new Request(INSTALL), {})).status, 404);
+  // Only /install itself: a path below it is not a route.
+  assert.equal((await handler.fetch(new Request(`${INSTALL}/x`), {})).status, 404);
+});
+
+test('/install downloads only from its own page: a matching Origin, or no Origin with a Referer from /install', async () => {
+  const handler = newHandler();
+  const url = `${INSTALL}?code=ABCDE-FGH23`;
+  const post = (headers) => handler.fetch(new Request(url, { method: 'POST', headers }), {});
+  const refused = [
+    ['Origin present but foreign, even with a good Referer', { origin: 'https://other.example', referer: url }],
+    ['Origin "null", even with a good Referer', { origin: 'null', referer: url }],
+    ['no Origin and a foreign Referer', { referer: 'https://other.example/install?code=ABCDE-FGH23' }],
+    ['no Origin and a Referer on a lookalike host', { referer: 'https://support.example.com.evil.example/install' }],
+    ['no Origin and a Referer outside /install', { referer: `${ORIGIN}/healthz` }],
+    ['neither Origin nor Referer', {}],
+  ];
+  for (const [name, headers] of refused) {
+    const r = await post(headers);
+    assert.equal(r.status, 403, name);
+    assert.notEqual(r.headers.get('content-type'), 'application/octet-stream', name);
+  }
+  for (const headers of [{ origin: ORIGIN }, { referer: url }]) {
+    const r = await post(headers);
+    assert.equal(r.status, 200, JSON.stringify(headers));
+    assert.equal(r.headers.get('content-type'), 'application/octet-stream');
+  }
+});
+
+test('the /install download is the same app with a device footer: origin and at most one of code and workspace, no session and no key', async () => {
+  const handler = newHandler();
+  const binary = Buffer.from(bundle.exe_b64, 'base64');
+  const cases = [
+    ['?code=abcde-fgh23', { kind: 'device', origin: ORIGIN, code: 'ABCDE-FGH23' }],
+    ['?workspace=acme-1', { kind: 'device', origin: ORIGIN, workspace: 'acme-1' }],
+    ['', { kind: 'device', origin: ORIGIN }],
+  ];
+  for (const [q, want] of cases) {
+    const r = await handler.fetch(new Request(`${INSTALL}${q}`, { method: 'POST', headers: { origin: ORIGIN } }), {});
+    assert.equal(r.status, 200, q);
+    assert.equal(r.headers.get('content-disposition'), 'attachment; filename="support-setup.exe"');
+    assert.equal(r.headers.get('cache-control'), 'no-store');
+    assert.equal(r.headers.get('x-content-type-options'), 'nosniff');
+    const body = Buffer.from(await r.arrayBuffer());
+    const { config, exe } = footerOf(body);
+    assert.deepEqual(exe, binary, q);
+    assert.deepEqual(config, want, q);
+    assert.equal(Object.keys(config)[0], 'kind', 'the kind comes first');
+  }
+  // Loopback dev keeps http, like /j/.
+  const local = await handler.fetch(new Request('http://127.0.0.1:8787/install?workspace=acme', { method: 'POST', headers: { origin: 'http://127.0.0.1:8787' } }), {});
+  assert.deepEqual(footerOf(Buffer.from(await local.arrayBuffer())).config, { kind: 'device', origin: 'http://127.0.0.1:8787', workspace: 'acme' });
+  assert.throws(() => buildDeviceDownload(bundle, { origin: ORIGIN, code: 'ABCDE-FGH23', workspace: 'acme' }));
+  assert.throws(() => buildDeviceDownload(bundle, { origin: ORIGIN, code: 'abcde-fgh23' }));
+  assert.throws(() => buildDeviceDownload(bundle, { origin: "https://x'evil" }));
+});
+
+test('the setup page and its download carry no vendor branding', async () => {
+  const brand = ['race', 'us'].join('');
+  const handler = newHandler();
+  const html = await (await handler.fetch(new Request(`${INSTALL}?code=ABCDE-FGH23`), {})).text();
+  assert.ok(!html.toLowerCase().includes(brand));
+  const body = Buffer.from(await (await handler.fetch(new Request(`${INSTALL}?code=ABCDE-FGH23`, { method: 'POST', headers: { origin: ORIGIN } }), {})).arrayBuffer());
+  assert.ok(!body.toString('latin1').toLowerCase().includes(brand));
 });

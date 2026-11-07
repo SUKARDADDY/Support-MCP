@@ -71,6 +71,20 @@ export function clientMode(value) {
 // little-endian uint32, then this magic string. The app reads it from its own file.
 export const APP_CONFIG_FOOTER = 'SUPPORTMCPCFG1';
 
+// The shared bundle with a configuration appended (see APP_CONFIG_FOOTER).
+function overlay(bundle, config) {
+  const binary = Uint8Array.from(atob(bundle.exe_b64), (c) => c.charCodeAt(0));
+  if (binary[0] !== 77 || binary[1] !== 90) throw new Error('bad app executable');
+  const json = new TextEncoder().encode(JSON.stringify(config));
+  const footer = new TextEncoder().encode(APP_CONFIG_FOOTER);
+  const out = new Uint8Array(binary.length + json.length + 4 + footer.length);
+  out.set(binary);
+  out.set(json, binary.length);
+  new DataView(out.buffer).setUint32(binary.length + json.length, json.length, true);
+  out.set(footer, binary.length + json.length + 4);
+  return out;
+}
+
 // A session-specific .NET executable: the shared bundle with only validated
 // pairing configuration appended. The attach key never appears in a URL or argv.
 export function buildAppDownload(bundle, { sid, key, origin, startup_expires_at, startup_ms }) {
@@ -78,19 +92,25 @@ export function buildAppDownload(bundle, { sid, key, origin, startup_expires_at,
   validateKey(key);
   validateOrigin(origin);
   if (!Number.isSafeInteger(startup_expires_at) || startup_expires_at <= 0) throw new Error('bad startup deadline');
-  const binary = Uint8Array.from(atob(bundle.exe_b64), (c) => c.charCodeAt(0));
-  if (binary[0] !== 77 || binary[1] !== 90) throw new Error('bad app executable');
   // startup_ms (optional) is the first-connect budget left at download time. The
   // app counts it on its own clock; startup_expires_at is an absolute fallback.
   if (startup_ms !== undefined && (!Number.isSafeInteger(startup_ms) || startup_ms <= 0 || startup_ms > 7200000)) throw new Error('bad startup budget');
-  const config = new TextEncoder().encode(JSON.stringify({ sid, key, origin, startup_expires_at, ...(startup_ms === undefined ? {} : { startup_ms }) }));
-  const footer = new TextEncoder().encode(APP_CONFIG_FOOTER);
-  const out = new Uint8Array(binary.length + config.length + 4 + footer.length);
-  out.set(binary);
-  out.set(config, binary.length);
-  new DataView(out.buffer).setUint32(binary.length + config.length, config.length, true);
-  out.set(footer, binary.length + config.length + 4);
-  return out;
+  return overlay(bundle, { sid, key, origin, startup_expires_at, ...(startup_ms === undefined ? {} : { startup_ms }) });
+}
+
+// The setup download from /install: the same bundle with a device footer, which
+// carries no session and no key. "kind": "device" is what tells the app to run
+// its setup wizard; the session reader refuses any footer with a kind. code is a
+// technician's pairing code (ABCDE-FGH23) and workspace a team's slug, at most
+// one of them, both already checked by the caller.
+const DEVICE_CODE_RE = /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{5}-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{5}$/;
+const SLUG_RE = /^[a-z0-9-]{1,40}$/;
+export function buildDeviceDownload(bundle, { origin, code, workspace }) {
+  validateOrigin(origin);
+  if (code !== undefined && workspace !== undefined) throw new Error('code or workspace, not both');
+  if (code !== undefined && !DEVICE_CODE_RE.test(code)) throw new Error('bad code');
+  if (workspace !== undefined && !SLUG_RE.test(workspace)) throw new Error('bad workspace');
+  return overlay(bundle, { kind: 'device', origin, ...(code === undefined ? {} : { code }), ...(workspace === undefined ? {} : { workspace }) });
 }
 
 export const INVALID_LINK_SCRIPT = "Write-Host 'This support link is invalid or expired.'\n";

@@ -231,7 +231,9 @@ test('a pairing code is shown once, in the 201 answer, and never listed', async 
   const r = await team();
   const made = (await ok(r.api(TECH, 'POST', '/pairing', {}), 201)).body.pairing;
   assert.match(made.code, /^[A-Z2-9]{5}-[A-Z2-9]{5}$/);
-  assert.deepEqual(Object.keys(made).sort(), ['code', 'expires_at', 'id', 'site_id']);
+  assert.deepEqual(Object.keys(made).sort(), ['code', 'expires_at', 'id', 'link', 'site_id']);
+  // The ready-to-send install link carries the same code, on this relay's address.
+  assert.equal(made.link, `${HOST}/install?code=${made.code}`);
   const listed = await ok(r.api(TECH, 'GET', '/pairing'));
   assert.equal(JSON.stringify(listed.body).includes(made.code.replace('-', '')), false);
   assert.deepEqual(listed.body.pairings.map((p) => p.id), [made.id]);
@@ -263,7 +265,7 @@ test('a paired PC is listed without its hashes; a technician sets its site and f
   const field = (await ok(r.api(BOSS, 'POST', '/fields', { entity: 'device', label: 'Asset tag' }), 201)).body.field;
   const pairing = (await ok(r.api(TECH, 'POST', '/pairing', { site_id: site.id }), 201)).body.pairing;
   assert.equal(pairing.site_id, site.id);
-  const paired = (await ok(r.pc('pair', { protocol: 1, code: pairing.code, name: 'Till', access: 'ask', control: 'limited', owner_contact: 'Sam' }), 201)).body;
+  const paired = (await ok(r.pc('pair', { protocol: 1, code: pairing.code, name: 'Till', access: 'ask', control: 'limited' }), 201)).body;
   const shown = (await ok(r.api(VIEW, 'GET', `/devices/${paired.device_id}`))).body.device;
   assert.deepEqual([shown.name, shown.site_id, shown.status, shown.access, shown.control, shown.paired_by], ['Till', site.id, 'active', 'ask', 'limited', TECH]);
   assert.equal(/key_hash|confirm_hash|"key"|secret/.test(JSON.stringify(shown)), false);
