@@ -4268,6 +4268,7 @@ namespace SupportMcp {
         long lastOkAt, lastRefresh = long.MinValue / 2;
         bool updateLogged, terminal;
         int allowing;
+        int localChanges; // bumped under the gate by each local access change, so CheckIn can spot a stale answer
         Thread worker; UiServer ui; EventWaitHandle uninstall;
 
         public DeviceService(string exe) {
@@ -4337,6 +4338,8 @@ namespace SupportMcp {
         }
         Schedule lastSchedule = Schedule.Normal;
         void CheckIn(ref long backoff) {
+            // A local "any time" change made while this hello is in flight is newer than its answer's access.
+            int seenLocal; lock (gate) seenLocal = localChanges;
             DeviceLink.Answer a;
             try { a = link.Hello(key, Report()); } catch (Exception) { a = new DeviceLink.Answer(DeviceLink.DeviceResult.Offline, 0, null, ""); }
             // A 200 must carry a device object; a malformed one counts as offline, so one bad answer never ends the loop.
@@ -4351,6 +4354,7 @@ namespace SupportMcp {
                 if (result == DeviceLink.DeviceResult.Ok) {
                     backoff = 0; lastOkAt = Client.UnixNow();
                     string nn = Wire.Text(dev, "name"), na = Wire.Text(dev, "access"), nc = Wire.Text(dev, "control"), ns = Wire.Text(dev, "status");
+                    if (localChanges != seenLocal) na = access; // a stale answer: the next check-in brings the team's view
                     var lines = HistoryFor(status, access, control, ns, na, nc);
                     bool changed = lines.Count > 0 || state != newState || (nn.Length > 0 && nn != name) || na != access || nc != control || ns != status || (ns == DeviceState.Active && confirm.Length > 0);
                     foreach (string line in lines) AddLine(line);
@@ -4399,7 +4403,7 @@ namespace SupportMcp {
             lock (gate) {
                 var dev = ReadDev(a.Body);
                 string na = dev != null ? Wire.Text(dev, "access") : "any";
-                if (na != access) { access = na; AddLine("You turned on connect any time from this PC."); Save(); }
+                if (na != access) { access = na; localChanges++; AddLine("You turned on connect any time from this PC."); Save(); }
             }
         }
         void Refresh() {
@@ -4765,7 +4769,9 @@ namespace SupportMcp {
             catch (Exception) { return false; }
         }
         // Leave counts as done whether the relay answered 200 or 401; only a network failure leaves the PC on the list.
-        public static bool LeaveReachedRelay(DeviceLink.DeviceResult result) { return result != DeviceLink.DeviceResult.Offline; }
+        // Only a 200 (forgotten now) or a 401 (already gone) means the relay no longer holds this PC. Anything else, a
+        // refusal or a server error included, removes locally but tells the owner the team must remove it.
+        public static bool LeaveReachedRelay(DeviceLink.DeviceResult result) { return result == DeviceLink.DeviceResult.Ok || result == DeviceLink.DeviceResult.Removed; }
         // Everything an uninstall removes, by exact name. The native test checks the list names only our artifacts and
         // never the one-off sessions' shared record (HKLM\SOFTWARE\SupportMCP).
         public static List<string> RemovalPlan() {

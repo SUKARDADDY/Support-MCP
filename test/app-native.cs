@@ -118,6 +118,8 @@ sealed class FakeDevice : IDisposable {
     public volatile string Body = "{\"protocol\":1}";
     public volatile string LastPath = "", LastAuth, LastJson = "";
     public volatile bool Refuse;
+    // A hello can answer with its own body after a delay, so a test can hold one in flight while another request runs.
+    public volatile string HelloBody; public volatile int HelloDelayMs;
     public FakeDevice() {
         var tcp = new TcpListener(IPAddress.Loopback, 0); tcp.Start(); int port = ((IPEndPoint)tcp.LocalEndpoint).Port; tcp.Stop();
         Origin = "http://127.0.0.1:" + port;
@@ -131,9 +133,11 @@ sealed class FakeDevice : IDisposable {
     void Reply(HttpListenerContext ctx) {
         try {
             if (Refuse) { ctx.Response.Abort(); return; }
-            LastPath = ctx.Request.Url.AbsolutePath; LastAuth = ctx.Request.Headers["Authorization"];
+            string path = ctx.Request.Url.AbsolutePath, body = path == "/device/hello" && HelloBody != null ? HelloBody : Body;
+            LastPath = path; LastAuth = ctx.Request.Headers["Authorization"];
             using (var r = new StreamReader(ctx.Request.InputStream)) LastJson = r.ReadToEnd();
-            byte[] bytes = Encoding.UTF8.GetBytes(Body);
+            if (path == "/device/hello" && HelloDelayMs > 0) Thread.Sleep(HelloDelayMs);
+            byte[] bytes = Encoding.UTF8.GetBytes(body);
             ctx.Response.StatusCode = Status; ctx.Response.ContentType = "application/json"; ctx.Response.ContentLength64 = bytes.Length;
             ctx.Response.OutputStream.Write(bytes, 0, bytes.Length); ctx.Response.Close();
         } catch (Exception) { try { ctx.Response.Abort(); } catch (Exception) { } }
@@ -504,7 +508,7 @@ public static class AppTests {
         Assert(DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Ok), "200 counts as done");
         Assert(DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Removed), "401 counts as done");
         Assert(!DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Offline), "a network failure is not reached");
-        Assert(DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Refused), "an unexpected refusal still removes locally");
+        Assert(!DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.Refused) && !DeviceUninstall.LeaveReachedRelay(DeviceLink.DeviceResult.UpdateNeeded), "a refusal or a server error leaves the PC on the team's list, so the owner is told the team must remove it");
 
         // The real removal on a temp folder whose exe is running (as a tray left behind would be): it is renamed aside,
         // so the original path is free for a fresh install. A running exe, not an open file handle: Windows renames a
@@ -592,6 +596,19 @@ public static class AppTests {
             relay.LastJson = ""; relay.LastPath = "";
             svc.TestHandle(Wire.Map("type", "allow_any_time")); Thread.Sleep(300);
             Assert(relay.LastJson == "", "allow_any_time does nothing once the mode is any");
+            // A hello still in flight when the PC turns on "any time" answers with the older "ask". That stale access is
+            // ignored: the mode stays any and no false "set to ask" line is logged. The next check-in brings the team's view.
+            relay.Body = dev("active", "Front desk", "ask", "limited");
+            svc.TestCheckInOnce();
+            Assert(Wire.Text(svc.TestStatus(), "access") == "ask", "the team set it back to ask");
+            int h0 = histCount(svc);
+            relay.HelloBody = dev("active", "Front desk", "ask", "limited"); relay.HelloDelayMs = 1500; relay.Body = dev("active", "Front desk", "any", "limited");
+            var inFlight = new Thread(delegate() { svc.TestCheckInOnce(); }); inFlight.IsBackground = true; inFlight.Start(); Thread.Sleep(300);
+            svc.TestHandle(Wire.Map("type", "allow_any_time"));
+            Assert(inFlight.Join(10000), "the held hello finishes");
+            Assert(Wire.Text(svc.TestStatus(), "access") == "any", "a stale hello answer does not undo a local any-time change");
+            Assert(histCount(svc) == h0 + 1, "only the local change is logged, no false set-to-ask line");
+            relay.HelloBody = null; relay.HelloDelayMs = 0;
         }
 
         // Terminal states are persisted and a reload serves them without a fresh check-in or a duplicate history line.
