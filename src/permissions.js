@@ -9,6 +9,9 @@ export const PERMISSIONS = Object.freeze([
   'members.manage',
   'roles.manage',
   'audit.view',
+  'devices.view',
+  'devices.manage',
+  'fields.manage',
   'sessions.create',
   'sessions.view',
   'sessions.control',
@@ -27,17 +30,22 @@ export const BUILTIN_ROLES = Object.freeze({
   admin: Object.freeze({ name: 'Admin', permissions: PERMISSIONS }),
   technician: Object.freeze({
     name: 'Technician',
-    permissions: Object.freeze(['sessions.create', 'sessions.view', 'sessions.control', 'sessions.end']),
+    permissions: Object.freeze(['devices.view', 'devices.manage', 'sessions.create', 'sessions.view', 'sessions.control', 'sessions.end']),
   }),
-  viewer: Object.freeze({ name: 'Viewer', permissions: Object.freeze(['sessions.view', 'audit.view']) }),
+  viewer: Object.freeze({ name: 'Viewer', permissions: Object.freeze(['audit.view', 'devices.view', 'sessions.view']) }),
 });
 
 // Permissions that need a second factor when the caller is signed in as
-// themselves in a browser (or, from PR 2c, an OAuth client): controlling a
-// session and managing the team. A role that holds any of them makes its
-// members enrol an authenticator. Access logins and service tokens are
-// unaffected: this is a rule for the sign-in layer (src/auth.js).
-export const FACTOR_PERMISSIONS = Object.freeze(['sessions.control', 'members.manage', 'roles.manage']);
+// themselves in a browser, or through OAuth consent: controlling a session,
+// managing the team, and managing saved PCs and custom fields. A role that
+// holds any of them makes its members enrol an authenticator (factorRequired
+// in src/auth.js), and the browser sign-in and the OAuth consent page ask for a
+// code before they act on that role. Access logins and service tokens are
+// exempt: this is a rule for the sign-in layer (src/auth.js). That includes
+// devices.manage and fields.manage, so a person whose role holds either must
+// enrol an authenticator even though the team API itself admits only Access
+// logins today.
+export const FACTOR_PERMISSIONS = Object.freeze(['sessions.control', 'members.manage', 'roles.manage', 'devices.manage', 'fields.manage']);
 export const needsSecondFactor = (permission) => FACTOR_PERMISSIONS.includes(permission);
 
 export const ROLE_ID_RE = /^[a-z0-9-]{1,40}$/;

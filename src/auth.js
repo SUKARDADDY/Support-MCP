@@ -77,8 +77,10 @@ const wellFormed = (v) => typeof v === 'string' && /^[A-Za-z0-9_-]{20,100}$/.tes
 // Does this sign-in hold `permission` in `workspace`, with the second factor
 // that permission needs? Used by the account page and by anything else that
 // acts on a sign-in (PR 2c's OAuth consent and tokens). Membership is read live.
-// A role holding sessions.control, members.manage or roles.manage needs the
+// A role holding any permission in FACTOR_PERMISSIONS (sessions.control,
+// members.manage, roles.manage, devices.manage or fields.manage) needs the
 // person to have passed an authenticator code in this sign-in (`session.factorAt`).
+// Access callers and service tokens never come through here and are exempt.
 export async function authorizeSignIn(team, session, workspace, permission) {
   const a = await team.authorize(workspace, session.email, permission);
   if (!a.ok) return { ok: false, reason: a.reason === 'not_member' ? 'not_member' : 'permission', message: a.reason === 'not_member' ? 'you are not a member of this team' : `your role does not allow ${permission}` };

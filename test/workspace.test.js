@@ -64,10 +64,10 @@ test('every tool the MCP endpoint lists needs a known permission', () => {
 });
 
 test('the built-in roles and permission keys are as specified', () => {
-  assert.deepEqual(PERMISSIONS, ['members.manage', 'roles.manage', 'audit.view', 'sessions.create', 'sessions.view', 'sessions.control', 'sessions.end']);
+  assert.deepEqual(PERMISSIONS, ['members.manage', 'roles.manage', 'audit.view', 'devices.view', 'devices.manage', 'fields.manage', 'sessions.create', 'sessions.view', 'sessions.control', 'sessions.end']);
   assert.deepEqual(BUILTIN_ROLES.admin.permissions, PERMISSIONS);
-  assert.deepEqual(BUILTIN_ROLES.technician.permissions, ['sessions.create', 'sessions.view', 'sessions.control', 'sessions.end']);
-  assert.deepEqual(BUILTIN_ROLES.viewer.permissions, ['sessions.view', 'audit.view']);
+  assert.deepEqual(BUILTIN_ROLES.technician.permissions, ['devices.view', 'devices.manage', 'sessions.create', 'sessions.view', 'sessions.control', 'sessions.end']);
+  assert.deepEqual(BUILTIN_ROLES.viewer.permissions, ['audit.view', 'devices.view', 'sessions.view']);
   assert.ok(!PERMISSIONS.some((p) => /system/.test(p)), 'there is no separate SYSTEM permission');
   assert.deepEqual(normalizePermissions(['sessions.end', 'audit.view', 'audit.view']), ['audit.view', 'sessions.end']);
   assert.throws(() => normalizePermissions(['sessions.control_system']), /unknown permission/);
@@ -562,8 +562,8 @@ test('a role manager cannot narrow, rename or delete a role that holds more than
   await assert.rejects(team.updateRole(W, rm, 'strong', { permissions: [] }), roleWithin);
   await assert.rejects(team.updateRole(W, rm, 'strong', { name: 'Renamed' }), roleWithin);
   await assert.rejects(team.removeRole(W, rm, 'strong'), roleWithin);
-  await assert.rejects(team.updateRole(W, rm, 'technician', { permissions: ['sessions.view'] }), /you do not hold sessions\.create/);
-  await assert.rejects(team.removeRole(W, rm, 'technician'), /you do not hold sessions\.create/);
+  await assert.rejects(team.updateRole(W, rm, 'technician', { permissions: ['sessions.view'] }), /you do not hold devices\.view, devices\.manage, sessions\.create/);
+  await assert.rejects(team.removeRole(W, rm, 'technician'), /you do not hold devices\.view, devices\.manage, sessions\.create/);
   assert.deepEqual(await permsOf(team, 'strong'), ['sessions.view', 'sessions.control']);
   assert.ok(await permsOf(team, 'technician'));
   assert.equal((await team.readAudit(W)).verified, true);

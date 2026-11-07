@@ -416,7 +416,7 @@ test('a members.manage member cannot make anyone admin, remove an admin, or hand
   await forbidden(r.api(LEAD, 'DELETE', '/members/admin2@example.com'), /only an admin can remove an admin/);
   await forbidden(r.api(LEAD, 'DELETE', `/members/${BOSS}`), /only an admin can remove an admin/);
   // Roles that hold more than the lead does: technician has sessions.control, viewer has audit.view.
-  await forbidden(r.api(LEAD, 'POST', '/members', { identity: 'new@example.com', role_id: 'technician' }), /you do not hold sessions\.create, sessions\.control, sessions\.end/);
+  await forbidden(r.api(LEAD, 'POST', '/members', { identity: 'new@example.com', role_id: 'technician' }), /you do not hold devices\.view, devices\.manage, sessions\.create, sessions\.control, sessions\.end/);
   await forbidden(r.api(LEAD, 'PATCH', '/members/v@example.com', { role_id: 'technician' }), /you do not hold/);
   await forbidden(r.api(LEAD, 'POST', '/members', { identity: 'new@example.com', role_id: 'viewer' }), /you do not hold audit\.view/);
   // Nobody changes their own role, even to a lesser one.
@@ -487,7 +487,7 @@ test('a roles.manage member cannot add permissions to their own role or grant on
   await forbidden(r.api(RM, 'POST', '/roles', { id: 'strong', permissions: ['members.manage'] }), /you do not hold members\.manage/);
   await forbidden(r.api(RM, 'PATCH', '/roles/sv', { permissions: ['sessions.view', 'sessions.end'] }), /you do not hold sessions\.end/);
   // Even a rename leaves technician holding permissions the rolemaker lacks.
-  await forbidden(r.api(RM, 'PATCH', '/roles/technician', { name: 'Tech' }), /you do not hold sessions\.create/);
+  await forbidden(r.api(RM, 'PATCH', '/roles/technician', { name: 'Tech' }), /you do not hold devices\.view, devices\.manage, sessions\.create/);
   assert.deepEqual((await r.api(BOSS, 'GET', '/roles')).body.roles.find((x) => x.id === 'rolemaker').permissions, ['roles.manage', 'sessions.view']);
   assert.deepEqual((await r.api(BOSS, 'GET', '/roles')).body.roles.find((x) => x.id === 'sv').permissions, ['sessions.view']);
   assert.equal(await r.logLength(), before);
@@ -508,7 +508,7 @@ test('a roles.manage member cannot narrow, rename or delete a role that holds mo
   await forbidden(r.api(RM, 'DELETE', '/roles/strong'), held);
   await forbidden(r.api(RM, 'DELETE', '/roles/viewer'), held);
   const roles = (await r.api(BOSS, 'GET', '/roles')).body.roles;
-  assert.deepEqual(roles.find((x) => x.id === 'technician').permissions, ['sessions.create', 'sessions.view', 'sessions.control', 'sessions.end']);
+  assert.deepEqual(roles.find((x) => x.id === 'technician').permissions, ['devices.view', 'devices.manage', 'sessions.create', 'sessions.view', 'sessions.control', 'sessions.end']);
   assert.ok(roles.some((x) => x.id === 'strong' && x.name === 'strong'));
   assert.ok(roles.some((x) => x.id === 'viewer'));
   assert.equal(await r.logLength(), before, 'a refused change writes no log row');
@@ -585,7 +585,7 @@ test('with DEPLOYMENT_ADMINS set, another caller cannot edit the roles before th
   await ok(r.api('owner@example.com', 'POST', '/members', { identity: 'owner@example.com', role_id: 'admin' }), 201);
   const roles = (await r.api('owner@example.com', 'GET', '/roles')).body.roles;
   assert.deepEqual(roles.map((x) => x.id), ['admin', 'technician', 'viewer']);
-  assert.deepEqual(roles.find((x) => x.id === 'viewer').permissions, ['sessions.view', 'audit.view']);
+  assert.deepEqual(roles.find((x) => x.id === 'viewer').permissions, ['audit.view', 'devices.view', 'sessions.view']);
 });
 
 // ---- more workspaces ----------------------------------------------------------------

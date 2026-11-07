@@ -1,6 +1,6 @@
 // support-mcp relay router: Access JWT gate + MCP JSON-RPC handler + the team
 // API (/api/v1/...) + the public customer paths (/healthz, /j/<code>, /agent,
-// /ws). Kept free of the .ps1 import and the DO classes so node --test can drive
+// /ws) + the public PC wire for saved PCs (/device/...). Kept free of the .ps1 import and the DO classes so node --test can drive
 // it route-level; index.js wires it to the real agent template.
 import { verifyAccessJwt, jwksKeyResolver, localBypassAllowed, callerIdentity } from './jwt.js';
 import { handleRpc, parseToolOptions } from './mcp.js';
@@ -9,6 +9,7 @@ import { permissionForTool } from './permissions.js';
 import { DEFAULT_WORKSPACE, teamFromEnv } from './workspace.js';
 import { registryName } from './registry.js';
 import { handleApi } from './api.js';
+import { handleDevice } from './device-api.js';
 import { handleAuth } from './auth.js';
 import {
   AS_METADATA_PATH, PROTECTED_RESOURCE_PREFIX, REGISTER_PATH, TOKEN_PATH, assertPersonActive, assertSecondFactor, bearerToken,
@@ -516,6 +517,8 @@ export function createHandler(agentText, appBundle = null, options = {}) {
         });
       }
       if (p === '/api' || p.startsWith('/api/')) return handleApi(request, env, url, { accessCaller, isJsonContentType });
+      // A PC pairs and checks in here with its own key. Public: outside Access.
+      if (p.startsWith('/device/')) return handleDevice(request, env, url, { isLoopback, isJsonContentType });
       return new Response('not found', { status: 404 });
     },
   };

@@ -10,7 +10,7 @@ An MCP server on Cloudflare Workers that lets your AI agent see, control and run
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers%20%2B%20Durable%20Objects-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/durable-objects/)
 [![.NET Framework 4.5.2+](https://img.shields.io/badge/.NET%20Framework-4.5.2%2B-512BD4)](src/agent-app.cs)
 [![PowerShell 5.1](https://img.shields.io/badge/PowerShell-5.1-5391FE)](src/agent.ps1)
-[![MCP](https://img.shields.io/badge/MCP-14%20tools-d97757)](#mcp-tools)
+[![MCP](https://img.shields.io/badge/MCP-22%20tools-d97757)](#mcp-tools)
 
 <img src="docs/hero.svg" alt="Claude Code calls session_create, run and put_file. A Cloudflare Worker relays them to the customer's PC, where a small Remote support window in the corner of the screen shows that an agent is connected, with an End session button." width="100%">
 
@@ -254,11 +254,17 @@ an attempt to edit or add a role, or to change or remove a member, gets a 409
   `CF_ACCESS_CLIENT_ID` value, which ends in `.access`). Identities ignore case
   and surrounding spaces.
 - **Roles.** `admin` can do everything and can't be changed. `technician` can
-  create, view, control and end sessions. `viewer` can view sessions and read
-  the team log. Admins can edit `technician` and `viewer`, delete them while no
-  member holds them, and add roles of their own from these permissions:
-  `members.manage`, `roles.manage`, `audit.view`, `sessions.create`,
-  `sessions.view`, `sessions.control`, `sessions.end`.
+  create, view, control and end sessions, and view and manage customers, sites
+  and saved PCs. `viewer` can view sessions, read the team log and view customers,
+  sites and saved PCs. Admins can edit `technician` and `viewer`, delete them
+  while no member holds them, and add roles of their own from these permissions:
+  `members.manage`, `roles.manage`, `audit.view`, `devices.view`,
+  `devices.manage`, `fields.manage`, `sessions.create`, `sessions.view`,
+  `sessions.control`, `sessions.end`. A workspace that edited `technician` or
+  `viewer` before the device permissions existed keeps its edit, without them
+  (admins hold every permission). Because `technician` and `viewer` now hold
+  more, a custom role with `members.manage` but no device permissions can no
+  longer add or change people in those roles, under the rule below.
 - **Who can give what.** Having `members.manage` or `roles.manage` does not let
   a member reach admin. Only an admin can add a member as admin, move anyone to
   or from admin, or remove an admin. Everyone else can give a member only a role
@@ -319,6 +325,57 @@ cloudflared access curl https://support.example.com/api/v1/w     # the workspace
 
 The routes, bodies and errors are in
 [docs/relay-v1-spec.md](docs/relay-v1-spec.md#team-api-apiv1wslug).
+
+## Saved devices
+
+Each workspace can keep customers, their sites and their saved PCs, so a team
+knows which PC is whose. A PC joins with its own long-lived key, which is not
+tied to a 24-hour session. This release stores and pairs PCs; it does not yet
+connect to them. One-off support links work as before.
+
+- **Records.** A customer has a name, phone, email and notes. A site belongs to
+  one customer and has a name, address and notes. A saved PC has the name its
+  owner gave it, an access mode (`ask` or `any`), a control level (`full` or
+  `limited`), an optional owner contact, a site, and what the PC reports about
+  itself: Windows version, machine name, app version and when it was last seen.
+  Reading needs `devices.view`; changing needs `devices.manage`.
+- **Custom fields.** An admin (`fields.manage`) can add text fields to
+  customers, sites or devices, such as "Contract until". A value is text of at
+  most 500 characters, and a record type has at most 30 fields. Custom field
+  text is untrusted input: only team members with `devices.manage` write it (a
+  PC cannot), and later it may be shown to an AI agent. So is what a PC reports
+  or sets about itself: its name, owner contact, Windows version and machine
+  name. None of it grants access to anything.
+- **Two ways to pair a PC.** A technician asks for a pairing code
+  (`POST .../pairing`). The code is 10 characters such as `ABCDE-FGH23`, works
+  once, and dies after 10 minutes. The owner types it into the PC's setup and
+  the PC joins with its own key. Or the owner starts the install, and the PC
+  joins as *waiting* with a six-digit number the owner reads out. A technician
+  approves it by typing that number. A waiting PC can only check in or leave, and
+  it is gone after 24 hours. A workspace takes at most 20 live codes, 20 waiting
+  PCs and 20 join requests an hour.
+- **Keys.** A PC's key is shown to it once, when it pairs, and the relay keeps
+  only a hash. The PC sends it in an `Authorization: Bearer` header, never in a
+  URL. A wrong key, an unknown PC and a removed PC all get the same 401. A PC
+  removes itself when it is uninstalled (`/device/leave`), and a technician can
+  remove any saved PC, which ends its key at once.
+- **Access mode.** The PC's owner can switch it between `ask` and `any`. So can
+  a technician with `devices.manage`; that change is logged with the technician
+  as the actor and the old and new mode. The control level and the PC's name
+  stay the owner's.
+- **The team log** records every change to customers, sites, custom fields,
+  pairing codes and PCs, with names and ids but never a code, a key or a field
+  value. A detail can hold customer, site and PC names, so anyone with
+  `audit.view` can read them. A PC's routine check-ins are not logged.
+
+`/device/pair`, `/device/hello`, `/device/update` and `/device/leave` are public
+addresses for the PC and are not behind Access. Their request and answer shapes
+are in [docs/relay-v1-spec.md](docs/relay-v1-spec.md#the-pc-wire-device).
+Pairing needs `AUTH_SECRET` (at least 32 characters) to be set, as sign-in does.
+Rotating `AUTH_SECRET` ends every live pairing code and every waiting PC's
+six-digit number, because both are stored as keyed hashes; a PC's key is a plain
+SHA-256 and keeps working.
+To try it locally, see [docs/development.md](docs/development.md#pairing-a-pc-locally).
 
 ## Sign-in
 
@@ -391,7 +448,8 @@ flowchart LR
 | `GET /ws?sid=` | attach key in a header, https only | PowerShell agent WebSocket, using the hibernation API |
 | `POST /mcp` | Cloudflare Access, then the caller's role | MCP JSON-RPC 2.0, stateless HTTP, for the `default` workspace |
 | `POST /w/<slug>/mcp` | Cloudflare Access, then the caller's role | the same endpoint for another workspace |
-| `/api/v1/w/<slug>/...` | Cloudflare Access, then the caller's role | the team API: members, roles and the team log |
+| `/api/v1/w/<slug>/...` | Cloudflare Access, then the caller's role | the team API: members, roles, the team log, customers, sites, saved PCs, custom fields and pairing codes |
+| `POST /device/pair`, `hello`, `update`, `leave` | public, https only; a saved PC's key in a header (pair: a pairing code or a workspace in the body) | the PC's side of saved devices. Not behind Access |
 | `POST /api/v1/w`, `GET /api/v1/w` | Cloudflare Access, a deployment admin to create | create a workspace, list yours |
 
 The Worker itself is the MCP server. There is no local bridge process. Each
@@ -409,7 +467,9 @@ keyed by workspace.
 | `src/permissions.js` | the permission keys, the built-in roles, and the permission each MCP tool needs |
 | `src/workspace.js` | team data in D1: members, roles, recent callers, the chained team log, and the role check. All team SQL is here |
 | `src/api.js` | the team API under `/api/v1/w/<slug>`, and workspace creation and listing |
-| `migrations/` | the D1 tables, applied in name order: `0001_team.sql` (members, roles, callers, the team log, each keyed by workspace) and `0002_workspaces.sql` (the workspaces table and an index on members by identity) |
+| `src/devices.js` | customers, sites, saved PCs, custom fields and pairing codes in D1. All their SQL is here; each change goes through `src/workspace.js`'s guarded change |
+| `src/device-api.js` | the PC wire under `/device/`: pair, hello, update and leave |
+| `migrations/` | the D1 tables, applied in name order: `0001_team.sql` (members, roles, callers, the team log, each keyed by workspace), `0002_workspaces.sql` (the workspaces table and an index on members by identity), `0003_signin.sql` (people, sign-ins, links and authenticators) and `0004_devices.sql` (customers, sites, devices, custom field definitions and pairing codes) |
 | `src/mcp.js` | JSON-RPC dispatch, the tool schemas, and the mapping of each screen tool to one normalized action |
 | `src/screen.js` | the screen actions, their audit text, and the strict check of every field an app result may carry |
 | `src/jwt.js` | RS256 verification of the Access JWT with WebCrypto |
@@ -489,9 +549,11 @@ deploy without Windows. You need Windows only to change the app: see
    Then run `npx wrangler deploy`.
 4. **Harden the zone.** Turn on **Always Use HTTPS** for the zone (SSL/TLS,
    Edge Certificates), so a link pasted without `https://` is redirected. The
-   relay refuses `/j` and `/ws` over plain http either way. The relay does no
-   rate limiting of its own, so add a Cloudflare rate-limiting rule on `/j` and
-   `/ws` (and on `/oauth/`, `/mcp` and `/w/` if you turn on OAuth).
+   relay refuses `/j`, `/ws` and `/device/` over plain http either way. The relay
+   does no rate limiting of its own, so add a Cloudflare rate-limiting rule on
+   `/j`, `/ws` and `/device/` (and on `/oauth/`, `/mcp` and `/w/` if you turn on
+   OAuth). A pairing code is 50 random bits, checked across every workspace, so
+   the rule on `/device/` is what keeps guessing out of reach.
 5. **Connect your MCP client.** Every request to `/mcp` needs the headers
    `CF-Access-Client-Id` and `CF-Access-Client-Secret`. `cf/mcp-headers.sh`
    reads them from `~/.config/support-mcp/access.env` when the client connects,
@@ -604,6 +666,10 @@ check are in [docs/development.md](docs/development.md).
 - An old app from before screen control keeps working for commands and files.
   Its screen calls return `this support app is too old for screen control`. The
   PowerShell fallback has no screen access either.
+- A workspace holds at most 10,000 customers, 10,000 sites and 2,000 saved PCs,
+  30 custom fields per record type, 20 live pairing codes and 20 waiting PCs.
+  Saved PCs cannot be connected to yet: in this release a saved PC is a record
+  and a key, and nothing in the relay reads a record to decide who may do what.
 - Cloudflare Access, or the relay's OAuth for MCP clients, decides who can reach
   the relay, and each workspace's roles decide what its members can do.
   `session_list` lists the sessions of the workspace you called it on. A session

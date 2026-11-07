@@ -42,9 +42,9 @@ using Shapes = System.Windows.Shapes;
 // Fully qualified, so no System.Reflection using brings new type names into scope.
 [assembly: System.Reflection.AssemblyTitle("Support-MCP")]
 [assembly: System.Reflection.AssemblyProduct("Support-MCP")]
-[assembly: System.Reflection.AssemblyVersion("0.2.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("0.2.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("0.2.0")]
+[assembly: System.Reflection.AssemblyVersion("0.3.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("0.3.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("0.3.0")]
 
 namespace SupportMcp {
     public static class SupportAccess {
@@ -104,7 +104,7 @@ namespace SupportMcp {
     public static class Wire {
         public const string Footer = "SUPPORTMCPCFG1";
         // The release version, sent in the hello. The hello's "agent" field stays the protocol generation.
-        public const string Version = "0.2.0";
+        public const string Version = "0.3.0";
         public static Dictionary<string, object> Map(params object[] pairs) {
             var d = new Dictionary<string, object>();
             for (int i = 0; i < pairs.Length; i += 2) d[(string)pairs[i]] = pairs[i + 1];

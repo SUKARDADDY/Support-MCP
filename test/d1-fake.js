@@ -16,7 +16,12 @@ const MIGRATIONS = readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith('.sql'))
 const tick = () => new Promise((r) => setImmediate(r));
 const plain = (row) => (row ? { ...row } : row);
 
+// D1 allows at most 100 bound parameters in one statement. node:sqlite allows 32766,
+// so without this check a query that works here fails on the real database.
+export const D1_MAX_PARAMS = 100;
+
 function check(params) {
+  if (params.length > D1_MAX_PARAMS) throw new Error(`D1_ERROR: too many SQL variables at offset 0: SQLITE_ERROR (${params.length} bound, the limit is ${D1_MAX_PARAMS})`);
   for (const p of params) {
     // D1 refuses undefined and booleans the same way.
     if (p === undefined || typeof p === 'boolean') throw new Error(`D1_TYPE_ERROR: Type '${typeof p}' not supported`);

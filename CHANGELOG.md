@@ -7,6 +7,49 @@ to run on unattended customer PCs.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-07
+
+### Added
+
+- Customers, sites and saved PCs. A workspace keeps customers, their sites and
+  their PCs through the team API, with built-in fields and text custom fields
+  that admins define. Migration `0004_devices.sql` adds the tables. Nothing here
+  connects to a saved PC yet.
+- Pairing. A technician asks for a 10-character code that works once and dies
+  after 10 minutes, and the owner types it on the PC. Or the owner starts the
+  install and a technician approves it with a six-digit number the owner reads
+  out. A PC gets its own long-lived key and keeps it until it leaves or a
+  technician removes it. The PC's side is four public addresses under
+  `/device/`: `pair`, `hello`, `update` and `leave`, each speaking `"protocol": 1`.
+- Three permissions: `devices.view`, `devices.manage` and `fields.manage`. A
+  technician gets the first two, a viewer gets the first, and admins hold all.
+- The team log records every change to customers, sites, custom fields, pairing
+  codes and PCs. A technician with `devices.manage` can switch a PC between
+  "asks first" and "any time"; the log names the technician and both modes.
+
+### Changed
+
+- A custom role with `members.manage` but no device permissions can no longer add
+  or change a technician or a viewer, because those roles now hold permissions
+  the custom role lacks (the rule that you hand out only what you hold). Give the
+  custom role `devices.view` and `devices.manage` to restore it.
+- A workspace that edited the `technician` or `viewer` role keeps its edit, which
+  has none of the new permissions. Edit the role to add them. Admins hold every
+  permission either way, and a workspace that never edited them gets the new
+  defaults.
+- Add `/device/` to the Cloudflare rate-limiting rule next to `/j` and `/ws`. It
+  must stay outside Access.
+- `devices.manage` and `fields.manage` join the permissions that need a second
+  factor at browser sign-in and OAuth consent. A person whose role holds either
+  must enrol an authenticator; Access callers are still exempt.
+- A technician's `PATCH .../devices/<id>` with `name`, `control` or another
+  field the PC owns is now 400 `bad_request`; those stay the owner's.
+- A PC's changed check-in details are written at most once a minute (unchanged
+  ones still every 5 minutes). A pairing code works only while the person who
+  made it still holds `devices.manage`. Migration `0004_devices.sql` adds the
+  indexes `devices_by_status` and `audit_by_kind`.
+- The README's tool count badge now says 22, as the relay lists.
+
 ## [0.2.0] - 2026-11-06
 
 ### Added
