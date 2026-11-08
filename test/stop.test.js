@@ -379,3 +379,53 @@ test('an unreadable stop state does not end a quiet PowerShell session: the alar
   assert.equal(w.stateOf(ps.sid), 'attached');
   assert.equal(ps.ctx.alarm(), w.now() + 30_000);
 });
+
+// The stop read awaits D1, which lets other requests run on the session. An end that lands during that read must
+// stay terminal: the attach or hello that was waiting must not bring the session back.
+function holdStopRead(w) {
+  const prepare = w.db.prepare;
+  let release; const gate = new Promise((r) => { release = r; });
+  const state = { hit: false, release };
+  w.db.prepare = (text) => {
+    const st = prepare.call(w.db, text);
+    if (/workspace_stopped/.test(text) && !state.hit) {
+      state.hit = true;
+      const bind = st.bind.bind(st);
+      st.bind = (...a) => { const b = bind(...a); const first = b.first.bind(b); b.first = async () => { await gate; return first(); }; return b; };
+    }
+    return st;
+  };
+  return state;
+}
+
+test('an end during a PowerShell attach\'s stop read stays terminal: the attach gets 410 and the end keeps its reason', async (t) => {
+  upgradeResponses(t);
+  const w = await world(t);
+  const ps = await w.tool(BOSS, 'session_create', { windows_mode: 'powershell' });
+  const { session } = w.sessionFor(ps.session_id);
+  const key = (await (await session.fetch(new Request('https://do/consume', { method: 'POST', body: JSON.stringify({ windows_mode: 'powershell' }) }))).json()).key;
+  const hold = holdStopRead(w);
+  const attach = session.fetch(new Request('https://do/ws', { headers: { 'x-attach-key': key, upgrade: 'websocket' } }));
+  await until(() => hold.hit);
+  const end = await (await session.fetch(new Request('https://do/end', { method: 'POST', body: JSON.stringify({ actor: BOSS, workspace: 'default' }) }))).json();
+  assert.equal(end.ended, true);
+  hold.release();
+  assert.equal((await attach).status, 410);
+  assert.equal(w.stateOf(ps.session_id), 'ended');
+  assert.equal(w.reasonOf(ps.session_id), 'ended_by_operator');
+});
+
+test('an end during a saved PC hello\'s stop read stays terminal: the hello gets 410 and the end keeps its reason', async (t) => {
+  const w = await world(t);
+  const pc = await w.addPc();
+  const started = await w.tool(TECH, 'device_connect', { device_id: pc.id });
+  const { session } = w.sessionFor(started.session_id);
+  const hold = holdStopRead(w);
+  const hello = w.agent(started.session_id, pc.key, { type: 'hello', control: 'full', caps: [] });
+  await until(() => hold.hit);
+  await session.fetch(new Request('https://do/end', { method: 'POST', body: JSON.stringify({ actor: TECH, workspace: 'default' }) }));
+  hold.release();
+  assert.equal((await hello).status, 410);
+  assert.equal(w.stateOf(started.session_id), 'ended');
+  assert.notEqual(w.reasonOf(started.session_id), 'stopped');
+});

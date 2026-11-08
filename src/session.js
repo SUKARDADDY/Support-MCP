@@ -380,6 +380,10 @@ export class Session {
       await this.endStopped();
       return new Response('gone', { status: 410 });
     }
+    // The stop read awaits D1, which lets other requests run: an end that landed
+    // meanwhile must stay terminal, so read the state again.
+    state = await this.get('state');
+    if (state === 'ended' || state === undefined) return new Response('gone', { status: 410 });
     if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('expected websocket', { status: 426 });
     }
@@ -618,6 +622,8 @@ export class Session {
   // The relay or the workspace is stopped: tell every socket and poll, fail what
   // is waiting, and end with reason "stopped".
   async endStopped() {
+    // The stop read awaits D1, so an end may have landed meanwhile: keep its reason.
+    if ((await this.get('state')) === 'ended') return;
     this.closeAll({ type: 'end', reason: 'stopped' }, 'stopped');
     this.failPending(() => true, 'session ended');
     await this.markEnded('stopped');
@@ -695,6 +701,9 @@ export class Session {
       await this.endStopped();
       return Response.json({ type: 'end', reason: 'stopped' }, { status: 410 });
     }
+    // The stop read awaits D1: an end that landed meanwhile stays terminal.
+    state = await this.get('state');
+    if (!state || state === 'ended') return Response.json({ type: 'end' }, { status: 410 });
     // A PC says no before it says hello: the person declined, nobody was there
     // to ask, or the PC was busy. The session ends with that reason. A PC that
     // restarts during a limited session and finds nobody to ask, or several
@@ -997,6 +1006,8 @@ export class Session {
       await this.endStopped();
       return;
     }
+    // An end during the stop read leaves nothing to wake for.
+    if ((await this.get('state')) === 'ended') return;
     // Re-arm: for the next stop check, or (fired early, clock skew) the real deadline.
     await this.ctx.storage.setAlarm(ps ? this.wakeFor(dl) : dl);
   }
