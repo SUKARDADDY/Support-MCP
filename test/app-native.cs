@@ -132,11 +132,15 @@ sealed class FakeDevice : IDisposable {
     // the next queued frame or, after a short wait, idle, and a result with an ack (kept by id).
     public readonly List<Dictionary<string, object>> AgentLog = new List<Dictionary<string, object>>();
     public volatile string AgentDriver = "tech@example.com"; public volatile int DeclineStatus = 200;
-    readonly Queue<Dictionary<string, object>> agentFrames = new Queue<Dictionary<string, object>>();
+    // Queued frames with the time each was last handed to a poll (MinValue: not yet). Like the relay, a frame with no
+    // result yet is handed out again 5 seconds after it was sent, unless the app says its lane is busy: a poll the app
+    // abandoned (a Nudge, a timeout) would otherwise lose the frame for good.
+    readonly List<KeyValuePair<Dictionary<string, object>, DateTime>> agentFrames = new List<KeyValuePair<Dictionary<string, object>, DateTime>>();
+    const int RedeliverMs = 5000;
     readonly Dictionary<string, Dictionary<string, object>> agentResults = new Dictionary<string, Dictionary<string, object>>();
     public string AgentQueue(Dictionary<string, object> frame) {
         string type = Wire.Text(frame, "type"); frame["id"] = Guid.NewGuid().ToString(); frame["lane"] = type == "screen" || type == "control" ? "screen" : "cmd";
-        lock (agentFrames) { agentFrames.Enqueue(frame); agentTypes[(string)frame["id"]] = type; } return (string)frame["id"];
+        lock (agentFrames) { agentFrames.Add(new KeyValuePair<Dictionary<string, object>, DateTime>(frame, DateTime.MinValue)); agentTypes[(string)frame["id"]] = type; } return (string)frame["id"];
     }
     readonly Dictionary<string, string> agentTypes = new Dictionary<string, string>();
     public Dictionary<string, object> AgentResult(string id, int seconds) {
@@ -152,6 +156,21 @@ sealed class FakeDevice : IDisposable {
         return list;
     }
     public bool WaitAgent(string type, int count, int ms) { var until = DateTime.UtcNow.AddMilliseconds(ms); while (DateTime.UtcNow < until) { if (Agent(type).Count >= count) return true; Thread.Sleep(50); } return Agent(type).Count >= count; }
+    // The first frame with no result yet that was never sent, or was sent at least RedeliverMs ago, on a lane the app
+    // does not report busy. A frame whose result came in is dropped.
+    Dictionary<string, object> NextFrame(List<string> busy) {
+        lock (agentFrames) {
+            lock (agentResults) agentFrames.RemoveAll(delegate(KeyValuePair<Dictionary<string, object>, DateTime> e) { return agentResults.ContainsKey((string)e.Key["id"]); });
+            for (int i = 0; i < agentFrames.Count; i++) {
+                var e = agentFrames[i];
+                if (busy.Contains((string)e.Key["lane"])) continue;
+                if (e.Value != DateTime.MinValue && (DateTime.UtcNow - e.Value).TotalMilliseconds < RedeliverMs) continue;
+                agentFrames[i] = new KeyValuePair<Dictionary<string, object>, DateTime>(e.Key, DateTime.UtcNow);
+                return new Dictionary<string, object>(e.Key);
+            }
+        }
+        return null;
+    }
     void AgentReply(HttpListenerContext ctx) {
         string raw; using (var r = new StreamReader(ctx.Request.InputStream)) raw = r.ReadToEnd();
         var b = Wire.Json().Deserialize<Dictionary<string, object>>(raw);
@@ -163,7 +182,8 @@ sealed class FakeDevice : IDisposable {
         else if (type == "result") { lock (agentResults) agentResults[Wire.Text(b, "id")] = b; reply = Wire.Map("type", "ack"); }
         else {
             Dictionary<string, object> next = null;
-            for (int i = 0; i < 6 && next == null; i++) { lock (agentFrames) if (agentFrames.Count > 0) next = agentFrames.Dequeue(); if (next == null) Thread.Sleep(50); }
+            var busy = new List<string>(); object bl; if (b.TryGetValue("busy_lanes", out bl) && bl is System.Collections.IEnumerable && !(bl is string)) foreach (var x in (System.Collections.IEnumerable)bl) busy.Add(x as string ?? "");
+            for (int i = 0; i < 6 && next == null; i++) { next = NextFrame(busy); if (next == null) Thread.Sleep(50); }
             reply = next ?? Wire.Map("type", "idle"); reply["driver"] = AgentDriver;
         }
         byte[] bytes = Encoding.UTF8.GetBytes(Wire.Json().Serialize(reply));
