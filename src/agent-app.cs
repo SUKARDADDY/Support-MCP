@@ -5110,6 +5110,10 @@ namespace SupportMcp {
         // A rollback starts the old service again for this long (with a growing wait between tries) when it will not start,
         // for example while a user holds the old file open without sharing.
         internal static long StartRetryMs = 300000;
+        // How long a service-configuration change keeps retrying. While Windows starts its automatic services at boot the
+        // service database is locked (ERROR_SERVICE_DATABASE_LOCKED), and a rollback the failure action runs then would
+        // otherwise fail to point the service back.
+        internal static long ConfigRetryMs = 300000;
 
         public static string SwitchArgs(string file) { return "--device-update \"" + file + "\""; }
         public static string RollbackCommand(string exe) { return "\"" + exe + "\" --device-update-rollback"; }
@@ -5244,7 +5248,12 @@ namespace SupportMcp {
                 string from = st.From, fromVersion = st.FromVersion, version = st.Version;
                 if (st.Phase == UpdateState.Trial) { st.Phase = UpdateState.RollingBack; if (blame || st.Started) st.AddFailed(version); st.Save(folder); }
                 if (restart) Stop();
-                try { if (File.Exists(from)) Repoint(from, fromVersion, folder); } catch (Exception) { }
+                // Only a rollback that pointed everything back finishes. Otherwise the trial stays in its rollback phase and the
+                // rollback command stays the failure action, so the new version's next failure (or the old version's next
+                // start) runs it again; nothing claims a rollback that did not happen.
+                bool pointed = false;
+                try { if (File.Exists(from)) { Repoint(from, fromVersion, folder); pointed = true; } } catch (Exception) { }
+                if (!pointed) return true;
                 try { SetActions(null); } catch (Exception) { }
                 DeviceService.AppendHistory(folder, "Support couldn't update to version " + version + ", so it went back to version " + fromVersion + ".");
                 st = UpdateState.TryLoad(folder);
@@ -5281,14 +5290,26 @@ namespace SupportMcp {
 
         // The service's command line, the tray's startup value and the Apps entry (64-bit view), all for exe.
         static void Repoint(string exe, string version, string folder) {
-            if (Dry) { Log("point " + exe + " " + version); return; }
-            Scm.SetBinary(DeviceSetup.ServiceName, DeviceInstall.ServiceBinary(exe));
-            DeviceInstall.WriteRegistry(exe, version, folder, (int)((new System.IO.FileInfo(exe).Length + 1023) / 1024));
+            if (Dry) { if (DryRepointFails) throw new Win32Exception(1055); Log("point " + exe + " " + version); return; }
+            Retrying(delegate { Scm.SetBinary(DeviceSetup.ServiceName, DeviceInstall.ServiceBinary(exe)); });
+            Retrying(delegate { DeviceInstall.WriteRegistry(exe, version, folder, (int)((new System.IO.FileInfo(exe).Length + 1023) / 1024)); });
         }
         static void SetActions(string rollbackCommand) {
             if (Dry) { Log(rollbackCommand == null ? "actions restart" : "actions " + rollbackCommand); return; }
-            Scm.SetFailureActions(DeviceSetup.ServiceName, rollbackCommand);
+            Retrying(delegate { Scm.SetFailureActions(DeviceSetup.ServiceName, rollbackCommand); });
         }
+        // Runs a configuration change, retrying for ConfigRetryMs (waiting 1 s, then 2, 4 and so on up to 15 s) and
+        // throwing the last error after that.
+        static void Retrying(Action change) {
+            var clock = Stopwatch.StartNew(); int wait = 1000;
+            while (true) {
+                try { change(); return; }
+                catch (Exception) { if (clock.ElapsedMilliseconds >= ConfigRetryMs) throw; }
+                Thread.Sleep(wait); wait = Math.Min(wait * 2, 15000);
+            }
+        }
+        // Tests only: makes the dry repoint fail, as a locked service database would.
+        internal static bool DryRepointFails = false;
         static void Stop() { if (Dry) Log("stop"); else Scm.StopAndWait(DeviceSetup.ServiceName, 60000); }
         // Starts the service. retry: keep trying for StartRetryMs, waiting 1 s, then 2, 4 and so on up to 30 s between tries,
         // so a user who holds the old file open without sharing only delays the rollback. Never throws.

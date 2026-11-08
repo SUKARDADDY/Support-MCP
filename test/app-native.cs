@@ -1157,6 +1157,22 @@ public static class AppTests {
                     Assert(!st.InTrial && st.Failed.Contains("99.0.0") && st.StagedFile == "", "the trial is closed and the version recorded as failed");
                     Assert(history(folder).Contains("couldn't update to version 99.0.0"), "a history line says so");
                 }
+                // A rollback that cannot point the service back (the service database is locked while Windows starts
+                // its services at boot) finishes nothing: the trial stays in its rollback phase, the rollback command stays
+                // the failure action, and no history line claims it went back. A later run that can point back finishes it.
+                {
+                    string folder = fresh(), old = Path.Combine(folder, "support.exe"), neu = Path.Combine(folder, "support-99.0.0-abcdef12.exe");
+                    openTrial(folder, old, neu); log();
+                    DeviceUpdate.DryRepointFails = true;
+                    try { DeviceUpdate.RollBack(folder); } finally { DeviceUpdate.DryRepointFails = false; }
+                    var seen = log(); var st = UpdateState.Load(folder);
+                    Assert(st.InTrial && st.Phase == UpdateState.RollingBack, "a rollback that could not point back stays open: " + st.Phase);
+                    Assert(!seen.Contains("actions restart"), "the rollback command stays the failure action: " + show(seen));
+                    Assert(!history(folder).Contains("went back"), "no history line claims it went back");
+                    log(); DeviceUpdate.RollBack(folder); seen = log(); st = UpdateState.Load(folder);
+                    Assert(!st.InTrial && seen.Contains("point " + old + " 0.4.0") && seen.Contains("actions restart"), "a later run points back and finishes: " + show(seen));
+                    Assert(history(folder).Contains("couldn't update to version 99.0.0"), "and only then says so");
+                }
                 // Refusals: a file that was not staged, outside the folder, the running exe, changed since staging, or the lock held.
                 {
                     string folder = fresh(), old = Path.Combine(folder, "support.exe"), neu = Path.Combine(folder, "support-99.0.0-abcdef12.exe");
