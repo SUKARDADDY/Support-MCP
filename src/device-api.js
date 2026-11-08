@@ -16,7 +16,8 @@
 //
 // A hello's answer may also carry "session": the one live session a technician
 // started for this PC, which it should pick up. It comes from the row the check-in
-// already loads, so it costs no query, and a waiting PC never gets it.
+// already loads, so it costs no query, and a waiting PC never gets it. It is left
+// out while EMERGENCY_STOP is set.
 //
 // GET /device/ring is the doorbell: a WebSocket the PC keeps open so the relay
 // can ring it when something changes (src/registry.js holds the sockets). It
@@ -61,7 +62,9 @@ const ROUTES = Object.freeze({
     const { device, app_version, session } = await devs.checkInFull(keyOf(request), body);
     const release = await releaseFrom(appBundle, env);
     const offered = release && await offerAtCheckIn(release, { ...device, app_version }, env?.UPDATE_ROLLOUT);
-    return [200, { device, ...(offered ? { update: updateField(release) } : {}), ...(session ? { session } : {}) }];
+    // While the relay is stopped by its operator a PC is told of no session (it would only be ended on arrival).
+    const stopped = String(env?.EMERGENCY_STOP ?? '') !== '';
+    return [200, { device, ...(offered ? { update: updateField(release) } : {}), ...(session && !stopped ? { session } : {}) }];
   },
   async update(devs, body, request) {
     return [200, { device: await devs.updateOwn(keyOf(request), body) }];

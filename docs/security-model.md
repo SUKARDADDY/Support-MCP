@@ -485,8 +485,8 @@ apply to only one client say which.
     contacts the relay with the PC's key, keeps a doorbell open so the relay can
     tell it to check in at once (below), and writes local history. It never reads
     a session footer. It runs a command, takes a screenshot or opens a file only in
-    a session that its own record at the relay points at, as the next bullet but
-    one describes. It also installs new versions of itself, but only releases
+    a session that its own record at the relay points at, as "Connecting to a saved
+    PC" below describes. It also installs new versions of itself, but only releases
     signed with the project's release key, below. Technicians can now connect to a
     saved PC, but Stage 1 stays off real customers' unattended PCs until the
     release that enforces rules about who may connect and when.
@@ -550,12 +550,36 @@ apply to only one client say which.
   - *The status pipe.* The tray talks to the service over the pipe
     `SupportMcpDevice-ui`. Only SYSTEM can create instances, it is closed to the
     network, and interactive users can read and write data on it. It serves
-    every signed-in session, with a cap per process. It answers three requests
-    and nothing else: read the status, refresh now (at most once every 30
-    seconds), and turn the access mode to "any time". No request turns it back to
-    "ask each time", and the service never sends that mode on its own. The
-    tray's pipe client allows the server to identify it only, so a process that
-    took the pipe's name first cannot act as SYSTEM or as the user.
+    every signed-in session, with a cap of two connections per process (the tray
+    keeps to it with a gate of two). It answers four requests and nothing else:
+    read the status, refresh now (at most once every 30 seconds), turn the access
+    mode to "any time", and end the live session (`end_session`, which works only
+    for a caller in the Windows session the service serves, and ends it with the
+    reason `owner`). Any other message closes the connection. The status shows the
+    PC's name, mode, state and history, and, while a session is live, who is
+    connected and since when; any signed-in user can read that, as they can see
+    the tray. It also carries the random part of the uninstall event's name. No
+    request turns the mode back to "ask each time", and the service never sends
+    that mode on its own. The tray's pipe client allows the server to identify it
+    only, and trusts only a server in session 0, so a process that took the pipe's
+    name first cannot act as SYSTEM or as the user.
+  - *Names in the `Global` namespace are checked, not trusted (issue #22).* Any
+    signed-in user can create a `Global` mutex or event before the service or the
+    installer does, with an access list of their own, and Windows then opens theirs
+    and ignores the one we ask for. So an existing object is used only when SYSTEM
+    or Administrators own it. An owner that cannot be read, or an object this
+    account may not open at all, counts as hostile. This covers the setup mutex
+    (one install, uninstall, update switch or rollback at a time), the SAS mutex
+    and the uninstall event. A hostile setup mutex stops an install or an uninstall
+    with "Another program is blocking Support. Restart the PC and try again."; a
+    hostile update lock holds the update back; a hostile SAS mutex is skipped as
+    busy (the session still runs, and `send_sas` says Windows refuses it). The
+    uninstall event has a random name per install, kept in `device.json` and
+    given to trays in the status frame; the service picks a new name when someone
+    else holds it, and a tray or the uninstaller opens only an event SYSTEM or
+    Administrators own. So a squatter's event cannot quit the trays early or hide
+    an uninstall from them. A squatter can still refuse the install or the
+    uninstall by holding a name, and then the PC is not changed.
   - *Anyone signed in can turn on unattended access.* The one-way rule is a
     decision by the project owner. The tray asks "Allow support to connect any
     time?" and says the owner cannot undo it from this PC. That prompt is not
@@ -563,7 +587,9 @@ apply to only one client say which.
     user or a guest, and Windows asks for no administrator prompt. Once it is
     "any time", nobody at the PC can turn it off. Only a technician with
     `devices.manage` (through the team API) or an uninstall can end it. The
-    tray says so plainly ("Only your support team can change this."). The rule
+    tray says so plainly ("Only your support team can change this."). While the mode
+    is "ask each time", the tray and the wizard say "Your support team's admins can
+    change this.", because the team's admins can change the mode. The rule
     is the app's, not the relay's: `/device/update` takes either mode from the
     holder of the key, and only SYSTEM or an elevated administrator process holds
     it. A technician who holds `sessions.unattended`
@@ -572,8 +598,8 @@ apply to only one client say which.
   - *Uninstall revokes and removes.* Uninstalling from Settings > Apps or the
     tray asks for one Windows permission prompt. It runs from a temporary copy,
     so nothing in the install folder stays open. It tells the relay to forget the
-    PC (`/device/leave`, so the key stops working), has the service end every
-    tray and ends any left that were started from any app file in the folder,
+    PC (`/device/leave`, so the key stops working), sets the PC's uninstall
+    event so every tray exits, and ends any left that were started from any app file in the folder,
     stops and deletes the service, and deletes the startup value, the Apps entry
     and the folder, with every version file and the update record in it, with the
     junction-safe delete the one-off cleanup uses. Anything still locked is
@@ -610,6 +636,27 @@ apply to only one client say which.
     hostile or mistaken relay cannot turn a limited PC into a full-control one.
     What the PC does with the user's identity is the app's rule; the live run
     checks that a file only the system can read is refused.
+  - *What the PC does with a session.* The relay only says which session to pick
+    up; the service decides. It asks the person at the PC when the session says
+    `ask` or its own mode is "ask each time", by starting `--device-ask` as the
+    signed-in user in their session. The question names the technician and the team,
+    says what the control level allows, and defaults to "Don't allow". "Allow" is
+    inert for its first 500 ms, and no answer in 2 minutes is "Don't allow", as is
+    a crash or a closed dialog. If nobody is signed in the PC declines (`nobody`),
+    except a full-control PC set to any time, which runs on the sign-in screen;
+    with several Remote Desktop users and nobody at the console it declines
+    (`busy`). Full control works as SYSTEM on the console session or the one Remote
+    Desktop session. Limited support works as the signed-in user: the session is
+    pinned to that user and session, and the screen helper, every command and every
+    file use that user's own token or impersonation, so it acts only as that
+    user, and it stops working once another user is there. A check-in never
+    raises control, and the PC never sends `control: "full"` unless its own setup
+    says full. A small window stays in the corner for the whole session. The
+    person ends it from there or from the tray, at once. The service saves the
+    session it allowed (`accepted_session` in `device.json`), so a restart or a
+    reboot rejoins it without asking again, and clears it when a check-in no longer
+    carries the session. No update is downloaded or switched while a session is
+    waiting or live.
   - *One driver, and taking over is not a back door.* One technician drives a
     session at a time. A command from anyone else is refused with the driver's
     name. Taking the session over (`take_over`) needs `sessions.unattended` and
@@ -625,7 +672,9 @@ apply to only one client say which.
     else; the PC reads no content, so a forged ring can only make it check in
     early. The PC sends nothing the relay reads, and a frame over 1 KB closes the
     socket. An idle doorbell costs nothing on Cloudflare; only a ring wakes the
-    object. The 5-minute check-in is the fallback when it is not connected.
+    object. The PC opens it as a direct TLS connection and does not use a proxy, so
+    behind a proxy it stays unconnected. The 5-minute check-in is the fallback
+    whenever it is not connected.
   - *A session lasts 24 hours at most.* From the first `hello`, with no idle
     timeout, as a link does. Waiting for the PC and its person takes at most 510
     seconds. The person at the PC can always end it (the end reason is `owner`).

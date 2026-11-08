@@ -167,7 +167,8 @@ async function attachAs(f, tag) {
 }
 
 async function nextFrame(ws) {
-  for (let i = 0; i < 100 && !ws.sent.length; i++) await new Promise((r) => setImmediate(r));
+  const end = performance.now() + 10_000; // a time bound: turns of the event loop are not time, and a hash runs on the thread pool
+  while (!ws.sent.length && performance.now() < end) await new Promise((r) => setImmediate(r));
   assert.ok(ws.sent.length, 'the relay sent no frame to the socket');
   return JSON.parse(ws.sent[ws.sent.length - 1]);
 }

@@ -30,7 +30,7 @@ to run on unattended customer PCs.
   `Authorization` and no attach key; the relay checks it against the database on
   every request and lets it into only the session its record points at. A new
   `decline` message before `hello` (`declined`, `nobody` or `busy`) ends the
-  session. A `hello` with full control from a limited PC is 403. `welcome` and
+  session; after a `hello` only `nobody` and `busy` are taken. A `hello` with full control from a limited PC is 403. `welcome` and
   every poll answer carry the `driver`.
 - One driver at a time. A command from anyone else is refused with the driver's
   name. `take_over` moves the driver and is logged, not an end. End reasons:
@@ -40,6 +40,22 @@ to run on unattended customer PCs.
 - A new permission, `sessions.unattended` ("connect to a PC without asking the
   person at it, and switch a PC to any time"). Admins hold it. It needs a second
   factor and open mode never grants it.
+- The Windows side of a session on a saved PC. The service asks the person at the
+  PC with `--device-ask` (names the technician and the team, "Don't allow" by
+  default, no answer in 2 minutes is a no), or declines `nobody` or `busy`. Full
+  control works as the system on the console or the one Remote Desktop session;
+  limited support works only as the signed-in user. A corner window shows who is
+  connected and ends the session, and its last message says whether the team can
+  connect again later or will ask first. The tray shows who is connected and has
+  an End session button; the status pipe gets `end_session` and `session` and
+  `uninstall_event` fields. A restarted service rejoins a session the person
+  already allowed. No update is installed during a session.
+- The PC's uninstall event has a random name per install. The setup mutex, the
+  SAS mutex and the uninstall event are used only when SYSTEM or Administrators
+  own them; one that someone else made first, or that shuts this account out, is
+  refused or skipped (issue #22). A refused install or uninstall says "Another
+  program is blocking Support. Restart the PC and try again."
+- While `EMERGENCY_STOP` is set the check-in answer leaves out `session`.
 - Stop and resume. `POST` and `DELETE /api/v1/w/<slug>/stop` (and `GET` for the
   state) stop a workspace, which ends every live session in it and refuses its
   tool calls, and resume it. Stop needs `sessions.end`, resume needs

@@ -4,7 +4,9 @@ import assert from 'node:assert/strict';
 import { world, BOSS, TECH, VIEW, LEAD } from './device-sessions-world.js';
 
 const tick = () => new Promise((r) => setImmediate(r));
-const until = async (fn) => { for (let i = 0; i < 200 && !fn(); i++) await tick(); assert.ok(fn(), 'timed out waiting'); };
+// Waits on the event itself, with a wall-clock bound. A count of event-loop turns is not a time: the work in
+// between (key hashes on the thread pool) takes as many turns as it takes, and a loaded CI runner needs far more.
+const until = async (fn, ms = 10_000) => { const end = performance.now() + ms; while (!fn() && performance.now() < end) await tick(); assert.ok(fn(), 'timed out waiting'); };
 const stopReads = (w, from) => w.db.seen.slice(from).filter((s) => /MAX\(seq\)[\s\S]*workspace_stopped/.test(s.sql)).length;
 
 // ---- the routes ---------------------------------------------------------------------------
@@ -199,6 +201,21 @@ test('EMERGENCY_STOP refuses every tool call and every connect, whoever asks, bu
   assert.equal((await w.rpc(BOSS, 'tools/list')).body.result.tools.length, 24, 'tools/list is static and still answers');
   // The PC wire still answers its check-in (it must learn the session is gone).
   assert.equal((await w.hello(pc.key)).status, 200);
+});
+
+test('while EMERGENCY_STOP is set a hello carries no session, and the answer is otherwise the same', async (t) => {
+  const w = await world(t);
+  const pc = await w.addPc();
+  const waiting = await w.tool(TECH, 'device_connect', { device_id: pc.id });
+  const before = await w.hello(pc.key);
+  assert.equal(before.body.session.id, waiting.session_id, 'the live session is offered');
+  w.env.EMERGENCY_STOP = '1';
+  const stopped = await w.hello(pc.key);
+  assert.equal(stopped.status, 200);
+  assert.equal('session' in stopped.body, false, 'no session while the relay is stopped');
+  assert.equal(stopped.body.device.id, before.body.device.id);
+  w.env.EMERGENCY_STOP = '';
+  assert.ok((await w.hello(pc.key)).body.session, 'and it is offered again once the stop is lifted');
 });
 
 test('any non-empty EMERGENCY_STOP counts; an empty one or none does not', async (t) => {

@@ -1100,6 +1100,8 @@ namespace SupportMcp {
         bool Lost { get; }
         // A saved PC's session: who drives it now (an email or a service id, from the relay), "" otherwise.
         string Driver { get; }
+        // A saved PC's session: the PC's access setting ("ask" or "any"), "" for a one-off link.
+        string Access { get; }
         void Stop();
     }
 
@@ -1151,6 +1153,7 @@ namespace SupportMcp {
         volatile string driver = "";
         // Who drives a saved PC's session, from the welcome and each poll answer (relay-v1-spec "driver").
         public string Driver { get { return driver; } }
+        public string Access { get { return ""; } }
         public event Action<string> Log;
         public event Action<string> Status;
         public event Action Finished;
@@ -1732,7 +1735,7 @@ namespace SupportMcp {
             if (origin.Scheme == "https") {
                 var ssl = new System.Net.Security.SslStream(s, false);
                 lock (connGate) { if (tcp != c) { ssl.Dispose(); return; } stream = ssl; }
-                ssl.AuthenticateAsClient(origin.DnsSafeHost, null, System.Security.Authentication.SslProtocols.Tls12, true);
+                ssl.AuthenticateAsClient(origin.DnsSafeHost, null, System.Security.Authentication.SslProtocols.Tls12, ServicePointManager.CheckCertificateRevocationList); // as the check-in: off unless the process turns it on
                 s = ssl;
             } else lock (connGate) { if (tcp != c) return; stream = s; }
             Upgrade(s);
@@ -2255,8 +2258,10 @@ namespace SupportMcp {
         public const string Refused = "Windows does not let this session send Ctrl+Alt+Del (SoftwareSASGeneration); ask the customer to press it";
         public static int WaitMs = 30000;
         static bool Locked(Action work) {
-            bool created; string name = MutexName;
-            using (var m = new Mutex(false, name, out created)) {
+            bool created; string name = MutexName; Mutex opened;
+            // A squatter whose access list shuts this caller out makes the open throw: skip as busy, like a squatter we can read.
+            try { opened = new Mutex(false, name, out created); } catch (UnauthorizedAccessException) { return false; }
+            using (var m = opened) {
                 if (!created && !OwnerCheck.Trusted(m, name)) return false; // issue #22: made by someone else, so skip as if busy
                 bool own;
                 try { own = m.WaitOne(WaitMs); } catch (AbandonedMutexException) { own = true; }
@@ -3004,7 +3009,7 @@ namespace SupportMcp {
     public sealed class ServiceLink : ISupportLink {
         public static int EndMs = 30000; // tests shorten it
         readonly string pipe; Thread loop, ender; volatile bool finished, lost, ending; bool connected, linkUp = true; int busy;
-        volatile bool paused, blocked; long expires; volatile string driver = "";
+        volatile bool paused, blocked; long expires; volatile string driver = "", access = "";
         public event Action Connected; public event Action<bool> LinkChanged; public event Action<int> BusyChanged; public event Action Finished;
         public ServiceLink(string sid8) { pipe = Backstop.Name(sid8) + "-ui"; }
         public bool Paused { get { return paused; } }
@@ -3012,6 +3017,7 @@ namespace SupportMcp {
         public bool Lost { get { return lost; } }
         public bool SurvivesSignOut { get { return true; } }
         public string Driver { get { return driver; } }
+        public string Access { get { return access; } }
         public DateTime ExpiresLocal { get { long ms = Interlocked.Read(ref expires); return ms == 0 ? DateTime.MinValue : new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddMilliseconds(ms).ToLocalTime(); } }
         static Dictionary<string, object> Ask(string name, string type, int ms) {
             using (var c = Pipes.Client(name)) { c.Connect(ms); Pipes.Write(c, Wire.Map("type", type)); return Pipes.Read(c, 4096, UiServer.ReadMs); }
@@ -3047,8 +3053,9 @@ namespace SupportMcp {
         }
         // True when the session is over. Values of the wrong type count as false or zero.
         bool Apply(Dictionary<string, object> s) {
+            object v; string a = Wire.Text(s, "access"); if (a == "ask" || a == "any") access = a; // a saved PC's session only; kept once seen, so the last words can use it
             if (Wire.Flag(s, "ended")) return true;
-            object v; long now = Client.UnixNow(), at = s.TryGetValue("expires_at", out v) && (v is int || v is long) ? Convert.ToInt64(v) : 0;
+            long now = Client.UnixNow(), at = s.TryGetValue("expires_at", out v) && (v is int || v is long) ? Convert.ToInt64(v) : 0;
             Interlocked.Exchange(ref expires, at > now && at - now <= FullState.DayMs + 60000 ? at : 0);
             paused = Wire.Flag(s, "paused"); blocked = Wire.Flag(s, "blocked");
             driver = Wire.Clean(s.TryGetValue("driver", out v) ? v as string : null, 200); // a saved PC's session only
@@ -3598,7 +3605,7 @@ namespace SupportMcp {
         // Set when the customer ended the session, so a full-control install still running can end the service it made.
         public volatile bool EndedByCustomer;
         bool connectedOnce, linkOk = true, busy, paused, blocked, workShown, ended, tucked, confirming, sessionEnding, sweeping, userMoved, placing, held, heldEnd, ending, lostEnd;
-        string driver = ""; // a saved PC's session: who drives it, shown in the heading
+        string driver = "", access = ""; // a saved PC's session: who drives it, shown in the heading, and its access setting
         readonly Stopwatch session = new Stopwatch(), workClock = new Stopwatch();
         TimeSpan endedAfter;
         double userLeft, userCardBottom;
@@ -3723,7 +3730,8 @@ namespace SupportMcp {
             tick.Interval = TimeSpan.FromSeconds(1); tick.Tick += delegate { UpdateTimer(); };
             pause.Interval = TimeSpan.FromMilliseconds(250);
             pause.Tick += delegate {
-                bool now = link != null && link.Paused, locked = link != null && link.Blocked; string who = link != null ? link.Driver ?? "" : "";
+                bool now = link != null && link.Paused, locked = link != null && link.Blocked; string who = link != null ? link.Driver ?? "" : "", how = link != null ? link.Access ?? "" : "";
+                if (how.Length > 0) access = how;
                 if (now != paused || locked != blocked || who != driver) { paused = now; blocked = locked; driver = who; Render(); }
             };
             hold.Tick += delegate { hold.Stop(); if (!busy) workShown = false; Render(); };
@@ -3845,8 +3853,17 @@ namespace SupportMcp {
             returnTo = IntPtr.Zero;
             if (back != IntPtr.Zero) Win.SetForegroundWindow(back);
         }
+        // The last words. A one-off link cannot be used again, so support can no longer reach the PC. A saved PC can be
+        // reached again later: any time, or only after it asks the person here.
+        internal static string EndedText(string clock, string access) {
+            string head = "Session ended after " + clock + ". ";
+            if (access == "any") return head + "Your support team can connect again later.";
+            if (access == "ask") return head + "Your support team will ask you before connecting again.";
+            return head + "Support can no longer reach this PC.";
+        }
         void ShowEnded() {
             if (ended) return;
+            string how = link != null ? link.Access ?? "" : ""; if (how.Length > 0) access = how;
             ended = true; endedAfter = session.Elapsed; session.Stop(); tick.Stop(); pause.Stop(); hold.Stop(); paused = false; blocked = false;
             confirming = false; tucked = false; workShown = false; busy = false;
             lostEnd = link != null && link.Lost;
@@ -3896,7 +3913,7 @@ namespace SupportMcp {
             if (ended && lostEnd) {
                 status.Inlines.Add(new Run("Support may still have access until the session ends by itself. Tell support."));
             } else if (ended) {
-                status.Inlines.Add(new Run("Session ended after " + Ui.Clock(endedAfter) + ". Support can no longer reach this PC."));
+                status.Inlines.Add(new Run(EndedText(Ui.Clock(endedAfter), access)));
             } else if (!connectedOnce) {
                 status.Inlines.Add(new Run("This window stays open while support is connected."));
             } else if (blocked && linkOk) {
@@ -4596,10 +4613,14 @@ namespace SupportMcp {
         internal static Mutex SetupMutex(string name) {
             // Owned by Administrators where the token allows it (SYSTEM and an elevated administrator), so the next
             // opener trusts it whatever this account's default owner is; else the default owner (a test account).
+            // A name that exists with an access list that shuts this caller out makes the open throw
+            // UnauthorizedAccessException before any owner can be read: that is a squatter too.
             bool created; Mutex m = null;
-            if (!SupportAccess.IsAdministrator()) m = new Mutex(false, name, out created, SetupSecurity(false));
-            else try { m = new Mutex(false, name, out created, SetupSecurity(true)); }
-                catch (IOException) { m = new Mutex(false, name, out created, SetupSecurity(false)); } // ERROR_INVALID_OWNER
+            try {
+                if (!SupportAccess.IsAdministrator()) m = new Mutex(false, name, out created, SetupSecurity(false));
+                else try { m = new Mutex(false, name, out created, SetupSecurity(true)); }
+                    catch (IOException) { m = new Mutex(false, name, out created, SetupSecurity(false)); } // ERROR_INVALID_OWNER
+            } catch (UnauthorizedAccessException) { throw new BlockedException(); }
             if (!created && !OwnerCheck.Trusted(m, name)) { m.Dispose(); throw new BlockedException(); }
             return m;
         }
@@ -5362,7 +5383,8 @@ namespace SupportMcp {
         // What the corner window reads (ServiceLink): the live session, or "ended" between sessions.
         Dictionary<string, object> CornerStatus() {
             Session c; lock (gate) c = current;
-            return c != null && c.Hosting ? c.WindowStatus() : Wire.Map("ended", true);
+            string access; lock (gate) access = this.access;
+            return c != null && c.Hosting ? c.WindowStatus() : Wire.Map("ended", true, "access", access == "any" ? "any" : "ask");
         }
         // Live: the console session when someone is signed in there, else the active Remote Desktop sessions with a user.
         static TargetChoice LiveTarget() {
@@ -5433,6 +5455,8 @@ namespace SupportMcp {
             public uint Target { get { var h = host; return h != null ? h.Session() : target; } }
             // Who drives it now: the welcome's or the last poll's driver, else who asked for it.
             public string Driver { get { var c = client; string d = c == null ? "" : c.Driver; return d.Length > 0 ? d : P.By; } }
+            // This PC's access setting now; the corner window words its last message by it.
+            string Access { get { string a; lock (svc.gate) a = svc.access; return a == "any" ? "any" : "ask"; } }
             // reason: "owner" when the person at the PC ended it. endRemote false: Windows shuts down, keep it for the restart.
             public void Stop(string reason, bool endRemote) {
                 var c = client;
@@ -5497,7 +5521,7 @@ namespace SupportMcp {
             public Dictionary<string, object> WindowStatus() {
                 var h = host; var s = h == null ? null : h.Helper.Status; var c = client;
                 return Wire.Map("connected", connected, "link", linkUp, "busy", Thread.VolatileRead(ref busy), "paused", s != null && Wire.Number(s, "paused_ms") > 0,
-                    "blocked", s != null && Wire.Number(s, "blocked_ms") > 0, "expires_at", c == null ? 0 : c.ExpiresAtMs, "ended", false, "driver", Driver);
+                    "blocked", s != null && Wire.Number(s, "blocked_ms") > 0, "expires_at", c == null ? 0 : c.ExpiresAtMs, "ended", false, "driver", Driver, "access", Access);
             }
             // IFullControl: the ScreenHost does the screen and the user's token.
             public bool Limited { get { return limited; } }
@@ -6277,8 +6301,13 @@ namespace SupportMcp {
     }
 
     public static class Tray {
+        // The service's pipe takes UiServer.PerProcess connections from one process. The refresh, the uninstall watcher
+        // and a button's request run on three threads, so they pass through this gate and never hold more than that.
+        static readonly SemaphoreSlim pipeSlots = new SemaphoreSlim(UiServer.PerProcess, UiServer.PerProcess);
+        internal static T Gated<T>(Func<T> work) { pipeSlots.Wait(); try { return work(); } finally { pipeSlots.Release(); } }
         // One status request to the service. null when it does not answer.
-        public static Dictionary<string, object> Ask(string type) {
+        public static Dictionary<string, object> Ask(string type) { return Gated(delegate { return AskNow(type); }); }
+        static Dictionary<string, object> AskNow(string type) {
             try {
                 using (var c = Pipes.Client(DeviceService.PipeName)) {
                     c.Connect(1500);

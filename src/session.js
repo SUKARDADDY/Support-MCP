@@ -679,10 +679,11 @@ export class Session {
     }
     // A PC says no before it says hello: the person declined, nobody was there
     // to ask, or the PC was busy. The session ends with that reason. A PC that
-    // restarts during a limited session and finds its user signed out says
-    // "nobody" after the hello, so that one reason is taken while attached too.
+    // restarts during a limited session and finds nobody to ask, or several
+    // Remote Desktop users to choose from (busy), says so after the hello, so
+    // those two reasons are taken while attached too. "declined" is not.
     if (b.type === 'decline') {
-      const allowed = state === 'waiting' || (state === 'attached' && b.reason === 'nobody');
+      const allowed = state === 'waiting' || (state === 'attached' && (b.reason === 'nobody' || b.reason === 'busy'));
       if (!deviceId || !allowed || !DECLINE_REASONS.includes(b.reason)) return Response.json({ error: 'invalid message' }, { status: 400 });
       this.logRow('declined', b.reason);
       this.failPending(() => true, 'session ended');

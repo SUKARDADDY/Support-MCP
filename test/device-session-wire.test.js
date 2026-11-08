@@ -7,7 +7,9 @@ import { world, BOSS, TECH, VIEW, LEAD, HOST } from './device-sessions-world.js'
 
 const HOUR = 3_600_000;
 const tick = () => new Promise((r) => setImmediate(r));
-const until = async (fn) => { for (let i = 0; i < 200 && !fn(); i++) await tick(); assert.ok(fn(), 'timed out waiting'); };
+// Waits on the event itself, with a wall-clock bound. A count of event-loop turns is not a time: the work in
+// between (key hashes on the thread pool) takes as many turns as it takes, and a loaded CI runner needs far more.
+const until = async (fn, ms = 10_000) => { const end = performance.now() + ms; while (!fn() && performance.now() < end) await tick(); assert.ok(fn(), 'timed out waiting'); };
 
 // ---- who may speak on /agent ----------------------------------------------------------
 test('a PC joins its session with its own key; the welcome names the driver and ends 24 hours after the first hello', async (t) => {
@@ -154,7 +156,7 @@ test('before hello a PC can decline with declined, nobody or busy; the session e
   }
 });
 
-test('decline is valid before hello with one of the three reasons, after hello only as nobody, and only on a saved-PC session', async (t) => {
+test('decline is valid before hello with one of the three reasons, after hello only as nobody or busy, and only on a saved-PC session', async (t) => {
   const w = await world(t);
   const pc = await w.addPc();
   const started = await w.tool(TECH, 'device_connect', { device_id: pc.id });
@@ -165,11 +167,16 @@ test('decline is valid before hello with one of the three reasons, after hello o
   assert.equal(w.stateOf(started.session_id), 'waiting');
   await w.agent(started.session_id, pc.key, { type: 'hello', control: 'full', caps: [] });
   assert.equal((await w.agent(started.session_id, pc.key, { type: 'decline', reason: 'declined' })).status, 400);
-  assert.equal((await w.agent(started.session_id, pc.key, { type: 'decline', reason: 'busy' })).status, 400);
   assert.equal(w.stateOf(started.session_id), 'attached');
-  // After hello only "nobody" is taken: a PC that restarted during a limited session and found its user signed out.
+  // After hello "nobody" and "busy" are taken: a PC that restarted during a limited session and found its user signed
+  // out, or several Remote Desktop users to choose from.
   assert.equal((await w.agent(started.session_id, pc.key, { type: 'decline', reason: 'nobody' })).status, 200);
-  assert.equal(w.stateOf(started.session_id), 'ended');
+  assert.deepEqual([w.stateOf(started.session_id), w.reasonOf(started.session_id)], ['ended', 'nobody']);
+  const again = await w.tool(TECH, 'device_connect', { device_id: pc.id });
+  await w.agent(again.session_id, pc.key, { type: 'hello', control: 'limited', caps: [] });
+  assert.equal((await w.agent(again.session_id, pc.key, { type: 'decline', reason: 'declined' })).status, 400);
+  assert.equal((await w.agent(again.session_id, pc.key, { type: 'decline', reason: 'busy' })).status, 200);
+  assert.deepEqual([w.stateOf(again.session_id), w.reasonOf(again.session_id)], ['ended', 'busy']);
   // A link session has no decline.
   const link = await w.tool(BOSS, 'session_create', {});
   const session = w.sessionFor(link.session_id).session;

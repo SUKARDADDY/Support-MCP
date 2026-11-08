@@ -512,7 +512,8 @@ workspaces are not affected.
 refuses every tool call (before any database read) and every connect to a saved
 PC, and ends a live session on its next `/agent` request (or `/ws` attach) with
 the reason `stopped`. A team cannot lift it. The check-in and the doorbell keep
-working, so PCs learn their session is gone. Clear the value and deploy to run
+working, so PCs learn their session is gone: the check-in answer leaves out
+`session`. Clear the value and deploy to run
 again.
 
 ## The install page (`/install`)
@@ -632,7 +633,7 @@ with a live session pointer and is `{"id":"<64 hex>","by":"<identity>",
 "team":"<workspace name>","ask":true|false,"expires_at":<ms>}`: the session to pick
 up (below), who started it (an email or a service token id), whether the PC must
 ask the person at it, and the session's hard end. A waiting PC never gets it, and
-neither does a PC whose pointer has passed its end. It comes from the row the
+neither does a PC whose pointer has passed its end, or any PC while `EMERGENCY_STOP` is set (the answer is otherwise the same, so the PC does not start a session that would be ended on arrival). It comes from the row the
 check-in already loads, so it costs no further query. A PC on 0.5.0 ignores it.
 There is no interval in the answer. Errors: 400, 401, 426.
 
@@ -673,6 +674,11 @@ without the key. The Registry accepts it with the hibernation API under the tag
 `dev:<device id>`, and a new socket for the same PC closes the older one. An idle
 doorbell is a hibernated socket, which Cloudflare does not bill, and only a ring
 wakes the object.
+
+The PC opens the doorbell itself, as a direct TCP and TLS connection to the relay
+(TLS 1.2, with the same certificate-revocation setting as its check-in), and does
+not use a proxy. On a network where only a proxy reaches the relay the doorbell
+never connects, and the PC uses the 5-minute check-in instead.
 
 Rung, best effort (the check-in schedule is the fallback): a connect and a
 take-over (`device_connect`), a team change to a PC's `access`, an approval, a
@@ -1036,9 +1042,10 @@ app's ([above](#app-sessions-https-polling)), plus:
 ```
 
 sent before `hello`, answered `{"type":"end"}`, and the session ends with that
-reason. After a `hello` only `nobody` is taken: a PC that restarts during a limited
-session and finds its user signed out sends it. Anything else (another reason,
-`declined` or `busy` after a `hello`, on a link session) is 400.
+reason. After a `hello` only `nobody` and `busy` are taken: a PC that restarts during a
+limited session and finds its user signed out sends `nobody`, and one that finds
+several Remote Desktop users to choose from sends `busy`. Anything else (another
+reason, `declined` after a `hello`, on a link session) is 400.
 A `hello` with `control: "full"` for a PC the record says is limited is 403 and
 changes nothing. `welcome` adds `"driver":"<identity>"`. Every poll answer for a
 saved-PC session, whether idle, a command frame or an end, carries `"driver"`, so the corner
@@ -1542,31 +1549,96 @@ one of a valid code or a slug. It refuses a session footer.
 | Role | Runs as | Does |
 |---|---|---|
 | none, with a device footer | the owner | the setup wizard, "Support setup", five steps (code, name, how support connects, how much control, install). Nothing is preselected for the last two. It first checks for the `SupportMcpDevice` service and, if it exists, says "Support is already set up on this PC" and opens the tray. It starts `--device-install` elevated with `ShellExecuteEx` `runas` and reads the exit code. After exit 0 or 10 it starts the installed exe with `--tray` as the owner |
-| `--device-install <nonce> <answers>` | administrator, through UAC | stages and holds its exe like `--elevate-install`, turns on the safe DLL search, reads its own file and footer once, and goes ahead only if the wizard's named event for `<nonce>` still exists and is not set. `<answers>` is one base64url JSON argument: name (1 to 100 characters), access, control, and either the code or "use the workspace" (at most 1,024 characters; no key). It takes the origin and the workspace from its own footer. Exit codes: 0 active, 10 pending, 20 code invalid, 21 network, 22 refused, 23 already set up. It pairs over `/device/pair`, creates `%ProgramFiles%\SupportMCP` with the locked ACL, writes `support.exe` (the exe without its footer, Users may read and run it), `device.json` and `history.json` (locked), registers the service `SupportMcpDevice` ("Support device service", LocalSystem, automatic, restart on failure, quoted path, `--device-service`), the `HKLM` Run value `SupportMcpTray` and the Apps entry, and starts the service. Any failure after pairing sends `/device/leave` with the new key and rolls back only what this run made. One install or remove runs at a time, under a `Global` mutex; a second gets "already set up". It never touches `HKLM\SOFTWARE\SupportMCP` |
-| `--device-service` | LocalSystem, session 0 | reads `device.json` and checks in with `/device/hello` at start, then every 5 minutes measured from the last answer plus up to 30 seconds of jitter. After a network error it retries after 1 minute, doubling to 15. A 200 updates the name, access, control and state (active or pending). A 401 means removed (after active) or expired (while pending), and ends check-ins for good. A 426 means the app needs an update and is retried every 6 hours. It keeps the last 50 history lines in `history.json`. It runs no command, takes no screenshot and opens no file for the relay. When an answer carries `update` and the checks in [Updates](#updates) pass, it downloads the release, writes it as `support-<version>-<8 hex>.exe` in the install folder with the app's ACL from the moment it exists, reads it back and hashes it through a handle that denies writing (held until it stops), records it in `update.json`, and starts its own exe with `--device-update <file>`. A release whose download or checks failed is tried again an hour later at the earliest. Starting on trial (below), it records `"started": true` in the trial, renews the deadline to at least 4 minutes from now, and starts `--device-update-rollback --at-deadline` from the old exe. On trial, a 200, 202 or 401 commits; a 426 or any other refusal (a 4xx) starts `--device-update-rollback` from the old exe instead; no network or a 5xx keeps the trial open and retries the hello every 30 seconds, and commits once the deadline is 90 seconds away or less. A commit that finds the setup mutex held tries again 5 seconds later. A service that starts while its own rollback was cut short starts `--device-update-rollback` again; a trial record that names neither its file nor the old one and is 10 minutes past its deadline is cleared, keeping the failed versions and the previous file. Outside a trial it deletes every version file but its own and the previous one; one a tray still runs is renamed to `<name>.<8 hex>.del` and that name is queued for the next restart |
+| `--device-install <nonce> <answers>` | administrator, through UAC | stages and holds its exe like `--elevate-install`, turns on the safe DLL search, reads its own file and footer once, and goes ahead only if the wizard's named event for `<nonce>` still exists and is not set. `<answers>` is one base64url JSON argument: name (1 to 100 characters), access, control, and either the code or "use the workspace" (at most 1,024 characters; no key). It takes the origin and the workspace from its own footer. Exit codes: 0 active, 10 pending, 20 code invalid, 21 network, 22 refused, 23 already set up, 24 blocked (another program made the setup mutex first, or made it so this account cannot open it; the wizard says "Another program is blocking Support. Restart the PC and try again." and offers Try again). It pairs over `/device/pair`, creates `%ProgramFiles%\SupportMCP` with the locked ACL, writes `support.exe` (the exe without its footer, Users may read and run it), `device.json` and `history.json` (locked), registers the service `SupportMcpDevice` ("Support device service", LocalSystem, automatic, restart on failure, quoted path, `--device-service`), the `HKLM` Run value `SupportMcpTray` and the Apps entry, and starts the service. Any failure after pairing sends `/device/leave` with the new key and rolls back only what this run made. One install or remove runs at a time, under the `Global\SupportMcpDeviceSetup` mutex, which the install owns as Administrators; a second gets "already set up". Any signed-in user can make a `Global` name before the install does, with an access list of their own, and Windows then opens theirs and ignores ours. So a mutex that already exists is used only when SYSTEM or Administrators own it, and one whose owner cannot be read, or that this account may not open, counts as hostile (exit 24). It never touches `HKLM\SOFTWARE\SupportMCP` |
+| `--device-service` | LocalSystem, session 0 | reads `device.json` and checks in with `/device/hello` at start, then on the schedule in [The check-in schedule](#the-check-in-schedule): every 6 hours plus up to 10 minutes of jitter, at each ring and when the doorbell connects, while the PC is active and its doorbell is up; otherwise every 5 minutes measured from the last answer plus up to 30 seconds of jitter (always, while pending). After a network error it retries after 1 minute, doubling to 15. A 200 updates the name, access, control and state (active or pending); control only goes down, because a check-in can lower full to limited and never raises it. A 401 means removed (after active) or expired (while pending), and ends check-ins and the doorbell for good. A 426 means the app needs an update and is retried every 6 hours. It keeps the last 50 history lines in `history.json`. It keeps the doorbell open from its start. An active PC's answer may carry `session`; the service then hosts it as [Sessions on the PC](#sessions-on-the-pc) says. Outside a session it runs no command, takes no screenshot and opens no file for the relay. It downloads and switches to an update only while no session is waiting or live (a session in the answer, or a run that has not finished, holds updates back). When an answer carries `update` and the checks in [Updates](#updates) pass, it downloads the release, writes it as `support-<version>-<8 hex>.exe` in the install folder with the app's ACL from the moment it exists, reads it back and hashes it through a handle that denies writing (held until it stops), records it in `update.json`, and starts its own exe with `--device-update <file>`. A release whose download or checks failed is tried again an hour later at the earliest. Starting on trial (below), it records `"started": true` in the trial, renews the deadline to at least 4 minutes from now, and starts `--device-update-rollback --at-deadline` from the old exe. On trial, a 200, 202 or 401 commits; a 426 or any other refusal (a 4xx) starts `--device-update-rollback` from the old exe instead; no network or a 5xx keeps the trial open and retries the hello every 30 seconds, and commits once the deadline is 90 seconds away or less. A commit that finds the setup mutex held tries again 5 seconds later. A service that starts while its own rollback was cut short starts `--device-update-rollback` again; a trial record that names neither its file nor the old one and is 10 minutes past its deadline is cleared, keeping the failed versions and the previous file. Outside a trial it deletes every version file but its own and the previous one; one a tray still runs is renamed to `<name>.<8 hex>.del` and that name is queued for the next restart |
 | `--device-update <file>` | LocalSystem, session 0, a child of the service | the switch. It takes the setup mutex (busy: exit 30), checks that `<file>` is the version file the service recorded in `update.json` and hashes it again through a handle that denies writing (refused: exit 31), and writes the trial (`from`, `to`, both versions, a 4-minute deadline). It sets the service's failure actions to run `"<old exe>" --device-update-rollback` on every failure, crashes and stops with an error alike; stops the service (stopped or stopping already is fine); points the service's command line, the `HKLM` Run value and the Apps entry's `UninstallString`, `DisplayVersion` and `EstimatedSize` at the new file; and starts it. It then watches `update.json` and rolls back itself if the trial is still open at its deadline, as `update.json` holds it then, and at least 4 minutes after it started (exit 32), else exits 0. Its hold on the file ends before the watch |
 | `--device-update-rollback` | LocalSystem, the failure action or a child of the new service | records the version as failed (never taken again), stops the service, points everything back at the old file with its own version and size, puts back the normal failure actions (restart twice, a minute apart), adds a history line, closes the trial and starts the service, trying again for up to 5 minutes when it will not start. The service is started again even when a step fails midway. With no trial open it only puts back the normal failure actions and starts the service; with `update.json` unreadable it changes nothing and only starts the service |
 | `--device-update-rollback --at-deadline` | LocalSystem, a child of the new service at its start on trial | the deadline watcher that survives a restart. It takes the setup mutex, renews the trial's deadline to at least 4 minutes from now, and then watches like the switch: it exits 0 once the trial is committed or rolled back, and rolls back a trial still open at the deadline (exit 32) |
-| `--tray` | the signed-in user, started by the `HKLM` Run value at each sign-in | one per session (a `Local` mutex). A notification icon drawn at run time, and a panel with the name, the access mode, the state, "No one is connected.", recent history, "Uninstall Support" and a small "Version x.y.z" line (the service's version; hidden when an older service sends none). It reads the service through the pipe and exits when the uninstall event is set. A tray keeps running the file it started from until the next sign-in, after an update too |
+| `--device-ask <answer>` | the signed-in user, started by the service in the session it asks | the question before a saved-PC session. `<answer>` is one base64url JSON argument of at most 2,048 characters holding exactly `by`, `team` and `control` (never a key). The dialog is the consent dialog's: "Allow <technician> to connect to this PC?" (or "Allow your support team", with no name), naming the technician and the team, saying what the control level allows, and that the corner window and the Support icon end it. "Don't allow" is the default, "Allow" does nothing for its first 500 ms, and with no answer after 2 minutes it closes as "Don't allow". Exit 10 is Allow; anything else (11, a crash, a malformed argument, no answer) is no |
+| `--tray` | the signed-in user, started by the `HKLM` Run value at each sign-in | one per session (a `Local` mutex). A notification icon drawn at run time, and a panel with the name, the access mode, the state, who is connected ("No one is connected.", or "Connected: <technician>" with an "End session" button while a session is live), recent history, "Uninstall Support" and a small "Version x.y.z" line (the service's version; hidden when an older service sends none). The mode line says "Support asks you before each connection. Your support team's admins can change this." in `ask`, and "Support can connect any time." with "Only your support team can change this." in `any`. It reads the service through the pipe, with at most two pipe connections at once (the service allows two per process), and exits when this PC's uninstall event is set. The event's name comes from the status frame and is opened only when SYSTEM or Administrators own it A tray keeps running the file it started from until the next sign-in, after an update too |
 | `--uninstall` | the owner | copies itself to a new Temp folder and runs from there. Confirms, then starts `--device-remove` elevated and shows "Support was removed" |
-| `--device-remove <nonce>` | administrator, through UAC | runs from the copy the uninstaller staged (it reads `device.json`, not a footer, so it holds no exe of its own), and goes ahead only while the uninstaller's named event for `<nonce>` still exists. It sends `/device/leave` (a 200 or a 401 both count as done), sets the uninstall event so every tray exits, waits a few seconds and ends any tray that remains, stops and deletes the service, deletes the Run value and the Apps entry, and removes the folder: it is renamed aside first (so a reinstall at the original path is never blocked), deleted with the junction-safe walk, and anything still locked is queued for the next restart. If the relay cannot be reached, or answers anything else (a refusal or a server error), it still removes everything and the owner is told the team must remove the PC. It ends trays started from any exe in the install folder (`support.exe` or a version file), and the folder removal takes every version file and `update.json` with it. One install, remove or update switch runs at a time, under a `Global` mutex. Exit codes: 0 removed, 10 removed but the relay did not confirm, 20 failed, 21 busy (the mutex is held, or an update's trial is open and less than 10 minutes past its deadline), and then the window says to try again in a few minutes |
+| `--device-remove <nonce>` | administrator, through UAC | runs from the copy the uninstaller staged (it reads `device.json`, not a footer, so it holds no exe of its own), and goes ahead only while the uninstaller's named event for `<nonce>` still exists. It sends `/device/leave` (a 200 or a 401 both count as done), sets this PC's uninstall event (and the fixed `Global\SupportMcpDeviceUninstall` of 0.5.0, for trays still on it, each only when SYSTEM or Administrators own it) so every tray exits, waits a few seconds and ends any tray that remains, stops and deletes the service, deletes the Run value and the Apps entry, and removes the folder: it is renamed aside first (so a reinstall at the original path is never blocked), deleted with the junction-safe walk, and anything still locked is queued for the next restart. If the relay cannot be reached, or answers anything else (a refusal or a server error), it still removes everything and the owner is told the team must remove the PC. It ends trays started from any exe in the install folder (`support.exe` or a version file), and the folder removal takes every version file and `update.json` with it. One install, remove or update switch runs at a time, under a `Global` mutex. The setup mutex gets the same owner check as the install's; a hostile one is exit 22 and the window shows "Another program is blocking Support. Restart the PC and try again." Exit codes: 0 removed, 10 removed but the relay did not confirm, 20 failed, 21 busy (the mutex is held, or an update's trial is open and less than 10 minutes past its deadline), and then the window says to try again in a few minutes, 22 blocked |
 
 The service's pipe is `SupportMcpDevice-ui`. Only SYSTEM can create instances,
 interactive users can read and write data, and it is never open to the network. It
-serves every interactive session, with a cap per process. Messages are a 4-byte
-length and UTF-8 JSON. It answers `{"type":"status"}` with `{name, access,
-control, state, confirm?, last_ok_at, history, version}` (`version` is the
-running service's own; state is `active`, `pending`,
-`expired`, `removed`, `update_needed` or `offline`; `confirm` is the six digits
-while pending), `{"type":"refresh"}` with a check-in now, at most once every 30
-seconds, and `{"type":"allow_any_time"}`, which is answered at once and sends
-`access: "any"` to `/device/update` in the background when the mode is `ask` (the
-change shows on the next status read). No request sets `ask`, and the service
-never sends `ask` on its own. Any other message closes the connection. A removed
-or expired state is kept in `device.json`, so a restart serves it from the pipe
-without checking in again. A saved
-install uses names of its own (the service, the folder, the pipe, the event and the
-mutexes), so it does not collide with a one-off session's.
+serves every interactive session, with a cap of two connections per process (the
+tray, which has three threads that use it, passes them through a gate of two).
+Messages are a 4-byte length and UTF-8 JSON. It answers `{"type":"status"}` with
+`{name, access, control, state, confirm?, last_ok_at, history, version, session?,
+uninstall_event?}`. `version` is the running service's own. `state` is `active`,
+`pending`, `expired`, `removed`, `update_needed` or `offline`. `confirm` is the six
+digits while pending. `session` is `{by, since}` (who drives it, Unix ms) only
+while a session is live. `uninstall_event` is the random part of this install's
+uninstall event name. The other requests are `{"type":"refresh"}` with a check-in
+now, at most once every 30 seconds; `{"type":"allow_any_time"}`, which is answered
+at once and sends `access: "any"` to `/device/update` in the background when the
+mode is `ask` (the change shows on the next status read); and
+`{"type":"end_session"}`, which ends the live session with the reason `owner` only
+when the caller is in the Windows session the service serves, and does nothing
+otherwise. Every request is answered with the status frame. No request sets `ask`,
+and the service never sends `ask` on its own. A message with any other type, or
+with any other key, closes the connection. A removed or expired state is kept in
+`device.json`, so a restart serves it from the pipe without checking in again. A
+saved install uses names of its own (the service, the folder, the pipe, the event
+and the mutexes), so it does not collide with a one-off session's.
+
+The uninstall event is `Global\SupportMcpDeviceUninstall-<32 hex>`. The service
+makes it (SYSTEM and Administrators full control, interactive users may wait on it
+and read its owner), keeps the random part in `device.json` as `uninstall_event`,
+and puts it in the status frame. Any signed-in user can read that part, so every
+opener (a tray, the uninstaller) checks the owner first and uses the event only
+when SYSTEM or Administrators own it (issue #22).
+When the service finds the name already taken by someone else, or by an object it
+may not open, it picks a new part. The SAS mutex (`Global\SupportMcp-Sas`) and the
+update lock (the setup mutex) follow the same rule; a squatted SAS mutex is
+skipped as busy, and a squatted update lock holds the update back.
+
+### Sessions on the PC
+
+What the service does with a session. The relay's side is in
+[Saved-PC sessions](#saved-pc-sessions).
+
+  - *The pointer.* Each active PC's `/device/hello` answer may carry `session`:
+    `{id, by, team, ask, expires_at}`. A new `id` starts a run. A run whose `id`
+    has left the answer ends locally, and the service goes back to checking in
+    without touching anything installed. A pending PC never gets a session. `by`
+    and `team` are shown to the person, so the service cleans them first; an `ask`
+    that is not exactly `false` counts as `true`.
+  - *Where it runs.* The console session when someone is signed in there. Else the
+    one active Remote Desktop session with a user. Several of those: the PC
+    declines `busy`, as it cannot tell whom to ask. None: nobody is signed in.
+  - *Whether it asks.* It asks when the session says `ask` or the PC's own access
+    is `ask`. With nobody signed in, only a full-control PC set to any time hosts
+    (on the sign-in screen); anything that would ask, and every limited PC, declines
+    `nobody`. A service that restarts and finds the session it already allowed
+    (`accepted_session` in `device.json`) rejoins without asking again.
+  - *The question.* `--device-ask`, as the signed-in user in that session, names
+    the technician and the team. "Don't allow" is the default, and no answer in 2
+    minutes is "Don't allow". The service treats a crash, a closed dialog or no
+    exit within 15 seconds after that as no. A no sends `{"type":"decline",
+    "reason":"declined"}` to `POST /agent?sid=<id>` with the device key as Bearer;
+    one that did not reach the relay is sent again at the next check-in while the
+    answer still carries the `id`, without asking again.
+  - *Hosting.* After a yes, or when nothing needed asking, the service saves the
+    `id` as `accepted_session` (cleared when a check-in no longer carries a
+    session) and runs the session with the app's polling client, the device key as
+    Bearer. Full control works as SYSTEM: the helper runs on the target session (the
+    console, the sign-in screen, or the one Remote Desktop session), and the hello
+    says `control: "full"`. Limited support is the signed-in user: the session
+    is pinned to that session and that user, the helper, the corner window and
+    every command run with the user's own token, files are opened while
+    impersonating the user, nothing works once another user is there, and the hello
+    says `control: "normal"`.
+  - *The corner window.* `--window <id>` as the signed-in user shows who is
+    connected, the timer and End session, from the service's per-session pipe
+    `SupportMcp-<id>-ui`, which only the target session may use. The person can
+    also end it from the tray's End session; either sends `end` with the reason
+    `owner`. When it ends, a saved PC's window says "Session ended after
+    HH:MM:SS." and then "Your support team can connect again later." (any time) or
+    "Your support team will ask you before connecting again." (ask first). A
+    one-off link's window says "Support can no longer reach this PC."
+  - *Stops.* Stopping the service ends the live session. Windows shutting down
+    keeps it, and the saved `accepted_session` lets the restarted service rejoin.
 
 Whatever starts or names the installed app (the tray at sign-in, the wizard's
 "Open Support", the tray's "Uninstall Support", the Apps entry) uses the exe in the

@@ -157,7 +157,7 @@ the reference assembly build does that. The first connection from a real
 Windows 7 PC was checked live (see [Limits](../README.md#limits)).
 
 The saved PC roles (the setup wizard, `--device-install`, `--device-service`,
-`--tray`, `--uninstall` and `--device-remove`) are built in `src/agent-app.cs`
+`--device-ask`, `--tray`, `--uninstall` and `--device-remove`) are built in `src/agent-app.cs`
 beside the one-off roles and share its helpers (`Elevation`, `FullAcl`, `Pipes`,
 `Scm`, `UiServer`). The native tests cover the parts that need no administrator
 and no second user: the device footer reader and its refusals (`ReadConfig` throws
@@ -176,7 +176,14 @@ without a fresh check-in. Uninstall is covered too: what it removes (only our ow
 artifacts, never `HKLM\SOFTWARE\SupportMCP`), the rename-aside removal of a
 locked folder (so a reinstall at the original path is not blocked), the setup
 mutex that lets one install or remove run at a time, and a waiter seeing the
-`Global` uninstall event once it is set. The relay side is covered by
+PC's uninstall event once it is set. The session side is covered too: the
+check-in schedule with and without the doorbell, which session a PC picks up and
+whether it asks, hosts or declines (`nobody`, `busy`), that a check-in never raises
+control, the `--device-ask` argument, the status pipe's `end_session` and `session`
+field, the tray's two-connection gate, and the corner window's last words. The
+issue #22 checks create squatters (a mutex or event this account made first, and
+one whose access list names only LocalService) and expect them to be refused or
+skipped. The relay side is covered by
 `npm test`: `test/app.test.js` has the `/install` page, the same-origin matrix,
 the refusals and the footer bytes, and `test/devices.test.js`,
 `test/devices-api.test.js` and `test/device-api.test.js` have the pairing `link`

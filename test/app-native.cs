@@ -738,7 +738,7 @@ public static class AppTests {
                 m1.ReleaseMutex();
                 using (var m3 = DeviceInstall.SetupMutex(mn)) { Assert(m3.WaitOne(0), "once released, the next one takes it"); m3Release(m3); }
             } else {
-                try { DeviceInstall.SetupMutex(mn).Dispose(); throw new Exception("a standard user opened the setup mutex"); } catch (UnauthorizedAccessException) { }
+                try { DeviceInstall.SetupMutex(mn).Dispose(); throw new Exception("a standard user opened the setup mutex"); } catch (DeviceInstall.BlockedException) { }
                 bool second = true; var other = new Thread(delegate() { second = m1.WaitOne(0); if (second) m1.ReleaseMutex(); }); other.Start(); other.Join();
                 Assert(!second, "a second one is refused while the first holds it");
                 m1.ReleaseMutex();
@@ -2538,6 +2538,26 @@ public static class AppTests {
             OwnerCheck.AlsoTrusted = me;
             try { using (var ok = DeviceInstall.SetupMutex(mn)) Assert(ok != null, "the same mutex with a trusted owner is used"); } finally { OwnerCheck.AlsoTrusted = null; }
         }
+        // A squatter whose access list names only LocalService: this account made it, so its own handle works, but any open
+        // by name is denied. The open throws before an owner can be read, and that counts as hostile too.
+        var lsec = new MutexSecurity(); lsec.AddAccessRule(new MutexAccessRule(new SecurityIdentifier(WellKnownSidType.LocalServiceSid, null), MutexRights.FullControl, AccessControlType.Allow));
+        string ln = "Local\\SupportMcpSquatDenied-" + Guid.NewGuid().ToString("N");
+        using (var shut = new System.Threading.Mutex(false, ln, out made, lsec)) {
+            Assert(made, "the shut-out squatter made the mutex first");
+            try { using (Mutex.OpenExisting(ln)) { } throw new Exception("this account could open a mutex whose access list names only LocalService"); } catch (UnauthorizedAccessException) { }
+            try { DeviceInstall.SetupMutex(ln).Dispose(); throw new Exception("the setup used a mutex that shuts it out"); }
+            catch (DeviceInstall.BlockedException e) { Assert(e.Message == OwnerCheck.Blocked, "a squatter that shuts the caller out is refused as blocked, not as an access error"); }
+            string lockName = DeviceUpdate.LockName; DeviceUpdate.LockName = ln;
+            try { Assert(DeviceUpdate.Lock(0) == null, "an update never takes a lock that shuts it out"); } finally { DeviceUpdate.LockName = lockName; }
+            string sasKeep = SasShare.MutexName, sasKey = @"Software\SupportMcpTest-" + Guid.NewGuid().ToString("N");
+            SasShare.MutexName = ln;
+            try {
+                using (var r = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(sasKey)) {
+                    Assert(!SasShare.Acquire(r, "SupportMcp-aaaaaaaa"), "a SAS mutex that shuts the caller out is skipped as busy, not thrown");
+                    Assert(!SasShare.Release(r, "SupportMcp-aaaaaaaa") && r.OpenSubKey(SasShare.HoldersKey) == null, "and a release is skipped the same way, with nothing recorded");
+                }
+            } finally { SasShare.MutexName = sasKeep; Microsoft.Win32.Registry.CurrentUser.DeleteSubKeyTree(sasKey, false); }
+        }
         // The setup mutex this code makes is trusted by the next opener on any account that may open it at all.
         if (Elevated()) {
             string own = "Local\\SupportMcpOwn-" + Guid.NewGuid().ToString("N");
@@ -2689,6 +2709,17 @@ public static class AppTests {
         Assert(!g.ContainsKey("session") && !g.ContainsKey("uninstall_event"), "neither when there is none");
         Assert(TrayText.Mode("ask").Contains("asks you") && TrayText.Mode("ask").Contains("Your support team's admins can change this.") && !TrayText.Mode("any").Contains("admins"), "the tray's ask line says the team's admins can change it");
         Assert(DeviceSetup.ModeText("ask") == "Support asks you here, on this PC, before each connection. Your support team's admins can change this.", "so does the wizard's");
+        // The tray's pipe requests (refresh, uninstall watcher, a button) pass a gate, so it never holds more connections
+        // than the service's per-process limit lets one process have.
+        int inside = 0, most = 0; var workers = new List<Thread>();
+        for (int i = 0; i < 8; i++) { var w = new Thread(delegate() { Tray.Gated<int>(delegate { int n = Interlocked.Increment(ref inside); int m; while (n > (m = Thread.VolatileRead(ref most))) Interlocked.CompareExchange(ref most, n, m); Thread.Sleep(50); Interlocked.Decrement(ref inside); return 0; }); }); workers.Add(w); w.Start(); }
+        foreach (var w in workers) w.Join();
+        Assert(most == UiServer.PerProcess, "eight tray requests at once never hold more than " + UiServer.PerProcess + " pipe connections, and use both: " + most);
+        // The corner window's last words: true for each kind of session.
+        Assert(SupportWindow.EndedText("00:12:30", "") == "Session ended after 00:12:30. Support can no longer reach this PC.", "a one-off link cannot be used again");
+        Assert(SupportWindow.EndedText("00:12:30", "any") == "Session ended after 00:12:30. Your support team can connect again later.", "an any-time PC can be reached again");
+        Assert(SupportWindow.EndedText("00:12:30", "ask") == "Session ended after 00:12:30. Your support team will ask you before connecting again.", "an ask-first PC says it will be asked");
+        Assert(SupportWindow.EndedText("00:12:30", "ask").IndexOf("no longer reach", StringComparison.Ordinal) < 0 && SupportWindow.EndedText("00:12:30", "any").IndexOf("no longer reach", StringComparison.Ordinal) < 0, "a saved PC never says support can no longer reach it");
         Assert(TrayText.SessionLine("tech@example.com") == "Connected: tech@example.com" && TrayText.EndSession == "End session", "who is connected, and End session");
         foreach (bool on in new bool[] { false, true })
             foreach (string access in new string[] { "ask", "any" }) {

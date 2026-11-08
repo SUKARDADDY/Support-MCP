@@ -398,14 +398,18 @@ PCs. One-off support links work as before.
   rung, about 10 requests a day. A PC whose doorbell cannot connect checks in
   every 5 minutes instead, so `device_connect` can take up to that long. The PC
   asks the person at it when it is set to ask, or when the caller may not connect
-  without asking; the person has 2 minutes, and a refusal, no answer or nobody
-  signed in ends the session. With full control the session works as the system on
+  without asking. The question names the technician and the team, and "Don't
+  allow" is the default. The person has 2 minutes, and a refusal, no answer, nobody
+  signed in, or several Remote Desktop users to choose from ends the session. A
+  restarted PC rejoins a session it already allowed without asking again. With full control the session works as the system on
   the screen in front of the PC, even at the sign-in screen. With limited support
   everything runs as the signed-in person. One technician drives a session at a
   time; a command from anyone else is refused with the driver's name. A technician
   with `sessions.unattended` can take over. A session lasts at most 24 hours, and
-  the person at the PC can end it from the corner window or the tray. Removing a
-  PC ends its session.
+  the person at the PC can end it from the corner window or the tray, and the
+  window then says whether the team can connect again later or will ask first.
+  Removing a PC ends its session. No update is installed on the PC during a
+  session.
 - **Stopping.** `POST /api/v1/w/<slug>/stop` (needs `sessions.end`) ends every live
   session in a workspace and refuses its tool calls until `DELETE .../stop` (needs
   `members.manage`) resumes it. Neither is an MCP tool. The `EMERGENCY_STOP`
@@ -455,10 +459,12 @@ The install puts these on the PC:
   and administrators can read the record and the history.
 - **A Windows service**, "Support device service" (`SupportMcpDevice`), runs as
   LocalSystem, starts automatically and restarts on failure. It checks in with
-  the relay every few minutes. In this release it runs no commands, takes no
-  screenshots and opens no files for anyone. It installs updates of itself
-  signed with the project's release key, and nothing else (see
-  [Updates](#updates)).
+  the relay (every 6 hours while its doorbell is connected, otherwise every 5
+  minutes) and keeps the doorbell open. It runs commands, takes screenshots and
+  opens files only inside a session that a technician started and the person at
+  the PC allowed (or that the PC's "any time" setting lets in), as described under
+  [Connecting](#saved-devices). It installs updates of itself signed with
+  the project's release key, never during a session (see [Updates](#updates)).
 - **A tray icon** starts at each sign-in.
 - **An entry in Windows Settings > Apps** (Control Panel > Programs and
   Features on Windows 7 and 8.1), named "Support", is how the owner uninstalls.
@@ -497,12 +503,14 @@ you build your own app, put your own release key in it, as that section says.
 ### The tray
 
 The tray icon opens a panel with the PC's name, its access mode, its state (for
-example "Your support team can see this PC" or "Waiting for approval"), "No one
-is connected.", a few lines of recent local history, "Uninstall Support" and the
-app's version.
+example "Your support team can see this PC" or "Waiting for approval"), who is
+connected ("No one is connected.", or "Connected: <technician>" with an "End
+session" button while a session is live), a few lines of recent local history,
+"Uninstall Support" and the app's version.
 
-The access mode changes in one direction only. While it is "ask each time", the
-panel offers "Allow support to connect any time". The button asks for a
+While the mode is "ask each time", the panel says "Support asks you before each
+connection. Your support team's admins can change this." On the PC the mode
+changes in one direction only: the panel offers "Allow support to connect any time". The button asks for a
 confirmation that says it cannot be undone from this PC. Once it is "any time",
 the panel says "Only your support team can change this." Nothing in the app turns
 it back to "ask each time"; only the support team can, through the team API. The
@@ -637,7 +645,7 @@ keyed by workspace.
 | `src/screen.js` | the screen actions, their audit text, and the strict check of every field an app result may carry |
 | `src/jwt.js` | RS256 verification of the Access JWT with WebCrypto |
 | `src/template.js` | builds the served script and the downloaded executable, validates every value placed in them, and maps the mode aliases |
-| `src/agent-app.cs` | the Windows app: C# source for .NET Framework 4.5.2 or later. One exe with several roles: the customer's app (WPF window, dialogs, HTTPS polling client with two lanes, normal-mode screen control), `--elevate-install`, the full-control `--service`, the SYSTEM `--helper` that runs screen operations on the console session, and the `--window` corner window. For a saved PC it also has the setup wizard (no arguments, with a device footer), `--device-install`, the `--device-service`, the `--tray` and `--uninstall` with `--device-remove` |
+| `src/agent-app.cs` | the Windows app: C# source for .NET Framework 4.5.2 or later. One exe with several roles: the customer's app (WPF window, dialogs, HTTPS polling client with two lanes, normal-mode screen control), `--elevate-install`, the full-control `--service`, the SYSTEM `--helper` that runs screen operations on the console session, and the `--window` corner window. For a saved PC it also has the setup wizard (no arguments, with a device footer), `--device-install`, the `--device-service` (which also hosts a session), the `--device-ask` question, the `--tray` and `--uninstall` with `--device-remove` |
 | `src/agent-app.manifest` | the app's `asInvoker` manifest. The app asks for elevation only through `--elevate-install`, after the customer started it |
 | `src/app-bundle.json` | the compiled x86 app with the SHA-256 of its source and manifest. Tests fail when the source changed without a rebuild |
 | `src/agent.ps1` | the PowerShell agent: bootstrap, run and cleanup roles in one file |
