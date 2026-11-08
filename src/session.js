@@ -678,10 +678,14 @@ export class Session {
       return Response.json({ type: 'end', reason: 'stopped' }, { status: 410 });
     }
     // A PC says no before it says hello: the person declined, nobody was there
-    // to ask, or the PC was busy. The session ends with that reason.
+    // to ask, or the PC was busy. The session ends with that reason. A PC that
+    // restarts during a limited session and finds its user signed out says
+    // "nobody" after the hello, so that one reason is taken while attached too.
     if (b.type === 'decline') {
-      if (!deviceId || state !== 'waiting' || !DECLINE_REASONS.includes(b.reason)) return Response.json({ error: 'invalid message' }, { status: 400 });
+      const allowed = state === 'waiting' || (state === 'attached' && b.reason === 'nobody');
+      if (!deviceId || !allowed || !DECLINE_REASONS.includes(b.reason)) return Response.json({ error: 'invalid message' }, { status: 400 });
       this.logRow('declined', b.reason);
+      this.failPending(() => true, 'session ended');
       this.closeAll({ type: 'end', reason: b.reason }, b.reason);
       await this.markEnded(b.reason);
       return Response.json({ type: 'end' });

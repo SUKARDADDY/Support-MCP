@@ -1035,8 +1035,10 @@ app's ([above](#app-sessions-https-polling)), plus:
 {"type":"decline","reason":"declined"|"nobody"|"busy"}
 ```
 
-sent before `hello` only, answered `{"type":"end"}`, and the session ends with that
-reason. Anything else (another reason, after a `hello`, on a link session) is 400.
+sent before `hello`, answered `{"type":"end"}`, and the session ends with that
+reason. After a `hello` only `nobody` is taken: a PC that restarts during a limited
+session and finds its user signed out sends it. Anything else (another reason,
+`declined` or `busy` after a `hello`, on a link session) is 400.
 A `hello` with `control: "full"` for a PC the record says is limited is 403 and
 changes nothing. `welcome` adds `"driver":"<identity>"`. Every poll answer for a
 saved-PC session, whether idle, a command frame or an end, carries `"driver"`, so the corner

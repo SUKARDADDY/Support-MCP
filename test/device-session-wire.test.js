@@ -154,7 +154,7 @@ test('before hello a PC can decline with declined, nobody or busy; the session e
   }
 });
 
-test('decline is only valid before hello, with one of the three reasons, on a saved-PC session', async (t) => {
+test('decline is valid before hello with one of the three reasons, after hello only as nobody, and only on a saved-PC session', async (t) => {
   const w = await world(t);
   const pc = await w.addPc();
   const started = await w.tool(TECH, 'device_connect', { device_id: pc.id });
@@ -165,7 +165,11 @@ test('decline is only valid before hello, with one of the three reasons, on a sa
   assert.equal(w.stateOf(started.session_id), 'waiting');
   await w.agent(started.session_id, pc.key, { type: 'hello', control: 'full', caps: [] });
   assert.equal((await w.agent(started.session_id, pc.key, { type: 'decline', reason: 'declined' })).status, 400);
+  assert.equal((await w.agent(started.session_id, pc.key, { type: 'decline', reason: 'busy' })).status, 400);
   assert.equal(w.stateOf(started.session_id), 'attached');
+  // After hello only "nobody" is taken: a PC that restarted during a limited session and found its user signed out.
+  assert.equal((await w.agent(started.session_id, pc.key, { type: 'decline', reason: 'nobody' })).status, 200);
+  assert.equal(w.stateOf(started.session_id), 'ended');
   // A link session has no decline.
   const link = await w.tool(BOSS, 'session_create', {});
   const session = w.sessionFor(link.session_id).session;
