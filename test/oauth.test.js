@@ -467,7 +467,7 @@ it('an Access login and a service token still work as members on every MCP addre
   const localEnv = { ...env, DEV_SKIP_ACCESS: '1' };
   const local = await mcp(localEnv, '/mcp', {}, rpc('tools/list'), LOCAL);
   assert.equal(local.status, 200);
-  assert.equal((await local.json()).result.tools.length, 22);
+  assert.equal((await local.json()).result.tools.length, 24);
   const localCall = await toolText(await mcp(localEnv, '/mcp', {}, call('session_list'), LOCAL));
   assert.deepEqual(localCall, { isError: true, text: 'you are not a member of this team' }, 'local-dev is not a member of a closed team, as before');
   // The bypass is for localhost only: the same env on the real host asks for a credential.
@@ -487,7 +487,7 @@ it('tools/list needs a credential now (401), and with a bearer reads the person 
   assert.equal((await mcp(dark, '/mcp', {}, rpc('tools/list'))).status, 401);
   assert.equal((await mcp(dark, '/w/acme/mcp', {}, rpc('tools/list'))).status, 401);
 
-  // With a valid bearer: 22 tools. D1 is read once, for the person (before KV is);
+  // With a valid bearer: 24 tools. D1 is read once, for the person (before KV is);
   // every other D1 statement and every Durable Object is untouched.
   const onlyUser = { prepare: (text) => { if (!/FROM users WHERE id = \?/.test(text)) trap(); return env.DB.prepare(text); }, batch: trap };
   const kvOnly = { ...env, DB: onlyUser, SESSION: { get: trap, idFromName: trap, idFromString: trap }, REGISTRY: { get: trap, idFromName: trap } };
@@ -495,7 +495,7 @@ it('tools/list needs a credential now (401), and with a bearer reads the person 
   const writes = env.OAUTH_KV.writes;
   const r = await mcp(kvOnly, '/mcp', bearer(access), rpc('tools/list'));
   assert.equal(r.status, 200);
-  assert.equal((await r.json()).result.tools.length, 22);
+  assert.equal((await r.json()).result.tools.length, 24);
   assert.equal(env.OAUTH_KV.reads - reads, 1, 'one KV read per OAuth call');
   assert.equal(env.OAUTH_KV.writes, writes, 'and no write');
   // Initialize and ping too.

@@ -272,13 +272,14 @@ test('a paired PC is listed without its hashes; a technician sets its site and f
   const list = JSON.stringify((await ok(r.api(VIEW, 'GET', '/devices'))).body);
   assert.equal(list.includes(paired.key.split('.')[3]), false);
   assert.equal(/key_hash|confirm_hash/.test(list), false);
-  // The technician moves it, labels it, and switches its access.
-  const patched = (await ok(r.api(TECH, 'PATCH', `/devices/${paired.device_id}`, { site_id: null, fields: { [field.id]: 'T-9' }, access: 'any' }))).body.device;
+  // The technician moves and labels it. Switching it to any time needs sessions.unattended, which only the admin holds.
+  await err(r.api(TECH, 'PATCH', `/devices/${paired.device_id}`, { access: 'any' }), 403, 'permission_denied');
+  const patched = (await ok(r.api(BOSS, 'PATCH', `/devices/${paired.device_id}`, { site_id: null, fields: { [field.id]: 'T-9' }, access: 'any' }))).body.device;
   assert.deepEqual([patched.site_id, patched.fields, patched.access, patched.control, patched.name], [null, { [field.id]: 'T-9' }, 'any', 'limited', 'Till']);
   const log = (await ok(r.api(BOSS, 'GET', '/audit?limit=500'))).body.rows;
   const changed = log.filter((x) => x.kind === 'device_changed');
   assert.equal(changed.length, 1);
-  assert.deepEqual([changed[0].actor], [TECH]);
+  assert.deepEqual([changed[0].actor], [BOSS]);
   assert.match(changed[0].detail, /access ask to any/);
   assert.match(changed[0].detail, /site .* to none/);
   assert.equal(changed[0].detail.includes('T-9'), false, 'a field value is not logged');
@@ -308,7 +309,7 @@ test('approving a waiting PC takes its six-digit number; deleting a PC ends its 
   await err(r.api(TECH, 'PATCH', `/devices/${waiting.device_id}`, { approve: { confirm: wrong } }), 403, 'confirm_wrong');
   await err(r.api(TECH, 'PATCH', `/devices/${waiting.device_id}`, { approve: { confirm: 'abc' } }), 400, 'bad_request');
   await err(r.api(TECH, 'PATCH', `/devices/${waiting.device_id}`, { approve: wrong }), 400, 'bad_request');
-  await err(r.api(TECH, 'PATCH', `/devices/${waiting.device_id}`, { access: 'any' }), 409, 'pending');
+  await err(r.api(BOSS, 'PATCH', `/devices/${waiting.device_id}`, { access: 'any' }), 409, 'pending');
   assert.equal((await ok(r.pc('hello', { protocol: 1 }, auth))).body.device.status, 'pending');
   await err(r.pc('update', { protocol: 1, name: 'x' }, auth), 403, 'pending');
   const approved = (await ok(r.api(TECH, 'PATCH', `/devices/${waiting.device_id}`, { approve: { confirm: waiting.confirm } }))).body.device;

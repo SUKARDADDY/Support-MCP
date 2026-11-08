@@ -76,7 +76,7 @@ test('localhost bypass: JSON POST reaches the MCP handler (tools/list)', async (
   );
   assert.equal(r.status, 200);
   const body = await r.json();
-  assert.equal(body.result.tools.length, 22);
+  assert.equal(body.result.tools.length, 24);
 });
 
 test('GET /mcp => 405', async () => {
@@ -116,11 +116,11 @@ test('/w/<slug>/mcp refuses Origin, then non-POST, then non-JSON, before any cre
   }
 });
 
-test('/w/<slug>/mcp lists the same 22 tools as /mcp for any well-formed slug, with no database or Durable Object', async () => {
+test('/w/<slug>/mcp lists the same 24 tools as /mcp for any well-formed slug, with no database or Durable Object', async () => {
   const local = { ...env, DEV_SKIP_ACCESS: '1' };
   const list = async (path) => (await (await handler.fetch(new Request(`http://127.0.0.1:8787${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: rpc }), local)).json()).result.tools;
   const base = await list('/mcp');
-  assert.equal(base.length, 22);
+  assert.equal(base.length, 24);
   for (const path of WORKSPACE_MCP) assert.deepEqual(await list(path), base, path);
 });
 

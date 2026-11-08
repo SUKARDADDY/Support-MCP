@@ -17,6 +17,17 @@
 // (run, put_file, get_file) and `screen` (screen and control frames). An older
 // client without it keeps one lane and cannot do screen work.
 //
+// A saved-PC session (created with a device_id) is a third kind. It starts in
+// `waiting` (the PC must pick it up and the person at it answer within 510 s),
+// then `attached`, then `ended`. It has no attach key: the Worker authenticates
+// the PC's device key against the database and forwards each /agent request
+// with the device id, which this object checks against the one stored at create.
+// One technician drives at a time (`driver`); a command from anyone else is
+// refused, and /takeover moves the driver. The session lasts 24 hours from the
+// first hello with no idle timeout. When it ends it clears the PC's session
+// pointer and writes the team log row, retrying from its alarm until that works.
+// /consume and /j/ refuse it.
+//
 // A session belongs to the team workspace that created it (`workspace`, stored
 // at create; a session without one is in "default"). Operator calls to
 // /status, /command and /end name their workspace, and a call from another
@@ -24,6 +35,9 @@
 // that name none (the download page, consume, the app) skip the check.
 
 import { registryName } from './registry.js';
+import { teamFromEnv } from './workspace.js';
+import { ID_RE, devicesFromEnv } from './devices.js';
+import { OPERATOR_END_REASONS } from './device-sessions.js';
 import { VERSION_PATTERN } from './version.js';
 import {
   LANES, auditText, decodeCaps, decodeControl, decodeControlResult, decodePollReport,
@@ -36,6 +50,11 @@ const CODE_TTL_MS = 10 * 60 * 1000; // pending -> consume window
 // Change both together.
 const CONSUMED_TTL_MS = 2 * 60 * 60 * 1000;
 const ATTACHED_LIFE_MS = 24 * 60 * 60 * 1000; // attach -> expiry, fixed
+const WAITING_MS = 510 * 1000; // saved PC: create -> the PC has picked it up and answered
+const STOP_CHECK_MS = 20 * 1000; // at most this often a poll reads whether the workspace is stopped
+const STOP_ALARM_MS = 30 * 1000; // an attached PowerShell session wakes this often to check, since a quiet socket sends nothing
+const CLEANUP_RETRY_MS = 30 * 1000; // a saved-PC session retries clearing its pointer this often
+const DECLINE_REASONS = ['declined', 'nobody', 'busy']; // what a PC may say before hello
 const RESULT_SLACK_MS = 15 * 1000; // relay waits timeout_s + this
 const HTTP_SEEN_MS = 60 * 1000; // app mode: a client counts as attached this long after its last request
 const POLL_PARK_MS = 25 * 1000; // app mode: a long poll with nothing to send ends after this long
@@ -70,6 +89,7 @@ function hex32() {
 // Which stored deadline governs each live state, and the `ended` reason used
 // when it passes.
 const DEADLINES = {
+  waiting: ['waiting_expires_at', 'timed_out'],
   pending: ['code_expires_at', 'code TTL'],
   consumed: ['consumed_expires_at', 'consume TTL'],
   attached: ['expires_at', 'expired'],
@@ -83,6 +103,8 @@ export class Session {
     this.pending = new Map(); // uuid -> {resolve, tag}
     this.httpCommands = { cmd: null, screen: null }; // app mode: per lane, {frame, tag, sent_at} waiting for its result
     this.httpPoll = null; // app mode: the parked long poll, if any, {resolve, timer, busy}
+    this.driver = undefined; // saved PC: who drives (undefined: not read yet, null: a one-off session)
+    this.stopCheckedAt = 0; // when a poll last read whether the workspace is stopped
     this.sql.exec(`CREATE TABLE IF NOT EXISTS log(ts INTEGER, kind TEXT, detail TEXT)`);
   }
 
@@ -199,10 +221,15 @@ export class Session {
     const state = await this.get('state');
     const dl = await this.deadlineFor(state);
     if (dl !== null && Date.now() >= dl) {
-      await this.expire(DEADLINES[state][1]);
+      await this.expire(await this.expiryReason(state));
       return true;
     }
     return false;
+  }
+
+  // Why a state's deadline ended the session. A saved PC's 24 hours is max_time.
+  async expiryReason(state) {
+    return state === 'attached' && (await this.get('device_id', null)) ? 'max_time' : DEADLINES[state][1];
   }
 
   // ---- routing -------------------------------------------------------------
@@ -210,6 +237,7 @@ export class Session {
     const url = new URL(request.url);
     const p = url.pathname;
     await this.loadTtlOverride();
+    await this.loadDriver();
     try {
       if (p === '/create') return await this.doCreate(request);
       if (p === '/consume') return await this.doConsume(request);
@@ -218,6 +246,7 @@ export class Session {
       if (p === '/status') return await this.doStatus(url);
       if (p === '/command') return await this.doCommand(request);
       if (p === '/end') return await this.doEnd(request);
+      if (p === '/takeover') return await this.doTakeover(request);
     } catch (e) {
       return Response.json({ ok: false, error: String(e && e.message ? e.message : e) }, { status: 500 });
     }
@@ -241,6 +270,25 @@ export class Session {
     }
     const now = Date.now();
     this._ttlOverride = Number(b.ttl_ms) > 0 ? Number(b.ttl_ms) : 0;
+    // A saved PC's session: no link, no key, no consume. It waits for the PC.
+    const device = b.device_id !== undefined;
+    if (device) {
+      if (typeof b.device_id !== 'string' || !ID_RE.test(b.device_id) || typeof b.driver !== 'string' || !b.driver || windowsMode !== 'app') {
+        return Response.json({ ok: false, error: 'bad device session' }, { status: 400 });
+      }
+      const waitingUntil = now + this.ttlMs(WAITING_MS);
+      this.driver = sameIdentity(b.driver);
+      await this.setMany({
+        code: b.code, sid: b.sid, label: b.label ?? null, state: 'waiting', created_at: now, created_by: b.actor ?? null,
+        workspace, waiting_expires_at: waitingUntil, ttl_ms: this._ttlOverride, machine: null, user: null, ps: null,
+        windows_mode: 'app', transport: null, http_generation: 0, http_seen_at: 0, elevated: null, expires_at: null, ws_gen: 0,
+        device_id: b.device_id, device_name: truncate(String(b.device_name ?? ''), 100), driver: this.driver,
+      });
+      this.logRow('created', `device ${b.device_id}`, b.actor);
+      await this.ctx.storage.setAlarm(waitingUntil);
+      await this.pushRegistry();
+      return Response.json({ ok: true, sid: b.sid, waiting_until: waitingUntil });
+    }
     const codeExpiry = now + this.ttlMs(CODE_TTL_MS);
     await this.setMany({
       code: b.code,
@@ -270,6 +318,8 @@ export class Session {
   }
 
   async doConsume(request) {
+    // A saved PC's session has no link to use up.
+    if (await this.get('device_id', null)) return Response.json({ ok: false, reason: 'not-pending' });
     let windowsMode = 'powershell';
     try { windowsMode = (await request.json()).windows_mode ?? 'powershell'; } catch (_) {}
     // Hash first. Hashing yields to other requests, so doing it between the state
@@ -309,6 +359,11 @@ export class Session {
     if (state === 'ended' || state === undefined) return new Response('gone', { status: 410 });
     if (state === 'pending') return new Response('unauthorized', { status: 401 });
     if ((await this.get('windows_mode', 'powershell')) === 'app') return new Response('wrong transport', { status: 401 });
+    // EMERGENCY_STOP ends a session that reaches this object instead of serving it.
+    if (String(this.env.EMERGENCY_STOP ?? '') !== '') {
+      await this.endStopped();
+      return new Response('gone', { status: 410 });
+    }
     const key = request.headers.get('X-Attach-Key') || '';
     const wantHash = await this.get('key_hash');
     if (!wantHash || (await sha256Hex(key)) !== wantHash) {
@@ -317,6 +372,16 @@ export class Session {
     // Hashing yields to other requests. An operator end or alarm during that
     // await must remain terminal, so a late attach can't resurrect the session.
     await this.expireIfDue();
+    state = await this.get('state');
+    if (state === 'ended' || state === undefined) return new Response('gone', { status: 410 });
+    // A workspace's stop ends this session here too, for the reconnect probe as
+    // well as the upgrade. Read at most every 20 seconds; a failed read fails open.
+    if (await this.stopped()) {
+      await this.endStopped();
+      return new Response('gone', { status: 410 });
+    }
+    // The stop read awaits D1, which lets other requests run: an end that landed
+    // meanwhile must stay terminal, so read the state again.
     state = await this.get('state');
     if (state === 'ended' || state === undefined) return new Response('gone', { status: 410 });
     if (request.headers.get('Upgrade') !== 'websocket') {
@@ -337,12 +402,12 @@ export class Session {
       expiresAt = now + this.ttlMs(ATTACHED_LIFE_MS);
       await this.setMany({ state: 'attached', attached_first_at: now, expires_at: expiresAt, ws_gen: gen, ws_tag: tag });
       this.logRow('attached', tag);
-      await this.ctx.storage.setAlarm(expiresAt);
     } else {
       // reattach: do NOT extend expiry
       await this.setMany({ ws_gen: gen, ws_tag: tag });
       this.logRow('attached', `reattach ${tag}`);
     }
+    await this.ctx.storage.setAlarm(this.wakeFor(expiresAt));
 
     const pair = new WebSocketPair();
     const client = pair[0];
@@ -364,7 +429,7 @@ export class Session {
     const s = await this.ctx.storage.get([
       'state', 'machine', 'user', 'expires_at', 'ps', 'code', 'ended_reason', 'consumed_expires_at',
       'windows_mode', 'transport', 'http_seen_at', 'elevated', 'caps', 'control', 'agent', 'version', 'desktop',
-      'paused_until', 'input_blocked_until',
+      'paused_until', 'input_blocked_until', 'device_id', 'driver', 'waiting_expires_at',
     ]);
     const rows = tail
       ? this.sql.exec(`SELECT ts,kind,detail FROM log ORDER BY ts DESC LIMIT ?`, tail).toArray().reverse()
@@ -381,6 +446,10 @@ export class Session {
     await this.expireIfDue();
     const state = await this.get('state');
     if (state === 'ended' || state === undefined) return Response.json({ ok: false, error: 'session ended' });
+    // One technician drives a saved PC's session at a time.
+    if (this.driver && sameIdentity(b.actor) !== this.driver) {
+      return Response.json({ ok: false, error: `${this.driver} is driving this session; use device_connect with take_over` });
+    }
     const lane = Object.hasOwn(LANE_OF, b.op) ? LANE_OF[b.op] : null;
     if (lane === 'screen' && (await this.get('windows_mode', 'powershell')) !== 'app') {
       return Response.json({ ok: false, error: NO_SCREEN_PS });
@@ -521,7 +590,50 @@ export class Session {
     const poll = this.httpPoll;
     this.httpPoll = null;
     clearTimeout(poll.timer);
-    poll.resolve(Response.json(frame));
+    poll.resolve(Response.json(this.withDriver(frame)));
+  }
+
+  // A saved-PC session adds the driver to every poll answer, so the PC's corner
+  // window can show a take-over. A one-off session's frames are unchanged.
+  withDriver(frame) {
+    return this.driver ? { ...frame, driver: this.driver } : frame;
+  }
+
+  async loadDriver() {
+    if (this.driver === undefined) this.driver = (await this.get('driver', null)) || null;
+  }
+
+  // Is this relay or this workspace stopped? EMERGENCY_STOP (any non-empty value)
+  // stops everything and costs no read. The workspace's own stop is read from the
+  // team log at most every 20 s; a read that fails counts as not stopped, because
+  // the stop also ends sessions directly.
+  async stopped() {
+    if (String(this.env.EMERGENCY_STOP ?? '') !== '') return true;
+    const now = Date.now();
+    if (now - this.stopCheckedAt < STOP_CHECK_MS) return false;
+    this.stopCheckedAt = now;
+    try {
+      return (await teamFromEnv(this.env).stopState(await this.get('workspace', DEFAULT_WORKSPACE))).stopped;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // The relay or the workspace is stopped: tell every socket and poll, fail what
+  // is waiting, and end with reason "stopped".
+  async endStopped() {
+    // The stop read awaits D1, so an end may have landed meanwhile: keep its reason.
+    if ((await this.get('state')) === 'ended') return;
+    this.closeAll({ type: 'end', reason: 'stopped' }, 'stopped');
+    this.failPending(() => true, 'session ended');
+    await this.markEnded('stopped');
+  }
+
+  // When this session's alarm next fires. An attached PowerShell session (a
+  // websocket) can sit quiet for hours, so it wakes every STOP_ALARM_MS to check
+  // for a stop; its deadline still ends it on time.
+  wakeFor(deadline) {
+    return Math.min(deadline, Date.now() + STOP_ALARM_MS);
   }
 
   // A command was queued for `lane`. Hand it to the parked poll if that poll
@@ -566,11 +678,15 @@ export class Session {
     await this.expireIfDue();
     let state = await this.get('state');
     if (!state || state === 'ended') return Response.json({ type: 'end' }, { status: 410 });
+    // A saved PC's session has no attach key: the Worker already checked the PC's
+    // device key and says which device this is. A link session needs its key.
+    const deviceId = await this.get('device_id', null);
     const key = request.headers.get('X-Attach-Key') || '';
-    if (state === 'pending' || (await this.get('windows_mode', 'powershell')) !== 'app'
-      || (await sha256Hex(key)) !== (await this.get('key_hash'))) {
-      return Response.json({ error: 'unauthorized' }, { status: 401 });
-    }
+    const authorized = deviceId
+      ? request.headers.get('X-Device-Id') === deviceId
+      : state !== 'pending' && (await this.get('windows_mode', 'powershell')) === 'app'
+        && (await sha256Hex(key)) === (await this.get('key_hash'));
+    if (!authorized) return Response.json({ error: 'unauthorized' }, { status: 401 });
     let b;
     try { b = await request.json(); } catch (_) { return Response.json({ error: 'invalid JSON' }, { status: 400 }); }
     if (!b || typeof b !== 'object' || Array.isArray(b)) return Response.json({ error: 'invalid message' }, { status: 400 });
@@ -579,7 +695,34 @@ export class Session {
     await this.expireIfDue();
     state = await this.get('state');
     if (!state || state === 'ended') return Response.json({ type: 'end' }, { status: 410 });
+    // A stopped relay or workspace ends the session at the next request, and a
+    // workspace's stop is read at most every 20 seconds.
+    if (await this.stopped()) {
+      await this.endStopped();
+      return Response.json({ type: 'end', reason: 'stopped' }, { status: 410 });
+    }
+    // The stop read awaits D1: an end that landed meanwhile stays terminal.
+    state = await this.get('state');
+    if (!state || state === 'ended') return Response.json({ type: 'end' }, { status: 410 });
+    // A PC says no before it says hello: the person declined, nobody was there
+    // to ask, or the PC was busy. The session ends with that reason. A PC that
+    // restarts during a limited session and finds nobody to ask, or several
+    // Remote Desktop users to choose from (busy), says so after the hello, so
+    // those two reasons are taken while attached too. "declined" is not.
+    if (b.type === 'decline') {
+      const allowed = state === 'waiting' || (state === 'attached' && (b.reason === 'nobody' || b.reason === 'busy'));
+      if (!deviceId || !allowed || !DECLINE_REASONS.includes(b.reason)) return Response.json({ error: 'invalid message' }, { status: 400 });
+      this.logRow('declined', b.reason);
+      this.failPending(() => true, 'session ended');
+      this.closeAll({ type: 'end', reason: b.reason }, b.reason);
+      await this.markEnded(b.reason);
+      return Response.json({ type: 'end' });
+    }
     if (b.type === 'hello') {
+      // A limited PC never runs a full-control session, whatever its hello says.
+      if (deviceId && request.headers.get('X-Device-Control') === 'limited' && decodeControl(b.control) === 'full') {
+        return Response.json({ error: 'this PC is limited; it cannot run a full-control session' }, { status: 403 });
+      }
       this.closeAll({ type: 'end', reason: 'replaced' }, 'replaced');
       const control = decodeControl(b.control);
       // A request_full_control in flight ends with a new hello, because the
@@ -595,7 +738,7 @@ export class Session {
       this.failPending(() => true, 'agent replaced');
       const now = Date.now();
       const generation = (await this.get('http_generation', 0)) + 1;
-      const firstAttach = state === 'consumed';
+      const firstAttach = state === 'consumed' || (deviceId !== null && state === 'waiting');
       const expiresAt = firstAttach ? now + this.ttlMs(ATTACHED_LIFE_MS) : await this.get('expires_at');
       const machine = truncate(String(b.machine ?? ''), 100) || null;
       const user = truncate(String(b.user ?? ''), 100) || null;
@@ -614,16 +757,20 @@ export class Session {
       this.logRow('hello', `${machine ?? '?'}\\${user ?? '?'} ps=${ps ?? '?'} agent=${agent ?? '?'} version=${version ?? '?'} control=${control ?? '?'} caps=${caps.join(',')}`);
       await this.ctx.storage.setAlarm(expiresAt);
       await this.pushRegistry();
-      return Response.json({ type: 'welcome', generation, expires_at: expiresAt, server_time: now });
+      // The PC's pointer carried the latest possible end; now the exact one is known.
+      if (deviceId && firstAttach) await this.pinPointerEnd(deviceId, expiresAt);
+      return Response.json({ type: 'welcome', generation, expires_at: expiresAt, server_time: now, ...(deviceId ? { driver: this.driver } : {}) });
     }
     const generation = await this.get('http_generation');
     if (state !== 'attached' || b.generation !== generation) return Response.json({ type: 'end', reason: 'replaced' }, { status: 409 });
     await this.setMany({ http_seen_at: Date.now() });
     if (b.type === 'end') {
-      this.logRow('detached', 'customer end');
-      this.closeAll({ type: 'end', reason: 'customer' }, 'customer end');
-      this.failPending(() => true, 'session ended by customer');
-      await this.markEnded('customer');
+      // At a saved PC the person ending it is its owner.
+      const reason = deviceId ? 'owner' : 'customer';
+      this.logRow('detached', deviceId ? 'owner end' : 'customer end');
+      this.closeAll({ type: 'end', reason }, deviceId ? 'owner end' : 'customer end');
+      this.failPending(() => true, deviceId ? 'session ended by the owner' : 'session ended by customer');
+      await this.markEnded(reason);
       return Response.json({ type: 'end' });
     }
     if (b.type === 'poll') {
@@ -638,14 +785,14 @@ export class Session {
       // Every lane busy: a sign of life only. Answer at once and park nothing.
       // The client waits for its operations between these, so this is not a
       // tight loop. A client with one lane free keeps long-polling instead.
-      if (lanes.every((l) => busy.has(l))) return Response.json({ type: 'idle' });
+      if (lanes.every((l) => busy.has(l))) return Response.json(this.withDriver({ type: 'idle' }));
       for (const lane of lanes) {
         const c = this.httpCommands[lane];
         // A frame sent a moment ago is still the client's. Its next poll may
         // have left before the lane showed busy, and a repeat would run it twice.
         if (c && !busy.has(lane) && (c.sent_at === null || Date.now() - c.sent_at >= REDELIVER_MS)) {
           c.sent_at = Date.now();
-          return Response.json(c.frame);
+          return Response.json(this.withDriver(c.frame));
         }
       }
       // One long poll per client. A retry releases its predecessor. The MCP
@@ -682,33 +829,91 @@ export class Session {
   async doEnd(request) {
     let actor = null;
     let workspace;
+    let reason = null;
+    let discard = false;
     try {
-      ({ actor = null, workspace } = await request.json());
+      ({ actor = null, workspace, reason = null, discard = false } = await request.json());
     } catch (_) {}
     if (await this.otherWorkspace(workspace)) return Response.json({ ended: true });
     await this.expireIfDue();
     const state = await this.get('state');
     if (state === 'ended' || state === undefined) return Response.json({ ended: true });
-    this.closeAll({ type: 'end', reason: 'ended_by_operator' }, 'ended');
+    const deviceId = await this.get('device_id', null);
+    // The team ends a session for a reason of its own (a stop, a removal). A
+    // saved-PC session ended by a technician says so; a link session keeps its old reason.
+    const why = OPERATOR_END_REASONS.includes(reason) ? reason : deviceId ? 'technician' : 'ended_by_operator';
+    // A session made but never claimed (a lost race) ends without a trace.
+    const quiet = discard === true && deviceId !== null && state === 'waiting';
+    this.closeAll({ type: 'end', reason: why }, 'ended');
     this.failPending(() => true, 'session ended');
-    await this.markEnded('ended_by_operator', actor);
+    await this.markEnded(why, actor, { quiet });
     return Response.json({ ended: true });
   }
 
-  async markEnded(reason, actor = null) {
+  // The team makes `actor` the driver of a live saved-PC session. The parked poll
+  // is answered at once, so the corner window shows the new name.
+  async doTakeover(request) {
+    let actor = null;
+    let workspace;
+    try {
+      ({ actor = null, workspace } = await request.json());
+    } catch (_) {}
+    if (await this.otherWorkspace(workspace)) return Response.json({ ok: false });
+    await this.expireIfDue();
+    const state = await this.get('state');
+    const next = sameIdentity(actor);
+    if (!(await this.get('device_id', null)) || !['waiting', 'attached'].includes(state) || !next) return Response.json({ ok: false });
+    const previous = this.driver;
+    await this.setMany({ driver: next });
+    this.driver = next;
+    this.logRow('driver', `${previous} to ${next}`);
+    this.replyToPoll({ type: 'idle' });
+    return Response.json({ ok: true, state, driver: next });
+  }
+
+  // A saved-PC session pins its pointer's end to the real one at the first hello.
+  // Best effort: the pointer's own bound still holds if this fails.
+  async pinPointerEnd(deviceId, expiresAt) {
+    try {
+      await devicesFromEnv(this.env).pinSessionEnd(await this.get('workspace', DEFAULT_WORKSPACE), deviceId, await this.get('sid'), expiresAt);
+    } catch (_) { /* best effort */ }
+  }
+
+  async markEnded(reason, actor = null, { quiet = false } = {}) {
+    const device = await this.get('device_id', null);
     await this.setMany({
       state: 'ended',
       ended_reason: reason,
       ended_at: Date.now(),
       expires_at: (await this.get('expires_at')) ?? Date.now(),
+      ...(device && !quiet ? { cleanup_pending: true, cleanup_reason: reason, cleanup_actor: actor } : {}),
     });
     this.logRow('ended', reason, actor);
     await this.ctx.storage.deleteAlarm();
     await this.pushRegistry();
+    if (device && !quiet) await this.runCleanup();
+  }
+
+  // A saved-PC session that ended writes device_session_ended and clears the PC's
+  // pointer (devices.session), in one change. If the database is unreachable the
+  // alarm tries again until it works, so a PC is never left looking busy.
+  async runCleanup() {
+    const s = await this.ctx.storage.get(['device_id', 'device_name', 'sid', 'workspace', 'cleanup_reason', 'cleanup_actor']);
+    try {
+      const deviceId = s.get('device_id');
+      const reason = s.get('cleanup_reason');
+      const actor = s.get('cleanup_actor') ?? (['owner', ...DECLINE_REASONS].includes(reason) ? `pc ${deviceId}` : 'relay');
+      await devicesFromEnv(this.env).sessionEnded(s.get('workspace') ?? DEFAULT_WORKSPACE, {
+        deviceId, sid: s.get('sid'), name: s.get('device_name') ?? '', reason, actor,
+      });
+      await this.setMany({ cleanup_pending: false });
+    } catch (_) {
+      await this.ctx.storage.setAlarm(Date.now() + CLEANUP_RETRY_MS);
+    }
   }
 
   async expire(reason) {
-    this.closeAll({ type: 'end', reason: 'expired' }, 'expired');
+    this.closeAll({ type: 'end', reason: (await this.get('device_id', null)) ? reason : 'expired' }, 'expired');
     this.failPending(() => true, 'session ended');
     await this.markEnded(reason);
   }
@@ -719,6 +924,13 @@ export class Session {
     try {
       msg = JSON.parse(typeof data === 'string' ? data : new TextDecoder().decode(data));
     } catch (_) {
+      return;
+    }
+    // A message from a socket of a stopped workspace ends the session, results
+    // included, with an end frame to every socket. Read at most every 20 seconds;
+    // a failed read fails open.
+    if ((await this.get('state')) !== 'ended' && (await this.stopped())) {
+      await this.endStopped();
       return;
     }
     if (msg.type === 'result' && msg.id) {
@@ -779,15 +991,31 @@ export class Session {
   async alarm() {
     await this.loadTtlOverride();
     const state = await this.get('state');
+    // An ended saved-PC session whose pointer is not cleared yet tries again.
+    if (state === 'ended' && (await this.get('cleanup_pending', false))) await this.runCleanup();
     const dl = await this.deadlineFor(state);
     if (dl === null) return; // ended (or never created): nothing to do
     if (Date.now() >= dl) {
-      await this.expire(DEADLINES[state][1]);
-    } else {
-      // fired early (clock skew / rescheduling): re-arm for the real deadline
-      await this.ctx.storage.setAlarm(dl);
+      await this.expire(await this.expiryReason(state));
+      return;
     }
+    // An attached PowerShell session may have no traffic to check the stop on, so
+    // the alarm does it. An app session checks on each of its polls.
+    const ps = state === 'attached' && (await this.get('windows_mode', 'powershell')) === 'powershell';
+    if (ps && (await this.stopped())) {
+      await this.endStopped();
+      return;
+    }
+    // An end during the stop read leaves nothing to wake for.
+    if ((await this.get('state')) === 'ended') return;
+    // Re-arm: for the next stop check, or (fired early, clock skew) the real deadline.
+    await this.ctx.storage.setAlarm(ps ? this.wakeFor(dl) : dl);
   }
+}
+
+// An identity as the session compares it: trimmed and lowercased. Empty when absent.
+function sameIdentity(v) {
+  return String(v ?? '').trim().toLowerCase();
 }
 
 function truncate(s, n) {
@@ -820,7 +1048,9 @@ function statusBody(s, rows, attached) {
     client_version: s.get('version') ?? s.get('agent') ?? null,
     client_agent: s.get('agent') ?? null,
     expires_at: s.get('expires_at') ?? null,
-    startup_expires_at: s.get('state') === 'consumed' ? s.get('consumed_expires_at') ?? null : null,
+    startup_expires_at: s.get('state') === 'consumed' ? s.get('consumed_expires_at') ?? null
+      : s.get('state') === 'waiting' ? s.get('waiting_expires_at') ?? null : null,
+    ...(s.get('device_id') ? { device_id: s.get('device_id'), driver: s.get('driver') ?? null } : {}),
     ended_reason: s.get('ended_reason') ?? null,
     attached,
     log: rows,

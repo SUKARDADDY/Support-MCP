@@ -1,0 +1,16 @@
+-- Connect to a saved PC (PR 6). One new column on devices.
+--
+-- session holds the one live session for a PC as JSON text:
+--   {"id":"<64 hex>","by":"<identity>","ask":true|false,"expires_at":<ms>,"code":"<16 characters>","team":"<workspace name>"}
+-- id is the Session object's id, by is who is driving, ask is whether the PC
+-- asks the person at it, expires_at is the session's hard end in milliseconds,
+-- code is the Session object's name (the key in the workspace's session list),
+-- and team is the workspace name the PC shows. NULL means no session.
+--
+-- A technician claims it with one guarded UPDATE that also reclaims a pointer
+-- whose expires_at has passed. The PC's check-in reads it from the row it
+-- already loads, and leaves out an expired one. The Session object clears it
+-- when the session ends, guarded on the id so it never clears a newer session.
+-- It holds no key, no typed text and no secret. The code only names the Session
+-- object: /j/ and /consume refuse a saved-PC session, so it opens nothing.
+ALTER TABLE devices ADD COLUMN session TEXT;

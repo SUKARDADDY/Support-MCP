@@ -76,6 +76,7 @@ work in the request path; use the WebSocket Hibernation API
 | `GET /healthz` | public | `{"ok":true,"service":"support-mcp","stage":"relay-v1","version":"<release>"}` (`stage` names this API generation, `version` the release, see [Versions](development.md#versions-and-releases)) |
 | `GET /j/<code>` | public | **GET only, https only.** The code is consumed only for a request whose `User-Agent` contains `PowerShell/` (`irm` sends `WindowsPowerShell/5.1.x` or `PowerShell/7.x`). Code valid+unused → 200 `text/plain` agent script with placeholders filled, code consumed; else 404 `text/plain` `Write-Host 'This support link is invalid or expired.'` (runnable, harmless). Any other `User-Agent` (a chat link preview, a browser) → 200 `text/plain`, `Cache-Control: no-store`, a one-line `Write-Host` telling the reader to paste the command into PowerShell, and the Durable Object is **not** touched. Over plain `http:` on any host except `localhost` / `127.0.0.1` → 200 `text/plain` `Write-Host` line asking for the https link, code **not** consumed. Any other method → 405 `text/plain` (harmless one-liner, `Allow: GET`) and the code is **not** consumed. Malformed percent-encoding → the same harmless 404 script, never 500. The `User-Agent` test keeps previews from burning the code. It is not a security control, since any client can send the header. |
 | `GET /j/<code>?client=app` | public | The downloaded app. `legacy` is an alias for `app`; any other `client` value → 404. **https only**: over plain `http:` on any host except `localhost` / `127.0.0.1` → 403 `text/plain`, code **not** consumed. `GET` serves the download page (200 `text/html`, `Cache-Control: no-store`, `Referrer-Policy: same-origin`, a CSP with `default-src 'none'` and `form-action 'self'`) and **never consumes the code**, however often the page is opened or refreshed. Only a `POST` from the page's button consumes it. If the request has an `Origin` header it must equal the relay's own origin exactly. If it has none (IE11 on Windows 7 can omit it on a same-origin form POST), its `Referer` must start with `<origin>/j/`, which the page's `Referrer-Policy: same-origin` keeps on the click. A foreign `Origin`, a foreign or missing `Referer` without an `Origin`, or neither header → 403, code unused. A first valid `POST` returns 200 `application/octet-stream` with `Content-Disposition: attachment; filename="remote-support-<sid8>.exe"`: the compiled app followed by the session configuration (below). The code is single use: a repeat after the download shows "Check your downloads" (409), an expired or ended one shows "This support link has expired" (410). A code made for a `powershell` session shows the expired page and stays unused. `HEAD` and every other method → 405 (`Allow: GET, POST`). |
+| `POST /agent?sid=<sid>` + `Authorization: Bearer smd1...` | device key | The same transport for a saved PC's session ([below](#saved-pc-sessions)). The Worker checks the key against the database on every request and lets the PC into one session only: the one its record points at (`session.id` equal to `sid`), else 401. It sends no `X-Attach-Key`, and none is forwarded. Any `Authorization` header selects this path. Everything else in the next row applies. |
 | `POST /agent?sid=<sid>` + `X-Attach-Key: <key>` | attach key | The app's transport, JSON in and out; below. 403 over plain `http:` on any host except `localhost` / `127.0.0.1`, 403 on any `Origin` header or a `key` query param, 405 on other methods, 415 on a non-JSON body, 413 over 750,000 characters (checked against `Content-Length` before the body is read, and again after it is read when there is no `Content-Length`), 401 on a bad sid, bad key, a `powershell` session or a session that is still `pending`, 409 on a stale generation, 410 when the session has ended. |
 | `GET /install[?code=<code>\|?workspace=<slug>]`, `POST /install[...]` | public | The setup download for a saved PC ([below](#the-install-page-install)). `GET` shows the page and never downloads. `POST` from the page returns `support-setup.exe` with a device footer. A saved PC downloads its updates here too, with the same `POST`. Not under any Access app |
 | `GET /ws?sid=<sid>` + `X-Attach-Key: <key>` | attach key | WebSocket upgrade for the agent; 403 over plain `http:` on any host except `localhost` / `127.0.0.1`; 401 on bad/missing key, on a `key` query param, on a bad sid, or on an `app` session; 410 if session ended/expired |
@@ -86,6 +87,8 @@ work in the request path; use the WebSocket Hibernation API
 | `GET`, `POST /oauth/authorize` | browser sign-in | the consent page; see [OAuth](#oauth-for-mcp-clients) |
 | `/api/v1/w/<slug>/...` | Access JWT | the team API (below) |
 | `POST /device/pair`, `/device/hello`, `/device/update`, `/device/leave` | none (pair) or a device key in `Authorization: Bearer` | the PC wire for saved PCs ([below](#the-pc-wire-device)). Public: not under any Access app. 403 over plain `http:` except loopback, 405 other methods, 403 on any `Origin` header, 400 on `?key=` or `?code=`, 415 non-JSON, 413 over 8 KB |
+| `GET /device/ring?protocol=1` | a device key in `Authorization: Bearer` | the doorbell, a WebSocket upgrade ([below](#the-doorbell)). Public, with the refusals of the PC wire |
+| `GET`, `POST`, `DELETE /api/v1/w/<slug>/stop` | Access JWT | read, set and clear a workspace's stop ([below](#stop-and-resume)) |
 | `POST /api/v1/w`, `GET /api/v1/w` | Access JWT | create a workspace, list yours (below) |
 | `GET /auth/signin`, `GET /auth/google`, `GET /auth/microsoft`, `GET /auth/<provider>/callback`, `POST /auth/email`, `GET` and `POST /auth/email/confirm`, `GET` and `POST /auth/factor`, `POST /auth/signout`, `GET /account`, `POST /account/signout-everywhere` | none, then a browser sign-in | people sign in; see [Sign-in](#sign-in-auth-and-account) |
 | anything else | — | 404 |
@@ -168,7 +171,7 @@ The session's own log keeps it as sent, in the `[identity] detail` form.
 ### Role check (`tools/call`)
 
 `initialize`, `ping`, `tools/list` and every refusal above never read team
-data, so `tools/list` answers the same 22 tools on any well-formed
+data, so `tools/list` answers the same 24 tools on any well-formed
 `/w/<slug>/mcp`, created or not, without touching D1 or a Durable Object. On
 `tools/call` for a listed tool, after the `session_id` check, the relay checks
 that the workspace exists (`default` always does; any other slug needs a row in
@@ -184,6 +187,8 @@ tool's arguments.
 | `session_create` | `sessions.create` |
 | `session_list`, `session_status` | `sessions.view` |
 | `session_end` | `sessions.end` |
+| `device_list` | `devices.view` |
+| `device_connect` | `sessions.control`, and `sessions.unattended` inside the tool when the session will not ask or the call is a take-over |
 | every other tool | `sessions.control` |
 
 - No members in `default` (open): allowed, and the caller is recorded in
@@ -194,6 +199,13 @@ tool's arguments.
 - A member whose role lacks the permission: tool error
   `your role does not allow <permission>`.
 - No `DB` binding: tool error `the team database (DB) is not configured`.
+
+After the role check, and before the tool runs, the relay refuses the call when
+the workspace is stopped (below): the tool error `this workspace is stopped;
+someone who can manage members must resume it`. A caller who is not a member
+never learns this. `EMERGENCY_STOP` is checked first of all, before any database
+read, and refuses every call whoever asks: `this relay is stopped by its
+operator`. `tools/list` is static and still answers.
 
 A refusal is a tool error (`isError`), and nothing reaches a Session.
 `session_create` sends `workspace: "<slug>"` to `/create`, and the operator
@@ -249,9 +261,17 @@ at most 200 characters with no spaces; names at most 100 characters with no
 control characters. Role ids match `[a-z0-9-]{1,40}`. Permission keys are
 `members.manage`, `roles.manage`, `audit.view`, `devices.view`,
 `devices.manage`, `fields.manage`, `sessions.create`, `sessions.view`,
-`sessions.control`, `sessions.end`. Built-in roles: `admin` (every key, fixed),
-`technician` (`devices.view`, `devices.manage` and the four `sessions.*` keys),
-`viewer` (`audit.view`, `devices.view`, `sessions.view`). A workspace that
+`sessions.control`, `sessions.end`, `sessions.unattended`. Built-in roles:
+`admin` (every key, fixed), `technician` (`devices.view`, `devices.manage` and
+`sessions.create`, `sessions.view`, `sessions.control`, `sessions.end`),
+`viewer` (`audit.view`, `devices.view`, `sessions.view`). Only `admin` holds
+`sessions.unattended` by default.
+
+`sessions.unattended` means "connect to a PC without asking the person at it, and
+switch a PC to any time". It needs a second factor like `sessions.control` does.
+Open mode (a default workspace with no members) grants every `sessions.*` key
+except this one, which is excluded by name, so nobody connects without asking
+until a first admin is added. A workspace that
 edited `technician` or `viewer` before the device keys existed keeps its stored
 role without them. Because those two roles now hold more, the rule that a
 non-admin hands out only what they hold means a custom role with
@@ -400,7 +420,7 @@ commit together, and a permission lost between the read and the commit is a 403.
 | `GET`, `PATCH`, `DELETE .../sites/<id>` | as customers | `PATCH`: `name, address, notes, fields` | `{site}`; `DELETE` is 409 `in_use` with PCs or live codes |
 | `GET .../devices?site=&status=&after=&limit=` | `devices.view` | | `{devices:[...], next}`; `status` is `pending` or `active` |
 | `GET .../devices/<id>` | `devices.view` | | `{device}` |
-| `PATCH .../devices/<id>` | `devices.manage` | `{site_id?, fields?, access?, owner_contact?, approve?:{confirm}}`; `owner_contact` is at most 200 characters and an empty string clears it; `name`, `control`, `os`, `machine` or `app_version` is 400 `bad_request` | `{device}` |
+| `PATCH .../devices/<id>` | `devices.manage`; a change of `access` from `ask` to `any` also needs `sessions.unattended` (403 `permission_denied` otherwise, checked again at commit). Sending `access: "any"` for a PC that is already `any` changes nothing and needs only `devices.manage` | `{site_id?, fields?, access?, owner_contact?, approve?:{confirm}}`; `owner_contact` is at most 200 characters and an empty string clears it; `name`, `control`, `os`, `machine` or `app_version` is 400 `bad_request` | `{device}` |
 | `DELETE .../devices/<id>` | `devices.manage` | | `{removed:{id}}`; the PC's key ends with its row |
 | `GET .../fields` | `devices.view` | | `{fields:[{id,entity,label,position,created_at}]}` |
 | `POST .../fields` | `fields.manage` | `{entity, label}` | 201 `{field}`; `entity` is `customer`, `site` or `device` |
@@ -433,6 +453,11 @@ cannot. `approve` is its own request: a waiting PC
 becomes `active` when `confirm` is the six-digit number shown on the PC (403
 `confirm_wrong` otherwise, 409 `not_pending` for an active PC).
 
+A change of `access` and an approval ring the PC's doorbell ([below](#the-doorbell))
+once the change has committed, so the PC checks in at once. Removing a PC ends
+its live session with the reason `removed` first, and rings its doorbell once
+the row is gone; the doorbell then closes.
+
 Limits per workspace: 10,000 customers, 10,000 sites, 2,000 PCs, 30 custom fields
 per record type, 20 live pairing codes, 20 waiting PCs. The relay stores a
 pairing code only as a keyed hash.
@@ -441,7 +466,9 @@ Log kinds: `customer_added`, `customer_changed`, `customer_removed`, `site_added
 `site_changed`, `site_removed`, `field_added`, `field_changed`, `field_removed`,
 `pairing_code_created`, `pairing_code_revoked`, `device_paired`,
 `device_requested`, `device_approved`, `device_changed`, `device_removed`,
-`device_left`. A detail names ids and names, never a code, a key, an owner
+`device_left`, `device_session_started`, `device_session_taken_over`,
+`device_session_ended` ([Saved-PC sessions](#saved-pc-sessions)),
+`workspace_stopped` and `workspace_resumed`. A detail names ids and names, never a code, a key, an owner
 contact or a field value. The only unlogged writes are a PC's check-in details (at
 most every 5 minutes, or once a minute when a value changed) and purging expired
 codes and waiting PCs. A detail can hold customer, site and PC names, so anyone
@@ -452,6 +479,49 @@ still holds `devices.manage` in the workspace (checked again at commit), so
 removing the person or their permission ends their live codes. Rotating
 `AUTH_SECRET` ends every live pairing code and waiting PC number (both are keyed
 hashes); a device key is a plain SHA-256 and is unaffected.
+
+### Stop and resume
+
+| Route | Needs | Answer |
+|---|---|---|
+| `GET .../stop` | `sessions.view` | `{stopped:true\|false}` |
+| `POST .../stop` | `sessions.end` | `{stopped:true, sessions_ended:<n>}` |
+| `DELETE .../stop` | `members.manage` | `{stopped:false}` |
+
+These are team API calls only. No MCP tool stops or resumes a workspace. A body
+is not read, but `POST` and `DELETE` need `Content-Type: application/json` like
+every write. A workspace has no status column: a stop is the log row
+`workspace_stopped` and a resume is `workspace_resumed`, and the workspace is
+stopped when its newest stop row has a higher `seq` than its newest resume row.
+Stopping a stopped workspace, or resuming a running one, changes nothing and
+adds no row. While `default` is open, anyone admitted may stop it (they hold
+`sessions.end`) and resume answers 409 `first_member`, so the first admin is
+added before it can be resumed.
+
+A stop ends every live session in the workspace's Registry list with the reason
+`stopped` (at most 40 in one call; the free plan allows 50 subrequests a call),
+rings every doorbell in the workspace, and from then on each tool call is
+refused. A second `POST` ends any session the first one missed. A session also
+checks for itself, reading the stop state at most once every 20 seconds, and a
+stopped workspace ends it with the reason `stopped`. An app session (a saved PC or
+a link session in app mode) checks on each `/agent` request. A PowerShell session
+checks on each `/ws` attach, including the reconnect probe (answered 410), on each
+message from its socket (an end frame goes to every socket and they close), and
+from its own alarm, which fires every 30 seconds while it is attached, so a
+PowerShell session with no traffic ends within about 30 seconds of the 20-second
+window. That read failing counts as not stopped, because the stop also ends
+sessions directly. Requests and tool calls to other workspaces are not affected.
+A connect that was under way when the workspace stopped cannot claim the PC: the
+claim holds only while the workspace is not stopped, and the connect then fails
+with the stopped error.
+
+`EMERGENCY_STOP` is a deploy setting for the whole relay. Any non-empty value
+refuses every tool call (before any database read) and every connect to a saved
+PC, and ends a live session on its next `/agent` request (or `/ws` attach) with
+the reason `stopped`. A team cannot lift it. The check-in and the doorbell keep
+working, so PCs learn their session is gone: the check-in answer leaves out
+`session`. Clear the value and deploy to run
+again.
 
 ## The install page (`/install`)
 
@@ -503,7 +573,7 @@ can land in browser history, link previews and the relay's request logs.
 ## The PC wire (`/device/*`)
 
 What a saved PC calls: pair or ask to join, check in, change its own settings, and
-leave on uninstall. These four addresses are public, with no Access login,
+leave on uninstall, plus the doorbell below. These addresses are public, with no Access login,
 because a PC has none. Every request is `POST` with `Content-Type:
 application/json` and a body of at most 8 KB that carries `"protocol": 1`. Every
 answer, success or error, carries `"protocol": 1`. Errors are
@@ -559,12 +629,20 @@ row and the code unused. A good one writes the device, the `device_paired` (or
 `device_requested`) row and, for a code, marks it used, in one batch.
 
 `POST /device/hello`, key: `{"protocol":1,"os"?,"machine"?,"app_version"?}` answers
-200 `{"protocol":1,"device":{"id","workspace","status":"active"|"pending","name","access","control","site_id"},"update"?:{...}}`.
+200 `{"protocol":1,"device":{"id","workspace","status":"active"|"pending","name","access","control","site_id"},"update"?:{...},"session"?:{...}}`.
 Allowed while pending. The reported details are written at most every 5 minutes,
 or once a minute when one changed (a changed value inside that minute is dropped
 and sent again at the next check-in), and are not logged. `update` is there only
 when the relay offers this PC its signed release ([Updates](#updates)); without
-it the answer is exactly as before. Errors: 400, 401, 426.
+it the answer is exactly as before. `session` is a new top-level key, beside
+`device` and `update`, never inside `device`. It is there only for an active PC
+with a live session pointer and is `{"id":"<64 hex>","by":"<identity>",
+"team":"<workspace name>","ask":true|false,"expires_at":<ms>}`: the session to pick
+up (below), who started it (an email or a service token id), whether the PC must
+ask the person at it, and the session's hard end. A waiting PC never gets it, and
+neither does a PC whose pointer has passed its end, or any PC while `EMERGENCY_STOP` is set (the answer is otherwise the same, so the PC does not start a session that would be ended on arrival). It comes from the row the
+check-in already loads, so it costs no further query. A PC on 0.5.0 ignores it.
+There is no interval in the answer. Errors: 400, 401, 426.
 
 `POST /device/update`, key: `{"protocol":1,"name"?,"access"?,"control"?}`
 with at least one key answers 200 with the same `device`. Logged as
@@ -576,7 +654,56 @@ the key's holder set either mode.
 
 `POST /device/leave`, key: `{"protocol":1}` answers 200
 `{"protocol":1,"removed":true}`, deletes the row and so the key, and logs
-`device_left` (also for a waiting PC). Afterwards the key is 401. Errors: 401, 426.
+`device_left` (also for a waiting PC). A live session of the PC ends first, with
+the reason `removed`. Afterwards the key is 401. Errors: 401, 426.
+
+### The doorbell
+
+`GET /device/ring?protocol=1`, a WebSocket upgrade with `Authorization: Bearer
+smd1...`. The PC keeps one open so the relay can tell it to check in. It carries
+no data a PC acts on: the relay sends the text frame `{"type":"ring"}` and nothing
+else, and the PC treats any text frame as "check in now" (at most once every 2
+seconds) and never reads its content, so a fake ring can only cause an early
+check-in. The PC sends WebSocket protocol pings every 30 seconds and nothing
+else. The relay ignores any text it receives and closes the socket on a frame
+over 1 KB.
+
+Refusals, in this order: plain `http:` except loopback 403 `https_required`;
+any method but `GET` 405 `method_not_allowed` (`Allow: GET`); an `Origin` header
+403 `forbidden`; `?key=` or `?code=` 400 `bad_request`; a `protocol` query that is
+missing or not a whole number 400 `bad_request`; a `protocol` outside 1 to 1 426
+`protocol_unsupported`; a missing, malformed or wrong key 401 `device_unknown`
+(a malformed key never reaches the database); a request without `Upgrade:
+websocket` 400 `bad_request`; no `REGISTRY` binding 503 `unavailable`. An active
+PC and a waiting PC may both connect. The Worker checks the key with the same
+query as a check-in, then hands the upgrade to the workspace's Registry object
+without the key. The Registry accepts it with the hibernation API under the tag
+`dev:<device id>`, and a new socket for the same PC closes the older one. An idle
+doorbell is a hibernated socket, which Cloudflare does not bill, and only a ring
+wakes the object.
+
+The PC opens the doorbell itself, as a direct TCP and TLS connection to the relay
+(TLS 1.2, with the same certificate-revocation setting as its check-in), and does
+not use a proxy. On a network where only a proxy reaches the relay the doorbell
+never connects, and the PC uses the 5-minute check-in instead.
+
+Rung, best effort (the check-in schedule is the fallback): a connect and a
+take-over (`device_connect`), a team change to a PC's `access`, an approval, a
+removal (after the row is deleted, then the doorbell closes), and a workspace
+stop (every doorbell). `device_list` reports `online` from the Registry's
+sockets, one request per list.
+
+### The check-in schedule
+
+While its doorbell is connected a PC checks in when the doorbell connects, at each
+ring and every 6 hours (plus up to 10 minutes of jitter, for staged updates): about 10
+requests a day. While it is not connected it checks in every 5 minutes plus up to
+30 seconds, as before. A waiting PC always uses the 5-minute schedule, because the
+six digits ring it anyway. The network-error backoff, the 426 schedule and an
+update trial's own check-ins are unchanged. The PC reconnects after a close or
+an error with a backoff from 5 seconds, doubling to 5 minutes, which a ring
+that arrives resets. A PC that has not seen a pong within 60 seconds treats the
+doorbell as dead, reconnects, and uses the 5-minute schedule until it is back.
 
 ### Updates
 
@@ -876,6 +1003,97 @@ of them and keeps working: see [Lanes](#lanes-screen-and-control-frames).
   answer any waiting poll with `{"type":"end"}`, fail the waiting command, and
   every later request gets 410.
 
+### Saved-PC sessions
+
+A technician starts one with `device_connect`. It is a Session object like a
+link's, with differences. It is named by a random 16-character code (the Session
+object's name and its key in the Registry), but nobody can use that code:
+`/consume` answers `not-pending` and `/j/<code>` shows an expired link. There is
+no attach key.
+
+States: `waiting`, `attached`, `ended`. The Session is created `waiting` for a
+device, with the technician as its `driver`. The PC must pick it up and the person
+at it answer within 510 seconds (a 330-second check-in without the doorbell, plus
+180); the deadline passing ends it as `timed_out`. The first `hello` attaches it
+and sets `expires_at` to that moment plus 24 hours, fixed; a later `hello` rejoins
+without extending it. There is no idle timeout. The 24 hours ending is
+`max_time`. The pointer's `expires_at` starts as the latest the session can end
+(the creation time, plus 510 seconds, plus 24 hours) and is set to the exact end at
+the first `hello`.
+
+The device's record holds the one live session as `devices.session`, JSON text
+`{"id","by","ask","expires_at","code","team"}` (`id` is the Session object's id,
+`by` the driver, `code` the Session object's name, `team` the name the PC
+shows). Connect claims it with one guarded `UPDATE` that holds only while the
+workspace is not stopped, the PC is active and has no pointer or one whose
+`expires_at` has passed, the caller still holds `sessions.control` (and
+`sessions.unattended` when the session does not ask), and the
+`device_session_started` row goes in; so two technicians cannot both connect, and
+a stale pointer is reclaimed. A pointer also counts as free when its Session
+object is not live: before refusing with `<who> is connected`, connect asks that
+Session for its state, and one that has ended or does not exist (a stop can end a
+new Session before its pointer is written) is replaced, with the claim guarded on
+the old pointer's id. A Session that cannot be reached counts as live. A connect
+retried after losing the log number keeps the Session it made only while that
+Session is still waiting; otherwise it makes a new one. The check-in does not
+make this check, because it must cost no further request: a PC that is handed a
+pointer to an ended Session gets 410 on its first request and ends it, and the next
+connect replaces the pointer. The Session object clears it with
+a `UPDATE` guarded on the session id when the session ends, in the same change as
+the `device_session_ended` row, and its alarm retries every 30 seconds until that
+works.
+
+`ask` is true unless the PC's access is `any`, the caller holds
+`sessions.unattended` (with its second factor for an OAuth caller), and did not
+pass `ask:true`. A caller without the permission is not refused: the session asks.
+The PC asks the person when `ask` is true or its own saved access is `ask`.
+
+**On the wire.** `POST /agent?sid=<sid>` with `Authorization: Bearer <device key>`.
+The relay checks the key against the database on every request and requires the
+PC's record to point at `sid`, else 401. The Session is called with the device id
+and the PC's control level from the record, never from the client. Messages are the
+app's ([above](#app-sessions-https-polling)), plus:
+
+```
+{"type":"decline","reason":"declined"|"nobody"|"busy"}
+```
+
+sent before `hello`, answered `{"type":"end"}`, and the session ends with that
+reason. After a `hello` only `nobody` and `busy` are taken: a PC that restarts during a
+limited session and finds its user signed out sends `nobody`, and one that finds
+several Remote Desktop users to choose from sends `busy`. Anything else (another
+reason, `declined` after a `hello`, on a link session) is 400.
+A `hello` with `control: "full"` for a PC the record says is limited is 403 and
+changes nothing. `welcome` adds `"driver":"<identity>"`. Every poll answer for a
+saved-PC session, whether idle, a command frame or an end, carries `"driver"`, so the corner
+window shows a take-over at once. `end` from the PC ends the session with the
+reason `owner` (a `"reason":"owner"` in it is optional).
+
+**One driver.** A command (`run`, files, screen, control) from anyone but the
+driver is refused: `<driver> is driving this session; use device_connect with
+take_over`. `session_status`, `session_list` and `session_end` are not commands.
+`device_connect` with `take_over:true` moves the driver to the caller (always
+needs `sessions.unattended`), changes `by` in the pointer, wakes the PC's parked
+poll with the new driver, rings the PC and writes `device_session_taken_over`. It
+is not an end. Without the permission the error says to ask the driver to end the
+session and connect again, so the person at the PC is asked.
+
+**End reasons** (`ended_reason` in `session_status`, and the last word of the
+`device_session_ended` detail): `declined`, `nobody` and `busy` (the PC's decline),
+`timed_out` (the waiting deadline), `max_time` (the 24 hours), `owner` (the PC
+ended it), `technician` (`session_end`), `stopped` (a workspace stop or
+`EMERGENCY_STOP`), `removed` (the PC was removed or left) and `replaced` (made
+but never claimed: this one is not logged).
+
+`session_status` for a saved-PC session adds `device_id` and `driver`, and its
+`startup_expires_at` is the waiting deadline while it waits. `session_list` shows
+it with the label `PC <name> (<device id>)`. The log rows are
+`device_session_started` (actor the technician; detail the device id, its name,
+the first 8 characters of the session id and whether it asks), `device_session_taken_over`
+(actor the new driver; detail ends `from <old driver>`) and `device_session_ended`
+(actor the technician, `pc <id>` for the PC's own words, or `relay`; detail ends
+with the reason). They hold ids and names, never a code or a key.
+
 ### Lanes, screen and control frames
 
 **Lanes.** Every operation frame carries `"lane":"cmd"` or `"lane":"screen"`.
@@ -1133,6 +1351,8 @@ text content item, not JSON-RPC errors.
 | `put_file` | `session_id`, `path`, `data_b64`, `append?` | bytes |
 | `get_file` | `session_id`, `path`, `offset?`, `length?` | data_b64, size, eof |
 | `session_end` | `session_id` | `{ended:true}`; sends `end` to agent first |
+| `device_list` | `site?` (an id), `status?` (`active` or `pending`), `after?` (an id) | `{devices:[...], next, untrusted_text}`: the team's device shape plus `online` (true while the PC's doorbell is connected; false when the Registry cannot be read), from one Registry request per call. Names, contacts and custom field values come from people and are untrusted data |
+| `device_connect` | `device_id`, `ask?` (boolean), `take_over?` (boolean) | `{session_id, state:"waiting"\|"attached", asks, rang}`. `rang` is true when the PC's doorbell was connected (else the PC sees the request within about 5 minutes). Refused: an unknown PC or one in another workspace, a waiting PC, an `app_version` below 0.6.0 (`this PC updates itself to 0.6.0 first`), a PC already in a session without `take_over` (`<who> is connected`) and a stopped workspace. See [Saved-PC sessions](#saved-pc-sessions) |
 
 The tools above are in every connection, with the screen tools below. `?ui=0`
 hides `ui_tree` and `ui_act` (`?ui=1` is the default); any other value gets 400
@@ -1140,7 +1360,8 @@ hides `ui_tree` and `ui_act` (`?ui=1` is the default); any other value gets 400
 parameter no longer exists: a request that carries it, with any value, gets 400
 `{"error":"the shape parameter was removed; ..."}` rather than a silently
 different tool list. A tool that the connection does not list is `unknown tool`.
-Every tool except `session_create` and `session_list` requires `session_id`. When
+Every tool except `session_create`, `session_list`, `device_list` and
+`device_connect` requires `session_id`. When
 it is missing, empty or not a string, `tools/call` returns a tool error
 `session_id is required; call session_list to find it` and nothing reaches the
 backend. There is no default session.
@@ -1345,31 +1566,96 @@ one of a valid code or a slug. It refuses a session footer.
 | Role | Runs as | Does |
 |---|---|---|
 | none, with a device footer | the owner | the setup wizard, "Support setup", five steps (code, name, how support connects, how much control, install). Nothing is preselected for the last two. It first checks for the `SupportMcpDevice` service and, if it exists, says "Support is already set up on this PC" and opens the tray. It starts `--device-install` elevated with `ShellExecuteEx` `runas` and reads the exit code. After exit 0 or 10 it starts the installed exe with `--tray` as the owner |
-| `--device-install <nonce> <answers>` | administrator, through UAC | stages and holds its exe like `--elevate-install`, turns on the safe DLL search, reads its own file and footer once, and goes ahead only if the wizard's named event for `<nonce>` still exists and is not set. `<answers>` is one base64url JSON argument: name (1 to 100 characters), access, control, and either the code or "use the workspace" (at most 1,024 characters; no key). It takes the origin and the workspace from its own footer. Exit codes: 0 active, 10 pending, 20 code invalid, 21 network, 22 refused, 23 already set up. It pairs over `/device/pair`, creates `%ProgramFiles%\SupportMCP` with the locked ACL, writes `support.exe` (the exe without its footer, Users may read and run it), `device.json` and `history.json` (locked), registers the service `SupportMcpDevice` ("Support device service", LocalSystem, automatic, restart on failure, quoted path, `--device-service`), the `HKLM` Run value `SupportMcpTray` and the Apps entry, and starts the service. Any failure after pairing sends `/device/leave` with the new key and rolls back only what this run made. One install or remove runs at a time, under a `Global` mutex; a second gets "already set up". It never touches `HKLM\SOFTWARE\SupportMCP` |
-| `--device-service` | LocalSystem, session 0 | reads `device.json` and checks in with `/device/hello` at start, then every 5 minutes measured from the last answer plus up to 30 seconds of jitter. After a network error it retries after 1 minute, doubling to 15. A 200 updates the name, access, control and state (active or pending). A 401 means removed (after active) or expired (while pending), and ends check-ins for good. A 426 means the app needs an update and is retried every 6 hours. It keeps the last 50 history lines in `history.json`. It runs no command, takes no screenshot and opens no file for the relay. When an answer carries `update` and the checks in [Updates](#updates) pass, it downloads the release, writes it as `support-<version>-<8 hex>.exe` in the install folder with the app's ACL from the moment it exists, reads it back and hashes it through a handle that denies writing (held until it stops), records it in `update.json`, and starts its own exe with `--device-update <file>`. A release whose download or checks failed is tried again an hour later at the earliest. Starting on trial (below), it records `"started": true` in the trial, renews the deadline to at least 4 minutes from now, and starts `--device-update-rollback --at-deadline` from the old exe. On trial, a 200, 202 or 401 commits; a 426 or any other refusal (a 4xx) starts `--device-update-rollback` from the old exe instead; no network or a 5xx keeps the trial open and retries the hello every 30 seconds, and commits once the deadline is 90 seconds away or less. A commit that finds the setup mutex held tries again 5 seconds later. A service that starts while its own rollback was cut short starts `--device-update-rollback` again; a trial record that names neither its file nor the old one and is 10 minutes past its deadline is cleared, keeping the failed versions and the previous file. Outside a trial it deletes every version file but its own and the previous one; one a tray still runs is renamed to `<name>.<8 hex>.del` and that name is queued for the next restart |
+| `--device-install <nonce> <answers>` | administrator, through UAC | stages and holds its exe like `--elevate-install`, turns on the safe DLL search, reads its own file and footer once, and goes ahead only if the wizard's named event for `<nonce>` still exists and is not set. `<answers>` is one base64url JSON argument: name (1 to 100 characters), access, control, and either the code or "use the workspace" (at most 1,024 characters; no key). It takes the origin and the workspace from its own footer. Exit codes: 0 active, 10 pending, 20 code invalid, 21 network, 22 refused, 23 already set up, 24 blocked (another program made the setup mutex first, or made it so this account cannot open it; the wizard says "Another program is blocking Support. Restart the PC and try again." and offers Try again). It pairs over `/device/pair`, creates `%ProgramFiles%\SupportMCP` with the locked ACL, writes `support.exe` (the exe without its footer, Users may read and run it), `device.json` and `history.json` (locked), registers the service `SupportMcpDevice` ("Support device service", LocalSystem, automatic, restart on failure, quoted path, `--device-service`), the `HKLM` Run value `SupportMcpTray` and the Apps entry, and starts the service. Any failure after pairing sends `/device/leave` with the new key and rolls back only what this run made. One install or remove runs at a time, under the `Global\SupportMcpDeviceSetup` mutex, which the install owns as Administrators; a second gets "already set up". Any signed-in user can make a `Global` name before the install does, with an access list of their own, and Windows then opens theirs and ignores ours. So a mutex that already exists is used only when SYSTEM or Administrators own it, and one whose owner cannot be read, or that this account may not open, counts as hostile (exit 24). It never touches `HKLM\SOFTWARE\SupportMCP` |
+| `--device-service` | LocalSystem, session 0 | reads `device.json` and checks in with `/device/hello` at start, then on the schedule in [The check-in schedule](#the-check-in-schedule): every 6 hours plus up to 10 minutes of jitter, at each ring and when the doorbell connects, while the PC is active and its doorbell is up; otherwise every 5 minutes measured from the last answer plus up to 30 seconds of jitter (always, while pending). After a network error it retries after 1 minute, doubling to 15. A 200 updates the name, access, control and state (active or pending); control only goes down, because a check-in can lower full to limited and never raises it. A 401 means removed (after active) or expired (while pending), and ends check-ins and the doorbell for good. A 426 means the app needs an update and is retried every 6 hours. It keeps the last 50 history lines in `history.json`. It keeps the doorbell open from its start. An active PC's answer may carry `session`; the service then hosts it as [Sessions on the PC](#sessions-on-the-pc) says. Outside a session it runs no command, takes no screenshot and opens no file for the relay. It downloads and switches to an update only while no session is waiting or live (a session in the answer, or a run that has not finished, holds updates back). When an answer carries `update` and the checks in [Updates](#updates) pass, it downloads the release, writes it as `support-<version>-<8 hex>.exe` in the install folder with the app's ACL from the moment it exists, reads it back and hashes it through a handle that denies writing (held until it stops), records it in `update.json`, and starts its own exe with `--device-update <file>`. A release whose download or checks failed is tried again an hour later at the earliest. Starting on trial (below), it records `"started": true` in the trial, renews the deadline to at least 4 minutes from now, and starts `--device-update-rollback --at-deadline` from the old exe. On trial, a 200, 202 or 401 commits; a 426 or any other refusal (a 4xx) starts `--device-update-rollback` from the old exe instead; no network or a 5xx keeps the trial open and retries the hello every 30 seconds, and commits once the deadline is 90 seconds away or less. A commit that finds the setup mutex held tries again 5 seconds later. A service that starts while its own rollback was cut short starts `--device-update-rollback` again; a trial record that names neither its file nor the old one and is 10 minutes past its deadline is cleared, keeping the failed versions and the previous file. Outside a trial it deletes every version file but its own and the previous one; one a tray still runs is renamed to `<name>.<8 hex>.del` and that name is queued for the next restart |
 | `--device-update <file>` | LocalSystem, session 0, a child of the service | the switch. It takes the setup mutex (busy: exit 30), checks that `<file>` is the version file the service recorded in `update.json` and hashes it again through a handle that denies writing (refused: exit 31), and writes the trial (`from`, `to`, both versions, a 4-minute deadline). It sets the service's failure actions to run `"<old exe>" --device-update-rollback` on every failure, crashes and stops with an error alike; stops the service (stopped or stopping already is fine); points the service's command line, the `HKLM` Run value and the Apps entry's `UninstallString`, `DisplayVersion` and `EstimatedSize` at the new file; and starts it. It then watches `update.json` and rolls back itself if the trial is still open at its deadline, as `update.json` holds it then, and at least 4 minutes after it started (exit 32), else exits 0. Its hold on the file ends before the watch |
 | `--device-update-rollback` | LocalSystem, the failure action or a child of the new service | records the version as failed (never taken again), stops the service, points everything back at the old file with its own version and size, puts back the normal failure actions (restart twice, a minute apart), adds a history line, closes the trial and starts the service, trying again for up to 5 minutes when it will not start. The service is started again even when a step fails midway. With no trial open it only puts back the normal failure actions and starts the service; with `update.json` unreadable it changes nothing and only starts the service |
 | `--device-update-rollback --at-deadline` | LocalSystem, a child of the new service at its start on trial | the deadline watcher that survives a restart. It takes the setup mutex, renews the trial's deadline to at least 4 minutes from now, and then watches like the switch: it exits 0 once the trial is committed or rolled back, and rolls back a trial still open at the deadline (exit 32) |
-| `--tray` | the signed-in user, started by the `HKLM` Run value at each sign-in | one per session (a `Local` mutex). A notification icon drawn at run time, and a panel with the name, the access mode, the state, "No one is connected.", recent history, "Uninstall Support" and a small "Version x.y.z" line (the service's version; hidden when an older service sends none). It reads the service through the pipe and exits when the uninstall event is set. A tray keeps running the file it started from until the next sign-in, after an update too |
+| `--device-ask <answer>` | the signed-in user, started by the service in the session it asks | the question before a saved-PC session. `<answer>` is one base64url JSON argument of at most 2,048 characters holding exactly `by`, `team` and `control` (never a key). The dialog is the consent dialog's: "Allow <technician> to connect to this PC?" (or "Allow your support team", with no name), naming the technician and the team, saying what the control level allows, and that the corner window and the Support icon end it. "Don't allow" is the default, "Allow" does nothing for its first 500 ms, and with no answer after 2 minutes it closes as "Don't allow". Exit 10 is Allow; anything else (11, a crash, a malformed argument, no answer) is no |
+| `--tray` | the signed-in user, started by the `HKLM` Run value at each sign-in | one per session (a `Local` mutex). A notification icon drawn at run time, and a panel with the name, the access mode, the state, who is connected ("No one is connected.", or "Connected: <technician>" with an "End session" button while a session is live), recent history, "Uninstall Support" and a small "Version x.y.z" line (the service's version; hidden when an older service sends none). The mode line says "Support asks you before each connection. Your support team's admins can change this." in `ask`, and "Support can connect any time." with "Only your support team can change this." in `any`. It reads the service through the pipe, with at most two pipe connections at once (the service allows two per process), and exits when this PC's uninstall event is set. The event's name comes from the status frame and is opened only when SYSTEM or Administrators own it A tray keeps running the file it started from until the next sign-in, after an update too |
 | `--uninstall` | the owner | copies itself to a new Temp folder and runs from there. Confirms, then starts `--device-remove` elevated and shows "Support was removed" |
-| `--device-remove <nonce>` | administrator, through UAC | runs from the copy the uninstaller staged (it reads `device.json`, not a footer, so it holds no exe of its own), and goes ahead only while the uninstaller's named event for `<nonce>` still exists. It sends `/device/leave` (a 200 or a 401 both count as done), sets the uninstall event so every tray exits, waits a few seconds and ends any tray that remains, stops and deletes the service, deletes the Run value and the Apps entry, and removes the folder: it is renamed aside first (so a reinstall at the original path is never blocked), deleted with the junction-safe walk, and anything still locked is queued for the next restart. If the relay cannot be reached, or answers anything else (a refusal or a server error), it still removes everything and the owner is told the team must remove the PC. It ends trays started from any exe in the install folder (`support.exe` or a version file), and the folder removal takes every version file and `update.json` with it. One install, remove or update switch runs at a time, under a `Global` mutex. Exit codes: 0 removed, 10 removed but the relay did not confirm, 20 failed, 21 busy (the mutex is held, or an update's trial is open and less than 10 minutes past its deadline), and then the window says to try again in a few minutes |
+| `--device-remove <nonce>` | administrator, through UAC | runs from the copy the uninstaller staged (it reads `device.json`, not a footer, so it holds no exe of its own), and goes ahead only while the uninstaller's named event for `<nonce>` still exists. It sends `/device/leave` (a 200 or a 401 both count as done), sets this PC's uninstall event (and the fixed `Global\SupportMcpDeviceUninstall` of 0.5.0, for trays still on it, each only when SYSTEM or Administrators own it) so every tray exits, waits a few seconds and ends any tray that remains, stops and deletes the service, deletes the Run value and the Apps entry, and removes the folder: it is renamed aside first (so a reinstall at the original path is never blocked), deleted with the junction-safe walk, and anything still locked is queued for the next restart. If the relay cannot be reached, or answers anything else (a refusal or a server error), it still removes everything and the owner is told the team must remove the PC. It ends trays started from any exe in the install folder (`support.exe` or a version file), and the folder removal takes every version file and `update.json` with it. One install, remove or update switch runs at a time, under a `Global` mutex. The setup mutex gets the same owner check as the install's; a hostile one is exit 22 and the window shows "Another program is blocking Support. Restart the PC and try again." Exit codes: 0 removed, 10 removed but the relay did not confirm, 20 failed, 21 busy (the mutex is held, or an update's trial is open and less than 10 minutes past its deadline), and then the window says to try again in a few minutes, 22 blocked |
 
 The service's pipe is `SupportMcpDevice-ui`. Only SYSTEM can create instances,
 interactive users can read and write data, and it is never open to the network. It
-serves every interactive session, with a cap per process. Messages are a 4-byte
-length and UTF-8 JSON. It answers `{"type":"status"}` with `{name, access,
-control, state, confirm?, last_ok_at, history, version}` (`version` is the
-running service's own; state is `active`, `pending`,
-`expired`, `removed`, `update_needed` or `offline`; `confirm` is the six digits
-while pending), `{"type":"refresh"}` with a check-in now, at most once every 30
-seconds, and `{"type":"allow_any_time"}`, which is answered at once and sends
-`access: "any"` to `/device/update` in the background when the mode is `ask` (the
-change shows on the next status read). No request sets `ask`, and the service
-never sends `ask` on its own. Any other message closes the connection. A removed
-or expired state is kept in `device.json`, so a restart serves it from the pipe
-without checking in again. A saved
-install uses names of its own (the service, the folder, the pipe, the event and the
-mutexes), so it does not collide with a one-off session's.
+serves every interactive session, with a cap of two connections per process (the
+tray, which has three threads that use it, passes them through a gate of two).
+Messages are a 4-byte length and UTF-8 JSON. It answers `{"type":"status"}` with
+`{name, access, control, state, confirm?, last_ok_at, history, version, session?,
+uninstall_event?}`. `version` is the running service's own. `state` is `active`,
+`pending`, `expired`, `removed`, `update_needed` or `offline`. `confirm` is the six
+digits while pending. `session` is `{by, since}` (who drives it, Unix ms) only
+while a session is live. `uninstall_event` is the random part of this install's
+uninstall event name. The other requests are `{"type":"refresh"}` with a check-in
+now, at most once every 30 seconds; `{"type":"allow_any_time"}`, which is answered
+at once and sends `access: "any"` to `/device/update` in the background when the
+mode is `ask` (the change shows on the next status read); and
+`{"type":"end_session"}`, which ends the live session with the reason `owner` only
+when the caller is in the Windows session the service serves, and does nothing
+otherwise. Every request is answered with the status frame. No request sets `ask`,
+and the service never sends `ask` on its own. A message with any other type, or
+with any other key, closes the connection. A removed or expired state is kept in
+`device.json`, so a restart serves it from the pipe without checking in again. A
+saved install uses names of its own (the service, the folder, the pipe, the event
+and the mutexes), so it does not collide with a one-off session's.
+
+The uninstall event is `Global\SupportMcpDeviceUninstall-<32 hex>`. The service
+makes it (SYSTEM and Administrators full control, interactive users may wait on it
+and read its owner), keeps the random part in `device.json` as `uninstall_event`,
+and puts it in the status frame. Any signed-in user can read that part, so every
+opener (a tray, the uninstaller) checks the owner first and uses the event only
+when SYSTEM or Administrators own it (issue #22).
+When the service finds the name already taken by someone else, or by an object it
+may not open, it picks a new part. The SAS mutex (`Global\SupportMcp-Sas`) and the
+update lock (the setup mutex) follow the same rule; a squatted SAS mutex is
+skipped as busy, and a squatted update lock holds the update back.
+
+### Sessions on the PC
+
+What the service does with a session. The relay's side is in
+[Saved-PC sessions](#saved-pc-sessions).
+
+  - *The pointer.* Each active PC's `/device/hello` answer may carry `session`:
+    `{id, by, team, ask, expires_at}`. A new `id` starts a run. A run whose `id`
+    has left the answer ends locally, and the service goes back to checking in
+    without touching anything installed. A pending PC never gets a session. `by`
+    and `team` are shown to the person, so the service cleans them first; an `ask`
+    that is not exactly `false` counts as `true`.
+  - *Where it runs.* The console session when someone is signed in there. Else the
+    one active Remote Desktop session with a user. Several of those: the PC
+    declines `busy`, as it cannot tell whom to ask. None: nobody is signed in.
+  - *Whether it asks.* It asks when the session says `ask` or the PC's own access
+    is `ask`. With nobody signed in, only a full-control PC set to any time hosts
+    (on the sign-in screen); anything that would ask, and every limited PC, declines
+    `nobody`. A service that restarts and finds the session it already allowed
+    (`accepted_session` in `device.json`) rejoins without asking again.
+  - *The question.* `--device-ask`, as the signed-in user in that session, names
+    the technician and the team. "Don't allow" is the default, and no answer in 2
+    minutes is "Don't allow". The service treats a crash, a closed dialog or no
+    exit within 15 seconds after that as no. A no sends `{"type":"decline",
+    "reason":"declined"}` to `POST /agent?sid=<id>` with the device key as Bearer;
+    one that did not reach the relay is sent again at the next check-in while the
+    answer still carries the `id`, without asking again.
+  - *Hosting.* After a yes, or when nothing needed asking, the service saves the
+    `id` as `accepted_session` (cleared when a check-in no longer carries a
+    session) and runs the session with the app's polling client, the device key as
+    Bearer. Full control works as SYSTEM: the helper runs on the target session (the
+    console, the sign-in screen, or the one Remote Desktop session), and the hello
+    says `control: "full"`. Limited support is the signed-in user: the session
+    is pinned to that session and that user, the helper, the corner window and
+    every command run with the user's own token, files are opened while
+    impersonating the user, nothing works once another user is there, and the hello
+    says `control: "normal"`.
+  - *The corner window.* `--window <id>` as the signed-in user shows who is
+    connected, the timer and End session, from the service's per-session pipe
+    `SupportMcp-<id>-ui`, which only the target session may use. The person can
+    also end it from the tray's End session; either sends `end` with the reason
+    `owner`. When it ends, a saved PC's window says "Session ended after
+    HH:MM:SS." and then "Your support team can connect again later." (any time) or
+    "Your support team will ask you before connecting again." (ask first). A
+    one-off link's window says "Support can no longer reach this PC."
+  - *Stops.* Stopping the service ends the live session. Windows shutting down
+    keeps it, and the saved `accepted_session` lets the restarted service rejoin.
 
 Whatever starts or names the installed app (the tray at sign-in, the wizard's
 "Open Support", the tray's "Uninstall Support", the Apps entry) uses the exe in the
@@ -1390,10 +1676,10 @@ never update themselves.
 1. `npm test` green; `npx wrangler deploy --dry-run` bundles without error
    and lists `env.DB` as a D1 database.
 2. Local stack (`wrangler dev`, `.dev.vars` with `DEV_SKIP_ACCESS=1`): MCP
-   `initialize` → `tools/list` returns the 7 base tools plus the nine screen
-   tools, `ui_tree`, `ui_act`, `block_input`, `send_sas`, `type_secret` and
-   `request_full_control` (22), `?ui=0` drops `ui_tree` and `ui_act`, and
-   `?shape=...` is a 400 (curl).
+   `initialize` → `tools/list` returns the 7 session tools and the two device
+   tools (`device_list`, `device_connect`) plus the nine screen tools, `ui_tree`,
+   `ui_act`, `block_input`, `send_sas`, `type_secret` and `request_full_control`
+   (24), `?ui=0` drops `ui_tree` and `ui_act`, and `?shape=...` is a 400 (curl).
 3. `/mcp` without the JWT on a non-localhost host → 403 (unit test with a fake
    host + a test for bad aud / expired / wrong sig using a locally generated
    RSA key).
@@ -1444,8 +1730,11 @@ never update themselves.
   session, at its own deadline, and through the backstop task, which never runs
   the app. A saved PC stays until its owner uninstalls it, and uninstalling
   removes the PC's key at the relay.
-- The service of a saved PC runs no command, takes no screenshot and opens no
-  file for anyone in this release, and nothing in the app turns the access mode
+- The service of a saved PC runs a command, takes a screenshot or opens a file
+  only inside a session its own record points at and that it accepted (asking the
+  person at the PC when the session or its own setting says ask), a limited PC
+  never acts as the system, a check-in never raises a PC from limited to full
+  control, and nothing in the app turns the access mode
   from `any` back to `ask` (the relay still accepts either mode from a holder of
   the key, as pinned earlier). It installs releases signed with the project's
   release key and nothing else, never a version lower than or equal to its own,
@@ -1456,7 +1745,11 @@ never update themselves.
   the audit log, the Session storage, the registry or the Worker log.
 - `ended` is terminal; no path reopens a session or extends `expires_at`.
 - Every `tools/call` checks the caller's role before it reaches a session; team
-  management is never an MCP tool.
+  management is never an MCP tool, and neither is stopping or resuming a
+  workspace.
+- A saved PC is connected without asking the person at it only for a caller who
+  holds `sessions.unattended`, which open mode never grants; and switching a PC to
+  `any` needs it too.
 - Customer, site, device and custom field data is never read when the relay
   decides who may do what. A device key is never in a URL, never logged, stored
   only as a hash, compared in constant time, and refused on a request with an

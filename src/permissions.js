@@ -16,13 +16,20 @@ export const PERMISSIONS = Object.freeze([
   'sessions.view',
   'sessions.control',
   'sessions.end',
+  'sessions.unattended',
 ]);
 
 export const ADMIN_ROLE = 'admin';
 
+// sessions.unattended: connect to a saved PC without asking the person at it,
+// and switch a PC to "any time". It is the one sessions.* key that open mode
+// never grants, so it is named here and not left to the prefix rule below.
+export const UNATTENDED_PERMISSION = 'sessions.unattended';
+
 // What any Access caller holds while the workspace has no members: the session
-// tools, as before teams existed. Changing the team is not among them.
-export const OPEN_PERMISSIONS = Object.freeze(PERMISSIONS.filter((key) => key.startsWith('sessions.')));
+// tools, as before teams existed. Changing the team is not among them, and
+// neither is connecting to a saved PC without asking.
+export const OPEN_PERMISSIONS = Object.freeze(PERMISSIONS.filter((key) => key.startsWith('sessions.') && key !== UNATTENDED_PERMISSION));
 
 // Built-in roles. admin is fixed. technician and viewer are defaults a
 // workspace can edit, or delete while no member holds them.
@@ -37,7 +44,8 @@ export const BUILTIN_ROLES = Object.freeze({
 
 // Permissions that need a second factor when the caller is signed in as
 // themselves in a browser, or through OAuth consent: controlling a session,
-// managing the team, and managing saved PCs and custom fields. A role that
+// managing the team, managing saved PCs and custom fields, and connecting to a
+// PC without asking the person at it. A role that
 // holds any of them makes its members enrol an authenticator (factorRequired
 // in src/auth.js), and the browser sign-in and the OAuth consent page ask for a
 // code before they act on that role. Access logins and service tokens are
@@ -45,7 +53,7 @@ export const BUILTIN_ROLES = Object.freeze({
 // devices.manage and fields.manage, so a person whose role holds either must
 // enrol an authenticator even though the team API itself admits only Access
 // logins today.
-export const FACTOR_PERMISSIONS = Object.freeze(['sessions.control', 'members.manage', 'roles.manage', 'devices.manage', 'fields.manage']);
+export const FACTOR_PERMISSIONS = Object.freeze(['sessions.control', 'members.manage', 'roles.manage', 'devices.manage', 'fields.manage', UNATTENDED_PERMISSION]);
 export const needsSecondFactor = (permission) => FACTOR_PERMISSIONS.includes(permission);
 
 export const ROLE_ID_RE = /^[a-z0-9-]{1,40}$/;
@@ -89,6 +97,11 @@ const TOOL_PERMISSIONS = Object.freeze({
   send_sas: 'sessions.control',
   type_secret: 'sessions.control',
   request_full_control: 'sessions.control',
+  // Listing saved PCs reads the team's records. Connecting needs sessions.control;
+  // connecting without asking, and taking over, check sessions.unattended inside
+  // the tool and again when the claim commits.
+  device_list: 'devices.view',
+  device_connect: 'sessions.control',
 });
 
 // The permission a tool call needs, or null for a tool this table does not know.

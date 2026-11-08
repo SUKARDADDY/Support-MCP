@@ -167,7 +167,8 @@ async function attachAs(f, tag) {
 }
 
 async function nextFrame(ws) {
-  for (let i = 0; i < 100 && !ws.sent.length; i++) await new Promise((r) => setImmediate(r));
+  const end = performance.now() + 10_000; // a time bound: turns of the event loop are not time, and a hash runs on the thread pool
+  while (!ws.sent.length && performance.now() < end) await new Promise((r) => setImmediate(r));
   assert.ok(ws.sent.length, 'the relay sent no frame to the socket');
   return JSON.parse(ws.sent[ws.sent.length - 1]);
 }
@@ -335,7 +336,8 @@ test('a websocket upgrade with the right key attaches, welcomes, and sets the 24
   assert.equal(f.values.get('ws_tag'), 'g1');
   const expiresAt = f.now() + 24 * 60 * 60 * 1000;
   assert.equal(f.values.get('expires_at'), expiresAt);
-  assert.equal(f.alarm(), expiresAt);
+  // The alarm wakes every 30 seconds to look for a stop, since a quiet socket sends nothing; the 24 hours still end it.
+  assert.equal(f.alarm(), f.now() + 30 * 1000);
   assert.equal(f.sockets.length, 1);
   assert.deepEqual(f.sockets[0].tags, ['g1']);
   assert.deepEqual(JSON.parse(f.sockets[0].sent[0]), { type: 'welcome', expires_at: expiresAt });

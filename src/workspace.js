@@ -321,6 +321,50 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
     return results.map((r) => r.slug);
   }
 
+  // The name a workspace shows people: default is "Default", any other is its
+  // row's name, and a slug that does not exist falls back to the slug.
+  async function workspaceName(slug) {
+    checkSlug(slug);
+    if (slug === DEFAULT_WORKSPACE) return DEFAULT_NAME;
+    return (await q('SELECT name FROM workspaces WHERE slug = ?', slug).first('name')) ?? slug;
+  }
+
+  // ---- stop and resume ---------------------------------------------------------
+  // A workspace has no status column. It is stopped when its newest stop row in
+  // the team log is newer than its newest resume row, by seq. Each look reads
+  // only the few stop and resume rows (the audit_by_kind index), not the log.
+  async function stopState(slug) {
+    checkSlug(slug);
+    const row = await q(`SELECT
+      (SELECT MAX(seq) FROM audit WHERE workspace = ? AND kind = 'workspace_stopped') AS stopped,
+      (SELECT MAX(seq) FROM audit WHERE workspace = ? AND kind = 'workspace_resumed') AS resumed`, slug, slug).first();
+    const stopped = row.stopped !== null && row.stopped !== undefined && (row.resumed === null || row.resumed === undefined || row.stopped > row.resumed);
+    return { stopped };
+  }
+
+  // Stop needs sessions.end, resume needs members.manage. While default is open
+  // (no members) anyone admitted may stop it, as they may end a session; resume
+  // needs a member, so the first admin is added first. Stopping a stopped
+  // workspace changes nothing, and neither does resuming a running one.
+  async function setStopped(slug, actorIdentity, stopped) {
+    checkSlug(slug);
+    const actor = normalizeIdentity(actorIdentity);
+    const permission = stopped ? 'sessions.end' : 'members.manage';
+    return mutate(slug, actor, async () => {
+      const open = stopped && slug === DEFAULT_WORKSPACE && (await memberCount(slug)) === 0;
+      const ctx = open ? null : await actorContext(slug, actor, permission);
+      if ((await stopState(slug)).stopped === stopped) return { noop: true, result: { stopped } };
+      return {
+        entries: [{ kind: stopped ? 'workspace_stopped' : 'workspace_resumed', detail: stopped ? 'stopped' : 'resumed' }],
+        guard: ctx ? and(actorHas(slug, actor, permission), actorUnchanged(slug, ctx)) : noMembers(slug),
+        change: () => [],
+        result: { stopped },
+      };
+    });
+  }
+  const stopWorkspace = (slug, actor) => setStopped(slug, actor, true);
+  const resumeWorkspace = (slug, actor) => setStopped(slug, actor, false);
+
   // The workspaces this identity is a member of, by slug, and default first
   // when it is open (role_id null, as in whoami) or the caller is a member of it.
   async function listWorkspaces(identity) {
@@ -814,7 +858,8 @@ export function teamStore(db, { deploymentAdmins = '' } = {}) {
 
   return {
     authorize, whoami, recentCallers,
-    workspaceExists, workspaceSlugs, listWorkspaces, createWorkspace,
+    workspaceExists, workspaceSlugs, workspaceName, listWorkspaces, createWorkspace,
+    stopState, stopWorkspace, resumeWorkspace,
     isInvited, isDeploymentAdmin, memberships,
     listMembers, getMember, addMember, updateMember, removeMember,
     listRoles, addRole, updateRole, removeRole,

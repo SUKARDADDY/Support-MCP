@@ -126,7 +126,7 @@ test('a scripted run of every kind of change writes exactly the expected log kin
   const first = await devs.redeemCode({ protocol: 1, code: live.code, name: 'Front desk' });
   const waiting = await devs.requestJoin({ protocol: 1, workspace: W, name: 'Back office' });
   await devs.updateDevice(W, TECH, waiting.device_id, { approve: { confirm: waiting.confirm } });
-  await devs.updateDevice(W, TECH, first.device_id, { access: 'any' });
+  await devs.updateDevice(W, BOSS, first.device_id, { access: 'any' });
   await devs.updateOwn(keyOf(waiting), { name: 'Back room' });
   await devs.removeDevice(W, TECH, first.device_id);
   const leaving = await devs.requestJoin({ protocol: 1, workspace: W, name: 'Spare' });
@@ -155,8 +155,8 @@ test('a scripted run of every kind of change writes exactly the expected log kin
   assert.deepEqual(by('device_requested'), [`pc ${waiting.device_id}`, `pc ${leaving.device_id}`]);
   assert.deepEqual(by('device_approved'), [TECH]);
   assert.deepEqual(by('device_left'), [`pc ${leaving.device_id}`]);
-  assert.deepEqual(by('device_changed'), [TECH, `pc ${waiting.device_id}`, TECH]);
-  // The technician's access change names the old and the new mode.
+  assert.deepEqual(by('device_changed'), [BOSS, `pc ${waiting.device_id}`, TECH]);
+  // The admin's access change (it needs sessions.unattended) names the old and the new mode.
   assert.match(log.rows.find((r) => r.kind === 'device_changed').detail, /access ask to any/);
 });
 
@@ -328,7 +328,7 @@ test('an owner-started PC is pending until a technician types its six-digit numb
   await assert.rejects(devs.updateDevice(W, TECH, out.device_id, { approve: { confirm: wrong } }), refused(403, 'confirm_wrong'));
   await assert.rejects(devs.updateDevice(W, TECH, out.device_id, { approve: { confirm: '12345' } }), refused(400, 'bad_request'));
   await assert.rejects(devs.updateDevice(W, TECH, out.device_id, { approve: { confirm: out.confirm }, access: 'any' }), refused(400, 'bad_request'));
-  await assert.rejects(devs.updateDevice(W, TECH, out.device_id, { access: 'any' }), refused(409, 'pending'));
+  await assert.rejects(devs.updateDevice(W, BOSS, out.device_id, { access: 'any' }), refused(409, 'pending'));
   assert.equal((await devs.getDevice(W, out.device_id)).status, 'pending');
   const approved = await devs.updateDevice(W, TECH, out.device_id, { approve: { confirm: out.confirm } });
   assert.deepEqual([approved.status, approved.approved_by, approved.expires_at], ['active', TECH, undefined]);
@@ -514,10 +514,14 @@ test('the actor is re-checked at commit: a technician demoted after the read can
 test('a technician with devices.manage can change a PC access mode, logged as theirs; control and name stay the owner', async () => {
   const { team, devs } = await setup();
   const { out } = await pair(devs, TECH, { access: 'ask', control: 'limited', name: 'Till' });
-  const changed = await devs.updateDevice(W, TECH, out.device_id, { access: 'any' });
-  assert.deepEqual([changed.access, changed.control, changed.name], ['any', 'limited', 'Till']);
+  const changed = await devs.updateDevice(W, TECH, out.device_id, { access: 'ask' });
+  assert.equal(changed.access, 'ask', 'no change, so nothing is logged');
+  // Switching to any time also needs sessions.unattended, which a technician does not hold.
+  await assert.rejects(devs.updateDevice(W, TECH, out.device_id, { access: 'any' }), refused(403, 'permission_denied'));
+  const switched = await devs.updateDevice(W, BOSS, out.device_id, { access: 'any' });
+  assert.deepEqual([switched.access, switched.control, switched.name], ['any', 'limited', 'Till']);
   const row = (await team.readAudit(W, { limit: 500 })).rows.at(-1);
-  assert.deepEqual([row.kind, row.actor], ['device_changed', TECH]);
+  assert.deepEqual([row.kind, row.actor], ['device_changed', BOSS]);
   assert.match(row.detail, /access ask to any/);
   // control and name are the owner's, set from the PC: a technician sending them is refused, not ignored.
   const log = (await kinds(team)).length;
@@ -547,7 +551,7 @@ test('the owner contact is the team side: a technician sets and clears it, logge
   assert.equal((await devs.updateDevice(W, TECH, out.device_id, { owner_contact: '' })).owner_contact, '');
   assert.equal((await kinds(team)).length, log + 1);
   // It combines with other changes, but not with an approval; it is text up to 200 characters.
-  const both = await devs.updateDevice(W, TECH, out.device_id, { owner_contact: 'Dana', access: 'any' });
+  const both = await devs.updateDevice(W, BOSS, out.device_id, { owner_contact: 'Dana', access: 'any' });
   assert.deepEqual([both.owner_contact, both.access], ['Dana', 'any']);
   assert.match((await team.readAudit(W, { limit: 500 })).rows.at(-1).detail, /^[a-z2-7]{20} access ask to any, owner_contact$/);
   for (const body of [{ owner_contact: 'x'.repeat(201) }, { owner_contact: 5 }, { owner_contact: 'a\u0007b' }, { owner_contact: 'x', approve: { confirm: '123456' } }]) {
@@ -954,7 +958,7 @@ test('a mode or site changed between the plan and the batch is never logged as a
   // A technician asks for 'any'; someone else already set it.
   const a = (await pair(devs, TECH, { access: 'ask' })).out;
   sneakBeforeBatch(db, () => db.sqlite.prepare("UPDATE devices SET access = 'any' WHERE id = ?").run(a.device_id));
-  assert.equal((await devs.updateDevice(W, TECH, a.device_id, { access: 'any' })).access, 'any');
+  assert.equal((await devs.updateDevice(W, BOSS, a.device_id, { access: 'any' })).access, 'any');
   assert.deepEqual(await details(), [], 'the retry found nothing to change and logged nothing');
   // A technician moves the PC to site C while another change moved it to site B.
   const customer = await devs.addRecord('customer', W, TECH, { name: 'Dana' });

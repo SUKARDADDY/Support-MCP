@@ -1,4 +1,4 @@
-// The team API: members, roles, the team log, and the customers, sites, saved
+// The team API: members, roles, the team log, the stop switch, and the customers, sites, saved
 // PCs, custom fields and pairing codes of a workspace, under
 // /api/v1/w/<slug>/..., plus POST and GET /api/v1/w to create a workspace and
 // list the caller's. "default" always exists; any other slug exists once it has
@@ -10,6 +10,7 @@
 // member. A PC pairs and checks in at /device/ (src/device-api.js), not here.
 import { TeamError, teamFromEnv } from './workspace.js';
 import { ID_RE, devicesFromEnv } from './devices.js';
+import { deviceHooks } from './device-sessions.js';
 
 const ROOT = '/api/v1/w';
 const PREFIX = '/api/v1/w/';
@@ -162,6 +163,27 @@ export async function handleApi(request, env, url, { accessCaller, isJsonContent
         return json({ removed: await team.removeRole(slug, caller, roleId) });
       }
       return notAllowed('PATCH, DELETE');
+    }
+
+    // Stop and resume. A stopped workspace ends every live session now and answers
+    // no tool call until it is resumed. Whoever may end sessions can stop it; resuming
+    // needs members.manage. Both are rows in the team log, so the state has no column
+    // to tamper with. Stopping again re-ends any session the first stop missed.
+    if (collection === 'stop' && item === undefined) {
+      if (method === 'GET') {
+        await need(team, slug, caller, ['sessions.view']);
+        return json(await team.stopState(slug));
+      }
+      if (method === 'POST') {
+        await need(team, slug, caller, ['sessions.end']);
+        const state = await team.stopWorkspace(slug, caller);
+        return json({ ...state, sessions_ended: await deviceHooks(env).stopAll(slug, caller) });
+      }
+      if (method === 'DELETE') {
+        await need(team, slug, caller, ['members.manage'], 'first_member');
+        return json(await team.resumeWorkspace(slug, caller));
+      }
+      return notAllowed('GET, POST, DELETE');
     }
 
     // Customers, sites, saved PCs, custom fields and pairing codes. Reading takes

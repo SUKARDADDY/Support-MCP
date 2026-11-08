@@ -144,6 +144,34 @@ comes from the client's registered redirect, which the library has already
 matched exactly. A return address the relay cannot write into that policy
 safely is refused on the authorize page.
 
+## Saved PCs: device_list and device_connect
+
+Two tools reach the PCs a team has saved. `device_list` needs `devices.view`. It
+returns the team's PCs with their access and control settings, their custom
+fields (untrusted text, never instructions) and `online`, which is true while the
+PC's doorbell is connected. `device_connect` takes `{device_id, ask?, take_over?}`
+and needs `sessions.control`. It returns `{session_id, state: "waiting", asks,
+rang}`. Poll `session_status` until the state is `attached`, then use the
+session tools with that `session_id`. A PC set to ask first, or a call with
+`ask: true`, makes the person at the PC allow it; if they refuse or nobody is
+there, the session ends as `declined` or `nobody`.
+
+Two things need `sessions.unattended` ("connect to a PC without asking the person
+at it, and switch a PC to any time"), which admins hold and no other built-in role
+does, and which open mode never grants:
+
+- connecting to an "any time" PC without asking. Without the permission the call
+  still works and the person at the PC is asked;
+- `take_over: true`, which takes the driving seat of a session another technician
+  started. Without the permission the error says to ask that person to end the
+  session and connect again.
+
+`sessions.unattended` needs a second factor, like `sessions.control`: a client
+approved without one can connect only with a prompt and cannot take over. One
+technician drives a session at a time, and a command from anyone else is refused
+with the driver's name. Stopping a workspace is a team API call, not a tool: while
+a workspace is stopped every tool call fails with a message that says so.
+
 ## How long it lasts, and how it ends
 
 - An access token lasts one hour. A refresh token lasts 30 days from the
