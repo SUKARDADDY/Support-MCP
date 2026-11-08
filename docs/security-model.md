@@ -274,7 +274,7 @@ apply to only one client say which.
   saved PC's four addresses under `/device/` are public and sit under none of
   these Access apps, because a PC has no Access login; they have their own rules,
   below. So does `/install`, the setup page and download that a PC's owner opens
-  from a link.
+  from a link, and where a saved PC downloads its updates.
   Access session revocation does not apply on a bypassed path. There the relay's
   own checks are the gate: the JWT or the OAuth token, and the role check on
   every tool call.
@@ -384,7 +384,9 @@ apply to only one client say which.
     install link is a different address and does carry a code: see below.) The
     four addresses are POST only, https only (loopback excepted), refuse any request with an `Origin`
     header, take only JSON of at most 8 KB, and carry `"protocol": 1` in every
-    request and answer so a later version can coexist.
+    request and answer so a later version can coexist. The update download is not
+    one of them: it is `POST /install` with the relay's own `Origin`, as the setup
+    page's button sends it, and it carries no key.
   - *An owner-started install needs a technician.* The PC joins as waiting and
     can only check in or leave. A technician approves it by typing the six-digit
     number the owner reads out. It is gone after 24 hours. A wrong number is
@@ -443,7 +445,9 @@ apply to only one client say which.
     one Windows permission prompt elevates it. It creates
     `%ProgramFiles%\SupportMCP` (the path comes from the registry, as for full
     control), and in it `support.exe`, the device record `device.json` and the
-    local history `history.json`. It registers a Windows service,
+    local history `history.json`. After an update the folder also holds the new
+    version as its own file, `support-<version>-<8 hex>.exe`, the previous one, and
+    the update record `update.json`. It registers a Windows service,
     "Support device service" (`SupportMcpDevice`, LocalSystem, automatic start,
     restart on failure, a quoted path), a tray startup value `SupportMcpTray`
     under `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`, and an entry
@@ -462,22 +466,82 @@ apply to only one client say which.
     step fails after the PC paired, the install tells the relay to forget the PC
     and removes what it made.
   - *Who can hold the key.* The PC's key is held only by SYSTEM or by an elevated
-    administrator process. `support.exe` is readable and runnable by users,
-    because the tray and the uninstall run from it, but it carries no key. The
-    folder, the device record and the history are readable only by SYSTEM and
-    administrators (inheritance off). The key is never in a URL, a command line,
+    administrator process. The app files (`support.exe` and any version file) are
+    readable and runnable by users, because the tray and the uninstall run from
+    them, but they carry no key and users cannot change them. The folder, the
+    device record, the history and the update record are readable only by SYSTEM
+    and administrators (inheritance off). The key is never in a URL, a command line,
     a log, the tray or a file a standard user can read.
   - *Consent at setup.* The wizard asks for the PC's name, then how support may
     connect ("Ask me each time" or "Connect any time (unattended)") and how
     much control (full control or limited support). Nothing is preselected for
     either, so the owner must choose. The Windows permission prompt is the
     second consent. No other path installs a saved PC.
-  - *The service only checks in.* In this release it contacts the relay every few
-    minutes with the PC's key and writes local history. It runs no commands,
-    takes no screenshots and opens no files for anyone, and it never reads a
-    session footer. Nobody can connect to a saved PC yet, and Stage 1 stays off
-    real customers' unattended PCs until the release that enforces rules about
-    who may connect and when.
+  - *The service checks in, and installs only signed releases.* In this release
+    it contacts the relay every few minutes with the PC's key and writes local
+    history. It runs no commands, takes no screenshots and opens no files for
+    anyone, and it never reads a session footer. It also installs new versions of
+    itself, but only releases signed with the project's release key, below.
+    Nobody can connect to a saved PC yet, and Stage 1 stays off real customers'
+    unattended PCs until the release that enforces rules about who may connect
+    and when.
+  - *Updates come signed, and only forward.* A release note (version, the exe's
+    SHA-256 and size, and a date) is signed with an ECDSA P-256 key that is kept
+    offline in a secrets manager and read into the signer only at deploy time. It
+    never reaches the relay, Cloudflare or CI. The relay passes the signature on
+    and checks nothing; the PC checks it against the public key built into the
+    app, refuses any other form of note or signature, and takes only a version
+    newer than its own that has not failed on it before. It downloads the app from
+    `/install` and keeps it only when its size and SHA-256 match the signed note.
+    So a relay, or anyone who controls it, can offer a release or hold one back,
+    but cannot make a PC run anything the key did not sign, or go back to an older
+    signed release. What it can do: answer a new version's check-in with a 426
+    or another refusal, so that version rolls back and is skipped from then on
+    until a newer release; and hold updates back. Both are accepted. A release reaches 10% of
+    PCs for a day, then half for a day, then all, by a group derived from the
+    release and the PC's id, and `UPDATE_ROLLOUT` pauses it or pins a share.
+  - *How a version is swapped.* The service writes each version as its own file
+    in the locked folder, with the users-may-read-and-run ACL applied when the
+    file is created, so nobody else can change it at any point. It reads the file
+    back through a handle that denies writing and holds it until the switch. A
+    SYSTEM child of the service then points the service, the tray's startup value
+    and the Apps entry at the new file and starts it. Nothing is staged in a
+    folder users can write, and no file is renamed, so a user holding the old file
+    open blocks nothing. While the new version is on trial, every failure of the
+    service (a crash, or a stop with an error) runs the old file's rollback, also
+    after a restart. The new version must also get a healthy answer to a
+    check-in within 4 minutes: a 200, a 202 or a 401 keeps it; a 426 or any
+    other refusal rolls it back at once. With no network or a server error it
+    tries again every 30 seconds, and near the deadline a PC still without a
+    network keeps it, since that is not the version's fault. A watcher started
+    from the old file rolls back a trial still open at the deadline. The switch
+    starts one; after a restart the new version starts another at its own start
+    and gets a fresh 4 minutes, so a version that never finishes a healthy
+    check-in is rolled back even across restarts. Only SYSTEM starts these
+    steps, and only the service (or its failure action) does. A rollback that a
+    restart cut short is finished at the next start, and a record that names
+    neither the running file nor the old one and is 10 minutes past its deadline
+    is cleared. A version that fails is recorded on the PC and never tried
+    again; one whose service never ran (a restart before the switch finished)
+    does not count as failed. The owner sees only history lines and the version
+    in the tray: no prompt and no window. One-off session apps never update
+    themselves.
+  - *A signed-in user can delay a rollback, not stop it for good.* The old file
+    is readable by every user, so a user can hold it open without sharing and
+    the old service then cannot start. The rollback keeps trying to start it for
+    5 minutes, with a growing wait between tries, while it holds the setup lock
+    (so an uninstall meanwhile says "busy"). If the user still holds the file
+    after that, the service stays stopped until the next restart, when Windows
+    starts it as usual. The user gains no control over the PC or the service
+    this way; it is a local denial of service of the support app only, and it
+    lasts until the next restart at most.
+  - *If the release key is lost or exposed.* PCs cannot be moved to a new key
+    without a release signed by the old one: a release that carries the new public
+    key moves them. Without the old key, each PC needs a reinstall. Keep the key
+    where only a machine account you control can read it. Self-hosters who build
+    their own app put their own public key in `release-key.pub` and in
+    `ReleaseKey.ProjectKey`, sign with their own key, and are never offered a
+    release signed by anyone else's.
   - *The status pipe.* The tray talks to the service over the pipe
     `SupportMcpDevice-ui`. Only SYSTEM can create instances, it is closed to the
     network, and interactive users can read and write data on it. It serves
@@ -504,9 +568,16 @@ apply to only one client say which.
     tray asks for one Windows permission prompt. It runs from a temporary copy,
     so nothing in the install folder stays open. It tells the relay to forget the
     PC (`/device/leave`, so the key stops working), has the service end every
-    tray, stops and deletes the service, and deletes the startup value, the Apps
-    entry and the folder with the junction-safe delete the one-off cleanup uses.
-    Anything still locked is deleted at the next restart. If the relay cannot be
+    tray and ends any left that were started from any app file in the folder,
+    stops and deletes the service, and deletes the startup value, the Apps entry
+    and the folder, with every version file and the update record in it, with the
+    junction-safe delete the one-off cleanup uses. Anything still locked is
+    deleted at the next restart. A version file still in use after an update
+    is renamed first and only the new name is queued, so a later install of
+    `support.exe` is never deleted by a queued removal. While an update's trial
+    is open it changes
+    nothing and says "Support is finishing an update. Try again in a few
+    minutes." If the relay cannot be
     reached, the PC is still removed locally, the key stays valid on the relay,
     and the team must remove the PC from their list to end it.
 - **Each session belongs to its workspace.** A session stores the workspace that
@@ -868,7 +939,9 @@ apply to only one client say which.
   cleanup covers only its own folder, logon entry and scheduled tasks, and the
   app's covers its service, task, folder and registry value. Neither undoes files an operator wrote,
   software it installed or settings it changed.
-- **The app is unsigned.** See [Unsigned app](#unsigned-app). An unsigned exe
+- **The app is unsigned.** See [Unsigned app](#unsigned-app). The release key
+  that signs updates for saved PCs is a different thing: Windows never sees it,
+  and it does not make the exe signed. An unsigned exe
   that installs a service may be removed by antivirus, so the download page says
   "If your antivirus removes the file, tell support." Anyone can ask the
   customer to run an unsigned program, so tell the customer who you are before
@@ -882,3 +955,8 @@ shows "Windows protected your PC" when the customer opens it. The download page
 tells them both steps: **Keep anyway** in Edge, then **More info** and **Run anyway**. The warning goes away
 only when you sign the app with a certificate your customers' Windows trusts.
 Signing, for example with `signtool`, is out of scope for this repository.
+
+The release key is not code signing. It signs a short release note, and only a
+saved PC's own update check reads that signature (see "Updates come signed, and
+only forward" above). SmartScreen and antivirus still see an unsigned exe, also
+when a saved PC replaces itself with a new version.

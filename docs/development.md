@@ -256,14 +256,90 @@ To cut a release:
    from `package.json`.
 
 After the PR merges, tag the merge commit `v0.3.0` and create a GitHub release
-from the CHANGELOG entry. Deploy with
+from the CHANGELOG entry. Then sign the release and deploy it, as below.
+
+### Sign and deploy a release
+
+Saved PCs update themselves only to a release signed with the project's release
+key ([Updates](relay-v1-spec.md#updates)). The private key is a secure note,
+"Support MCP release key", in the maintainers' Bitwarden organisation vault. It is
+never written to disk: not on your computer, not in Cloudflare, not in CI. You sign at deploy time, because the stages (10% of PCs
+for a day, then half for a day, then all) count from the signing time; a
+release signed long before its deploy would skip them.
+
+1. Make sure `src/app-bundle.json` is the bundle built from the merged source
+   (CI's `verify-app-binary` passed on the PR).
+2. Sign. Open the note in the Bitwarden web vault, click **Copy notes**, and
+   pipe the clipboard straight into the signer, then clear the clipboard:
+
+   ```sh
+   wl-paste | node scripts/sign-release.mjs --out release-files   # pbpaste on macOS
+   wl-copy --clear
+   ```
+
+   With the Bitwarden CLI signed in and unlocked, `bw get notes "Support MCP
+   release key" | node scripts/sign-release.mjs --out release-files` does the
+   same. Either way the key goes from pipe to pipe and is never on a command line
+   or on disk.
+
+   `scripts/sign-release.mjs` reads the key from stdin only. It checks that the
+   bundle was built from `src/agent-app.cs` and carries `VERSION`, builds the
+   release note from the exe's SHA-256 and size and the current time, signs it,
+   and checks the signature against `release-key.pub`. A key that does not match
+   signs nothing. It prints `RELEASE_SIGNATURE=...`, `RELEASE_SIGNED_AT=...` and
+   the note, and `--out` writes the exe, the note and the signature
+   (`support-mcp-<version>.exe`, `.note` and `.note.sig`) into that folder.
+3. Deploy right away with the two settings, so the relay offers the release:
+
+   ```sh
+   npx wrangler deploy --tag vX.Y.Z --message "<one-line summary>" \
+     --var RELEASE_SIGNATURE:<signature> --var RELEASE_SIGNED_AT:<seconds>
+   ```
+
+   (add `--config` if you deploy from a separate config file) so the version
+   list in the Cloudflare dashboard shows which release each deployment is.
+   Without the two settings the relay offers no update, and nothing else
+   changes. A later deploy of the same bundle and version can pass the same two
+   values again; any rebuild or new version needs a new signature.
+4. Attach the three files from `release-files` to the GitHub release, so anyone
+   can check a PC's app against the signed note.
+
+`UPDATE_ROLLOUT` controls who is offered the release: empty follows the stages,
+`pause` (or `0`) offers nothing at once, also in the 426 answer, and a whole
+number 0 to 100 pins that share of PCs. Set it with `--var
+UPDATE_ROLLOUT:pause` on a deploy. A prerelease version (`0.6.0-rc.1`) is offered
+only when `UPDATE_ROLLOUT` pins a number. A PC that waits for approval is never
+offered one. Each PC reports its version at every check-in, so the team's device
+list shows how far a release has gone.
+
+The release key was made once with `scripts/release-key.mjs`, which creates the
+key in memory, writes the private key (a PEM block) to stdout for your secrets
+manager, and writes only the public key (64 bytes `X||Y`, base64) to the file you
+name. It refuses to print the key to a terminal, so pipe it to the clipboard:
 
 ```sh
-npx wrangler deploy --tag v0.3.0 --message "<one-line summary>"
+node scripts/release-key.mjs release-key.pub | pbcopy   # macOS; clip on Windows, wl-copy on Linux
 ```
 
-(add `--config` if you deploy from a separate config file) so the version list
-in the Cloudflare dashboard shows which release each deployment is.
+Paste it, from `-----BEGIN` to `-----END ... -----` inclusive, into the Notes of
+a new secure note in the Bitwarden web vault, owned by the organisation, then
+clear the clipboard (and any clipboard history). Do not pass it to a command such
+as `bw create`: that puts the key on a command line, where other processes and the
+shell history can see it. Any other way of storing it works if it never puts the
+key on a command line or on disk.
+
+The same public key is the constant `ReleaseKey.ProjectKey` in
+`src/agent-app.cs`; `test/release.test.js` fails when the two differ. To move to a
+new key, ship a release signed by the old key that carries the new public key;
+PCs that never got it need a reinstall.
+
+If you host your own relay with a tagged release's `src/app-bundle.json`
+unchanged, you can deploy with the signature and the `released` time from that
+GitHub release's `.note` and `.note.sig`: the relay rebuilds the same note from
+the same bundle. If you build your own app, make your own key the same way, put
+its public key in `release-key.pub` and in `ReleaseKey.ProjectKey`, rebuild the
+app, and sign with your key. A relay that serves a bundle the project key did
+not sign offers PCs nothing they will take.
 
 ## Develop and test
 

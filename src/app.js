@@ -599,7 +599,7 @@ export function createHandler(agentText, appBundle = null, options = {}) {
       }
       if (p === '/api' || p.startsWith('/api/')) return handleApi(request, env, url, { accessCaller, isJsonContentType, origin });
       // A PC pairs and checks in here with its own key. Public: outside Access.
-      if (p.startsWith('/device/')) return handleDevice(request, env, url, { isLoopback, isJsonContentType });
+      if (p.startsWith('/device/')) return handleDevice(request, env, url, { isLoopback, isJsonContentType, appBundle });
       return new Response('not found', { status: 404 });
     },
   };

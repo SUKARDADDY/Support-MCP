@@ -45,6 +45,14 @@ MAIL_PROVIDER = ""
 MAIL_FROM = ""
 SIGNIN_IDLE_HOURS = "12"
 SIGNIN_MAX_DAYS = "14"
+# Updates for saved PCs (docs/development.md, "Releases"). RELEASE_SIGNATURE and
+# RELEASE_SIGNED_AT come from scripts/sign-release.mjs at each deploy (pass them
+# with --var); with either empty, no PC is offered an update. UPDATE_ROLLOUT
+# empty follows the stages (10%, then half, then all, a day apart), "pause"
+# offers nothing, and a whole number 0 to 100 pins the share of PCs.
+RELEASE_SIGNATURE = ""
+RELEASE_SIGNED_AT = ""
+UPDATE_ROLLOUT = ""
 # Secrets, set with `wrangler secret put <NAME>`, never here: AUTH_SECRET
 # (32 or more random characters), GOOGLE_CLIENT_SECRET, MICROSOFT_CLIENT_SECRET
 # and RESEND_API_KEY.

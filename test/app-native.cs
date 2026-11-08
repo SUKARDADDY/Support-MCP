@@ -110,7 +110,14 @@ public sealed class FakeRelay : IDisposable {
 
 // A fake /device/ relay for DeviceLink, on an HttpListener like FakeRelay. Status and Body are what it answers next;
 // LastPath, LastAuth and LastJson record the request it saw; Refuse drops the connection, so the client reads offline.
+// /install is routed apart and answers with bytes: InstallBody with InstallStatus (and InstallLocation for a redirect);
+// InstallCut sends half of the body it announced and drops the connection; InstallChunked sends the body chunked, with
+// no Content-Length; InstallTrickleMs sends it 1 KB at a time with that pause between. InstallHits counts the
+// downloads, and the Install* fields record the last download request.
 sealed class FakeDevice : IDisposable {
+    public volatile byte[] InstallBody; public volatile int InstallStatus = 200, InstallTrickleMs; public volatile bool InstallCut, InstallChunked;
+    public volatile string InstallLocation, InstallMethod = "", InstallQuery = "", InstallOrigin, InstallType;
+    public int InstallHits, InstallBodyLength = -1;
     readonly HttpListener listener = new HttpListener();
     readonly Thread server;
     public readonly string Origin;
@@ -133,6 +140,7 @@ sealed class FakeDevice : IDisposable {
     void Reply(HttpListenerContext ctx) {
         try {
             if (Refuse) { ctx.Response.Abort(); return; }
+            if (ctx.Request.Url.AbsolutePath == "/install") { Install(ctx); return; }
             string path = ctx.Request.Url.AbsolutePath, body = path == "/device/hello" && HelloBody != null ? HelloBody : Body;
             LastPath = path; LastAuth = ctx.Request.Headers["Authorization"];
             using (var r = new StreamReader(ctx.Request.InputStream)) LastJson = r.ReadToEnd();
@@ -142,12 +150,88 @@ sealed class FakeDevice : IDisposable {
             ctx.Response.OutputStream.Write(bytes, 0, bytes.Length); ctx.Response.Close();
         } catch (Exception) { try { ctx.Response.Abort(); } catch (Exception) { } }
     }
+    void Install(HttpListenerContext ctx) {
+        Interlocked.Increment(ref InstallHits);
+        InstallMethod = ctx.Request.HttpMethod; InstallQuery = ctx.Request.Url.Query; InstallOrigin = ctx.Request.Headers["Origin"]; InstallType = ctx.Request.ContentType;
+        using (var seen = new MemoryStream()) { ctx.Request.InputStream.CopyTo(seen); InstallBodyLength = (int)seen.Length; }
+        byte[] body = InstallBody ?? new byte[0];
+        ctx.Response.StatusCode = InstallStatus;
+        if (InstallLocation != null) ctx.Response.RedirectLocation = InstallLocation;
+        ctx.Response.ContentType = "application/octet-stream";
+        if (InstallChunked) ctx.Response.SendChunked = true; else ctx.Response.ContentLength64 = body.Length;
+        if (InstallTrickleMs > 0) {
+            for (int i = 0; i < body.Length; i += 1024) { ctx.Response.OutputStream.Write(body, i, Math.Min(1024, body.Length - i)); ctx.Response.OutputStream.Flush(); Thread.Sleep(InstallTrickleMs); }
+            ctx.Response.Close(); return;
+        }
+        if (InstallCut) { ctx.Response.OutputStream.Write(body, 0, body.Length / 2); ctx.Response.OutputStream.Flush(); ctx.Response.Abort(); return; }
+        ctx.Response.OutputStream.Write(body, 0, body.Length); ctx.Response.Close();
+    }
     public Dictionary<string, object> Sent() { return Wire.Json().Deserialize<Dictionary<string, object>>(LastJson); }
     public void Dispose() { try { listener.Close(); } catch (Exception) { } server.Join(1000); }
 }
 
+// A throwaway P-256 key made at run time, so the tests can sign any release note. Xy is its public key in the form the
+// app carries (ReleaseKey). ECDsaCng.SignData gives the 64-byte r||s form the app takes.
+sealed class TestSigner : IDisposable {
+    readonly System.Security.Cryptography.ECDsaCng key;
+    public readonly string Xy;
+    public TestSigner() {
+        key = new System.Security.Cryptography.ECDsaCng(256);
+        key.HashAlgorithm = System.Security.Cryptography.CngAlgorithm.Sha256;
+        byte[] blob = key.Key.Export(System.Security.Cryptography.CngKeyBlobFormat.EccPublicBlob), xy = new byte[64];
+        Buffer.BlockCopy(blob, 8, xy, 0, 64); Xy = Convert.ToBase64String(xy);
+    }
+    public string Sign(string note) { return Convert.ToBase64String(key.SignData(Encoding.UTF8.GetBytes(note))); }
+    public void Dispose() { key.Dispose(); }
+}
+
+// Reads a service's failure actions back the way Windows stores them (QueryServiceConfig2, levels 2 and 4), and makes
+// a throwaway demand-start service for the service-control test.
+static class ScmProbe {
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern IntPtr OpenSCManager(string machine, string database, uint access);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern IntPtr CreateService(IntPtr scm, string name, string display, uint access, uint type, uint start, uint error, string path, string group, IntPtr tag, string dependencies, string account, string password);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern IntPtr OpenService(IntPtr scm, string name, uint access);
+    [DllImport("advapi32.dll", SetLastError = true)] public static extern bool CloseServiceHandle(IntPtr h);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern bool QueryServiceConfig2(IntPtr service, uint level, IntPtr buffer, int size, out int needed);
+    [StructLayout(LayoutKind.Sequential)] struct FailureActions { public uint ResetPeriod; public IntPtr RebootMessage, Command; public uint Count; public IntPtr Actions; }
+    [StructLayout(LayoutKind.Sequential)] struct ScAction { public int Type; public uint Delay; }
+    public sealed class Actions { public uint Reset; public string Command; public readonly List<string> Steps = new List<string>(); public bool NonCrash; }
+    // A demand-start (3), own-process (0x10) service that is never started.
+    public static void Create(string name, string binary) {
+        IntPtr scm = OpenSCManager(null, null, 0x0003); if (scm == IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
+        try { IntPtr s = CreateService(scm, name, name, 0xF01FF, 0x10, 3, 1, binary, null, IntPtr.Zero, null, null, null); if (s == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(); CloseServiceHandle(s); }
+        finally { CloseServiceHandle(scm); }
+    }
+    public static Actions Query(string name) {
+        IntPtr scm = OpenSCManager(null, null, 0x0001); if (scm == IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
+        try {
+            IntPtr s = OpenService(scm, name, 0x0001); if (s == IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
+            IntPtr buf = Marshal.AllocHGlobal(8192);
+            try {
+                var r = new Actions(); int needed;
+                if (!QueryServiceConfig2(s, 2, buf, 8192, out needed)) throw new System.ComponentModel.Win32Exception();
+                var fa = (FailureActions)Marshal.PtrToStructure(buf, typeof(FailureActions));
+                r.Reset = fa.ResetPeriod; r.Command = fa.Command == IntPtr.Zero ? null : Marshal.PtrToStringUni(fa.Command);
+                int size = Marshal.SizeOf(typeof(ScAction));
+                for (int i = 0; i < (int)fa.Count; i++) {
+                    var a = (ScAction)Marshal.PtrToStructure(new IntPtr(fa.Actions.ToInt64() + i * size), typeof(ScAction));
+                    r.Steps.Add(a.Type + "/" + a.Delay);
+                }
+                if (!QueryServiceConfig2(s, 4, buf, 8192, out needed)) throw new System.ComponentModel.Win32Exception();
+                r.NonCrash = Marshal.ReadInt32(buf) != 0;
+                return r;
+            } finally { Marshal.FreeHGlobal(buf); CloseServiceHandle(s); }
+        } finally { CloseServiceHandle(scm); }
+    }
+}
+
 public static class AppTests {
     static void Assert(bool ok, string detail) { if (!ok) throw new Exception(detail); }
+    // Windows adds Synchronize to an allow rule it reads back (a FileSecurity's ReadAndExecute comes back as
+    // "ReadAndExecute, Synchronize"), so the update tests compare rights without it, and only without it.
+    static FileSystemRights NoSync(FileSystemRights r) { return r & ~FileSystemRights.Synchronize; }
+    // Test cleanup never throws: a file a failed test left open must not hide that failure behind another.
+    static void TryDeleteDir(string dir) { try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch (Exception e) { Console.WriteLine("NOTE could not remove " + dir + ": " + e.Message); } }
     static void m3Release(System.Threading.Mutex m) { try { m.ReleaseMutex(); } catch (Exception) { } }
     static string Decode(Dictionary<string, object> r, string key) { return Encoding.UTF8.GetString(Convert.FromBase64String(Wire.Text(r, key))); }
     static Dictionary<string, object> Run(string command, int timeout) { return Wire.Map("type", "run", "command", command, "timeout_s", timeout); }
@@ -323,7 +407,8 @@ public static class AppTests {
         Assert(DeviceSetup.Folder.EndsWith("\\SupportMCP") && DeviceSetup.Exe == Path.Combine(DeviceSetup.Folder, "support.exe") && Directory.Exists(FullInstall.Root), "the install folder is under %ProgramFiles%\\SupportMCP and the app is support.exe in it");
         // A tray the wizard starts must not hold the install folder as its current directory, or it cannot be renamed aside.
         var trayStart = DeviceSetup.TrayStart(); string trayDir = Path.GetFullPath(trayStart.WorkingDirectory).TrimEnd('\\');
-        Assert(trayStart.FileName == DeviceSetup.Exe && trayStart.Arguments == "--tray" && !trayStart.UseShellExecute, "the wizard starts the installed exe with --tray");
+        Assert(trayStart.FileName == DeviceSetup.InstalledExe() && trayStart.Arguments == "--tray" && !trayStart.UseShellExecute, "the wizard starts the installed exe with --tray");
+        Assert(UpdateSwitch.InFolder(DeviceSetup.InstalledExe(), DeviceSetup.Folder) && UpdateSwitch.IsVersionFile(Path.GetFileName(DeviceSetup.InstalledExe())), "the installed exe is a version file in the install folder (support.exe when not installed)");
         Assert(trayDir.Length > 0 && !(trayDir + "\\").StartsWith(DeviceSetup.Folder.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase), "the tray's working directory is not inside the install folder");
 
         // The locked folder: owner Administrators, SYSTEM and Administrators full, nothing inherited (as FullAcl.Folder,
@@ -379,6 +464,7 @@ public static class AppTests {
 
         // The status frame: confirm is shown only while pending.
         var pending = DeviceService.StatusFrame("PC", "ask", "limited", DeviceState.Pending, "482913", 111, new System.Collections.ArrayList());
+        Assert(Wire.Text(pending, "version") == Wire.Version, "the status frame carries the service's own version");
         Assert(Wire.Text(pending, "state") == DeviceState.Pending && Wire.Text(pending, "confirm") == "482913" && Wire.Number(pending, "last_ok_at") == 111, "a pending frame carries the six digits");
         foreach (string st in new string[] { DeviceState.Active, DeviceState.Expired, DeviceState.Removed, DeviceState.Offline }) {
             Assert(!DeviceService.StatusFrame("PC", "any", "full", st, "482913", 0, new System.Collections.ArrayList()).ContainsKey("confirm"), "no confirm outside pending: " + st);
@@ -465,6 +551,7 @@ public static class AppTests {
         Assert(recent.Count == 4 && recent[0].Contains("line 5") && recent[3].Contains("line 2"), "the last four history lines, newest first");
         Assert(TrayText.Recent(null, 4).Count == 0, "no history is no lines");
         Assert(TrayText.Tip(new string('x', 200)).Length <= 63, "the tooltip fits 63 characters");
+        Assert(TrayText.VersionLine("0.5.1") == "Version 0.5.1" && TrayText.VersionLine("") == "" && TrayText.VersionLine(null) == "" && TrayText.VersionLine("<b>1</b>") == "", "the version line, hidden for an older service or junk");
 
         // The icon is drawn at run time: Create makes a handle, DestroyIcon frees it. A different color per state.
         IntPtr h = TrayIcon.Create(16, TrayIcon.ColorFor(DeviceState.Active));
@@ -646,6 +733,692 @@ public static class AppTests {
         }
         Console.WriteLine("PASS the live service: a 200 with no device, a team mode change, allow_any_time one-way and async, terminal persistence across a reload, and the uninstall event");
     }
+    // ---- signed updates -----------------------------------------------------------------------------------------
+    // The test-key vector: a note signed by a throwaway key whose private half was never committed. TestKeyXy is that
+    // key; TestSigDer is the same note signed in DER form, which the app must refuse.
+    const string TestKeyXy = "EIVL0HmT752JhnLYiey2OvyNAoKvG/GA7kJWMJABU2pxweY7hn0EzmZlSmF6584sb8cYDZBGRK1E5bOIckyGgg==";
+    const string TestNote = "support-mcp-release 1\nversion 0.5.1\nsha256 abababababababababababababababababababababababababababababababab\nsize 229376\nreleased 1794000000\n";
+    const string TestSig = "fLoDvxmMWPIAhN3RyHweH44dJX+aDX7jD2s8SnZ8iCdUhPjPnC0aGna+3dtLT1WjwhgDHZiYpE+tLglfCh0ZFg==";
+    const string TestSigDer = "MEUCIGHh+cKtdr8sMRGKhXlqNwjVm95i/pDDpU0IEZ0/SQZTAiEA1wmbyICv4E4TMPnKjkA13XNQOR7giPBFAxokivEa2HQ=";
+    // The real-key vector: a note signed by the real project key, for a version and hash no release can carry.
+    const string RealNote = "support-mcp-release 1\nversion 0.0.1\nsha256 0000000000000000000000000000000000000000000000000000000000000000\nsize 1\nreleased 1794000000\n";
+    const string RealSig = "tggCO4NlR1GiGwMYh2C2xtwbIQK9e5cO8Y3PCNM4QcPKuKOjk+Hibnv3Q6BbSaKynp1Uu2+O89jobT62EhGXNQ==";
+    // Another P-256 public key, for "the wrong key".
+    const string OtherKeyXy = "ryQntQ49C0HNyTj3BmEGPnJdHRhDVRjA+hU5AldhahWNhLCnnfyQ2OV+bfi+Td4QXhoXHdxWOZ9Q6lPUw/s2ug==";
+
+    static string NoteFor(string version, string sha, long size) {
+        return "support-mcp-release 1\nversion " + version + "\nsha256 " + sha + "\nsize " + size.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\nreleased 1794000000\n";
+    }
+    // An exe with a setup footer appended, as /install serves it.
+    static byte[] WithFooter(byte[] exe, string origin) {
+        byte[] json = Encoding.UTF8.GetBytes(Wire.Json().Serialize(Wire.Map("kind", "device", "origin", origin))), footer = Encoding.ASCII.GetBytes(Wire.Footer);
+        var ms = new MemoryStream(); ms.Write(exe, 0, exe.Length); ms.Write(json, 0, json.Length);
+        byte[] n = BitConverter.GetBytes(json.Length); ms.Write(n, 0, n.Length); ms.Write(footer, 0, footer.Length);
+        return ms.ToArray();
+    }
+    static byte[] FakeExe(int size, int seed) { var b = new byte[size]; new Random(seed).NextBytes(b); b[0] = 77; b[1] = 90; return b; }
+    static string Sha(byte[] b) { return ReleaseKey.Sha256Hex(b, 0, b.Length); }
+
+    // The signature check, with the test-key vector: it verifies, and a tampered note, a flipped signature, a DER
+    // signature, the wrong key and malformed input all fail. Also a key made here round-trips.
+    static void ReleaseKeyTests() {
+        byte[] note = Encoding.UTF8.GetBytes(TestNote), sig = Convert.FromBase64String(TestSig);
+        Assert(ReleaseKey.Verify(note, sig, TestKeyXy), "the test-key vector verifies");
+        byte[] tampered = (byte[])note.Clone(); tampered[30] ^= 1;
+        Assert(!ReleaseKey.Verify(tampered, sig, TestKeyXy), "a tampered note fails");
+        byte[] flipped = (byte[])sig.Clone(); flipped[10] ^= 1;
+        Assert(!ReleaseKey.Verify(note, flipped, TestKeyXy), "a flipped signature fails");
+        Assert(!ReleaseKey.Verify(note, Convert.FromBase64String(TestSigDer), TestKeyXy), "a DER signature fails, even of the right note by the right key");
+        Assert(!ReleaseKey.Verify(note, sig, OtherKeyXy), "the wrong key fails");
+        Assert(!ReleaseKey.Verify(note, sig, "not base64!") && !ReleaseKey.Verify(note, sig, Convert.ToBase64String(new byte[63])) && !ReleaseKey.Verify(note, sig, Convert.ToBase64String(new byte[64])), "a malformed key fails, never throws");
+        byte[] longer = new byte[65]; Buffer.BlockCopy(sig, 0, longer, 0, 64);
+        Assert(!ReleaseKey.Verify(note, longer, TestKeyXy) && !ReleaseKey.Verify(note, new byte[63], TestKeyXy) && !ReleaseKey.Verify(null, sig, TestKeyXy) && !ReleaseKey.Verify(note, null, TestKeyXy), "a signature of another size, or nothing, fails");
+        Assert(Encoding.UTF8.GetBytes(TestNote.Replace("\n", "\r\n")).Length > note.Length && !ReleaseKey.Verify(Encoding.UTF8.GetBytes(TestNote.Replace("\n", "\r\n")), sig, TestKeyXy), "the same note with CRLF fails");
+        using (var signer = new TestSigner()) {
+            string s = signer.Sign(TestNote);
+            Assert(Convert.FromBase64String(s).Length == 64 && ReleaseKey.Verify(note, Convert.FromBase64String(s), signer.Xy), "a key made here signs a note that verifies");
+            Assert(!ReleaseKey.Verify(note, Convert.FromBase64String(s), TestKeyXy), "and only with its own key");
+        }
+        Assert(ReleaseKey.Sha256Hex(Encoding.ASCII.GetBytes("abc"), 0, 3) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "SHA-256 in lowercase hex");
+        Assert(ReleaseKey.ProjectKey.Length == 88 && Convert.FromBase64String(ReleaseKey.ProjectKey).Length == 64, "the embedded key is 64 bytes X||Y");
+        // The real-key vector verifies with the embedded key, and the test-key vector does not, so a build that carries
+        // the test key, or a mistyped real key, can never ship.
+        Assert(ReleaseKey.Verify(Encoding.UTF8.GetBytes(RealNote), Convert.FromBase64String(RealSig)), "the real-key vector verifies with the embedded release key");
+        Assert(!ReleaseKey.Verify(Encoding.UTF8.GetBytes(RealNote), Convert.FromBase64String(RealSig), TestKeyXy), "and not with the test key");
+        Assert(!ReleaseKey.Verify(note, sig), "the embedded release key is still the test key: put the real project key in ReleaseKey.ProjectKey and release-key.pub");
+        Console.WriteLine("PASS the release key: the test-key and real-key vectors verify; tampered, flipped, DER, wrong-key and malformed input fail");
+    }
+
+    // The note parser takes the exact five lines and nothing else.
+    static void ReleaseNoteTests() {
+        var n = ReleaseNote.Parse(TestNote);
+        string sha = "abababababababababababababababababababababababababababababababab";
+        Assert(n != null && n.Version == "0.5.1" && n.Sha256 == sha && n.Size == 229376 && n.Released == 1794000000, "the vector's note parses");
+        var bad = new List<string> {
+            TestNote.Substring(0, TestNote.Length - 1),                                   // no final LF
+            TestNote.Replace("\n", "\r\n"),                                               // CRLF
+            TestNote + "extra 1\n",                                                       // an extra line
+            TestNote.Replace("released 1794000000\n", ""),                                // a missing line
+            TestNote.Replace("version 0.5.1\nsha256 " + sha, "sha256 " + sha + "\nversion 0.5.1"), // wrong order
+            TestNote.Replace(sha, sha.ToUpperInvariant()),                                // uppercase hex
+            TestNote.Replace(sha, sha.Substring(2)),                                      // short hex
+            TestNote.Replace("size 229376", "size 0229376"),                              // a leading zero
+            TestNote.Replace("size 229376", "size -1"),
+            TestNote.Replace("size 229376", "size 0"),
+            TestNote.Replace("version 0.5.1", "version 0.5.01"),                          // a leading zero in the version
+            TestNote.Replace("version 0.5.1", "version v0.5.1"),
+            TestNote.Replace("support-mcp-release 1", "support-mcp-release 2"),
+            TestNote.Replace("size 229376", "size  229376"),
+            TestNote.Replace("size 229376", "size 229376 "),
+            TestNote.Replace("version 0.5.1", "version 0.5.1\u00e9"),
+            "\n" + TestNote, "", null,
+        };
+        foreach (string text in bad) Assert(ReleaseNote.Parse(text) == null, "refused: " + (text == null ? "null" : text.Replace("\n", "\\n").Replace("\r", "\\r")));
+        Console.WriteLine("PASS the release note parser takes the exact five lines and refuses any other text");
+    }
+
+    // SemVer order: 0.5.0 < 0.5.1 < 0.6.0, a prerelease below its release, build metadata ignored, leading zeros refused.
+    static void SemVerTests() {
+        string[] order = { "0.4.9", "0.5.0-alpha", "0.5.0-alpha.1", "0.5.0-alpha.beta", "0.5.0-beta.2", "0.5.0-beta.11", "0.5.0-rc.1", "0.5.0", "0.5.1", "0.6.0-rc.1", "0.6.0", "0.10.0", "1.0.0" };
+        for (int i = 0; i < order.Length; i++)
+            for (int j = 0; j < order.Length; j++) Assert(SemVer.Compare(order[i], order[j]) == Math.Sign(i - j), order[i] + " vs " + order[j]);
+        Assert(SemVer.Compare("0.5.0+build.1", "0.5.0+build.2") == 0 && SemVer.Compare("0.5.0+x", "0.5.0") == 0, "build metadata is ignored");
+        Assert(SemVer.Compare("10.0.0", "9.99.99") == 1, "numbers, not text");
+        foreach (string v in new string[] { "01.0.0", "0.05.0", "0.5.0-01", "0.5", "v0.5.0", "", null, "0.5.0-", "0.5.0+", new string('1', 33), "\u0661.0.0" }) {
+            Assert(!SemVer.Valid(v), "refused: " + v);
+            bool threw = false; try { SemVer.Compare(v, "0.5.0"); } catch (ArgumentException) { threw = true; }
+            Assert(threw, "Compare refuses " + v);
+        }
+        Assert(SemVer.Valid(Wire.Version), "this app's own version is valid: " + Wire.Version);
+        Console.WriteLine("PASS SemVer order, build metadata ignored, leading zeros refused");
+    }
+
+    // Updater.Check and CheckDownload, as pure functions.
+    static void UpdaterTests() {
+        using (var signer = new TestSigner()) {
+            byte[] exe = FakeExe(5000, 1); string sha = Sha(exe);
+            Func<string, string, Dictionary<string, object>> offer = delegate(string version, string note) { return Wire.Map("version", version, "note", note, "signature", signer.Sign(note)); };
+            string reason;
+            string newer = NoteFor("99.0.0", sha, exe.Length);
+            var taken = Updater.Check(offer("99.0.0", newer), Wire.Version, new List<string>(), signer.Xy, out reason);
+            Assert(taken != null && reason == "" && taken.Version == "99.0.0" && taken.Size == exe.Length && taken.Sha256 == sha, "a newer signed release is taken: " + reason);
+            Assert(Updater.Check(offer("99.0.0", newer), Wire.Version, null, TestKeyXy, out reason) == null && reason == "bad signature", "signed by another key: refused");
+            var forged = offer("99.0.0", newer); forged["note"] = NoteFor("99.0.0", Sha(FakeExe(5000, 2)), exe.Length);
+            Assert(Updater.Check(forged, Wire.Version, null, signer.Xy, out reason) == null && reason == "bad signature", "a note changed after signing: refused");
+            Assert(Updater.Check(offer("0.0.1", NoteFor("0.0.1", sha, exe.Length)), Wire.Version, null, signer.Xy, out reason) == null && reason == "not newer", "an older signed version: refused");
+            Assert(Updater.Check(offer(Wire.Version, NoteFor(Wire.Version, sha, exe.Length)), Wire.Version, null, signer.Xy, out reason) == null && reason == "not newer", "the same version: refused");
+            Assert(Updater.Check(offer("99.0.1", newer), Wire.Version, null, signer.Xy, out reason) == null && reason == "version mismatch", "an outer version other than the note's: refused");
+            var noOuter = offer("99.0.0", newer); noOuter.Remove("version");
+            Assert(Updater.Check(noOuter, Wire.Version, null, signer.Xy, out reason) != null, "the outer version is never needed: the note's is used");
+            Assert(Updater.Check(offer("99.0.0", newer), Wire.Version, new List<string> { "99.0.0" }, signer.Xy, out reason) == null && reason == "failed before", "a version that failed its trial: skipped");
+            var der = offer("99.0.0", newer); der["signature"] = TestSigDer;
+            Assert(Updater.Check(der, Wire.Version, null, signer.Xy, out reason) == null, "a DER signature: refused");
+            var junk = offer("99.0.0", newer); junk["signature"] = "%%%";
+            Assert(Updater.Check(junk, Wire.Version, null, signer.Xy, out reason) == null, "a signature that is not base64: refused");
+            Assert(Updater.Check(Wire.Map("note", newer), Wire.Version, null, signer.Xy, out reason) == null && Updater.Check(null, Wire.Version, null, signer.Xy, out reason) == null, "no signature, or no update: nothing");
+            string huge = NoteFor("99.0.0", sha, DeviceLink.DownloadCap + 1);
+            Assert(Updater.Check(offer("99.0.0", huge), Wire.Version, null, signer.Xy, out reason) == null && reason == "too large", "a size over the download cap: refused");
+            var crlf = offer("99.0.0", newer.Replace("\n", "\r\n"));
+            Assert(Updater.Check(crlf, Wire.Version, null, signer.Xy, out reason) == null && reason == "bad note", "a signed note in another form: refused");
+
+            // The download: footer stripped, then size and SHA-256.
+            byte[] body = WithFooter(exe, "https://support.example.com");
+            Assert(Updater.CheckDownload(body, taken) == exe.Length, "the served exe matches the note");
+            byte[] other = WithFooter(FakeExe(5000, 3), "https://support.example.com");
+            Assert(Updater.CheckDownload(other, taken) == -1, "another exe of the same size: refused");
+            Assert(Updater.CheckDownload(WithFooter(FakeExe(5001, 1), "https://support.example.com"), taken) == -1, "another size: refused");
+            Assert(Updater.CheckDownload(exe, taken) == -1, "no footer: refused");
+            byte[] cut = new byte[body.Length / 2]; Buffer.BlockCopy(body, 0, cut, 0, cut.Length);
+            Assert(Updater.CheckDownload(cut, taken) == -1 && Updater.CheckDownload(null, taken) == -1 && Updater.CheckDownload(new byte[3], taken) == -1, "a body cut short, or nothing: refused");
+        }
+        Console.WriteLine("PASS the update decision: newer, signed and never failed only; the download must match the note");
+    }
+
+    // DeviceLink.Download against the fake relay: POST /install with no query, Origin and an empty body; anything but a
+    // whole 200 under the cap is null.
+    static void DownloadTests() {
+        using (var relay = new FakeDevice()) {
+            var link = new DeviceLink(relay.Origin);
+            byte[] body = WithFooter(FakeExe(70000, 4), relay.Origin);
+            relay.InstallBody = body;
+            byte[] got = link.Download();
+            Assert(got != null && got.Length == body.Length && Sha(got) == Sha(body), "the download is the served bytes");
+            Assert(relay.InstallMethod == "POST" && relay.InstallQuery == "" && relay.InstallOrigin == relay.Origin && relay.InstallBodyLength == 0, "POST /install, no query, Origin set, empty body: " + relay.InstallMethod + " " + relay.InstallQuery + " " + relay.InstallOrigin + " " + relay.InstallBodyLength);
+            relay.InstallBody = new byte[DeviceLink.DownloadCap + 1];
+            Assert(link.Download() == null, "over the cap: nothing");
+            relay.InstallBody = body; relay.InstallStatus = 302; relay.InstallLocation = relay.Origin + "/elsewhere";
+            Assert(link.Download() == null, "a redirect is not followed");
+            relay.InstallLocation = null; relay.InstallStatus = 500;
+            Assert(link.Download() == null, "a server error: nothing");
+            relay.InstallStatus = 200; relay.InstallCut = true;
+            Assert(link.Download() == null, "a body cut short: nothing");
+            relay.InstallCut = false; relay.Refuse = true;
+            Assert(link.Download() == null, "a dropped connection: nothing");
+            relay.Refuse = false;
+            // Chunked, with no Content-Length: under the cap it is read whole; over it, the streaming cap refuses it.
+            relay.InstallChunked = true; relay.InstallBody = body;
+            got = link.Download();
+            Assert(got != null && Sha(got) == Sha(body), "a chunked body under the cap is the served bytes");
+            relay.InstallBody = new byte[DeviceLink.DownloadCap + 200000];
+            Assert(link.Download() == null, "a chunked body over the cap, with no Content-Length: nothing");
+            // A body that keeps trickling in ends at the download deadline, though each read gets data in time.
+            relay.InstallChunked = false; relay.InstallBody = body; relay.InstallTrickleMs = 100; // 69 KB at 1 KB per 100 ms: about 7 s
+            int saved = DeviceLink.DownloadMs; DeviceLink.DownloadMs = 1500;
+            try {
+                var clock = Stopwatch.StartNew();
+                Assert(link.Download() == null, "a trickling body past the deadline: nothing");
+                Assert(clock.ElapsedMilliseconds < 5000, "ended at the deadline, not when the body was done: " + clock.ElapsedMilliseconds + " ms");
+            } finally { DeviceLink.DownloadMs = saved; relay.InstallTrickleMs = 0; }
+        }
+        Console.WriteLine("PASS the release download: POST /install with Origin and no body, with the cap (also chunked), no redirects, drops refused, and the overall deadline");
+    }
+
+    // The names, places and decisions of the switch, as pure functions.
+    static void UpdateSwitchRuleTests() {
+        Assert(UpdateSwitch.VersionFileName("0.5.1", "abcdef12") == "support-0.5.1-abcdef12.exe", "the version file name");
+        foreach (string good in new string[] { "support.exe", "SUPPORT.EXE", "support-0.5.1-abcdef12.exe", "support-0.6.0-rc.1-0123abcd.exe", "support-1.2.3+b.4-00000000.exe" }) Assert(UpdateSwitch.IsVersionFile(good), "a version file: " + good);
+        foreach (string bad in new string[] { "support-0.5.1.exe", "support-0.5-abcdef12.exe", "support-0.5.1-abcdef1.exe", "support-0.5.1-abcdef12.dll", "other.exe", "support-.exe", "device.json", null }) Assert(!UpdateSwitch.IsVersionFile(bad), "not a version file: " + bad);
+        string folder = @"C:\Program Files\SupportMCP";
+        Assert(UpdateSwitch.InFolder(folder + @"\support-0.5.1-abcdef12.exe", folder) && UpdateSwitch.InFolder(folder + @"\support.exe", folder + "\\"), "a file directly in the folder");
+        Assert(!UpdateSwitch.InFolder(folder + @"\sub\support.exe", folder) && !UpdateSwitch.InFolder(@"C:\Program Files\SupportMCP2\support.exe", folder) && !UpdateSwitch.InFolder(folder, folder), "not below it, beside it or the folder itself");
+        Assert(DeviceSetup.ExeOf("\"" + folder + "\\support-0.5.1-abcdef12.exe\" --device-service", folder) == folder + @"\support-0.5.1-abcdef12.exe", "the service's command line names the installed exe");
+        foreach (string cmd in new string[] { null, "", folder + @"\support-0.5.1-abcdef12.exe --device-service", "\"C:\\Windows\\evil.exe\" --device-service", "\"" + folder + "\\other.exe\" --device-service", "\"" })
+            Assert(DeviceSetup.ExeOf(cmd, folder) == folder + @"\support.exe", "anything else falls back to support.exe: " + cmd);
+
+        string old = folder + @"\support.exe", neu = folder + @"\support-0.5.1-abcdef12.exe";
+        var st = new UpdateState();
+        string third = folder + @"\support-0.4.0-11111111.exe";
+        Assert(UpdateSwitch.OnStart(st, old, 1000) == UpdateSwitch.Start.Normal, "no trial: normal");
+        st.Phase = UpdateState.Trial; st.From = old; st.To = neu; st.Version = "0.5.1"; st.Deadline = 1000;
+        Assert(UpdateSwitch.OnStart(st, neu, 1000) == UpdateSwitch.Start.Trial && UpdateSwitch.OnStart(st, neu, 1000 + 10 * UpdateSwitch.StaleMs) == UpdateSwitch.Start.Trial, "the new version on trial, however late");
+        Assert(UpdateSwitch.OnStart(st, old, 1000) == UpdateSwitch.Start.Interrupted, "the old version with the trial still open: interrupted, put itself back");
+        Assert(UpdateSwitch.OnStart(st, third, 1000) == UpdateSwitch.Start.Waiting && UpdateSwitch.OnStart(st, third, 1000 + UpdateSwitch.StaleMs - 1) == UpdateSwitch.Start.Waiting, "a recent record about other files: touch nothing");
+        Assert(UpdateSwitch.OnStart(st, third, 1000 + UpdateSwitch.StaleMs) == UpdateSwitch.Start.Stale, "a record about other files long past its deadline: stale, cleared");
+        st.Phase = UpdateState.RollingBack;
+        Assert(UpdateSwitch.OnStart(st, neu, 1000) == UpdateSwitch.Start.ResumeRollback && UpdateSwitch.OnStart(st, old, 1000) == UpdateSwitch.Start.Interrupted, "a rollback cut short: the new version starts it again; the old one finishes it");
+        Assert(UpdateSwitch.OnStart(st, third, 1000) == UpdateSwitch.Start.Waiting && UpdateSwitch.OnStart(st, third, 1000 + UpdateSwitch.StaleMs) == UpdateSwitch.Start.Stale, "a rollback about other files waits, until it is stale");
+        Assert(UpdateSwitch.WatchOver(st, neu) && !UpdateSwitch.WatchOver(new UpdateState { Phase = UpdateState.Trial, To = neu }, neu) && UpdateSwitch.WatchOver(new UpdateState(), neu), "the switch watches only its own open trial");
+        // Trial health: 200, 202 and 401 commit; no network and 5xx retry; a 426 and every other refusal roll back.
+        Assert(UpdateSwitch.TrialHealth(DeviceLink.DeviceResult.Ok, 200) == UpdateSwitch.Health.Healthy && UpdateSwitch.TrialHealth(DeviceLink.DeviceResult.Pending, 202) == UpdateSwitch.Health.Healthy && UpdateSwitch.TrialHealth(DeviceLink.DeviceResult.Removed, 401) == UpdateSwitch.Health.Healthy, "200, 202 and 401 are healthy");
+        Assert(UpdateSwitch.TrialHealth(DeviceLink.DeviceResult.Offline, 0) == UpdateSwitch.Health.Retry && UpdateSwitch.TrialHealth(DeviceLink.DeviceResult.Offline, 200) == UpdateSwitch.Health.Retry, "no network, or a 200 with no device: retry");
+        foreach (int code in new int[] { 500, 502, 503 }) Assert(UpdateSwitch.TrialHealth(DeviceLink.DeviceResult.Refused, code) == UpdateSwitch.Health.Retry, "a server error retries: " + code);
+        Assert(UpdateSwitch.TrialHealth(DeviceLink.DeviceResult.UpdateNeeded, 426) == UpdateSwitch.Health.Unhealthy, "a 426 is not healthy");
+        foreach (int code in new int[] { 400, 403, 404, 409, 413, 429 }) Assert(UpdateSwitch.TrialHealth(DeviceLink.DeviceResult.Refused, code) == UpdateSwitch.Health.Unhealthy, "a refusal is not healthy: " + code);
+        Assert(UpdateSwitch.TrialHealth(DeviceLink.DeviceResult.CodeInvalid, 404) == UpdateSwitch.Health.Unhealthy, "nor a code_invalid");
+        Assert(!UpdateSwitch.DecideNow(1000000 - UpdateSwitch.DecideBeforeMs - 1, 1000000) && UpdateSwitch.DecideNow(1000000 - UpdateSwitch.DecideBeforeMs, 1000000) && UpdateSwitch.DecideNow(2000000, 1000000), "an offline trial decides only near its deadline");
+        Assert(UpdateSwitch.DecideBeforeMs > 2 * UpdateSwitch.RetryHelloMs && UpdateSwitch.DecideBeforeMs < UpdateSwitch.TrialMs, "with time for retries before, and a full retry window ahead of, the watcher's deadline");
+        // A file still in use is set aside under a name no version-file pattern takes.
+        string aside = UpdateSwitch.AsideName("support-0.4.0-11111111.exe", "abcdef12");
+        Assert(aside == "support-0.4.0-11111111.exe.abcdef12.del" && UpdateSwitch.IsAside(aside) && !UpdateSwitch.IsVersionFile(aside), "the set-aside name: " + aside);
+        Assert(UpdateSwitch.IsAside(UpdateSwitch.AsideName("support.exe", "00000000")) && !UpdateSwitch.IsAside("support.exe") && !UpdateSwitch.IsAside("other.exe.abcdef12.del") && !UpdateSwitch.IsAside("support.exe.abcdef1.del") && !UpdateSwitch.IsAside(null), "only our set-aside names");
+        Assert(UpdateSwitch.UninstallBusy(st, 1000) && UpdateSwitch.UninstallBusy(st, 1000 + UpdateSwitch.StaleMs - 1) && !UpdateSwitch.UninstallBusy(st, 1000 + UpdateSwitch.StaleMs) && !UpdateSwitch.UninstallBusy(new UpdateState(), 0), "uninstall waits for an open trial, not a stale one");
+        var files = new List<string> { old, neu, folder + @"\support-0.4.0-11111111.exe", folder + @"\support-0.3.0-22222222.exe", folder + @"\device.json", folder + @"\notes.exe" };
+        var gone = UpdateSwitch.Obsolete(files, neu, old);
+        Assert(gone.Count == 2 && gone.Contains(folder + @"\support-0.4.0-11111111.exe") && gone.Contains(folder + @"\support-0.3.0-22222222.exe"), "every version file but the current and the previous goes, nothing else");
+        Assert(UpdateSwitch.Obsolete(files, neu, "").Contains(old), "with no previous, support.exe goes too");
+        Assert(DeviceUpdate.RollbackCommand(old) == "\"" + old + "\" --device-update-rollback" && DeviceUpdate.SwitchArgs(neu) == "--device-update \"" + neu + "\"", "the command lines");
+
+        // update.json round-trips, and a damaged one is an empty state.
+        string dir = Path.Combine(Path.GetTempPath(), "support-mcp-upd-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+        try {
+            var s1 = new UpdateState(); s1.AddFailed("0.5.2"); s1.Previous = old; s1.StagedFile = neu; s1.StagedVersion = "0.5.1"; s1.StagedSha = new string('a', 64); s1.StagedSize = 7;
+            s1.Phase = UpdateState.Trial; s1.From = old; s1.FromVersion = "0.5.0"; s1.To = neu; s1.Version = "0.5.1"; s1.Deadline = 123;
+            s1.Save(dir);
+            var s2 = UpdateState.Load(dir);
+            Assert(s2.Failed.Count == 1 && s2.Failed[0] == "0.5.2" && s2.Previous == old && s2.StagedFile == neu && s2.StagedSize == 7 && s2.Phase == UpdateState.Trial && s2.FromVersion == "0.5.0" && s2.Deadline == 123 && !s2.Started, "update.json round-trips");
+            s2.Started = true; s2.Save(dir);
+            Assert(UpdateState.Load(dir).Started && !File.Exists(Path.Combine(dir, UpdateState.FileName + ".new")), "the started marker round-trips, and no temp file is left");
+            // A scanner that holds update.json for a moment without sharing does not make a save fail: it tries again.
+            {
+                var scanner = new FileStream(Path.Combine(dir, UpdateState.FileName), FileMode.Open, FileAccess.Read, FileShare.None);
+                var release = new Thread(delegate() { Thread.Sleep(150); scanner.Dispose(); }); release.Start();
+                try { s2.Deadline = 456; s2.Save(dir); } finally { release.Join(); scanner.Dispose(); }
+                Assert(UpdateState.Load(dir).Deadline == 456, "a save goes through once the file is free again");
+            }
+            // Held without sharing (as a scanner might), the file cannot be read: TryLoad says so (null), never an empty state.
+            using (new FileStream(Path.Combine(dir, UpdateState.FileName), FileMode.Open, FileAccess.Read, FileShare.None)) {
+                Assert(UpdateState.TryLoad(dir) == null, "an update.json that cannot be read now is null, so nothing writes over it");
+            }
+            for (int i = 0; i < 30; i++) s2.AddFailed("0.0." + i);
+            Assert(s2.Failed.Count == UpdateState.FailedCap && s2.Failed[s2.Failed.Count - 1] == "0.0.29", "the failed list keeps the newest " + UpdateState.FailedCap);
+            File.WriteAllText(Path.Combine(dir, UpdateState.FileName), "{not json");
+            Assert(!UpdateState.Load(dir).InTrial && UpdateState.Load(dir).Failed.Count == 0, "a damaged update.json is an empty state");
+        } finally { TryDeleteDir(dir); }
+        Console.WriteLine("PASS the switch rules: version files, the install folder, the start decision, health, uninstall waiting, cleanup and update.json");
+    }
+
+    static Dictionary<string, object> Dev(string status) { return Wire.Map("id", "d", "workspace", "default", "status", status, "name", "PC", "access", "ask", "control", "limited", "site_id", null); }
+    static string Snapshot(string folder) {
+        var names = new List<string>();
+        foreach (string f in Directory.GetFiles(folder)) names.Add(Path.GetFileName(f) + ":" + new System.IO.FileInfo(f).Length);
+        names.Sort(StringComparer.OrdinalIgnoreCase); return string.Join("|", names.ToArray());
+    }
+    static string NewServiceFolder(string dir, string origin) {
+        string folder = Path.Combine(dir, "upd-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(folder);
+        File.WriteAllText(Path.Combine(folder, "device.json"), Wire.Json().Serialize(Wire.Map("origin", origin, "workspace", "default", "device_id", "d", "key", "smd1.default.id.secret", "status", "active", "name", "PC", "access", "ask", "control", "limited")));
+        return folder;
+    }
+
+    // The real service against a hostile fake relay: a release whose exe does not match the signed size or SHA-256, a bad
+    // signature, an older or equal version, an outer version other than the note's, a body cut short, no footer, and a
+    // version that failed before are each refused and change nothing in the folder; a good one is staged as its own
+    // version file with the app's ACL, held against writing, recorded, and handed to the switch.
+    static void UpdateServiceTests(string dir) {
+        using (var relay = new FakeDevice())
+        using (var signer = new TestSigner()) {
+            byte[] exe = FakeExe(60000, 5); string sha = Sha(exe);
+            relay.InstallBody = WithFooter(exe, relay.Origin);
+            Func<string, string, string, string> hello = delegate(string outer, string note, string signature) {
+                return Wire.Json().Serialize(Wire.Map("protocol", 1, "device", Dev("active"), "update", Wire.Map("version", outer, "note", note, "signature", signature)));
+            };
+            // Each case: a fresh service, one check-in, and the folder and the switch looked at after.
+            Action<string, string, bool, Action<string>> refused = delegate(string name, string body, bool downloads, Action<string> setup) {
+                string folder = NewServiceFolder(dir, relay.Origin);
+                if (setup != null) setup(folder);
+                var launched = new List<string>();
+                var svc = new DeviceService(Path.Combine(folder, "support.exe"));
+                svc.TestUpdates(signer.Xy, delegate(string f, string a) { launched.Add(f + " " + a); return null; });
+                Assert(svc.TestInit(), "init: " + name);
+                string before = Snapshot(folder); int hits = relay.InstallHits;
+                relay.Status = 200; relay.Body = body;
+                svc.TestCheckInOnce();
+                Assert(Snapshot(folder) == before, name + ": nothing in the folder changes: " + Snapshot(folder));
+                Assert(launched.Count == 0 && svc.TestStaged == "", name + ": no switch starts");
+                Assert((relay.InstallHits > hits) == downloads, name + (downloads ? ": downloaded, then refused" : ": refused before any download"));
+            };
+            string good = NoteFor("99.0.0", sha, exe.Length);
+            refused("a different exe of the same size", hello("99.0.0", NoteFor("99.0.0", Sha(FakeExe(60000, 6)), exe.Length), signer.Sign(NoteFor("99.0.0", Sha(FakeExe(60000, 6)), exe.Length))), true, null);
+            refused("a different size", hello("99.0.0", NoteFor("99.0.0", sha, exe.Length + 1), signer.Sign(NoteFor("99.0.0", sha, exe.Length + 1))), true, null);
+            using (var other = new TestSigner()) refused("a signature by another key", hello("99.0.0", good, other.Sign(good)), false, null);
+            refused("a note changed after signing", hello("99.0.0", good, signer.Sign(NoteFor("99.0.0", sha, exe.Length - 1))), false, null);
+            refused("an older signed version", hello("0.0.1", NoteFor("0.0.1", sha, exe.Length), signer.Sign(NoteFor("0.0.1", sha, exe.Length))), false, null);
+            refused("the same signed version", hello(Wire.Version, NoteFor(Wire.Version, sha, exe.Length), signer.Sign(NoteFor(Wire.Version, sha, exe.Length))), false, null);
+            refused("an outer version other than the note's", hello("99.0.1", good, signer.Sign(good)), false, null);
+            relay.InstallCut = true;
+            refused("a body cut short", hello("99.0.0", good, signer.Sign(good)), true, null);
+            relay.InstallCut = false; relay.InstallBody = exe;
+            refused("an exe with no footer", hello("99.0.0", good, signer.Sign(good)), true, null);
+            relay.InstallBody = WithFooter(exe, relay.Origin);
+            refused("a version that failed its trial before", hello("99.0.0", good, signer.Sign(good)), false, delegate(string folder) {
+                var st = new UpdateState(); st.AddFailed("99.0.0"); st.Save(folder);
+            });
+
+            // A good release, offered in a 426 this time: staged, recorded and handed to the switch. The switch here is a
+            // real process that keeps running (PING), so "one switch at a time" is checked against a live one.
+            {
+                string folder = NewServiceFolder(dir, relay.Origin);
+                var launched = new List<string>();
+                string self = Path.Combine(folder, "support.exe");
+                var svc = new DeviceService(self);
+                Process pinger = null;
+                svc.TestUpdates(signer.Xy, delegate(string f, string a) {
+                    launched.Add(f + " " + a);
+                    pinger = Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "PING.EXE"), "-n 60 127.0.0.1") { UseShellExecute = false, CreateNoWindow = true });
+                    return pinger;
+                });
+                try {
+                    Assert(svc.TestInit(), "init good");
+                    relay.Status = 426; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "error", Wire.Map("code", "protocol_unsupported", "message", "x"), "supported", Wire.Map("min", 2, "max", 2), "update", Wire.Map("version", "99.0.0", "note", good, "signature", signer.Sign(good))));
+                    svc.TestCheckInOnce();
+                    string staged = svc.TestStaged;
+                    Assert(staged.Length > 0 && File.Exists(staged), "a good release is staged");
+                    Assert(UpdateSwitch.InFolder(staged, folder) && System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(staged), @"^support-99\.0\.0-[0-9a-f]{8}\.exe$"), "as support-<version>-<8 hex>.exe in the install folder: " + staged);
+                    byte[] written = File.ReadAllBytes(staged); // a reader gets in: the held handle denies only writing
+                    Assert(Sha(written) == sha && written.Length == exe.Length, "the file is the exe without its footer");
+                    var acl = File.GetAccessControl(staged);
+                    Assert(acl.AreAccessRulesProtected, "the file inherits nothing");
+                    foreach (FileSystemAccessRule rule in acl.GetAccessRules(true, true, typeof(SecurityIdentifier))) {
+                        bool full = (rule.IdentityReference.Equals(FullAcl.SystemSid) || rule.IdentityReference.Equals(FullAcl.AdminsSid)) && NoSync(rule.FileSystemRights) == NoSync(FileSystemRights.FullControl);
+                        bool users = rule.IdentityReference.Equals(FullAcl.UsersSid) && NoSync(rule.FileSystemRights) == NoSync(FileSystemRights.ReadAndExecute);
+                        Assert(rule.AccessControlType == AccessControlType.Allow && !rule.IsInherited && (full || users), "only SYSTEM and Administrators full, Users read and run: " + rule.IdentityReference + " " + rule.FileSystemRights);
+                    }
+                    bool writable = true;
+                    try { using (new FileStream(staged, FileMode.Open, FileAccess.Write, FileShare.ReadWrite)) { } } catch (IOException) { writable = false; } catch (UnauthorizedAccessException) { writable = false; }
+                    Assert(!writable, "nobody can open the staged file for writing while it is held");
+                    var st = UpdateState.Load(folder);
+                    Assert(UpdateSwitch.Same(st.StagedFile, staged) && st.StagedVersion == "99.0.0" && st.StagedSha == sha && st.StagedSize == exe.Length && !st.InTrial, "update.json records the staged file and what it must hash to");
+                    Assert(launched.Count == 1 && launched[0] == self + " --device-update \"" + staged + "\"", "the service starts its own exe with --device-update and the file: " + string.Join(";", launched.ToArray()));
+                    // A second offer while the switch runs starts nothing more and keeps the staged file.
+                    svc.TestCheckInOnce();
+                    Assert(launched.Count == 1 && svc.TestStaged == staged && File.Exists(staged), "one switch at a time");
+                    // The switch ends without stopping the service (refused or busy): the next offer lets the staged file go.
+                    try { pinger.Kill(); pinger.WaitForExit(5000); } catch (Exception) { }
+                    svc.TestCheckInOnce();
+                    Assert(svc.TestStaged == "" && !File.Exists(staged) && UpdateState.Load(folder).StagedFile == "", "a switch that ended lets go of the staged file and its record");
+                    Assert(launched.Count == 1, "and the same release is not tried again within the hour");
+                } finally {
+                    svc.TestDropStaged(); // the held handle must be closed before any cleanup touches the folder
+                    try { if (pinger != null && !pinger.HasExited) pinger.Kill(); } catch (Exception) { }
+                }
+            }
+            // A switch whose process could not be started (null) counts as ended, so switching never sticks.
+            {
+                string folder = NewServiceFolder(dir, relay.Origin);
+                var launched = new List<string>();
+                var svc = new DeviceService(Path.Combine(folder, "support.exe"));
+                svc.TestUpdates(signer.Xy, delegate(string f, string a) { launched.Add(f + " " + a); return null; });
+                try {
+                    Assert(svc.TestInit(), "init null switch");
+                    relay.Status = 200; relay.Body = hello("99.0.0", good, signer.Sign(good));
+                    svc.TestCheckInOnce();
+                    string staged = svc.TestStaged;
+                    Assert(staged.Length > 0 && launched.Count == 1, "staged and handed to a switch that never started");
+                    svc.TestCheckInOnce();
+                    Assert(svc.TestStaged == "" && !File.Exists(staged) && UpdateState.Load(folder).StagedFile == "", "the next offer lets the staged file go");
+                } finally { svc.TestDropStaged(); }
+            }
+        }
+        Console.WriteLine("PASS updates against a hostile relay: wrong exe, size, signature, version, outer version, cut body, no footer and failed versions change nothing; a good release is staged, held and handed over, one switch at a time, and let go when the switch ends or never starts");
+    }
+
+    // The switch, the trial and the rollback, with the service and registry changes recorded (DeviceUpdate.Dry) and a
+    // Local lock: a trial nobody commits rolls back at its deadline; refusals change nothing; a healthy first pass
+    // commits; a 426 starts the rollback; the crash action's rollback; and an interrupted trial put back at start.
+    static void UpdateTrialTests(string dir) {
+        DeviceUpdate.Dry = true; DeviceUpdate.LockName = "Local\\SupportMcpUpdateTest-" + Guid.NewGuid().ToString("N"); DeviceUpdate.TrialMs = 1500; DeviceUpdate.PollMs = 100;
+        Func<List<string>> log = delegate { lock (DeviceUpdate.DryLog) { var copy = new List<string>(DeviceUpdate.DryLog); DeviceUpdate.DryLog.Clear(); return copy; } };
+        Func<List<string>, string> show = delegate(List<string> l) { return string.Join(" ; ", l.ToArray()); };
+        try {
+            using (var relay = new FakeDevice()) {
+                // One folder: support.exe (the old version), a new version file, and an older leftover.
+                Func<string> fresh = delegate {
+                    string folder = NewServiceFolder(dir, relay.Origin);
+                    File.WriteAllBytes(Path.Combine(folder, "support.exe"), FakeExe(3000, 7));
+                    File.WriteAllBytes(Path.Combine(folder, "support-99.0.0-abcdef12.exe"), FakeExe(4000, 8));
+                    File.WriteAllBytes(Path.Combine(folder, "support-0.0.9-00000000.exe"), FakeExe(100, 9));
+                    return folder;
+                };
+                Action<string, string> stage = delegate(string folder, string file) {
+                    var st = UpdateState.Load(folder); byte[] b = File.ReadAllBytes(file);
+                    st.StagedFile = file; st.StagedVersion = "99.0.0"; st.StagedSha = Sha(b); st.StagedSize = b.Length; st.Save(folder);
+                };
+                Action<string, string, string> openTrial = delegate(string folder, string from, string to) {
+                    var st = UpdateState.Load(folder); st.Phase = UpdateState.Trial; st.From = from; st.FromVersion = "0.4.0"; st.To = to; st.Version = "99.0.0"; st.Deadline = Client.UnixNow() + 240000; st.Save(folder);
+                };
+                // Decoded, not raw: the JSON writer stores an apostrophe as \u0027.
+                Func<string, string> history = delegate(string folder) {
+                    string path = Path.Combine(folder, "history.json"); if (!File.Exists(path)) return "";
+                    var lines = Wire.Json().Deserialize<System.Collections.ArrayList>(File.ReadAllText(path)); var sb = new StringBuilder();
+                    if (lines != null) foreach (object o in lines) { var m = o as Dictionary<string, object>; if (m != null) sb.Append(Wire.Text(m, "text")).Append('\n'); }
+                    return sb.ToString();
+                };
+
+                // A trial nobody commits: the switch rolls back at the deadline, and the version is never taken again.
+                {
+                    string folder = fresh(), old = Path.Combine(folder, "support.exe"), neu = Path.Combine(folder, "support-99.0.0-abcdef12.exe");
+                    stage(folder, neu); log();
+                    int code = DeviceUpdate.Switch(old, neu, folder);
+                    var seen = log();
+                    Assert(code == UpdateSwitch.RolledBack, "an uncommitted trial rolls back: " + code);
+                    var want = new List<string> { "actions " + DeviceUpdate.RollbackCommand(old), "stop", "point " + neu + " 99.0.0", "start", "stop", "point " + old + " " + Wire.Version, "actions restart", "start" };
+                    Assert(show(seen) == show(want), "switch then rollback, in order: " + show(seen));
+                    var st = UpdateState.Load(folder);
+                    Assert(!st.InTrial && st.Failed.Contains("99.0.0") && st.StagedFile == "", "the trial is closed and the version recorded as failed");
+                    Assert(history(folder).Contains("couldn't update to version 99.0.0"), "a history line says so");
+                }
+                // A rollback that cannot point the service back (the service database is locked while Windows starts
+                // its services at boot) finishes nothing: the trial stays in its rollback phase, the rollback command stays
+                // the failure action, and no history line claims it went back. A later run that can point back finishes it.
+                {
+                    string folder = fresh(), old = Path.Combine(folder, "support.exe"), neu = Path.Combine(folder, "support-99.0.0-abcdef12.exe");
+                    openTrial(folder, old, neu); log();
+                    DeviceUpdate.DryRepointFails = true;
+                    try { DeviceUpdate.RollBack(folder); } finally { DeviceUpdate.DryRepointFails = false; }
+                    var seen = log(); var st = UpdateState.Load(folder);
+                    Assert(st.InTrial && st.Phase == UpdateState.RollingBack, "a rollback that could not point back stays open: " + st.Phase);
+                    Assert(!seen.Contains("actions restart"), "the rollback command stays the failure action: " + show(seen));
+                    Assert(!history(folder).Contains("went back"), "no history line claims it went back");
+                    log(); DeviceUpdate.RollBack(folder); seen = log(); st = UpdateState.Load(folder);
+                    Assert(!st.InTrial && seen.Contains("point " + old + " 0.4.0") && seen.Contains("actions restart"), "a later run points back and finishes: " + show(seen));
+                    Assert(history(folder).Contains("couldn't update to version 99.0.0"), "and only then says so");
+                }
+                // A rollback with the old file gone has nothing to go back to: the trial closes on the new version, the
+                // normal restarts come back, nothing is pointed, and the history does not claim it went back.
+                {
+                    string folder = fresh(), old = Path.Combine(folder, "support.exe"), neu = Path.Combine(folder, "support-99.0.0-abcdef12.exe");
+                    openTrial(folder, old, neu); File.Delete(old); log();
+                    DeviceUpdate.RollBack(folder);
+                    var seen = log(); var st = UpdateState.Load(folder);
+                    Assert(!st.InTrial && seen.Contains("actions restart") && !seen.Exists(delegate(string l) { return l.StartsWith("point "); }), "a missing old file closes the trial without pointing: " + show(seen));
+                    Assert(history(folder).Contains("couldn't update to version 99.0.0") && !history(folder).Contains("went back"), "and the history does not claim it went back");
+                }
+                // Refusals: a file that was not staged, outside the folder, the running exe, changed since staging, or the lock held.
+                {
+                    string folder = fresh(), old = Path.Combine(folder, "support.exe"), neu = Path.Combine(folder, "support-99.0.0-abcdef12.exe");
+                    log();
+                    Assert(DeviceUpdate.Switch(old, neu, folder) == UpdateSwitch.Refused, "a file the service did not stage");
+                    stage(folder, neu);
+                    Assert(DeviceUpdate.Switch(old, Path.Combine(dir, "support-99.0.0-abcdef12.exe"), folder) == UpdateSwitch.Refused, "a file outside the install folder");
+                    Assert(DeviceUpdate.Switch(old, Path.Combine(folder, "device.json"), folder) == UpdateSwitch.Refused, "not a version file");
+                    Assert(DeviceUpdate.Switch(neu, neu, folder) == UpdateSwitch.Refused, "the running exe itself");
+                    File.WriteAllBytes(neu, FakeExe(4000, 10));
+                    Assert(DeviceUpdate.Switch(old, neu, folder) == UpdateSwitch.Refused, "a file changed since the service checked it");
+                    stage(folder, neu);
+                    using (var held = DeviceInstall.SetupMutex(DeviceUpdate.LockName)) {
+                        Assert(held.WaitOne(0), "the test holds the lock");
+                        int code = -1; var t = new Thread(delegate() { code = DeviceUpdate.Switch(old, neu, folder); }); t.Start(); t.Join();
+                        Assert(code == UpdateSwitch.Busy, "the lock held by an install or uninstall: busy");
+                        held.ReleaseMutex();
+                    }
+                    Assert(log().Count == 0 && !UpdateState.Load(folder).InTrial, "no refusal touches the service, the registry or the trial");
+                }
+                // A healthy first pass of the new version commits: normal restarts back, the old file kept as the previous one, older files removed.
+                {
+                    string folder = fresh(), old = Path.Combine(folder, "support.exe"), neu = Path.Combine(folder, "support-99.0.0-abcdef12.exe");
+                    // The switch runs in its own thread, as its own process would; the commit below ends its watch.
+                    stage(folder, neu); DeviceUpdate.TrialMs = 20000; log();
+                    int switched = -1; var switching = new Thread(delegate() { switched = DeviceUpdate.Switch(old, neu, folder); }); switching.IsBackground = true; switching.Start();
+                    Func<bool> started = delegate { lock (DeviceUpdate.DryLog) return DeviceUpdate.DryLog.Contains("start"); };
+                    for (int i = 0; i < 200 && !started(); i++) Thread.Sleep(50);
+                    Assert(started(), "the switch started the new version");
+                    Thread.Sleep(500); // and let go of the lock
+                    var svc = new DeviceService(neu); var launched = new List<string>();
+                    svc.TestUpdates(TestKeyXy, delegate(string f, string a) { launched.Add(f + " " + a); return null; });
+                    Assert(svc.TestPrepare() && svc.TestTrial, "the new version starts on trial");
+                    var marked = UpdateState.Load(folder);
+                    Assert(marked.Started && marked.Deadline >= Client.UnixNow() + 15000, "it records that it started and renews its trial window");
+                    Assert(launched.Count == 1 && launched[0] == old + " " + DeviceUpdate.WatchArgs, "and starts the old exe's deadline watcher: " + string.Join(";", launched.ToArray()));
+                    relay.Status = 200; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "device", Dev("active")));
+                    svc.TestCheckInOnce();
+                    Assert(!svc.TestTrial && launched.Count == 1, "a 200 commits the trial");
+                    Assert(switching.Join(10000) && switched == UpdateSwitch.Ok, "the switch stops watching once the trial is committed: " + switched);
+                    DeviceUpdate.TrialMs = 1500;
+                    var st = UpdateState.Load(folder);
+                    Assert(!st.InTrial && UpdateSwitch.Same(st.Previous, old) && st.Failed.Count == 0, "committed: no trial, the old file is the previous one");
+                    var seen = log();
+                    Assert(show(seen) == show(new List<string> { "actions " + DeviceUpdate.RollbackCommand(old), "stop", "point " + neu + " 99.0.0", "start", "actions restart" }), "switch, then the commit puts the normal restarts back: " + show(seen));
+                    Assert(File.Exists(old) && File.Exists(neu) && !File.Exists(Path.Combine(folder, "support-0.0.9-00000000.exe")), "the current and previous files stay, an older one goes");
+                    bool line = false; foreach (object h in (System.Collections.ArrayList)svc.TestStatus()["history"]) if (Wire.Text((Dictionary<string, object>)h, "text") == "Support updated to version 99.0.0.") line = true;
+                    Assert(line, "the history says Support updated");
+                }
+                // A 401 commits at once. No network or a server error keeps the trial open (the hello is retried), until
+                // the deadline is near: then it commits, as a network failure is not the new version's fault.
+                Action<string, long> deadline = delegate(string folder, long at) { var st = UpdateState.TryLoad(folder); st.Deadline = at; st.Save(folder); };
+                {
+                    string folder = fresh(), old = Path.Combine(folder, "support.exe"), neu = Path.Combine(folder, "support-99.0.0-abcdef12.exe");
+                    openTrial(folder, old, neu); log();
+                    var svc = new DeviceService(neu); svc.TestUpdates(TestKeyXy, delegate(string f, string a) { return null; });
+                    Assert(svc.TestPrepare() && svc.TestTrial, "on trial");
+                    relay.Status = 401; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "error", Wire.Map("code", "device_unknown", "message", "x")));
+                    svc.TestCheckInOnce();
+                    Assert(!svc.TestTrial && !UpdateState.Load(folder).InTrial && show(log()) == "actions restart", "a 401 commits");
+                }
+                foreach (bool drop in new bool[] { true, false }) {
+                    string what = drop ? "no network" : "a 503";
+                    string folder = fresh(), old = Path.Combine(folder, "support.exe"), neu = Path.Combine(folder, "support-99.0.0-abcdef12.exe");
+                    openTrial(folder, old, neu); log();
+                    var launched = new List<string>();
+                    var svc = new DeviceService(neu); svc.TestUpdates(TestKeyXy, delegate(string f, string a) { launched.Add(f + " " + a); return null; });
+                    Assert(svc.TestPrepare() && svc.TestTrial, "on trial");
+                    relay.Refuse = drop; relay.Status = 503; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "error", Wire.Map("code", "unavailable", "message", "x")));
+                    try {
+                        svc.TestCheckInOnce();
+                        Assert(svc.TestTrial && UpdateState.Load(folder).Phase == UpdateState.Trial && log().Count == 0 && launched.Count == 1, what + " well before the deadline: the trial stays open, nothing rolls back: " + string.Join(";", launched.ToArray()));
+                        deadline(folder, Client.UnixNow() + UpdateSwitch.DecideBeforeMs - 5000);
+                        svc.TestCheckInOnce();
+                    } finally { relay.Refuse = false; }
+                    Assert(!svc.TestTrial && !UpdateState.Load(folder).InTrial && show(log()) == "actions restart" && launched.Count == 1, what + " still near the deadline: committed");
+                }
+                // A 426, or any other refusal, on a pass starts the old exe's rollback and does not commit.
+                foreach (int code in new int[] { 426, 403, 409, 429 }) {
+                    string folder = fresh(), old = Path.Combine(folder, "support.exe"), neu = Path.Combine(folder, "support-99.0.0-abcdef12.exe");
+                    openTrial(folder, old, neu); log();
+                    var svc = new DeviceService(neu); var launched = new List<string>();
+                    svc.TestUpdates(TestKeyXy, delegate(string f, string a) { launched.Add(f + " " + a); return null; });
+                    Assert(svc.TestPrepare() && svc.TestTrial, "on trial");
+                    Assert(launched.Count == 1 && launched[0] == old + " " + DeviceUpdate.WatchArgs, "the new version starts the old exe's deadline watcher: " + string.Join(";", launched.ToArray()));
+                    relay.Status = code; relay.Body = code == 426
+                        ? Wire.Json().Serialize(Wire.Map("protocol", 1, "error", Wire.Map("code", "protocol_unsupported", "message", "x"), "supported", Wire.Map("min", 2, "max", 2)))
+                        : Wire.Json().Serialize(Wire.Map("protocol", 1, "error", Wire.Map("code", "refused", "message", "x")));
+                    svc.TestCheckInOnce();
+                    Assert(launched.Count == 2 && launched[1] == old + " --device-update-rollback", "a " + code + " starts the rollback from the old exe: " + string.Join(";", launched.ToArray()));
+                    Assert(UpdateState.Load(folder).Phase == UpdateState.Trial && log().Count == 0, "the service itself commits nothing and changes nothing");
+                    if (code != 426) continue;
+                    // The rollback that starts (also the failure action after a crash).
+                    Assert(DeviceUpdate.RollBack(folder) == UpdateSwitch.RolledBack, "the rollback role puts the old version back");
+                    var seen = log();
+                    Assert(show(seen) == show(new List<string> { "stop", "point " + old + " 0.4.0", "actions restart", "start" }), "stop, point at the old file, normal restarts, start: " + show(seen));
+                    var st = UpdateState.Load(folder);
+                    Assert(!st.InTrial && st.Failed.Contains("99.0.0"), "the version is recorded as failed");
+                    Assert(DeviceUpdate.RollBack(folder) == UpdateSwitch.Ok && show(log()) == "actions restart ; start", "with no trial, the failure action only restarts the service with normal restarts");
+                }
+                // A trial interrupted (a restart midway): the old version puts itself back at start. The version is failed
+                // only when update.json says its service started; one that never ran is tried again later.
+                foreach (bool ran in new bool[] { false, true }) {
+                    string folder = fresh(), old = Path.Combine(folder, "support.exe"), neu = Path.Combine(folder, "support-99.0.0-abcdef12.exe");
+                    openTrial(folder, old, neu);
+                    if (ran) { var rs = UpdateState.TryLoad(folder); rs.Started = true; rs.Save(folder); }
+                    log();
+                    var svc = new DeviceService(old); svc.TestUpdates(TestKeyXy, delegate(string f, string a) { return null; });
+                    Assert(svc.TestPrepare() && !svc.TestTrial, "the old version starts normally");
+                    var seen = log();
+                    Assert(show(seen) == show(new List<string> { "point " + old + " 0.4.0", "actions restart" }), "points everything back without stopping itself: " + show(seen));
+                    var st = UpdateState.Load(folder);
+                    Assert(!st.InTrial && st.Failed.Contains("99.0.0") == ran && !File.Exists(neu), ran ? "a version that ran is failed and its file removed" : "a version that never ran is not failed; its file is removed");
+                    bool line = false; foreach (object h in (System.Collections.ArrayList)svc.TestStatus()["history"]) if (Wire.Text((Dictionary<string, object>)h, "text").Contains("couldn't update to version 99.0.0")) line = true;
+                    Assert(line, "the history line shows in the tray");
+                }
+                // A rollback decided and written down, then cut short by a restart, while the new file still runs: the new
+                // version starts the rollback again at its start and does not take the trial.
+                {
+                    string folder = fresh(), old = Path.Combine(folder, "support.exe"), neu = Path.Combine(folder, "support-99.0.0-abcdef12.exe");
+                    openTrial(folder, old, neu);
+                    var rs = UpdateState.TryLoad(folder); rs.Phase = UpdateState.RollingBack; rs.AddFailed("99.0.0"); rs.Save(folder);
+                    log();
+                    var launched = new List<string>();
+                    var svc = new DeviceService(neu); svc.TestUpdates(TestKeyXy, delegate(string f, string a) { launched.Add(f + " " + a); return null; });
+                    Assert(svc.TestPrepare() && !svc.TestTrial && launched.Count == 1 && launched[0] == old + " --device-update-rollback" && log().Count == 0, "an interrupted rollback is started again: " + string.Join(";", launched.ToArray()));
+                    Assert(DeviceUpdate.RollBack(folder) == UpdateSwitch.RolledBack && !UpdateState.Load(folder).InTrial, "and finishes");
+                    log();
+                }
+                // A record about files this service is neither, long past its deadline, is cleared; the failed versions and
+                // the previous file stay. A recent one is left alone.
+                foreach (bool stale in new bool[] { true, false }) {
+                    string folder = fresh(), old = Path.Combine(folder, "support.exe");
+                    var rs = new UpdateState(); rs.AddFailed("98.0.0"); rs.Previous = Path.Combine(folder, "support-0.0.9-00000000.exe");
+                    rs.Phase = UpdateState.Trial; rs.From = Path.Combine(folder, "support-0.0.8-11111111.exe"); rs.To = Path.Combine(folder, "support-0.0.7-22222222.exe"); rs.Version = "0.0.7";
+                    rs.Deadline = stale ? Client.UnixNow() - UpdateSwitch.StaleMs - 1000 : Client.UnixNow();
+                    rs.Save(folder); log();
+                    var svc = new DeviceService(old); svc.TestUpdates(TestKeyXy, delegate(string f, string a) { return null; });
+                    Assert(svc.TestPrepare() && !svc.TestTrial, "a service the record does not name runs normally");
+                    var st = UpdateState.Load(folder);
+                    Assert(st.InTrial != stale && st.Failed.Contains("98.0.0") && UpdateSwitch.Same(st.Previous, rs.Previous) && log().Count == 0, stale ? "a stale record is cleared, failed and previous kept" : "a recent one is left alone");
+                }
+                // The deadline watcher a restart leaves behind (--device-update-rollback --at-deadline): it renews the
+                // deadline to a fresh window, and rolls back a trial nobody commits; with nothing to watch it exits.
+                {
+                    string folder = fresh(), old = Path.Combine(folder, "support.exe"), neu = Path.Combine(folder, "support-99.0.0-abcdef12.exe");
+                    Assert(DeviceUpdate.WatchDeadline(folder) == UpdateSwitch.Ok, "no trial: nothing to watch");
+                    openTrial(folder, old, neu); deadline(folder, Client.UnixNow() - 60000); log();
+                    var clock = Stopwatch.StartNew();
+                    int code = DeviceUpdate.WatchDeadline(folder);
+                    Assert(code == UpdateSwitch.RolledBack && clock.ElapsedMilliseconds >= DeviceUpdate.TrialMs, "a trial long past its deadline gets a fresh window, then rolls back: " + code + " after " + clock.ElapsedMilliseconds + " ms");
+                    var st = UpdateState.Load(folder);
+                    Assert(!st.InTrial && st.Failed.Contains("99.0.0") && show(log()) == show(new List<string> { "stop", "point " + old + " 0.4.0", "actions restart", "start" }), "rolled back and failed");
+                }
+                {
+                    string folder = fresh(), old = Path.Combine(folder, "support.exe"), neu = Path.Combine(folder, "support-99.0.0-abcdef12.exe");
+                    openTrial(folder, old, neu); log();
+                    DeviceUpdate.TrialMs = 20000;
+                    try {
+                        int watched = -1; var watcher = new Thread(delegate() { watched = DeviceUpdate.WatchDeadline(folder); }); watcher.IsBackground = true; watcher.Start();
+                        Thread.Sleep(500);
+                        var svc = new DeviceService(neu); svc.TestUpdates(TestKeyXy, delegate(string f, string a) { return null; });
+                        Assert(svc.TestPrepare() && svc.TestTrial, "on trial");
+                        relay.Status = 200; relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "device", Dev("active")));
+                        svc.TestCheckInOnce();
+                        Assert(!svc.TestTrial && watcher.Join(10000) && watched == UpdateSwitch.Ok, "a commit ends the watcher: " + watched);
+                    } finally { DeviceUpdate.TrialMs = 1500; log(); }
+                }
+                // A removed PC never checks in, so its trial is committed at start.
+                {
+                    string folder = fresh(), old = Path.Combine(folder, "support.exe"), neu = Path.Combine(folder, "support-99.0.0-abcdef12.exe");
+                    var dev = Wire.Json().Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(folder, "device.json"))); dev["state"] = DeviceState.Removed;
+                    File.WriteAllText(Path.Combine(folder, "device.json"), Wire.Json().Serialize(dev));
+                    openTrial(folder, old, neu); log();
+                    var svc = new DeviceService(neu); svc.TestUpdates(TestKeyXy, delegate(string f, string a) { return null; });
+                    Assert(svc.TestPrepare() && !svc.TestTrial && !UpdateState.Load(folder).InTrial && show(log()) == "actions restart", "a removed PC commits its trial at start");
+                }
+            }
+        } finally { DeviceUpdate.Dry = false; DeviceUpdate.LockName = DeviceInstall.SetupMutexName; DeviceUpdate.TrialMs = UpdateSwitch.TrialMs; DeviceUpdate.PollMs = 2000; log(); }
+        Console.WriteLine("PASS the switch and trial: deadline rollback, refusals, commit on 200 or 401, retry then commit on no network or 5xx, rollback on 426 or another refusal and by the failure action, an interrupted trial blamed only when it ran, a rollback resumed, a stale record cleared, the deadline watcher, and a removed PC");
+    }
+
+    // Uninstall and updates: the busy exit code, restaging from any file in the install folder, and ending trays started
+    // from any exe in the folder (a live tray from a renamed copy of PING).
+    static void UninstallUpdateTests(string dir) {
+        Assert(DeviceUninstall.Map(DeviceUninstall.Busy) == DeviceUninstall.Outcome.Busy && DeviceUninstall.Busy != DeviceUninstall.Fail, "busy has its own exit code and outcome");
+        Assert(DeviceUninstall.BusyText.Contains("Try again in a few minutes"), "and its own message");
+        Assert(DeviceUninstall.NeedsRestage(Path.Combine(DeviceSetup.Folder, "support-0.5.1-abcdef12.exe")) && DeviceUninstall.NeedsRestage(DeviceSetup.Exe), "any exe in the install folder restages");
+        Assert(!DeviceUninstall.NeedsRestage(Path.Combine(DeviceSetup.Folder, "sub\\support.exe")) && !DeviceUninstall.NeedsRestage(Path.Combine(Path.GetTempPath(), "support-0.5.1-abcdef12.exe")), "nothing outside it does");
+        Assert(DeviceUninstall.StagedFolder(Path.Combine(DeviceSetup.Folder, "support-0.5.1-abcdef12.exe")) == null, "a version file in the install folder names no folder to remove");
+        // EndTrays looks only at processes outside session 0, so this check skips when the tests run in session 0 (a CI
+        // runner as a service). It stays: the VM runs, in a signed-in session, cover it.
+        if (Process.GetCurrentProcess().SessionId == 0) { Console.WriteLine("SKIP ending trays by folder: this test runs in session 0, where no tray runs"); }
+        else {
+            string trays = Path.Combine(dir, "trays-" + Guid.NewGuid().ToString("N")), elsewhere = Path.Combine(dir, "elsewhere-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(trays); Directory.CreateDirectory(elsewhere);
+            string a = Path.Combine(trays, "support-9.9.9-abcdef12.exe"), b = Path.Combine(trays, "support.exe"), c = Path.Combine(elsewhere, "support-9.9.9-abcdef12.exe");
+            foreach (string f in new string[] { a, b, c }) File.Copy(Path.Combine(Environment.SystemDirectory, "PING.EXE"), f);
+            var procs = new List<Process>();
+            foreach (string f in new string[] { a, b, c }) procs.Add(Process.Start(new ProcessStartInfo(f, "-n 60 127.0.0.1") { UseShellExecute = false, CreateNoWindow = true }));
+            try {
+                Thread.Sleep(500);
+                DeviceUninstall.EndTrays(trays);
+                Assert(procs[0].WaitForExit(5000) && procs[1].WaitForExit(5000), "trays started from any exe in the folder end");
+                Assert(!procs[2].HasExited, "a process from another folder is left alone");
+            } finally { foreach (var p in procs) { try { if (!p.HasExited) p.Kill(); } catch (Exception) { } p.WaitForExit(5000); p.Dispose(); } }
+        }
+        Console.WriteLine("PASS uninstall with updates: the busy code, restaging from any version file, and ending trays by folder");
+    }
+
+    // The real service-control calls the switch and rollback make, on a throwaway demand-start service that is never
+    // started: the command line (Scm.SetBinary, read back with Scm.ImagePath, quoting included) and the failure actions
+    // (Scm.SetFailureActions with the rollback command and with the normal restarts, read back at levels 2 and 4). Needs
+    // an elevated run; otherwise it says SKIP.
+    static void ScmCallTests() {
+        if (!SupportAccess.IsAdministrator()) { Console.WriteLine("SKIP the service-control calls: the tests are not running elevated"); return; }
+        string name = "SupportMcpScmTest-" + Guid.NewGuid().ToString("N").Substring(0, 12);
+        ScmProbe.Create(name, "\"" + Path.Combine(Environment.SystemDirectory, "PING.EXE") + "\"");
+        try {
+            string exe = Path.Combine(DeviceSetup.Folder, "support-99.0.0-abcdef12.exe"), bin = DeviceInstall.ServiceBinary(exe);
+            Assert(bin == "\"" + exe + "\" --device-service" && exe.Contains(" "), "the command line quotes a path with a space: " + bin);
+            Scm.SetBinary(name, bin);
+            Assert(Scm.ImagePath(name) == bin, "SetBinary is stored exactly, quotes included: " + Scm.ImagePath(name));
+            string cmd = DeviceUpdate.RollbackCommand(Path.Combine(DeviceSetup.Folder, "support.exe"));
+            Scm.SetFailureActions(name, cmd);
+            var q = ScmProbe.Query(name);
+            Assert(q.Command == cmd && q.Reset == 86400 && string.Join(",", q.Steps.ToArray()) == "3/1000,3/1000,3/1000" && q.NonCrash,
+                "the trial's actions: run the rollback on every failure, stops with an error included: " + q.Command + " " + q.Reset + " " + string.Join(",", q.Steps.ToArray()) + " " + q.NonCrash);
+            Scm.SetFailureActions(name, null);
+            q = ScmProbe.Query(name);
+            Assert(string.IsNullOrEmpty(q.Command) && q.Reset == 86400 && string.Join(",", q.Steps.ToArray()) == "1/60000,1/60000,0/0" && !q.NonCrash,
+                "the normal actions: two restarts a minute apart, no command, crashes only: " + q.Command + " " + q.Reset + " " + string.Join(",", q.Steps.ToArray()) + " " + q.NonCrash);
+            Assert(Scm.Status(name) == System.ServiceProcess.ServiceControllerStatus.Stopped, "the service was never started");
+        } finally { try { Scm.Delete(name); } catch (Exception) { } }
+        Console.WriteLine("PASS the service-control calls: the command line and both sets of failure actions round-trip");
+    }
+
     // The focus the confirm gives back: only to the window that had it, only while the support window still holds it.
     static void FocusReturnTests() {
         Func<IntPtr, bool> ours = delegate(IntPtr w) { return (int)w >= 100; }, here = delegate(IntPtr w) { return (int)w != 7; };
@@ -1802,12 +2575,22 @@ public static class AppTests {
             TrayTests();
             UninstallTests(dir);
             DeviceServiceLiveTests(dir);
+            ReleaseKeyTests();
+            ReleaseNoteTests();
+            SemVerTests();
+            UpdaterTests();
+            DownloadTests();
+            UpdateSwitchRuleTests();
+            UpdateServiceTests(dir);
+            UpdateTrialTests(dir);
+            UninstallUpdateTests(dir);
+            ScmCallTests();
             // The downloaded PE overlay must be readable by the actual .NET client.
             string overlay = Path.Combine(dir, "overlay.exe"); byte[] cfg = Encoding.UTF8.GetBytes(Wire.Json().Serialize(Wire.Map("sid", new string('a', 64), "key", new string('b', 64), "origin", "https://support.example.com", "startup_expires_at", Client.UnixNow() + 10000)));
             using (var f = File.Create(overlay)) { f.WriteByte(77); f.WriteByte(90); f.Write(cfg, 0, cfg.Length); byte[] n = BitConverter.GetBytes(cfg.Length); f.Write(n, 0, n.Length); byte[] footer = Encoding.ASCII.GetBytes(Wire.Footer); f.Write(footer, 0, footer.Length); }
             Assert(Wire.Text(Wire.ReadConfig(overlay), "sid") == new string('a', 64), "Overlay configuration");
             Console.WriteLine("PASS executable session overlay"); return 0;
         } catch (Exception e) { Console.Error.WriteLine(e); return 1; }
-        finally { Directory.Delete(dir, true); }
+        finally { TryDeleteDir(dir); }
     }
 }

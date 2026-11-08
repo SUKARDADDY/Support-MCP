@@ -1,5 +1,7 @@
 // .NET Framework 4 client for Windows 7 to 11. One exe with several roles, chosen by the first argument:
-// none (the customer's app), --elevate-install, --service, --helper and --window (full control, see FullInstall).
+// none (the customer's app), --elevate-install, --service, --helper and --window (full control, see FullInstall),
+// and for a saved PC the setup wizard, --device-install, --device-service, --tray, --uninstall, --device-remove,
+// --device-update and --device-update-rollback (DeviceSetup to DeviceUninstall).
 // Normal mode runs screen control (capture, input, UI Automation) in the user's own process; full control runs
 // it in a SYSTEM helper on the user's console session, so it reaches the secure desktop too.
 // The compiler names a helper class with a random GUID for a constant primitive
@@ -42,9 +44,9 @@ using Shapes = System.Windows.Shapes;
 // Fully qualified, so no System.Reflection using brings new type names into scope.
 [assembly: System.Reflection.AssemblyTitle("Support-MCP")]
 [assembly: System.Reflection.AssemblyProduct("Support-MCP")]
-[assembly: System.Reflection.AssemblyVersion("0.4.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("0.4.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("0.4.0")]
+[assembly: System.Reflection.AssemblyVersion("0.5.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("0.5.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("0.5.0")]
 
 namespace SupportMcp {
     public static class SupportAccess {
@@ -104,7 +106,7 @@ namespace SupportMcp {
     public static class Wire {
         public const string Footer = "SUPPORTMCPCFG1";
         // The release version, sent in the hello. The hello's "agent" field stays the protocol generation.
-        public const string Version = "0.4.0";
+        public const string Version = "0.5.0";
         public static Dictionary<string, object> Map(params object[] pairs) {
             var d = new Dictionary<string, object>();
             for (int i = 0; i < pairs.Length; i += 2) d[(string)pairs[i]] = pairs[i + 1];
@@ -1529,6 +1531,41 @@ namespace SupportMcp {
         public Answer Hello(string key, Dictionary<string, object> body) { return Send("/device/hello", body, key); }
         public Answer Update(string key, Dictionary<string, object> body) { return Send("/device/update", body, key); }
         public Answer Leave(string key) { return Send("/device/leave", Wire.Map(), key); }
+        // The release download (DeviceUpdate): the same app the setup page serves, from POST <origin>/install with no query,
+        // the header Origin: <origin> and an empty body, as the page's button sends it. The answer carries a setup footer,
+        // which the caller strips (Wire.Payload) before it checks the exe against the signed note. Null for anything but a
+        // 200, a body over DownloadCap, a drop, or a download that takes longer than DownloadMs in all. The same TLS,
+        // proxy and no-redirect rules as the wire.
+        public const int DownloadCap = 2 * 1024 * 1024;
+        internal static int DownloadMs = 120000; // the whole download's deadline; the native tests shorten it
+        public byte[] Download() {
+            System.Threading.Timer deadline = null;
+            try {
+                ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2 on .NET 4.5.2
+                var req = (HttpWebRequest)WebRequest.Create(origin + "/install");
+                req.Method = "POST"; req.AllowAutoRedirect = false; req.ContentLength = 0;
+                req.Timeout = 30000; req.ReadWriteTimeout = 30000;
+                req.Proxy = WebRequest.DefaultWebProxy;
+                req.Headers["Origin"] = origin;
+                // ReadWriteTimeout limits each read; this ends a body that keeps trickling in.
+                int deadlineMs = DownloadMs;
+                deadline = new System.Threading.Timer(delegate { try { req.Abort(); } catch (Exception) { } }, null, deadlineMs, Timeout.Infinite);
+                var clock = Stopwatch.StartNew();
+                using (var response = (HttpWebResponse)req.GetResponse()) {
+                    if ((int)response.StatusCode != 200 || response.ContentLength > DownloadCap) return null;
+                    using (var stream = response.GetResponseStream()) {
+                        var data = new MemoryStream(); byte[] buf = new byte[65536]; int n;
+                        while ((n = stream.Read(buf, 0, buf.Length)) > 0) {
+                            if (data.Length + n > DownloadCap || clock.ElapsedMilliseconds > deadlineMs) return null;
+                            data.Write(buf, 0, n);
+                        }
+                        return data.ToArray();
+                    }
+                }
+            } catch (Exception) {
+                return null;
+            } finally { if (deadline != null) deadline.Dispose(); }
+        }
         Answer Send(string path, Dictionary<string, object> body, string key) {
             try {
                 ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2 on .NET 4.5.2
@@ -2144,20 +2181,80 @@ namespace SupportMcp {
                 try {
                     var d = new Description { Text = description };
                     ChangeServiceConfig2(s, 1, ref d);
-                    if (restartOnFailure) {
-                        // Two restarts after a one-minute wait, then no more. SC_ACTION_RESTART is 1, SC_ACTION_NONE is 0.
-                        var actions = new ScAction[3];
-                        actions[0].Type = 1; actions[0].Delay = 60000;
-                        actions[1].Type = 1; actions[1].Delay = 60000;
-                        actions[2].Type = 0; actions[2].Delay = 0;
-                        var pin = GCHandle.Alloc(actions, GCHandleType.Pinned);
-                        try {
-                            var fa = new FailureActions { ResetPeriod = 86400, RebootMessage = null, Command = null, Count = (uint)actions.Length, Actions = pin.AddrOfPinnedObject() };
-                            ChangeServiceConfig2(s, 2, ref fa);
-                        } finally { pin.Free(); }
-                    }
+                    if (restartOnFailure) SetFailureActions(s, null, null);
                 } finally { CloseServiceHandle(s); }
             } finally { CloseServiceHandle(scm); }
+        }
+        // The failure actions. With runCommand null: two restarts after a one-minute wait, then no more (SC_ACTION_RESTART is
+        // 1, SC_ACTION_NONE is 0). With a command line: run it on every failure (SC_ACTION_RUN_COMMAND is 3), which an
+        // update's trial uses to put the old version back after a crash. command is the lpCommand field: null leaves the
+        // stored command as it is, "" deletes it.
+        static bool SetFailureActions(IntPtr s, string runCommand, string command) {
+            var actions = new ScAction[3];
+            for (int i = 0; i < actions.Length; i++) {
+                actions[i].Type = runCommand != null ? 3 : i < 2 ? 1 : 0;
+                actions[i].Delay = runCommand != null ? 1000u : i < 2 ? 60000u : 0u;
+            }
+            var pin = GCHandle.Alloc(actions, GCHandleType.Pinned);
+            try {
+                var fa = new FailureActions { ResetPeriod = 86400, RebootMessage = null, Command = runCommand ?? command, Count = (uint)actions.Length, Actions = pin.AddrOfPinnedObject() };
+                return ChangeServiceConfig2(s, 2, ref fa);
+            } finally { pin.Free(); }
+        }
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool ChangeServiceConfig(IntPtr service, uint type, uint start, uint error, string binary, string group, IntPtr tag, string dependencies, string account, string password, string display);
+        // Opens an existing service with access and runs work on it. Throws when either handle cannot be opened.
+        static void With(string name, uint access, Action<IntPtr> work) {
+            IntPtr scm = OpenSCManager(null, null, 0x0001); if (scm == IntPtr.Zero) throw new Win32Exception();
+            try {
+                IntPtr s = OpenService(scm, name, access); if (s == IntPtr.Zero) throw new Win32Exception();
+                try { work(s); } finally { CloseServiceHandle(s); }
+            } finally { CloseServiceHandle(scm); }
+        }
+        // Points the service at another command line (SERVICE_CHANGE_CONFIG; 0xFFFFFFFF is SERVICE_NO_CHANGE).
+        public static void SetBinary(string name, string binary) {
+            With(name, 0x0002, delegate(IntPtr s) { if (!ChangeServiceConfig(s, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, binary, null, IntPtr.Zero, null, null, null, null)) throw new Win32Exception(); });
+        }
+        // runCommand null puts back the normal restarts and deletes any command; otherwise every failure runs runCommand.
+        // With a command, a stop with an error (an exception in OnStart) counts as a failure too, not only a crash
+        // (SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, level 4); the normal actions put back the default, crashes only. A restart
+        // action needs SERVICE_START on the handle as well as SERVICE_CHANGE_CONFIG.
+        [StructLayout(LayoutKind.Sequential)] struct FailureFlag { public int OnNonCrashFailures; }
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool ChangeServiceConfig2(IntPtr service, uint level, ref FailureFlag info);
+        public static void SetFailureActions(string name, string runCommand) {
+            With(name, 0x0002 | 0x0010, delegate(IntPtr s) {
+                if (!SetFailureActions(s, runCommand, "")) throw new Win32Exception();
+                var flag = new FailureFlag { OnNonCrashFailures = runCommand != null ? 1 : 0 };
+                if (!ChangeServiceConfig2(s, 4, ref flag)) throw new Win32Exception();
+            });
+        }
+        // The service's command line as stored (readable by every user), or null.
+        public static string ImagePath(string name) {
+            try {
+                using (var hklm = SasShare.Machine())
+                using (var k = hklm.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\" + name))
+                    return k == null ? null : k.GetValue("ImagePath", null, Microsoft.Win32.RegistryValueOptions.DoNotExpandEnvironmentNames) as string;
+            } catch (Exception) { return null; }
+        }
+        // Stops a service that is not this process and waits up to ms; stopped or stopping already is fine. Never throws.
+        public static void StopAndWait(string name, int ms) {
+            try {
+                using (var c = new ServiceController(name)) {
+                    if (c.Status == ServiceControllerStatus.Stopped) return;
+                    if (c.Status != ServiceControllerStatus.StopPending) { try { c.Stop(); } catch (InvalidOperationException) { } }
+                    c.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromMilliseconds(ms));
+                }
+            } catch (Exception) { }
+        }
+        // Starts a service and waits until it runs; running or starting already is fine. Never throws.
+        public static void StartTolerant(string name) {
+            try {
+                using (var c = new ServiceController(name)) {
+                    if (c.Status == ServiceControllerStatus.Running || c.Status == ServiceControllerStatus.StartPending) return;
+                    if (c.Status == ServiceControllerStatus.StopPending) c.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+                    try { c.Start(); } catch (InvalidOperationException) { } // started meanwhile
+                    c.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(30));
+                }
+            } catch (Exception) { }
         }
         public static ServiceControllerStatus? Status(string name) { try { using (var c = new ServiceController(name)) return c.Status; } catch (InvalidOperationException) { return null; } }
         public static void Start(string name) { using (var c = new ServiceController(name)) { c.Start(); c.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(30)); } }
@@ -3581,6 +3678,20 @@ namespace SupportMcp {
         // The install folder and the app in it, under %ProgramFiles% read from HKLM (FullInstall.Root).
         public static string Folder { get { return Path.Combine(FullInstall.Root, "SupportMCP"); } }
         public static string Exe { get { return Path.Combine(Folder, "support.exe"); } }
+        // The installed app as the service runs it. A fresh install writes support.exe; an update (DeviceUpdate) points the
+        // service at a version file beside it. So whatever starts or names the installed app reads it from the service's
+        // command line, and falls back to support.exe.
+        public static string InstalledExe() { return ExeOf(Scm.ImagePath(ServiceName), Folder); }
+        // The quoted exe at the start of a service command line, when it is a version file directly in folder; else
+        // folder\support.exe.
+        public static string ExeOf(string command, string folder) {
+            string fallback = Path.Combine(folder, "support.exe");
+            if (string.IsNullOrEmpty(command) || command[0] != '"') return fallback;
+            int end = command.IndexOf('"', 1);
+            if (end < 2) return fallback;
+            string exe = command.Substring(1, end - 1);
+            return UpdateSwitch.InFolder(exe, folder) && UpdateSwitch.IsVersionFile(Path.GetFileName(exe)) ? exe : fallback;
+        }
         // The wizard's screens. Code to Install are steps 1 to 5.
         public enum Screen { Intro, Code, Name, Access, Control, Install, Done, Waiting, Already, Unavailable }
         public static int StepOf(Screen s) { return s >= Screen.Code && s <= Screen.Install ? (int)s : 0; }
@@ -3714,11 +3825,11 @@ namespace SupportMcp {
         }
         // Starts the tray as the signed-in user, when it is installed. A failure is not an error: it starts at the next sign-in.
         public static void StartTray() {
-            try { if (File.Exists(Exe)) using (Process.Start(TrayStart())) { } } catch (Exception) { }
+            try { var start = TrayStart(); if (File.Exists(start.FileName)) using (Process.Start(start)) { } } catch (Exception) { }
         }
         // The tray starts in the system folder: a process's current directory blocks renaming it, and the install folder
         // must stay free to rename aside when the PC is removed.
-        internal static ProcessStartInfo TrayStart() { return new ProcessStartInfo(Exe, "--tray") { UseShellExecute = false, WorkingDirectory = Environment.SystemDirectory }; }
+        internal static ProcessStartInfo TrayStart() { return new ProcessStartInfo(InstalledExe(), "--tray") { UseShellExecute = false, WorkingDirectory = Environment.SystemDirectory }; }
         // The wizard, one per session.
         public static void Run(Application app, Dictionary<string, object> footer, string exe) {
             bool first; using (var mutex = new Mutex(true, "Local\\SupportMcpSetup", out first)) {
@@ -4186,7 +4297,8 @@ namespace SupportMcp {
             if (registry) RemoveRegistry();
             if (folderMade) RemoveFolderAside(folder);
         }
-        static void WriteRegistry(string exe, string version, string folder, int sizeKb) {
+        // The tray's startup value and the Apps entry, for the app at exe. An update calls it again for each version file.
+        internal static void WriteRegistry(string exe, string version, string folder, int sizeKb) {
             using (var hklm = SasShare.Machine()) {
                 using (var run = hklm.CreateSubKey(RunKey)) run.SetValue(TrayValueName, TrayRunValue(exe), Microsoft.Win32.RegistryValueKind.String);
                 using (var app = hklm.CreateSubKey(AppsKey))
@@ -4211,8 +4323,9 @@ namespace SupportMcp {
 
     // --device-service: the saved PC's background service (LocalSystem). It checks in with the relay over the
     // /device/ wire, keeps a short local history, and serves a status pipe the tray reads. It runs no command and
-    // takes no screenshot: PR 4 adds only check-ins. The pure parts (the state map, the timing, the status frame and
-    // the history rules) are static so the native tests can drive them without a live service.
+    // takes no screenshot. Besides check-ins it installs releases signed with the project key, and nothing else
+    // (Updater, DeviceUpdate). The pure parts (the state map, the timing, the status frame and the history rules) are
+    // static so the native tests can drive them without a live service.
     public sealed class DeviceService : ServiceBase {
         public const string PipeName = "SupportMcpDevice-ui";
         // The tray's pipe: SYSTEM creates instances, interactive users read and write data, never the network.
@@ -4244,9 +4357,9 @@ namespace SupportMcp {
             if (oldControl != newControl) lines.Add(newControl == "full" ? "Control set to full control." : "Control set to limited support.");
             return lines;
         }
-        // The status frame the tray reads. confirm is shown only while pending.
+        // The status frame the tray reads. confirm is shown only while pending; version is this service's own.
         public static Dictionary<string, object> StatusFrame(string name, string access, string control, string state, string confirm, long lastOkAt, object history) {
-            var m = Wire.Map("name", name, "access", access, "control", control, "state", state, "last_ok_at", lastOkAt, "history", history);
+            var m = Wire.Map("name", name, "access", access, "control", control, "state", state, "last_ok_at", lastOkAt, "history", history, "version", Wire.Version);
             if (state == DeviceState.Pending && confirm != null && confirm.Length > 0) m["confirm"] = confirm;
             return m;
         }
@@ -4270,6 +4383,15 @@ namespace SupportMcp {
         int allowing;
         int localChanges; // bumped under the gate by each local access change, so CheckIn can spot a stale answer
         Thread worker; UiServer ui; EventWaitHandle uninstall;
+        // Updates, all on the worker thread: the key a release must be signed with and how a process is started (tests
+        // replace both), this version's open trial, and the staged version file with the handle that holds it.
+        string releaseKey = ReleaseKey.ProjectKey;
+        Func<string, string, Process> run = RunHidden;
+        bool trial, switching;
+        FileStream stagedHold; string stagedFile = "";
+        Process switcher;
+        string lastTry = ""; long lastTryAt;
+        long soonMs; // a trial asks the loop to come back this soon (a hello to retry, or a commit to try again)
 
         public DeviceService(string exe) {
             this.exe = exe; folder = Path.GetDirectoryName(exe);
@@ -4281,12 +4403,12 @@ namespace SupportMcp {
 
         void Run() {
             try {
-                if (!Load()) return; // no device.json, or a damaged one: nothing to run
-                link = new DeviceLink(origin);
+                if (!Prepare()) return; // no device.json, or a damaged one: nothing to run
                 try { uninstall = OpenUninstall(true, EventWaitHandleRights.FullControl); } catch (Exception) { uninstall = null; }
                 StartPipe();
-                // A removed or expired PC keeps serving the pipe (so the tray shows it) but never checks in again.
-                if (!terminal) Loop();
+                // A removed or expired PC keeps serving the pipe (so the tray shows it) but never checks in again. The
+                // loop still runs while its trial is open, until the commit gets through.
+                if (!terminal || trial) Loop();
             } catch (Exception) { }
         }
         void StartPipe() {
@@ -4310,6 +4432,45 @@ namespace SupportMcp {
             LoadHistory();
             return true;
         }
+        // Everything before the loop: an update's open trial first (UpdateSwitch.OnStart), then device.json. A removed or
+        // expired PC never checks in, so its trial is committed at once. Outside a trial, old version files go (Tidy).
+        bool Prepare() {
+            UpdateSwitch.Start start = UpdateSwitch.Start.Normal;
+            try { var st = UpdateState.TryLoad(folder); if (st != null) start = UpdateSwitch.OnStart(st, exe, Client.UnixNow()); } catch (Exception) { }
+            if (start == UpdateSwitch.Start.Interrupted || start == UpdateSwitch.Start.Stale) {
+                var m = DeviceUpdate.Lock(30000);
+                if (m != null) {
+                    try {
+                        if (start == UpdateSwitch.Start.Interrupted) DeviceUpdate.RollBackLocked(folder, false, false);
+                        else DeviceUpdate.ClearStale(folder, exe);
+                    } catch (Exception) { } finally { DeviceUpdate.Unlock(m); }
+                }
+            }
+            // A rollback was decided and written down, but cut short (a restart midway): finish it.
+            if (start == UpdateSwitch.Start.ResumeRollback) StartRollback();
+            trial = start == UpdateSwitch.Start.Trial;
+            if (trial) BeginTrial();
+            if (!Load()) return false;
+            link = new DeviceLink(origin);
+            if (trial && terminal) FinishTrial(DeviceLink.DeviceResult.Ok, 200);
+            if (!trial) Tidy();
+            return true;
+        }
+        // This version starts on trial: it records that it started (so an interrupted trial blames it only if it ran),
+        // gives itself a fresh trial window, and starts the old file's deadline watcher, so the trial ends even when the
+        // switch that opened it is gone (a restart midway).
+        void BeginTrial() {
+            var m = DeviceUpdate.Lock(30000);
+            if (m != null) {
+                try {
+                    var st = UpdateState.TryLoad(folder);
+                    if (st != null && UpdateSwitch.OnStart(st, exe, Client.UnixNow()) == UpdateSwitch.Start.Trial) {
+                        st.Started = true; st.Deadline = Math.Max(st.Deadline, Client.UnixNow() + DeviceUpdate.TrialMs); st.Save(folder);
+                    }
+                } catch (Exception) { } finally { DeviceUpdate.Unlock(m); }
+            }
+            Launch(DeviceUpdate.WatchArgs);
+        }
         void LoadHistory() {
             try {
                 var list = Wire.Json().Deserialize<System.Collections.ArrayList>(File.ReadAllText(Path.Combine(folder, "history.json")));
@@ -4323,11 +4484,14 @@ namespace SupportMcp {
             while (!stop.WaitOne(0)) {
                 try {
                     if (ui == null) StartPipe(); // retry a pipe the service could not create (a squatter held the name)
-                    CheckIn(ref backoff);
+                    // A removed or expired PC sends nothing; it only commits a trial still open.
+                    if (!terminal) CheckIn(ref backoff); else if (trial) FinishTrial(DeviceLink.DeviceResult.Ok, 200);
                     if (stop.WaitOne(0)) break;
-                    Schedule sched; lock (gate) sched = lastSchedule;
-                    if (sched == Schedule.Stopped) break; // removed or expired: stop checking in for good; the pipe keeps serving
+                    Schedule sched; bool done; lock (gate) { sched = lastSchedule; done = terminal; }
+                    if (done && !trial) break; // removed or expired: stop checking in for good; the pipe keeps serving
                     long delay = sched == Schedule.Backoff ? backoff : sched == Schedule.Update ? UpdateEveryMs : NextCheckDelay(jitter);
+                    // A trial asks to come back sooner: a hello to retry, or a commit that found the lock busy.
+                    if (soonMs > 0) { delay = Math.Min(delay, soonMs); soonMs = 0; }
                     int which = WaitHandle.WaitAny(waits, (int)Math.Min(delay, int.MaxValue));
                     if (which == 0 || (uninstall != null && which == 2)) break;
                 } catch (Exception) {
@@ -4368,11 +4532,135 @@ namespace SupportMcp {
                     Save(); // persist the terminal state, so a reboot serves it without a fresh check-in
                 } else if (sched == Schedule.Update) {
                     state = newState; backoff = 0;
-                    if (!updateLogged) { updateLogged = true; AddLine("Support needs an update to keep working with your team."); }
+                    if (!updateLogged && !trial) { updateLogged = true; AddLine("Support needs an update to keep working with your team."); }
                 } else {
                     state = newState; backoff = NextBackoff(backoff);
                 }
             }
+            if (trial) FinishTrial(result, a.Status);
+            else if (result == DeviceLink.DeviceResult.Ok || result == DeviceLink.DeviceResult.UpdateNeeded) MaybeUpdate(a.Body);
+        }
+
+        // ---- updates (Updater, DeviceUpdate) -----------------------------------------------------------------------
+        // A check-in pass of a version on trial (UpdateSwitch.TrialHealth). An answer (200 or 202) or a 401 commits. A 426
+        // or any other refusal means this version cannot work with the relay, so the old one comes back. No network or a
+        // server error keeps the trial open and tries the hello again about every 30 seconds; still so near the deadline,
+        // the trial is committed, since a network failure is not the new version's fault.
+        void FinishTrial(DeviceLink.DeviceResult result, int status) {
+            var health = UpdateSwitch.TrialHealth(result, status);
+            if (health == UpdateSwitch.Health.Unhealthy) { trial = false; StartRollback(); return; }
+            if (health == UpdateSwitch.Health.Retry) {
+                UpdateState st = null;
+                try { st = UpdateState.TryLoad(folder); } catch (Exception) { }
+                if (st == null || !UpdateSwitch.DecideNow(Client.UnixNow(), st.Deadline)) { soonMs = UpdateSwitch.RetryHelloMs; return; }
+            }
+            string version;
+            var done = DeviceUpdate.Commit(folder, exe, out version);
+            if (done == DeviceUpdate.Committed.Busy) { soonMs = UpdateSwitch.CommitRetryMs; return; } // the lock was held: again in seconds
+            trial = false;
+            if (done == DeviceUpdate.Committed.Done) { lock (gate) AddLine("Support updated to version " + version + "."); }
+            Tidy();
+        }
+        void StartRollback() { Launch(DeviceUpdate.RollbackArgs); }
+        // Starts the rollback or the deadline watcher of the open trial: from the old file, or from this one when the old
+        // file is gone (the rollback then closes the trial and keeps this version, as there is nothing to go back to).
+        void Launch(string args) {
+            try {
+                var st = UpdateState.TryLoad(folder);
+                if (st == null || !st.InTrial) return;
+                var p = run(File.Exists(st.From) ? st.From : exe, args);
+                if (p != null) p.Dispose();
+            } catch (Exception) { }
+        }
+        // An offered release (the "update" of a hello or a 426): check its signature, note and version, download it,
+        // check the size and SHA-256, write it as its own version file and start the switch. Nothing is shown. A release
+        // whose download or checks failed is tried again an hour later at the earliest; a version that failed its trial,
+        // never.
+        void MaybeUpdate(Dictionary<string, object> body) {
+            object offered;
+            if (body == null || !body.TryGetValue("update", out offered) || !(offered is Dictionary<string, object>)) return;
+            if (switching) {
+                // A switch that ended without stopping this service (refused, or busy with an install or uninstall). A
+                // switch that never started (no process) counts as ended, so switching cannot stick.
+                bool over;
+                try { over = switcher == null || switcher.HasExited; } catch (Exception) { over = true; }
+                if (!over) return;
+                DropStaged();
+            }
+            try {
+                var st = UpdateState.TryLoad(folder);
+                if (st == null || st.InTrial) return; // unreadable now, or a trial open: not now
+                string reason;
+                var note = Updater.Check((Dictionary<string, object>)offered, Wire.Version, st.Failed, releaseKey, out reason);
+                if (note == null) return;
+                long now = PauseClock.Now();
+                if (note.Version == lastTry && now - lastTryAt < UpdateSwitch.RetryMs) return;
+                lastTry = note.Version; lastTryAt = now;
+                byte[] all = link.Download();
+                int n = Updater.CheckDownload(all, note);
+                if (n < 0) return;
+                string file = Stage(all, n, note);
+                if (file == null) return;
+                st = UpdateState.TryLoad(folder);
+                if (st == null || st.InTrial) { DropStaged(); return; } // never write a record over one that cannot be read
+                st.StagedFile = file; st.StagedVersion = note.Version; st.StagedSha = note.Sha256; st.StagedSize = note.Size;
+                st.Save(folder);
+                switching = true;
+                switcher = run(exe, DeviceUpdate.SwitchArgs(file));
+            } catch (Exception) { DropStaged(); }
+        }
+        // Writes the exe as support-<version>-<8 hex>.exe in the install folder, with the app's ACL (FullAcl.Window) from
+        // the moment it exists, then reads it back and hashes it through a handle that denies writing. That handle stays
+        // open until this service stops for the switch, or DropStaged lets it go. Null when anything fails, and then
+        // nothing is left behind and no handle stays open.
+        string Stage(byte[] all, int n, ReleaseNote note) {
+            string file = Path.Combine(folder, UpdateSwitch.VersionFileName(note.Version, Elevation.Nonce().Substring(0, 8)));
+            FileStream hold = null; bool made = false;
+            try {
+                using (var w = new FileStream(file, FileMode.CreateNew, FileSystemRights.Write, FileShare.None, 4096, FileOptions.WriteThrough, FullAcl.Window())) { made = true; w.Write(all, 0, n); w.Flush(true); }
+                hold = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read);
+                if (hold.Length != note.Size || ReleaseKey.Sha256Hex(hold) != note.Sha256) throw new InvalidDataException("the written file does not match the note");
+                stagedHold = hold; stagedFile = file;
+                return file;
+            } catch (Exception) {
+                if (hold != null) try { hold.Dispose(); } catch (Exception) { }
+                if (made) try { File.Delete(file); } catch (Exception) { }
+                return null;
+            }
+        }
+        // Lets go of a staged file the switch did not take: the process, the handle, the record and the file.
+        void DropStaged() {
+            switching = false;
+            if (switcher != null) { try { switcher.Dispose(); } catch (Exception) { } switcher = null; }
+            if (stagedHold != null) { try { stagedHold.Dispose(); } catch (Exception) { } stagedHold = null; }
+            if (stagedFile.Length == 0) return;
+            try { var st = UpdateState.TryLoad(folder); if (st != null && !st.InTrial && UpdateSwitch.Same(st.StagedFile, stagedFile)) { st.ClearStaged(); st.Save(folder); } } catch (Exception) { }
+            try { File.Delete(stagedFile); } catch (Exception) { }
+            stagedFile = "";
+        }
+        // Outside a trial: forgets a staged file no switch took, and deletes every version file but this one and the
+        // previous one. One that a tray still runs is renamed aside first (a running exe can be renamed), and only that
+        // new name is queued for removal at the next restart, so a file installed later under the old name is never
+        // removed by it. Files set aside earlier and free by now go too.
+        void Tidy() {
+            try {
+                var st = UpdateState.TryLoad(folder);
+                if (st == null || st.InTrial) return;
+                if (st.StagedFile.Length > 0 && !UpdateSwitch.Same(st.StagedFile, stagedFile)) { st.ClearStaged(); st.Save(folder); }
+                foreach (string file in UpdateSwitch.Obsolete(Directory.GetFiles(folder, "support*.exe"), exe, st.Previous)) {
+                    if (UpdateSwitch.Same(file, stagedFile)) continue;
+                    try { File.Delete(file); continue; } catch (Exception) { }
+                    string aside = Path.Combine(folder, UpdateSwitch.AsideName(Path.GetFileName(file), Elevation.Nonce().Substring(0, 8)));
+                    try { File.Move(file, aside); } catch (Exception) { continue; } // not even renamed: the next tidy tries again
+                    try { Native.MoveFileEx(aside, null, 4); } catch (Exception) { }
+                }
+                foreach (string file in Directory.GetFiles(folder, "support*" + UpdateSwitch.AsideSuffix))
+                    if (UpdateSwitch.IsAside(Path.GetFileName(file))) try { File.Delete(file); } catch (Exception) { }
+            } catch (Exception) { }
+        }
+        // A SYSTEM child in session 0 with no window, started in the system folder.
+        static Process RunHidden(string file, string args) {
+            return Process.Start(new ProcessStartInfo(file, args) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Environment.SystemDirectory });
         }
         Dictionary<string, object> Report() { return Wire.Map("os", DeviceSetup.Os(), "machine", Environment.MachineName, "app_version", Wire.Version); }
         static Dictionary<string, object> ReadDev(Dictionary<string, object> body) { object o; return body != null && body.TryGetValue("device", out o) ? o as Dictionary<string, object> : null; }
@@ -4421,13 +4709,21 @@ namespace SupportMcp {
             if (terminal) m["state"] = state; // removed or expired, so a reboot serves it without checking in
             WriteAtomic(Path.Combine(folder, "device.json"), Wire.Json().Serialize(m));
         }
-        // A crash midway must never leave a half-written file: write a sibling temp and swap it in.
-        static void WriteAtomic(string file, string text) {
+        // A line added to history.json by another process (a rollback), while this service is stopped.
+        public static void AppendHistory(string folder, string text) {
             try {
-                string temp = file + ".new";
-                File.WriteAllText(temp, text);
-                if (File.Exists(file)) File.Replace(temp, file, null); else File.Move(temp, file);
+                string file = Path.Combine(folder, "history.json");
+                System.Collections.ArrayList list = null;
+                string text0 = UpdateState.ReadShared(file); // null when there is no file; throws when it cannot be read now
+                try { if (text0 != null) list = Wire.Json().Deserialize<System.Collections.ArrayList>(text0); } catch (Exception) { }
+                if (list == null) list = new System.Collections.ArrayList(); // missing or damaged: start a new one
+                list.Add(Wire.Map("at", Client.UnixNow(), "text", text)); TrimHistory(list);
+                WriteAtomic(file, Wire.Json().Serialize(list));
             } catch (Exception) { }
+        }
+        // A crash midway must never leave a half-written file: write a sibling temp, flushed to disk, and swap it in.
+        static void WriteAtomic(string file, string text) {
+            try { UpdateState.WriteReplace(file, text); } catch (Exception) { }
         }
 
         // The Global uninstall event, created by the service (SYSTEM) and watched by every tray. Interactive users may
@@ -4473,6 +4769,13 @@ namespace SupportMcp {
         internal Dictionary<string, object> TestHandle(Dictionary<string, object> m) { return Handle(m); }
         internal Dictionary<string, object> TestStatus() { return Snapshot(); }
         internal bool TestTerminal { get { return terminal; } }
+        // Updates: the key releases are checked against and what starts a process (null: start nothing), then the start
+        // as Run does it, the staged file, and letting it go.
+        internal void TestUpdates(string key, Func<string, string, Process> runner) { releaseKey = key; run = runner; }
+        internal bool TestPrepare() { return Prepare(); }
+        internal string TestStaged { get { return stagedFile; } }
+        internal bool TestTrial { get { return trial; } }
+        internal void TestDropStaged() { DropStaged(); }
         internal static EventWaitHandle TestCreateEvent(string name) {
             var sec = new EventWaitHandleSecurity();
             sec.AddAccessRule(new EventWaitHandleAccessRule(WindowsIdentity.GetCurrent().User, EventWaitHandleRights.FullControl, AccessControlType.Allow));
@@ -4481,6 +4784,552 @@ namespace SupportMcp {
         internal static EventWaitHandle TestOpenEvent(string name, EventWaitHandleRights rights) { EventWaitHandle e; return EventWaitHandle.TryOpenExisting(name, rights, out e) ? e : null; }
     }
 
+
+    // ---- Signed updates ---------------------------------------------------------------------------------------------
+    // A saved PC installs a new version of this app by itself, but only a release signed with the project's offline
+    // release key (docs/security-model.md). The relay offers a release in a hello's answer or a 426 (src/release.js):
+    // the note (ReleaseNote) and its signature. The PC checks the signature against the key built in here, the note,
+    // and that the version is newer and has not failed before (Updater), downloads the app, checks its size and SHA-256
+    // against the note, writes it as its own version file (DeviceService) and switches to it with a trial and an
+    // automatic rollback (DeviceUpdate). One-off session apps never update themselves.
+
+    // The release key: ECDSA P-256, the 64-byte public key X||Y in base64, the same line as release-key.pub at the repo
+    // root (test/release.test.js checks they are equal). Self-hosters who build their own app put their own key in both.
+    // A base64 string, not a byte array: a constant array initializer would break the reproducible build.
+    public static class ReleaseKey {
+        public const string ProjectKey = "6oEnKHINMEr2HVlmklxxL9XEcvq1439e1rdY004x54yOw0fVCqNn+OPrtWpENnHQ+blljSYk+GCVIavvxiH5DA==";
+        public static bool Verify(byte[] data, byte[] signature) { return Verify(data, signature, ProjectKey); }
+        // ECDSA over SHA-256 of data. The signature must be exactly 64 bytes r||s (IEEE P1363): .NET 4.5.2's ECDsaCng takes
+        // only that form, and never a DER one (checked on Windows 7 SP1 x86 and Windows 11 x64). xyBase64 is the key.
+        public static bool Verify(byte[] data, byte[] signature, string xyBase64) {
+            if (data == null || signature == null || signature.Length != 64 || xyBase64 == null) return false;
+            try {
+                byte[] xy = Convert.FromBase64String(xyBase64);
+                if (xy.Length != 64) return false;
+                // BCRYPT_ECCKEY_BLOB: the magic "ECS1" (a P-256 public key), the key length 32, then X and Y.
+                byte[] blob = new byte[72];
+                blob[0] = 0x45; blob[1] = 0x43; blob[2] = 0x53; blob[3] = 0x31;
+                blob[4] = 32;
+                Buffer.BlockCopy(xy, 0, blob, 8, 64);
+                using (System.Security.Cryptography.CngKey key = System.Security.Cryptography.CngKey.Import(blob, System.Security.Cryptography.CngKeyBlobFormat.EccPublicBlob))
+                using (var ecdsa = new System.Security.Cryptography.ECDsaCng(key)) {
+                    ecdsa.HashAlgorithm = System.Security.Cryptography.CngAlgorithm.Sha256;
+                    return ecdsa.VerifyData(data, signature);
+                }
+            } catch (System.Security.Cryptography.CryptographicException) { return false; }
+            catch (FormatException) { return false; }
+        }
+        public static string Hex(byte[] hash) { return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant(); }
+        public static string Sha256Hex(byte[] data, int offset, int count) {
+            using (var h = new System.Security.Cryptography.SHA256Cng()) return Hex(h.ComputeHash(data, offset, count));
+        }
+        public static string Sha256Hex(Stream stream) {
+            using (var h = new System.Security.Cryptography.SHA256Cng()) return Hex(h.ComputeHash(stream));
+        }
+    }
+
+    // A release version: strict SemVer, the pattern of src/version.js (no leading zeros), at most 32 characters.
+    public static class SemVer {
+        const string Id = "(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)";
+        static readonly System.Text.RegularExpressions.Regex Pattern = new System.Text.RegularExpressions.Regex(
+            @"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-" + Id + @"(?:\." + Id + @")*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\z",
+            System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+        public static bool Valid(string v) { return v != null && v.Length <= 32 && Pattern.IsMatch(v); }
+        // SemVer precedence, build metadata ignored: -1, 0 or 1. Throws unless both are Valid.
+        public static int Compare(string a, string b) {
+            if (!Valid(a) || !Valid(b)) throw new ArgumentException("not a version");
+            string[] ca = Core(a).Split('.'), cb = Core(b).Split('.');
+            for (int i = 0; i < 3; i++) { int c = Number(ca[i], cb[i]); if (c != 0) return c; }
+            string pa = Pre(a), pb = Pre(b);
+            if (pa == null || pb == null) return pa == pb ? 0 : pa == null ? 1 : -1;
+            string[] ia = pa.Split('.'), ib = pb.Split('.');
+            for (int i = 0; i < Math.Min(ia.Length, ib.Length); i++) {
+                bool na = Numeric(ia[i]), nb = Numeric(ib[i]); int c;
+                if (na && nb) c = Number(ia[i], ib[i]);
+                else if (na != nb) c = na ? -1 : 1;
+                else c = Math.Sign(string.CompareOrdinal(ia[i], ib[i]));
+                if (c != 0) return c;
+            }
+            return Math.Sign(ia.Length - ib.Length);
+        }
+        static string NoBuild(string v) { int plus = v.IndexOf('+'); return plus < 0 ? v : v.Substring(0, plus); }
+        static string Core(string v) { string s = NoBuild(v); int dash = s.IndexOf('-'); return dash < 0 ? s : s.Substring(0, dash); }
+        static string Pre(string v) { string s = NoBuild(v); int dash = s.IndexOf('-'); return dash < 0 ? null : s.Substring(dash + 1); }
+        // Digits without leading zeros: the longer is larger, equal lengths compare as text.
+        static int Number(string x, string y) { return x.Length != y.Length ? Math.Sign(x.Length - y.Length) : Math.Sign(string.CompareOrdinal(x, y)); }
+        static bool Numeric(string s) { if (s.Length == 0) return false; foreach (char c in s) if (c < '0' || c > '9') return false; return true; }
+    }
+
+    // The signed release note: exactly five lines, each ending in LF, in this order and nothing else.
+    //   support-mcp-release 1 / version <x.y.z> / sha256 <64 lowercase hex> / size <bytes> / released <unix seconds>
+    // sha256 and size are those of the exe without a footer. Parse refuses any other text: an extra or missing line,
+    // another order, uppercase hex, a CR, a leading zero, a character outside printable ASCII.
+    public sealed class ReleaseNote {
+        public const string Header = "support-mcp-release 1";
+        public string Version, Sha256; public long Size, Released;
+        public static ReleaseNote Parse(string text) {
+            if (text == null || text.Length == 0 || text.Length > 512 || text[text.Length - 1] != '\n') return null;
+            foreach (char c in text) if (c != '\n' && (c < ' ' || c > '~')) return null;
+            string[] lines = text.Substring(0, text.Length - 1).Split('\n');
+            if (lines.Length != 5 || lines[0] != Header) return null;
+            string version = Value(lines[1], "version"), sha = Value(lines[2], "sha256"), size = Value(lines[3], "size"), released = Value(lines[4], "released");
+            if (!SemVer.Valid(version) || sha == null || !System.Text.RegularExpressions.Regex.IsMatch(sha, @"^[0-9a-f]{64}\z") || !Whole(size) || !Whole(released)) return null;
+            return new ReleaseNote { Version = version, Sha256 = sha, Size = long.Parse(size, System.Globalization.CultureInfo.InvariantCulture), Released = long.Parse(released, System.Globalization.CultureInfo.InvariantCulture) };
+        }
+        static string Value(string line, string name) { return line.StartsWith(name + " ", StringComparison.Ordinal) ? line.Substring(name.Length + 1) : null; }
+        static bool Whole(string s) { return s != null && System.Text.RegularExpressions.Regex.IsMatch(s, @"^[1-9][0-9]{0,15}\z"); }
+    }
+
+    // Whether an offered update is taken, as pure functions the native tests drive.
+    public static class Updater {
+        // The update object of an answer ({"version","note","signature"}) checked against the key: the signature over the
+        // note's exact bytes, the note's form, the outer version (when present) equal to the note's, a version newer than
+        // current that has not failed its trial before, and a size the download can carry. Returns the note, or null and
+        // why not.
+        public static ReleaseNote Check(Dictionary<string, object> update, string current, ICollection<string> failed, string keyXy, out string reason) {
+            object o;
+            string note = update != null && update.TryGetValue("note", out o) ? o as string : null;
+            string sig = update != null && update.TryGetValue("signature", out o) ? o as string : null;
+            reason = "no release";
+            if (note == null || sig == null) return null;
+            byte[] signature;
+            try { signature = Convert.FromBase64String(sig); } catch (FormatException) { reason = "bad signature"; return null; }
+            reason = "bad signature";
+            if (!ReleaseKey.Verify(Encoding.UTF8.GetBytes(note), signature, keyXy)) return null;
+            var parsed = ReleaseNote.Parse(note);
+            reason = "bad note";
+            if (parsed == null) return null;
+            reason = "version mismatch";
+            if (update.TryGetValue("version", out o) && !(o is string && (string)o == parsed.Version)) return null;
+            reason = "not newer";
+            if (!SemVer.Valid(current) || SemVer.Compare(parsed.Version, current) <= 0) return null;
+            reason = "failed before";
+            if (failed != null && failed.Contains(parsed.Version)) return null;
+            reason = "too large";
+            if (parsed.Size > DeviceLink.DownloadCap) return null;
+            reason = "";
+            return parsed;
+        }
+        // The exe in a download, after its footer is stripped, checked against the note's size and SHA-256. Returns the
+        // exe's length, or -1.
+        public static int CheckDownload(byte[] all, ReleaseNote note) {
+            if (all == null || note == null) return -1;
+            int n;
+            try { n = Wire.Payload(all); } catch (InvalidDataException) { return -1; }
+            if (n != note.Size || n < 2 || all[0] != 77 || all[1] != 90) return -1;
+            return ReleaseKey.Sha256Hex(all, 0, n) == note.Sha256 ? n : -1;
+        }
+    }
+
+    // update.json beside device.json, with the locked folder's ACL: the versions that failed their trial (never taken
+    // again), the file of the version before the current one (kept as the last good one), the version file the service
+    // staged for the switch with its size and SHA-256, and an open trial. Written whole through a temp file flushed to
+    // disk, and read with every sharing mode, so a reader never blocks a writer. A read-modify-write that cannot read
+    // the file (TryLoad null) writes nothing, so an unreadable record is never replaced by an empty one.
+    //   {"failed":[...],"previous":"<exe>","staged":{"file","version","sha256","size"},
+    //    "trial":{"phase":"trial"|"rollback","from","from_version","to","version","deadline","started"}}
+    // started: the new version's service has run (DeviceService.BeginTrial), so an interrupted trial may blame it.
+    public sealed class UpdateState {
+        public const string FileName = "update.json", Trial = "trial", RollingBack = "rollback";
+        public const int FailedCap = 20, SaveTries = 5;
+        public readonly List<string> Failed = new List<string>();
+        public string Previous = "";
+        public string StagedFile = "", StagedVersion = "", StagedSha = ""; public long StagedSize;
+        public string Phase = "", From = "", FromVersion = "", To = "", Version = ""; public long Deadline; public bool Started;
+        public bool InTrial { get { return Phase == Trial || Phase == RollingBack; } }
+        public void AddFailed(string version) { if (!Failed.Contains(version)) Failed.Add(version); while (Failed.Count > FailedCap) Failed.RemoveAt(0); }
+        public void ClearStaged() { StagedFile = StagedVersion = StagedSha = ""; StagedSize = 0; }
+        public void ClearTrial() { Phase = From = FromVersion = To = Version = ""; Deadline = 0; Started = false; }
+        // A missing file is an empty state; a damaged one too, so a bad file never blocks the service. Read-only checks
+        // only: a caller that saves uses TryLoad.
+        public static UpdateState Load(string folder) { return TryLoad(folder) ?? new UpdateState(); }
+        // null when the file exists but cannot be read now, after a few short tries (a watcher then keeps watching, and
+        // a read-modify-write does nothing).
+        public static UpdateState TryLoad(string folder) {
+            var st = new UpdateState();
+            string file = Path.Combine(folder, FileName), text = null;
+            for (int i = 0; ; i++) {
+                try { text = ReadShared(file); break; }
+                catch (IOException) { if (i >= 2) return null; }
+                catch (UnauthorizedAccessException) { if (i >= 2) return null; }
+                Thread.Sleep(50);
+            }
+            if (text == null) return st;
+            Dictionary<string, object> m;
+            try { m = Wire.Json().Deserialize<Dictionary<string, object>>(text); } catch (Exception) { return st; }
+            if (m == null) return st;
+            object o;
+            if (m.TryGetValue("failed", out o) && o is System.Collections.ArrayList)
+                foreach (object v in (System.Collections.ArrayList)o) if (v is string && SemVer.Valid((string)v)) st.AddFailed((string)v);
+            st.Previous = Wire.Text(m, "previous");
+            try {
+                if (m.TryGetValue("staged", out o) && o is Dictionary<string, object>) {
+                    var s = (Dictionary<string, object>)o;
+                    st.StagedFile = Wire.Text(s, "file"); st.StagedVersion = Wire.Text(s, "version"); st.StagedSha = Wire.Text(s, "sha256"); st.StagedSize = Wire.Number(s, "size");
+                }
+                if (m.TryGetValue("trial", out o) && o is Dictionary<string, object>) {
+                    var t = (Dictionary<string, object>)o;
+                    st.Phase = Wire.Text(t, "phase"); st.From = Wire.Text(t, "from"); st.FromVersion = Wire.Text(t, "from_version");
+                    st.To = Wire.Text(t, "to"); st.Version = Wire.Text(t, "version"); st.Deadline = Wire.Number(t, "deadline");
+                    object started; st.Started = t.TryGetValue("started", out started) && started is bool && (bool)started;
+                    if (!st.InTrial) st.ClearTrial();
+                }
+            } catch (Exception) { st.ClearStaged(); st.ClearTrial(); }
+            return st;
+        }
+        // Throws when update.json cannot be written after a few short tries; the caller then changes nothing more.
+        public void Save(string folder) {
+            var m = Wire.Map("failed", Failed.ToArray(), "previous", Previous);
+            if (StagedFile.Length > 0) m["staged"] = Wire.Map("file", StagedFile, "version", StagedVersion, "sha256", StagedSha, "size", StagedSize);
+            if (InTrial) {
+                var t = Wire.Map("phase", Phase, "from", From, "from_version", FromVersion, "to", To, "version", Version, "deadline", Deadline);
+                if (Started) t["started"] = true;
+                m["trial"] = t;
+            }
+            WriteReplace(Path.Combine(folder, FileName), Wire.Json().Serialize(m));
+        }
+        // The whole text of file, read with every sharing mode (a writer may replace or delete it meanwhile). null when
+        // there is no file. Throws IOException or UnauthorizedAccessException when it cannot be read now.
+        internal static string ReadShared(string file) {
+            try {
+                using (var f = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                using (var r = new StreamReader(f, Encoding.UTF8)) return r.ReadToEnd();
+            } catch (FileNotFoundException) { return null; } catch (DirectoryNotFoundException) { return null; }
+        }
+        // Writes text to a sibling temp file, flushed to disk, and swaps it in for file. A few short tries, as a reader
+        // or a virus scanner may hold the file for a moment; the last failure is thrown.
+        internal static void WriteReplace(string file, string text) {
+            byte[] data = new UTF8Encoding(false).GetBytes(text);
+            string temp = file + ".new";
+            for (int i = 1; ; i++) {
+                try {
+                    using (var f = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough)) { f.Write(data, 0, data.Length); f.Flush(true); }
+                    if (File.Exists(file)) File.Replace(temp, file, null); else File.Move(temp, file);
+                    return;
+                } catch (IOException) { if (i >= SaveTries) throw; }
+                catch (UnauthorizedAccessException) { if (i >= SaveTries) throw; }
+                Thread.Sleep(100 * i);
+            }
+        }
+    }
+
+    // The switch's rules, as pure functions the native tests drive.
+    public static class UpdateSwitch {
+        // TrialMs: how long a new version has to finish a healthy check-in pass. StaleMs: past its deadline by this much,
+        // an open trial no longer makes uninstall wait, and a service it does not name clears it. RetryMs: a release whose
+        // download or checks failed is tried again after this long at the earliest. RetryHelloMs: a trial with no network
+        // (or a server error) tries its hello again this often. DecideBeforeMs: that close to the deadline, a trial still
+        // without a network commits, before the watcher would roll it back (a hello can itself take a minute to fail).
+        // CommitRetryMs: a commit that found the lock busy tries again this soon.
+        public const long TrialMs = 240000, StaleMs = 600000, RetryMs = 3600000, RetryHelloMs = 30000, DecideBeforeMs = 90000, CommitRetryMs = 5000;
+        // --device-update and --device-update-rollback exit codes.
+        public const int Ok = 0, Busy = 30, Refused = 31, RolledBack = 32;
+        public enum Start { Normal, Trial, Interrupted, Waiting, ResumeRollback, Stale }
+        public enum Health { Healthy, Unhealthy, Retry }
+        static readonly System.Text.RegularExpressions.Regex VersionName = new System.Text.RegularExpressions.Regex(@"^support-(.+)-[0-9a-f]{8}\.exe\z",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+        public static string VersionFileName(string version, string hex8) { return "support-" + version + "-" + hex8 + ".exe"; }
+        // An obsolete version file still in use is renamed to this before it is queued for removal at the next restart.
+        public const string AsideSuffix = ".del";
+        static readonly System.Text.RegularExpressions.Regex AsidePattern = new System.Text.RegularExpressions.Regex(@"^support[^\\/]*\.exe\.[0-9a-f]{8}\.del\z",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+        public static string AsideName(string name, string hex8) { return name + "." + hex8 + AsideSuffix; }
+        public static bool IsAside(string name) { return name != null && AsidePattern.IsMatch(name); }
+        // support.exe (a fresh install) or support-<version>-<8 hex>.exe (an update).
+        public static bool IsVersionFile(string name) {
+            if (name == null) return false;
+            if (string.Equals(name, "support.exe", StringComparison.OrdinalIgnoreCase)) return true;
+            var m = VersionName.Match(name);
+            return m.Success && SemVer.Valid(m.Groups[1].Value);
+        }
+        public static bool Same(string a, string b) {
+            if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) return false;
+            try { return string.Equals(Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase); } catch (Exception) { return false; }
+        }
+        // The file sits directly in folder.
+        public static bool InFolder(string file, string folder) {
+            try {
+                string dir = Path.GetDirectoryName(Path.GetFullPath(file));
+                return dir != null && string.Equals(dir.TrimEnd('\\'), Path.GetFullPath(folder).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase);
+            } catch (Exception) { return false; }
+        }
+        // What the service at self does at start about update.json, at now (Unix ms). Trial: this version is on trial, and
+        // its check-ins decide. Interrupted: the trial away from this version never finished (a restart or a crash
+        // midway), so this version puts itself back. ResumeRollback: the rollback away from this version was decided and
+        // written down but cut short, so this version starts it again. Stale: the record names other files and is past its
+        // deadline by StaleMs, so it is cleared (the failed versions and the previous file stay). Waiting: a rollback is
+        // under way, or a recent record names other files: touch nothing.
+        public static Start OnStart(UpdateState st, string self, long now) {
+            if (!st.InTrial) return Start.Normal;
+            if (st.Phase == UpdateState.Trial && Same(st.To, self)) return Start.Trial;
+            if (Same(st.From, self)) return Start.Interrupted;
+            if (st.Phase == UpdateState.RollingBack && Same(st.To, self)) return Start.ResumeRollback;
+            if (now >= st.Deadline + StaleMs) return Start.Stale;
+            return Start.Waiting;
+        }
+        // A check-in pass of a version on trial. Healthy: an answer (200 or 202) or a 401 (the PC was removed, which is
+        // not the version's fault). Retry: no network or a server error (5xx): try again, and decide at the deadline.
+        // Unhealthy: a 426 or any other refusal (a 4xx), so the old version comes back.
+        public static Health TrialHealth(DeviceLink.DeviceResult result, int status) {
+            if (result == DeviceLink.DeviceResult.Ok || result == DeviceLink.DeviceResult.Pending || result == DeviceLink.DeviceResult.Removed) return Health.Healthy;
+            if (result == DeviceLink.DeviceResult.Offline || status == 0 || status >= 500) return Health.Retry;
+            return Health.Unhealthy;
+        }
+        // A trial still without a network commits from DecideBeforeMs before its deadline on.
+        public static bool DecideNow(long now, long deadline) { return now >= deadline - DecideBeforeMs; }
+        // The switch stops watching once the trial of file is committed, or someone else rolls it back.
+        public static bool WatchOver(UpdateState st, string file) { return !(st.Phase == UpdateState.Trial && Same(st.To, file)); }
+        // Uninstall waits for an open trial, but not for one long past its deadline: a stuck record must not block it.
+        public static bool UninstallBusy(UpdateState st, long now) { return st.InTrial && now < st.Deadline + StaleMs; }
+        // The version files to remove: every one but the current and the previous.
+        public static List<string> Obsolete(IEnumerable<string> files, string current, string previous) {
+            var list = new List<string>();
+            foreach (string f in files) if (IsVersionFile(Path.GetFileName(f)) && !Same(f, current) && !Same(f, previous)) list.Add(f);
+            return list;
+        }
+    }
+
+    // --device-update <file> and --device-update-rollback [--at-deadline], all SYSTEM with no window, and started only by
+    // the service (or, for the rollback, by its failure action). The service, having staged a checked version file,
+    // starts its own exe with --device-update and that file. The switch takes the setup lock, records the trial in
+    // update.json, makes every failure of the service run the old exe with --device-update-rollback, stops the service,
+    // points the service, the tray's startup value and the Apps entry at the new file, and starts it. The new service
+    // commits the trial after a healthy check-in pass or, on a refusal, starts the rollback. It also starts the old exe
+    // with --device-update-rollback --at-deadline, a watcher that outlives a restart: the switch's own watch ends with a
+    // restart, so after one the new service starts a new watcher at its own start. Either watcher rolls back when the
+    // trial is still open at its deadline. A rollback points everything at the old file again, puts the normal restarts
+    // back and records the version as failed, so it is never taken again.
+    public static class DeviceUpdate {
+        // Tests: Dry records the service and registry changes in DryLog instead of making them; LockName is the lock (a
+        // Local one in tests); TrialMs and PollMs time the watch.
+        internal static bool Dry = false;
+        internal static readonly List<string> DryLog = new List<string>();
+        internal static string LockName = DeviceInstall.SetupMutexName;
+        internal static long TrialMs = UpdateSwitch.TrialMs;
+        internal static int PollMs = 2000;
+        // A rollback starts the old service again for this long (with a growing wait between tries) when it will not start,
+        // for example while a user holds the old file open without sharing.
+        internal static long StartRetryMs = 300000;
+        // How long a service-configuration change keeps retrying. While Windows starts its automatic services at boot the
+        // service database is locked (ERROR_SERVICE_DATABASE_LOCKED), and a rollback the failure action runs then would
+        // otherwise fail to point the service back.
+        internal static long ConfigRetryMs = 300000;
+
+        public static string SwitchArgs(string file) { return "--device-update \"" + file + "\""; }
+        public static string RollbackCommand(string exe) { return "\"" + exe + "\" --device-update-rollback"; }
+        public const string RollbackArgs = "--device-update-rollback", AtDeadline = "--at-deadline", WatchArgs = RollbackArgs + " " + AtDeadline;
+
+        // The setup lock (DeviceInstall.SetupMutex): one install, uninstall, switch, commit or rollback at a time. null
+        // when another still holds it after ms.
+        internal static Mutex Lock(int ms) {
+            Mutex m = null;
+            try {
+                m = DeviceInstall.SetupMutex(LockName);
+                bool held; try { held = m.WaitOne(ms); } catch (AbandonedMutexException) { held = true; }
+                if (held) return m;
+            } catch (Exception) { }
+            if (m != null) m.Dispose();
+            return null;
+        }
+        internal static void Unlock(Mutex m) { try { m.ReleaseMutex(); } catch (Exception) { } m.Dispose(); }
+
+        // --device-update <file>. self is this exe, the one the service runs now; folder is the install folder.
+        public static int Switch(string self, string file, string folder) {
+            try { file = Path.GetFullPath(file); } catch (Exception) { return UpdateSwitch.Refused; }
+            if (!UpdateSwitch.InFolder(file, folder) || !UpdateSwitch.IsVersionFile(Path.GetFileName(file)) || UpdateSwitch.Same(file, self)) return UpdateSwitch.Refused;
+            var m = Lock(0);
+            if (m == null) return UpdateSwitch.Busy;
+            try {
+                var st = UpdateState.TryLoad(folder);
+                if (st == null) return UpdateSwitch.Busy; // unreadable now: change nothing
+                if (st.InTrial || !UpdateSwitch.Same(st.StagedFile, file)) return UpdateSwitch.Refused;
+                // Still what the service checked: hashed again through a handle that denies writing, held until the new
+                // service runs. The using closes it on every path, before the watch below.
+                using (var hold = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read)) {
+                    if (hold.Length != st.StagedSize || ReleaseKey.Sha256Hex(hold) != st.StagedSha) return UpdateSwitch.Refused;
+                    string version = st.StagedVersion;
+                    st.ClearStaged();
+                    st.Phase = UpdateState.Trial; st.From = self; st.FromVersion = Wire.Version; st.To = file; st.Version = version;
+                    st.Deadline = Client.UnixNow() + TrialMs; st.Started = false;
+                    st.Save(folder);
+                    try {
+                        SetActions(RollbackCommand(self));
+                        Stop();
+                        Repoint(file, version, folder);
+                        Start(false); // the new version: its failure action, not a retry here, handles a start that fails
+                    } catch (Exception) {
+                        // The switch itself failed, so the new version is failed only if its service ever ran.
+                        try { RollBackLocked(folder, true, false); } catch (Exception) { Start(true); }
+                        return UpdateSwitch.RolledBack;
+                    }
+                }
+            } catch (Exception) {
+                return UpdateSwitch.Refused;
+            } finally { Unlock(m); }
+            return Watch(folder, file);
+        }
+
+        // Watches the open trial of file until it is committed or rolled back by someone else (Ok), or rolls it back once
+        // it is still open at its deadline, and at least TrialMs after the watch began (RolledBack). The deadline is read
+        // from update.json each time, so a trial window the new version renewed at its start counts. A deadline further
+        // away than twice TrialMs (a damaged record) is not waited for.
+        static int Watch(string folder, string file) {
+            var clock = Stopwatch.StartNew();
+            while (true) {
+                Thread.Sleep(PollMs);
+                var now = UpdateState.TryLoad(folder);
+                if (now == null) continue;
+                if (UpdateSwitch.WatchOver(now, file)) return UpdateSwitch.Ok;
+                if (!Due(now, clock)) continue;
+                var again = Lock(60000);
+                if (again == null) continue;
+                try {
+                    var st = UpdateState.TryLoad(folder);
+                    if (st == null) continue;
+                    if (UpdateSwitch.WatchOver(st, file)) return UpdateSwitch.Ok;
+                    if (!Due(st, clock)) continue;
+                    try { RollBackLocked(folder, true, true); } catch (IOException) { continue; } // update.json unreadable now: look again
+                    return UpdateSwitch.RolledBack;
+                } finally { Unlock(again); }
+            }
+        }
+        static bool Due(UpdateState st, Stopwatch clock) {
+            long ran = clock.ElapsedMilliseconds;
+            return ran >= TrialMs && (Client.UnixNow() >= st.Deadline || ran >= 2 * TrialMs);
+        }
+
+        // --device-update-rollback --at-deadline: the new service starts this from the old exe when it starts on trial. It
+        // renews the deadline to a fresh trial window from now (never shortening it), then watches like the switch, so a
+        // trial whose switch was ended by a restart still ends: committed by the new version, or rolled back at the
+        // deadline. Ok when there is no trial to watch.
+        public static int WatchDeadline(string folder) {
+            string to;
+            var m = Lock(120000);
+            if (m == null) return UpdateSwitch.Busy;
+            try {
+                var st = UpdateState.TryLoad(folder);
+                if (st == null) return UpdateSwitch.Busy;
+                if (st.Phase != UpdateState.Trial) return UpdateSwitch.Ok;
+                to = st.To;
+                long fresh = Client.UnixNow() + TrialMs;
+                if (st.Deadline < fresh) { st.Deadline = fresh; st.Save(folder); }
+            } finally { Unlock(m); }
+            return Watch(folder, to);
+        }
+
+        // --device-update-rollback: the service's failure action during a trial, or the new service on a refusal. With no
+        // trial open (a crash after the commit raced it), it only puts the normal restarts back and starts the service.
+        // With update.json unreadable it changes nothing and only starts the service, so a next failure tries again.
+        public static int RollBack(string folder) {
+            var m = Lock(120000);
+            if (m == null) return UpdateSwitch.Busy;
+            try {
+                bool rolled;
+                try { rolled = RollBackLocked(folder, true, true); }
+                catch (IOException) { Start(false); return UpdateSwitch.Busy; }
+                if (rolled) return UpdateSwitch.RolledBack;
+                try { SetActions(null); } catch (Exception) { }
+                Start(true);
+                return UpdateSwitch.Ok;
+            } finally { Unlock(m); }
+        }
+
+        // Puts the old version back; the caller holds the lock. restart stops the service first and starts it after,
+        // in a finally, so an exception midway never leaves it stopped; the old version finishing an interrupted trial
+        // at its own start passes false. blame records the version as failed; without it (an interrupted switch) the
+        // version is failed only if update.json says its service started. The version is recorded first, so even a
+        // rollback cut short never takes it again. False when no trial was open; IOException when update.json cannot be
+        // read (nothing changed).
+        internal static bool RollBackLocked(string folder, bool restart, bool blame) {
+            var st = UpdateState.TryLoad(folder);
+            if (st == null) throw new IOException("update.json cannot be read now");
+            if (!st.InTrial) return false;
+            try {
+                string from = st.From, fromVersion = st.FromVersion, version = st.Version;
+                if (st.Phase == UpdateState.Trial) { st.Phase = UpdateState.RollingBack; if (blame || st.Started) st.AddFailed(version); st.Save(folder); }
+                if (restart) Stop();
+                // Only a rollback that pointed everything back finishes. Otherwise the trial stays in its rollback phase and the
+                // rollback command stays the failure action, so the new version's next failure (or the old version's next
+                // start) runs it again; nothing claims a rollback that did not happen.
+                // With the old file gone there is nothing to go back to: the trial ends on the new version.
+                bool gone = !File.Exists(from), pointed = gone;
+                if (!gone) { try { Repoint(from, fromVersion, folder); pointed = true; } catch (Exception) { } }
+                if (!pointed) return true;
+                try { SetActions(null); } catch (Exception) { }
+                DeviceService.AppendHistory(folder, gone ? "Support couldn't update to version " + version + "." : "Support couldn't update to version " + version + ", so it went back to version " + fromVersion + ".");
+                st = UpdateState.TryLoad(folder);
+                if (st == null) throw new IOException("update.json cannot be read now"); // the next start of the old version finishes it
+                st.ClearTrial(); st.Save(folder);
+                return true;
+            } finally { if (restart) Start(true); }
+        }
+        // The service at self found a trial record about other files, long past its deadline: it is cleared, keeping the
+        // failed versions and the previous file. The caller holds the lock.
+        internal static void ClearStale(string folder, string self) {
+            var st = UpdateState.TryLoad(folder);
+            if (st == null || UpdateSwitch.OnStart(st, self, Client.UnixNow()) != UpdateSwitch.Start.Stale) return;
+            st.ClearTrial(); st.Save(folder);
+        }
+
+        public enum Committed { Done, NoTrial, Busy }
+        // The new service at self after a healthy pass: the normal restarts come back and the trial closes; the old file
+        // stays as the previous one. Busy: the lock was held, or update.json could not be read or written; try again soon.
+        internal static Committed Commit(string folder, string self, out string version) {
+            version = "";
+            var m = Lock(60000);
+            if (m == null) return Committed.Busy;
+            try {
+                var st = UpdateState.TryLoad(folder);
+                if (st == null) return Committed.Busy;
+                if (UpdateSwitch.OnStart(st, self, Client.UnixNow()) != UpdateSwitch.Start.Trial) return Committed.NoTrial;
+                try { SetActions(null); } catch (Exception) { }
+                version = st.Version; st.Previous = st.From; st.ClearTrial(); st.Save(folder);
+                return Committed.Done;
+            } catch (Exception) { return Committed.Busy; }
+            finally { Unlock(m); }
+        }
+
+        // The service's command line, the tray's startup value and the Apps entry (64-bit view), all for exe.
+        static void Repoint(string exe, string version, string folder) {
+            if (Dry) { if (DryRepointFails) throw new Win32Exception(1055); Log("point " + exe + " " + version); return; }
+            Retrying(delegate { Scm.SetBinary(DeviceSetup.ServiceName, DeviceInstall.ServiceBinary(exe)); });
+            // The service's command line is what counts; the tray's startup value and the Apps entry are best effort.
+            try { DeviceInstall.WriteRegistry(exe, version, folder, (int)((new System.IO.FileInfo(exe).Length + 1023) / 1024)); } catch (Exception) { }
+        }
+        static void SetActions(string rollbackCommand) {
+            if (Dry) { Log(rollbackCommand == null ? "actions restart" : "actions " + rollbackCommand); return; }
+            Retrying(delegate { Scm.SetFailureActions(DeviceSetup.ServiceName, rollbackCommand); });
+        }
+        // Runs a configuration change, retrying only while the service database is locked (1055) for ConfigRetryMs
+        // (waiting 1 s, then 2, 4 and so on up to 15 s). Any other error, and the last one, is thrown.
+        static void Retrying(Action change) {
+            var clock = Stopwatch.StartNew(); int wait = 1000;
+            while (true) {
+                try { change(); return; }
+                catch (Win32Exception e) { if (e.NativeErrorCode != 1055 || clock.ElapsedMilliseconds >= ConfigRetryMs) throw; }
+                Thread.Sleep(wait); wait = Math.Min(wait * 2, 15000);
+            }
+        }
+        // Tests only: makes the dry repoint fail, as a locked service database would.
+        internal static bool DryRepointFails = false;
+        static void Stop() { if (Dry) Log("stop"); else Scm.StopAndWait(DeviceSetup.ServiceName, 60000); }
+        // Starts the service. retry: keep trying for StartRetryMs, waiting 1 s, then 2, 4 and so on up to 30 s between tries,
+        // so a user who holds the old file open without sharing only delays the rollback. Never throws.
+        static void Start(bool retry) {
+            if (Dry) { Log("start"); return; }
+            var clock = Stopwatch.StartNew(); int wait = 1000;
+            while (true) {
+                Scm.StartTolerant(DeviceSetup.ServiceName);
+                if (!retry) return;
+                var status = Scm.Status(DeviceSetup.ServiceName);
+                if (status == null || status == ServiceControllerStatus.Running || status == ServiceControllerStatus.StartPending) return; // running, or gone
+                if (clock.ElapsedMilliseconds >= StartRetryMs) return;
+                try { Thread.Sleep(wait); } catch (Exception) { return; }
+                wait = Math.Min(wait * 2, 30000);
+            }
+        }
+        static void Log(string line) { lock (DryLog) DryLog.Add(line); }
+    }
 
     // The tray's words and choices, kept apart from its windows so the native tests can check them. The one-way rule
     // (call 3): the only access action is turning on "any time", shown only while the PC is active and asks first.
@@ -4527,6 +5376,8 @@ namespace SupportMcp {
             }
             return lines;
         }
+        // The panel's version line, from the status frame: "Version 0.5.1", or "" (hidden) for no valid version.
+        public static string VersionLine(string version) { return SemVer.Valid(version) ? "Version " + version : ""; }
         // The tray tooltip: at most 63 characters, as NotifyIcon allows.
         public static string Tip(string name) { string t = "Support" + (string.IsNullOrEmpty(name) ? "" : ": " + name); return t.Length > 63 ? t.Substring(0, 60) + "..." : t; }
     }
@@ -4562,7 +5413,7 @@ namespace SupportMcp {
     public sealed class TrayPanel : Window {
         const double CardWidth = 340, Pad = 16;
         readonly Palette p;
-        readonly TextBlock nameLine, modeLine, teamOnly, stateLine, noOne, note;
+        readonly TextBlock nameLine, modeLine, teamOnly, stateLine, noOne, note, versionLine;
         readonly StackPanel historyBox, confirmBox;
         readonly FlatButton allow, confirmYes, confirmNo, uninstall;
         public event Action AllowConfirmed;
@@ -4602,6 +5453,7 @@ namespace SupportMcp {
             note = Line(12, p.Stop, 8); note.Visibility = Visibility.Collapsed; body.Children.Add(note);
             uninstall = new FlatButton(TrayText.Uninstall, p.Muted, Brushes.Transparent, p.Surface2, p.Work, 28, 0, 8, 6, 12.5, true); uninstall.Margin = new Thickness(-8, 10, 0, 0); uninstall.HorizontalAlignment = HorizontalAlignment.Left;
             body.Children.Add(uninstall);
+            versionLine = Line(11, p.Muted, 6); versionLine.Visibility = Visibility.Collapsed; body.Children.Add(versionLine);
             stack.Children.Add(body);
 
             allow.Click += delegate { allow.Visibility = Visibility.Collapsed; confirmBox.Visibility = Visibility.Visible; confirmNo.Focus(); };
@@ -4621,9 +5473,12 @@ namespace SupportMcp {
             if (status == null) {
                 nameLine.Text = "Support"; modeLine.Text = ""; stateLine.Text = TrayText.NotRunning;
                 teamOnly.Visibility = Visibility.Collapsed; allow.Visibility = Visibility.Collapsed; confirmBox.Visibility = Visibility.Collapsed;
-                noOne.Visibility = Visibility.Collapsed; historyBox.Children.Clear();
+                noOne.Visibility = Visibility.Collapsed; historyBox.Children.Clear(); versionLine.Visibility = Visibility.Collapsed;
                 return;
             }
+            // An older service sends no version, and then the line stays hidden.
+            versionLine.Text = TrayText.VersionLine(Wire.Text(status, "version"));
+            versionLine.Visibility = versionLine.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
             string state = Wire.Text(status, "state"), access = Wire.Text(status, "access");
             nameLine.Text = Wire.Text(status, "name");
             modeLine.Text = TrayText.Mode(access);
@@ -4722,7 +5577,7 @@ namespace SupportMcp {
                 };
                 panel.UninstallClicked += delegate {
                     bool started = false;
-                    try { if (File.Exists(DeviceSetup.Exe)) using (Process.Start(new ProcessStartInfo(DeviceSetup.Exe, "--uninstall") { UseShellExecute = false, WorkingDirectory = Path.GetTempPath() })) { started = true; } } catch (Exception) { }
+                    try { string installed = DeviceSetup.InstalledExe(); if (File.Exists(installed)) using (Process.Start(new ProcessStartInfo(installed, "--uninstall") { UseShellExecute = false, WorkingDirectory = Path.GetTempPath() })) { started = true; } } catch (Exception) { }
                     if (!started) panel.Note(TrayText.UninstallMissing);
                     else panel.Hide();
                 };
@@ -4755,19 +5610,20 @@ namespace SupportMcp {
     // reached relay) are static so the native tests can check them. --device-remove never touches
     // HKLM\SOFTWARE\SupportMCP or anything of the one-off sessions.
     public static class DeviceUninstall {
-        public const int Removed = 0, Unreachable = 10, Fail = 20;
-        public enum Outcome { Removed, RemovedUnreachable, Declined, Failed }
+        // Busy: another install, uninstall or update holds the setup lock, or an update's trial is open. Nothing changed.
+        public const int Removed = 0, Unreachable = 10, Fail = 20, Busy = 21;
+        public enum Outcome { Removed, RemovedUnreachable, Declined, Failed, Busy }
         public static Outcome Map(int exit) {
             if (exit == Removed) return Outcome.Removed;
             if (exit == Unreachable) return Outcome.RemovedUnreachable;
             if (exit == -1223) return Outcome.Declined;
+            if (exit == Busy) return Outcome.Busy;
             return Outcome.Failed;
         }
-        // --uninstall must run from a copy, not the install folder's support.exe. True when it is still the installed one.
-        public static bool NeedsRestage(string exePath) {
-            try { return string.Equals(Path.GetFullPath(exePath), Path.GetFullPath(DeviceSetup.Exe), StringComparison.OrdinalIgnoreCase); }
-            catch (Exception) { return false; }
-        }
+        public const string BusyText = "Support is finishing an update. Try again in a few minutes.";
+        // --uninstall must run from a copy, not from the install folder. True for any file in it: support.exe or a version
+        // file an update left there.
+        public static bool NeedsRestage(string exePath) { return UpdateSwitch.InFolder(exePath, DeviceSetup.Folder); }
         // Leave counts as done whether the relay answered 200 or 401; only a network failure leaves the PC on the list.
         // Only a 200 (forgotten now) or a 401 (already gone) means the relay no longer holds this PC. Anything else, a
         // refusal or a server error included, removes locally but tells the owner the team must remove it.
@@ -4790,13 +5646,17 @@ namespace SupportMcp {
             if (args.Length != 2 || !System.Text.RegularExpressions.Regex.IsMatch(args[1], @"^[0-9a-f]{32}\z")) return Fail;
             var want = Elevation.Wanted("device-remove", args[1]);
             if (want == null) return Fail;
-            // One install or remove at a time across the PC; a second gets Fail and touches nothing.
+            // One install, remove or update switch at a time across the PC; a second gets Busy and touches nothing.
             Mutex only = null; bool held = false;
             try { only = DeviceInstall.SetupMutex(); try { held = only.WaitOne(0); } catch (AbandonedMutexException) { held = true; } } catch (Exception) { }
-            if (!held) { if (only != null) only.Dispose(); want.Dispose(); return Fail; }
+            if (!held) { if (only != null) only.Dispose(); want.Dispose(); return Busy; }
             using (want)
             try {
                 string folder = DeviceSetup.Folder;
+                // An update's trial decides within minutes which version stays; removing the PC meanwhile would race it.
+                // update.json that cannot be read at this moment counts as busy too: try again in a few minutes.
+                var upd = UpdateState.TryLoad(folder);
+                if (upd == null || UpdateSwitch.UninstallBusy(upd, Client.UnixNow())) return Busy;
                 // Only an actual leave call counts as reaching the relay; a missing or damaged device.json leaves the
                 // PC on the team's list, so the final window says so.
                 bool reached = false;
@@ -4809,17 +5669,20 @@ namespace SupportMcp {
                 } catch (Exception) { }
                 DeviceService.SignalUninstall();         // every tray watches this and exits
                 try { Thread.Sleep(3000); } catch (Exception) { } // give the trays a few seconds to close themselves
-                EndTrays();                              // best effort for any that remain
+                EndTrays(folder);                        // best effort for any that remain
                 try { Scm.Remove(DeviceSetup.ServiceName); } catch (Exception) { }
                 DeviceInstall.RemoveRegistry();
                 RemoveFolder(folder);
                 return reached ? Removed : Unreachable;
             } finally { try { only.ReleaseMutex(); } catch (Exception) { } only.Dispose(); }
         }
-        static void EndTrays() {
+        // Ends every tray started from any exe in folder: support.exe or any version file, whatever an update renamed. Only
+        // processes in a signed-in session (never session 0, where the service and the update switch run), and only those
+        // whose name starts with "support", are looked at.
+        internal static void EndTrays(string folder) {
             try {
-                foreach (var pr in Process.GetProcessesByName("support")) {
-                    try { if (string.Equals(pr.MainModule.FileName, DeviceSetup.Exe, StringComparison.OrdinalIgnoreCase)) pr.Kill(); }
+                foreach (var pr in Process.GetProcesses()) {
+                    try { if (pr.SessionId != 0 && pr.ProcessName.StartsWith("support", StringComparison.OrdinalIgnoreCase) && UpdateSwitch.InFolder(pr.MainModule.FileName, folder)) pr.Kill(); }
                     catch (Exception) { }
                     finally { pr.Dispose(); }
                 }
@@ -4942,6 +5805,7 @@ namespace SupportMcp {
             DeviceUninstall.Outcome outcome = DeviceUninstall.Map(exit);
             if (outcome == DeviceUninstall.Outcome.Removed) screen = Screen.Done;
             else if (outcome == DeviceUninstall.Outcome.RemovedUnreachable) screen = Screen.DoneUnreachable;
+            else if (outcome == DeviceUninstall.Outcome.Busy) { screen = Screen.Confirm; note = DeviceUninstall.BusyText; }
             else { screen = Screen.Confirm; note = "Support couldn't be removed. Try again, or ask your support team for help."; }
             Render(); Activate();
         }
@@ -4978,6 +5842,21 @@ namespace SupportMcp {
             // The roles that run elevated or as SYSTEM show nothing at all: no window, no message box.
             if (role == "--service") { try { ServiceBase.Run(new SupportService(executable, Wire.ReadConfig(executable))); } catch (Exception) { } return; }
             if (role == "--device-service") { try { ServiceBase.Run(new DeviceService(executable)); } catch (Exception) { } return; }
+            // A saved PC's update switch and rollback (DeviceUpdate), SYSTEM children of the service or its failure action.
+            // The installed exe carries no footer, so they are routed before any footer is read.
+            if (role == "--device-update") {
+                Native.SafeDllSearch(); int code = UpdateSwitch.Refused;
+                try { if (args.Length == 2) code = DeviceUpdate.Switch(executable, args[1], DeviceSetup.Folder); } catch (Exception) { }
+                Environment.Exit(code);
+            }
+            if (role == "--device-update-rollback") {
+                Native.SafeDllSearch(); int code = UpdateSwitch.Refused;
+                try {
+                    if (args.Length == 1) code = DeviceUpdate.RollBack(DeviceSetup.Folder);
+                    else if (args.Length == 2 && args[1] == DeviceUpdate.AtDeadline) code = DeviceUpdate.WatchDeadline(DeviceSetup.Folder);
+                } catch (Exception) { }
+                Environment.Exit(code);
+            }
             if (role == "--helper") { try { Helper.Run(executable, args); } catch (Exception) { } Environment.Exit(0); }
             if (role == "--elevate-install") {
                 Native.SafeDllSearch(); int code = 1; FileStream held = null;

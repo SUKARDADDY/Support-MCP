@@ -40,8 +40,9 @@ AI agent does the diagnosis and the fix while a person watches.
   commands as the signed-in user, but no Windows security prompts.
 - A small window in the corner shows that the session is live.
 - A PC's owner can also install the app permanently as a saved PC, so the
-  support team keeps it on their list. Nobody can connect to a saved PC yet. See
-  [Saved devices](#saved-devices).
+  support team keeps it on their list. Nobody can connect to a saved PC yet. A
+  saved PC updates itself, but only to a release signed with the project's
+  offline release key. See [Saved devices](#saved-devices).
 - When the customer uses the mouse or keyboard, support's input pauses for 3
   seconds.
 - Access ends 24 hours after the PC connects, or sooner if either side ends it.
@@ -426,18 +427,50 @@ The install puts these on the PC:
 - **A Windows service**, "Support device service" (`SupportMcpDevice`), runs as
   LocalSystem, starts automatically and restarts on failure. It checks in with
   the relay every few minutes. In this release it runs no commands, takes no
-  screenshots and opens no files for anyone.
+  screenshots and opens no files for anyone. It installs updates of itself
+  signed with the project's release key, and nothing else (see
+  [Updates](#updates)).
 - **A tray icon** starts at each sign-in.
 - **An entry in Windows Settings > Apps** (Control Panel > Programs and
   Features on Windows 7 and 8.1), named "Support", is how the owner uninstalls.
 
 Running the wizard on a PC that is already set up says so and opens the tray.
 
+### Updates
+
+A saved PC updates itself in the background, with no prompt and no window. At a
+check-in the relay may offer its current release. The PC takes it only when:
+
+- the release note is signed with the project's release key, which the app has
+  built in. The private key is kept offline and is never on the relay, so a relay
+  can offer or hold back a release but cannot make one;
+- the version is newer than the PC's own (a PC never goes back to an older
+  signed release), and has not failed on this PC before;
+- the downloaded app has exactly the size and SHA-256 that the note names.
+
+The PC writes the new version as its own file in `%ProgramFiles%\SupportMCP`,
+points the service, the tray's startup entry and the Apps entry at it, and
+starts it on trial. If the new version crashes, fails to start, gets a protocol
+refusal or another refusal from the relay, or has no answer from it within 4
+minutes, the PC goes back to the old version and never tries that one again. No
+network at all is not the new version's fault: it keeps trying, and is kept if
+the relay is still unreachable at the end of the trial. A restart during the
+trial starts a fresh 4 minutes. The tray's history says "Support updated to version 0.5.1" or
+that it went back, and the tray shows the version. Tray icons already running keep
+the old version until the next sign-in.
+
+A release reaches 10% of PCs for a day, then half for a day, then all.
+`UPDATE_ROLLOUT` pauses it or pins a share, and a PC that waits for approval is
+never offered one. Releases are signed at deploy time; see
+[Sign and deploy a release](docs/development.md#sign-and-deploy-a-release). If
+you build your own app, put your own release key in it, as that section says.
+
 ### The tray
 
 The tray icon opens a panel with the PC's name, its access mode, its state (for
 example "Your support team can see this PC" or "Waiting for approval"), "No one
-is connected.", a few lines of recent local history and "Uninstall Support".
+is connected.", a few lines of recent local history, "Uninstall Support" and the
+app's version.
 
 The access mode changes in one direction only. While it is "ask each time", the
 panel offers "Allow support to connect any time". The button asks for a
@@ -458,9 +491,13 @@ The owner can uninstall from Settings > Apps, or with "Uninstall Support" in the
 tray. Windows asks once for permission. Then:
 
 - The relay forgets the PC, so its key stops working.
-- The tray closes.
-- The service, the startup entry, the Apps entry and the folder are removed.
-  Anything still locked is deleted at the next restart.
+- The tray closes, also one still running an older version.
+- The service, the startup entry, the Apps entry and the folder, with every
+  version of the app in it, are removed. Anything still locked is deleted at the
+  next restart.
+
+During the few minutes an update is on trial, uninstall changes nothing and says
+to try again in a few minutes.
 
 If the relay cannot be reached, everything is still removed from the PC. The
 final window then says the support team will still see the PC in their list until
@@ -640,7 +677,12 @@ deploy without Windows. You need Windows only to change the app: see
    `ACCESS_AUD` (and `ACCESS_MCP_AUD` if you use OAuth, below) and the D1 `database_id`. Set `DEPLOYMENT_ADMINS` to your own
    email (comma-separate several). Only they can become default's first admin, and
    only they can create more workspaces. With it empty, nobody can create one.
-   Then run `npx wrangler deploy`.
+   Then run `npx wrangler deploy`. Saved PCs are offered an update only when you
+   deploy with a release signature (`RELEASE_SIGNATURE`, `RELEASE_SIGNED_AT`);
+   see [Sign and deploy a release](docs/development.md#sign-and-deploy-a-release).
+   With the bundle of a tagged release unchanged, you can use the signature and
+   the `released` time from that GitHub release. If you build your own app, it
+   needs your own release key.
 4. **Harden the zone.** Turn on **Always Use HTTPS** for the zone (SSL/TLS,
    Edge Certificates), so a link pasted without `https://` is redirected. The
    relay refuses `/j`, `/ws` and `/device/` over plain http either way. The relay
