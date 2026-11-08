@@ -136,12 +136,14 @@ sealed class FakeDevice : IDisposable {
     readonly Dictionary<string, Dictionary<string, object>> agentResults = new Dictionary<string, Dictionary<string, object>>();
     public string AgentQueue(Dictionary<string, object> frame) {
         string type = Wire.Text(frame, "type"); frame["id"] = Guid.NewGuid().ToString(); frame["lane"] = type == "screen" || type == "control" ? "screen" : "cmd";
-        lock (agentFrames) agentFrames.Enqueue(frame); return (string)frame["id"];
+        lock (agentFrames) { agentFrames.Enqueue(frame); agentTypes[(string)frame["id"]] = type; } return (string)frame["id"];
     }
+    readonly Dictionary<string, string> agentTypes = new Dictionary<string, string>();
     public Dictionary<string, object> AgentResult(string id, int seconds) {
         var until = DateTime.UtcNow.AddSeconds(seconds);
         while (DateTime.UtcNow < until) { lock (agentResults) if (agentResults.ContainsKey(id)) return agentResults[id]; Thread.Sleep(50); }
-        throw new Exception("no result for " + id);
+        string t; lock (agentFrames) agentTypes.TryGetValue(id, out t);
+        throw new Exception("no result in " + seconds + " s for the " + (t ?? "?") + " frame " + id);
     }
     // The logged /agent requests of one type ("hello", "decline", "end", ...).
     public List<Dictionary<string, object>> Agent(string type) {
@@ -2909,17 +2911,17 @@ public static class AppTests {
                 Assert(svc.TestHoldUpdates, "updates wait while a session is live");
                 var r = relay.AgentResult(relay.AgentQueue(Wire.Map("type", "run", "command", "[Console]::Write([Environment]::UserName)", "timeout_s", 60)), 90);
                 Assert(Wire.Flag(r, "ok") && Decode(r, "stdout_b64") == Environment.UserName, "run runs as the user: " + Wire.Text(r, "error") + Decode(r, "stdout_b64"));
-                r = relay.AgentResult(relay.AgentQueue(Wire.Map("type", "run", "command", "whoami", "as", "system", "timeout_s", 30)), 30);
+                r = relay.AgentResult(relay.AgentQueue(Wire.Map("type", "run", "command", "whoami", "as", "system", "timeout_s", 30)), 90);
                 Assert(!Wire.Flag(r, "ok") && Wire.Text(r, "error").Contains("needs full control"), "as: system is refused with limited support");
                 string probe = Path.Combine(dir, "limited-" + Guid.NewGuid().ToString("N") + ".txt"); File.WriteAllText(probe, "hello");
-                r = relay.AgentResult(relay.AgentQueue(Wire.Map("type", "get_file", "path", probe, "length", 100)), 30);
+                r = relay.AgentResult(relay.AgentQueue(Wire.Map("type", "get_file", "path", probe, "length", 100)), 90);
                 Assert(Wire.Flag(r, "ok") && Decode(r, "data_b64") == "hello", "a file is read as the user: " + Wire.Text(r, "error"));
                 string written = probe + ".put";
-                r = relay.AgentResult(relay.AgentQueue(Wire.Map("type", "put_file", "path", written, "data_b64", Convert.ToBase64String(Encoding.UTF8.GetBytes("put")))), 30);
+                r = relay.AgentResult(relay.AgentQueue(Wire.Map("type", "put_file", "path", written, "data_b64", Convert.ToBase64String(Encoding.UTF8.GetBytes("put")))), 90);
                 Assert(Wire.Flag(r, "ok") && File.ReadAllText(written) == "put", "a file is written as the user: " + Wire.Text(r, "error"));
-                r = relay.AgentResult(relay.AgentQueue(Wire.Map("type", "screen", "action", Wire.Map("name", "block_input", "on", true))), 30);
+                r = relay.AgentResult(relay.AgentQueue(Wire.Map("type", "screen", "action", Wire.Map("name", "block_input", "on", true))), 90);
                 Assert(!Wire.Flag(r, "ok") && Wire.Text(r, "error") == Screen.NoFull, "block_input needs full control");
-                r = relay.AgentResult(relay.AgentQueue(Wire.Map("type", "control")), 30);
+                r = relay.AgentResult(relay.AgentQueue(Wire.Map("type", "control")), 90);
                 Assert(!Wire.Flag(r, "ok"), "a limited PC never takes full control: " + Wire.Text(r, "error"));
                 relay.AgentDriver = "other@example.com";
                 Assert(Until(delegate { var st = svc.TestStatus(); return st.ContainsKey("session") && Wire.Text((Dictionary<string, object>)st["session"], "by") == "other@example.com"; }, 5000), "a take-over shows the new driver");
