@@ -53,6 +53,13 @@ SIGNIN_MAX_DAYS = "14"
 RELEASE_SIGNATURE = ""
 RELEASE_SIGNED_AT = ""
 UPDATE_ROLLOUT = ""
+# The operator's stop for the whole relay. Any non-empty value (for example "1")
+# refuses every MCP tool call, every connect to a saved PC and every /agent
+# request, and ends the live sessions on their next request. Teams cannot lift it.
+# Empty is normal. Change it with `wrangler deploy --var EMERGENCY_STOP:1`, or in
+# the Cloudflare dashboard under the Worker's variables; clear it to run again.
+# A single workspace is stopped with POST /api/v1/w/<slug>/stop instead.
+EMERGENCY_STOP = ""
 # Secrets, set with `wrangler secret put <NAME>`, never here: AUTH_SECRET
 # (32 or more random characters), GOOGLE_CLIENT_SECRET, MICROSOFT_CLIENT_SECRET
 # and RESEND_API_KEY.

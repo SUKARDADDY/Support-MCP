@@ -76,6 +76,7 @@ work in the request path; use the WebSocket Hibernation API
 | `GET /healthz` | public | `{"ok":true,"service":"support-mcp","stage":"relay-v1","version":"<release>"}` (`stage` names this API generation, `version` the release, see [Versions](development.md#versions-and-releases)) |
 | `GET /j/<code>` | public | **GET only, https only.** The code is consumed only for a request whose `User-Agent` contains `PowerShell/` (`irm` sends `WindowsPowerShell/5.1.x` or `PowerShell/7.x`). Code valid+unused → 200 `text/plain` agent script with placeholders filled, code consumed; else 404 `text/plain` `Write-Host 'This support link is invalid or expired.'` (runnable, harmless). Any other `User-Agent` (a chat link preview, a browser) → 200 `text/plain`, `Cache-Control: no-store`, a one-line `Write-Host` telling the reader to paste the command into PowerShell, and the Durable Object is **not** touched. Over plain `http:` on any host except `localhost` / `127.0.0.1` → 200 `text/plain` `Write-Host` line asking for the https link, code **not** consumed. Any other method → 405 `text/plain` (harmless one-liner, `Allow: GET`) and the code is **not** consumed. Malformed percent-encoding → the same harmless 404 script, never 500. The `User-Agent` test keeps previews from burning the code. It is not a security control, since any client can send the header. |
 | `GET /j/<code>?client=app` | public | The downloaded app. `legacy` is an alias for `app`; any other `client` value → 404. **https only**: over plain `http:` on any host except `localhost` / `127.0.0.1` → 403 `text/plain`, code **not** consumed. `GET` serves the download page (200 `text/html`, `Cache-Control: no-store`, `Referrer-Policy: same-origin`, a CSP with `default-src 'none'` and `form-action 'self'`) and **never consumes the code**, however often the page is opened or refreshed. Only a `POST` from the page's button consumes it. If the request has an `Origin` header it must equal the relay's own origin exactly. If it has none (IE11 on Windows 7 can omit it on a same-origin form POST), its `Referer` must start with `<origin>/j/`, which the page's `Referrer-Policy: same-origin` keeps on the click. A foreign `Origin`, a foreign or missing `Referer` without an `Origin`, or neither header → 403, code unused. A first valid `POST` returns 200 `application/octet-stream` with `Content-Disposition: attachment; filename="remote-support-<sid8>.exe"`: the compiled app followed by the session configuration (below). The code is single use: a repeat after the download shows "Check your downloads" (409), an expired or ended one shows "This support link has expired" (410). A code made for a `powershell` session shows the expired page and stays unused. `HEAD` and every other method → 405 (`Allow: GET, POST`). |
+| `POST /agent?sid=<sid>` + `Authorization: Bearer smd1...` | device key | The same transport for a saved PC's session ([below](#saved-pc-sessions)). The Worker checks the key against the database on every request and lets the PC into one session only: the one its record points at (`session.id` equal to `sid`), else 401. It sends no `X-Attach-Key`, and none is forwarded. Any `Authorization` header selects this path. Everything else in the next row applies. |
 | `POST /agent?sid=<sid>` + `X-Attach-Key: <key>` | attach key | The app's transport, JSON in and out; below. 403 over plain `http:` on any host except `localhost` / `127.0.0.1`, 403 on any `Origin` header or a `key` query param, 405 on other methods, 415 on a non-JSON body, 413 over 750,000 characters (checked against `Content-Length` before the body is read, and again after it is read when there is no `Content-Length`), 401 on a bad sid, bad key, a `powershell` session or a session that is still `pending`, 409 on a stale generation, 410 when the session has ended. |
 | `GET /install[?code=<code>\|?workspace=<slug>]`, `POST /install[...]` | public | The setup download for a saved PC ([below](#the-install-page-install)). `GET` shows the page and never downloads. `POST` from the page returns `support-setup.exe` with a device footer. A saved PC downloads its updates here too, with the same `POST`. Not under any Access app |
 | `GET /ws?sid=<sid>` + `X-Attach-Key: <key>` | attach key | WebSocket upgrade for the agent; 403 over plain `http:` on any host except `localhost` / `127.0.0.1`; 401 on bad/missing key, on a `key` query param, on a bad sid, or on an `app` session; 410 if session ended/expired |
@@ -86,6 +87,8 @@ work in the request path; use the WebSocket Hibernation API
 | `GET`, `POST /oauth/authorize` | browser sign-in | the consent page; see [OAuth](#oauth-for-mcp-clients) |
 | `/api/v1/w/<slug>/...` | Access JWT | the team API (below) |
 | `POST /device/pair`, `/device/hello`, `/device/update`, `/device/leave` | none (pair) or a device key in `Authorization: Bearer` | the PC wire for saved PCs ([below](#the-pc-wire-device)). Public: not under any Access app. 403 over plain `http:` except loopback, 405 other methods, 403 on any `Origin` header, 400 on `?key=` or `?code=`, 415 non-JSON, 413 over 8 KB |
+| `GET /device/ring?protocol=1` | a device key in `Authorization: Bearer` | the doorbell, a WebSocket upgrade ([below](#the-doorbell)). Public, with the refusals of the PC wire |
+| `GET`, `POST`, `DELETE /api/v1/w/<slug>/stop` | Access JWT | read, set and clear a workspace's stop ([below](#stop-and-resume)) |
 | `POST /api/v1/w`, `GET /api/v1/w` | Access JWT | create a workspace, list yours (below) |
 | `GET /auth/signin`, `GET /auth/google`, `GET /auth/microsoft`, `GET /auth/<provider>/callback`, `POST /auth/email`, `GET` and `POST /auth/email/confirm`, `GET` and `POST /auth/factor`, `POST /auth/signout`, `GET /account`, `POST /account/signout-everywhere` | none, then a browser sign-in | people sign in; see [Sign-in](#sign-in-auth-and-account) |
 | anything else | — | 404 |
@@ -168,7 +171,7 @@ The session's own log keeps it as sent, in the `[identity] detail` form.
 ### Role check (`tools/call`)
 
 `initialize`, `ping`, `tools/list` and every refusal above never read team
-data, so `tools/list` answers the same 22 tools on any well-formed
+data, so `tools/list` answers the same 24 tools on any well-formed
 `/w/<slug>/mcp`, created or not, without touching D1 or a Durable Object. On
 `tools/call` for a listed tool, after the `session_id` check, the relay checks
 that the workspace exists (`default` always does; any other slug needs a row in
@@ -184,6 +187,8 @@ tool's arguments.
 | `session_create` | `sessions.create` |
 | `session_list`, `session_status` | `sessions.view` |
 | `session_end` | `sessions.end` |
+| `device_list` | `devices.view` |
+| `device_connect` | `sessions.control`, and `sessions.unattended` inside the tool when the session will not ask or the call is a take-over |
 | every other tool | `sessions.control` |
 
 - No members in `default` (open): allowed, and the caller is recorded in
@@ -194,6 +199,13 @@ tool's arguments.
 - A member whose role lacks the permission: tool error
   `your role does not allow <permission>`.
 - No `DB` binding: tool error `the team database (DB) is not configured`.
+
+After the role check, and before the tool runs, the relay refuses the call when
+the workspace is stopped (below): the tool error `this workspace is stopped;
+someone who can manage members must resume it`. A caller who is not a member
+never learns this. `EMERGENCY_STOP` is checked first of all, before any database
+read, and refuses every call whoever asks: `this relay is stopped by its
+operator`. `tools/list` is static and still answers.
 
 A refusal is a tool error (`isError`), and nothing reaches a Session.
 `session_create` sends `workspace: "<slug>"` to `/create`, and the operator
@@ -249,9 +261,17 @@ at most 200 characters with no spaces; names at most 100 characters with no
 control characters. Role ids match `[a-z0-9-]{1,40}`. Permission keys are
 `members.manage`, `roles.manage`, `audit.view`, `devices.view`,
 `devices.manage`, `fields.manage`, `sessions.create`, `sessions.view`,
-`sessions.control`, `sessions.end`. Built-in roles: `admin` (every key, fixed),
-`technician` (`devices.view`, `devices.manage` and the four `sessions.*` keys),
-`viewer` (`audit.view`, `devices.view`, `sessions.view`). A workspace that
+`sessions.control`, `sessions.end`, `sessions.unattended`. Built-in roles:
+`admin` (every key, fixed), `technician` (`devices.view`, `devices.manage` and
+`sessions.create`, `sessions.view`, `sessions.control`, `sessions.end`),
+`viewer` (`audit.view`, `devices.view`, `sessions.view`). Only `admin` holds
+`sessions.unattended` by default.
+
+`sessions.unattended` means "connect to a PC without asking the person at it, and
+switch a PC to any time". It needs a second factor like `sessions.control` does.
+Open mode (a default workspace with no members) grants every `sessions.*` key
+except this one, which is excluded by name, so nobody connects without asking
+until a first admin is added. A workspace that
 edited `technician` or `viewer` before the device keys existed keeps its stored
 role without them. Because those two roles now hold more, the rule that a
 non-admin hands out only what they hold means a custom role with
@@ -400,7 +420,7 @@ commit together, and a permission lost between the read and the commit is a 403.
 | `GET`, `PATCH`, `DELETE .../sites/<id>` | as customers | `PATCH`: `name, address, notes, fields` | `{site}`; `DELETE` is 409 `in_use` with PCs or live codes |
 | `GET .../devices?site=&status=&after=&limit=` | `devices.view` | | `{devices:[...], next}`; `status` is `pending` or `active` |
 | `GET .../devices/<id>` | `devices.view` | | `{device}` |
-| `PATCH .../devices/<id>` | `devices.manage` | `{site_id?, fields?, access?, owner_contact?, approve?:{confirm}}`; `owner_contact` is at most 200 characters and an empty string clears it; `name`, `control`, `os`, `machine` or `app_version` is 400 `bad_request` | `{device}` |
+| `PATCH .../devices/<id>` | `devices.manage`; `access: "any"` also needs `sessions.unattended` (403 `permission_denied` otherwise, checked again at commit) | `{site_id?, fields?, access?, owner_contact?, approve?:{confirm}}`; `owner_contact` is at most 200 characters and an empty string clears it; `name`, `control`, `os`, `machine` or `app_version` is 400 `bad_request` | `{device}` |
 | `DELETE .../devices/<id>` | `devices.manage` | | `{removed:{id}}`; the PC's key ends with its row |
 | `GET .../fields` | `devices.view` | | `{fields:[{id,entity,label,position,created_at}]}` |
 | `POST .../fields` | `fields.manage` | `{entity, label}` | 201 `{field}`; `entity` is `customer`, `site` or `device` |
@@ -433,6 +453,11 @@ cannot. `approve` is its own request: a waiting PC
 becomes `active` when `confirm` is the six-digit number shown on the PC (403
 `confirm_wrong` otherwise, 409 `not_pending` for an active PC).
 
+A change of `access` and an approval ring the PC's doorbell ([below](#the-doorbell))
+once the change has committed, so the PC checks in at once. Removing a PC ends
+its live session with the reason `removed` first, and rings its doorbell once
+the row is gone; the doorbell then closes.
+
 Limits per workspace: 10,000 customers, 10,000 sites, 2,000 PCs, 30 custom fields
 per record type, 20 live pairing codes, 20 waiting PCs. The relay stores a
 pairing code only as a keyed hash.
@@ -441,7 +466,9 @@ Log kinds: `customer_added`, `customer_changed`, `customer_removed`, `site_added
 `site_changed`, `site_removed`, `field_added`, `field_changed`, `field_removed`,
 `pairing_code_created`, `pairing_code_revoked`, `device_paired`,
 `device_requested`, `device_approved`, `device_changed`, `device_removed`,
-`device_left`. A detail names ids and names, never a code, a key, an owner
+`device_left`, `device_session_started`, `device_session_taken_over`,
+`device_session_ended` ([Saved-PC sessions](#saved-pc-sessions)),
+`workspace_stopped` and `workspace_resumed`. A detail names ids and names, never a code, a key, an owner
 contact or a field value. The only unlogged writes are a PC's check-in details (at
 most every 5 minutes, or once a minute when a value changed) and purging expired
 codes and waiting PCs. A detail can hold customer, site and PC names, so anyone
@@ -452,6 +479,41 @@ still holds `devices.manage` in the workspace (checked again at commit), so
 removing the person or their permission ends their live codes. Rotating
 `AUTH_SECRET` ends every live pairing code and waiting PC number (both are keyed
 hashes); a device key is a plain SHA-256 and is unaffected.
+
+### Stop and resume
+
+| Route | Needs | Answer |
+|---|---|---|
+| `GET .../stop` | `sessions.view` | `{stopped:true\|false}` |
+| `POST .../stop` | `sessions.end` | `{stopped:true, sessions_ended:<n>}` |
+| `DELETE .../stop` | `members.manage` | `{stopped:false}` |
+
+These are team API calls only. No MCP tool stops or resumes a workspace. A body
+is not read, but `POST` and `DELETE` need `Content-Type: application/json` like
+every write. A workspace has no status column: a stop is the log row
+`workspace_stopped` and a resume is `workspace_resumed`, and the workspace is
+stopped when its newest stop row has a higher `seq` than its newest resume row.
+Stopping a stopped workspace, or resuming a running one, changes nothing and
+adds no row. While `default` is open, anyone admitted may stop it (they hold
+`sessions.end`) and resume answers 409 `first_member`, so the first admin is
+added before it can be resumed.
+
+A stop ends every live session in the workspace's Registry list with the reason
+`stopped` (at most 40 in one call; the free plan allows 50 subrequests a call),
+rings every doorbell in the workspace, and from then on each tool call is
+refused. A second `POST` ends any session the first one missed. A session also
+checks for itself: on its polls, at most once every 20 seconds, it reads the
+stop state, and a stopped workspace ends it with the reason `stopped`. That read
+failing counts as not stopped, because the stop also ends sessions directly. Link
+sessions are checked the same way. `/agent` requests and tool calls to other
+workspaces are not affected.
+
+`EMERGENCY_STOP` is a deploy setting for the whole relay. Any non-empty value
+refuses every tool call (before any database read) and every connect to a saved
+PC, and ends a live session on its next `/agent` request (or `/ws` attach) with
+the reason `stopped`. A team cannot lift it. The check-in and the doorbell keep
+working, so PCs learn their session is gone. Clear the value and deploy to run
+again.
 
 ## The install page (`/install`)
 
@@ -503,7 +565,7 @@ can land in browser history, link previews and the relay's request logs.
 ## The PC wire (`/device/*`)
 
 What a saved PC calls: pair or ask to join, check in, change its own settings, and
-leave on uninstall. These four addresses are public, with no Access login,
+leave on uninstall, plus the doorbell below. These addresses are public, with no Access login,
 because a PC has none. Every request is `POST` with `Content-Type:
 application/json` and a body of at most 8 KB that carries `"protocol": 1`. Every
 answer, success or error, carries `"protocol": 1`. Errors are
@@ -559,12 +621,20 @@ row and the code unused. A good one writes the device, the `device_paired` (or
 `device_requested`) row and, for a code, marks it used, in one batch.
 
 `POST /device/hello`, key: `{"protocol":1,"os"?,"machine"?,"app_version"?}` answers
-200 `{"protocol":1,"device":{"id","workspace","status":"active"|"pending","name","access","control","site_id"},"update"?:{...}}`.
+200 `{"protocol":1,"device":{"id","workspace","status":"active"|"pending","name","access","control","site_id"},"update"?:{...},"session"?:{...}}`.
 Allowed while pending. The reported details are written at most every 5 minutes,
 or once a minute when one changed (a changed value inside that minute is dropped
 and sent again at the next check-in), and are not logged. `update` is there only
 when the relay offers this PC its signed release ([Updates](#updates)); without
-it the answer is exactly as before. Errors: 400, 401, 426.
+it the answer is exactly as before. `session` is a new top-level key, beside
+`device` and `update`, never inside `device`. It is there only for an active PC
+with a live session pointer and is `{"id":"<64 hex>","by":"<identity>",
+"team":"<workspace name>","ask":true|false,"expires_at":<ms>}`: the session to pick
+up (below), who started it (an email or a service token id), whether the PC must
+ask the person at it, and the session's hard end. A waiting PC never gets it, and
+neither does a PC whose pointer has passed its end. It comes from the row the
+check-in already loads, so it costs no further query. A PC on 0.5.0 ignores it.
+There is no interval in the answer. Errors: 400, 401, 426.
 
 `POST /device/update`, key: `{"protocol":1,"name"?,"access"?,"control"?}`
 with at least one key answers 200 with the same `device`. Logged as
@@ -576,7 +646,51 @@ the key's holder set either mode.
 
 `POST /device/leave`, key: `{"protocol":1}` answers 200
 `{"protocol":1,"removed":true}`, deletes the row and so the key, and logs
-`device_left` (also for a waiting PC). Afterwards the key is 401. Errors: 401, 426.
+`device_left` (also for a waiting PC). A live session of the PC ends first, with
+the reason `removed`. Afterwards the key is 401. Errors: 401, 426.
+
+### The doorbell
+
+`GET /device/ring?protocol=1`, a WebSocket upgrade with `Authorization: Bearer
+smd1...`. The PC keeps one open so the relay can tell it to check in. It carries
+no data a PC acts on: the relay sends the text frame `{"type":"ring"}` and nothing
+else, and the PC treats any text frame as "check in now" (at most once every 2
+seconds) and never reads its content, so a fake ring can only cause an early
+check-in. The PC sends WebSocket protocol pings every 30 seconds and nothing
+else. The relay ignores any text it receives and closes the socket on a frame
+over 1 KB.
+
+Refusals, in this order: plain `http:` except loopback 403 `https_required`;
+any method but `GET` 405 `method_not_allowed` (`Allow: GET`); an `Origin` header
+403 `forbidden`; `?key=` or `?code=` 400 `bad_request`; a `protocol` query that is
+missing or not a whole number 400 `bad_request`; a `protocol` outside 1 to 1 426
+`protocol_unsupported`; a missing, malformed or wrong key 401 `device_unknown`
+(a malformed key never reaches the database); a request without `Upgrade:
+websocket` 400 `bad_request`; no `REGISTRY` binding 503 `unavailable`. An active
+PC and a waiting PC may both connect. The Worker checks the key with the same
+query as a check-in, then hands the upgrade to the workspace's Registry object
+without the key. The Registry accepts it with the hibernation API under the tag
+`dev:<device id>`, and a new socket for the same PC closes the older one. An idle
+doorbell is a hibernated socket, which Cloudflare does not bill, and only a ring
+wakes the object.
+
+Rung, best effort (the check-in schedule is the fallback): a connect and a
+take-over (`device_connect`), a team change to a PC's `access`, an approval, a
+removal (after the row is deleted, then the doorbell closes), and a workspace
+stop (every doorbell). `device_list` reports `online` from the Registry's
+sockets, one request per list.
+
+### The check-in schedule
+
+While its doorbell is connected a PC checks in when the doorbell connects, at each
+ring and every 6 hours (plus up to 10 minutes of jitter, for staged updates): about 10
+requests a day. While it is not connected it checks in every 5 minutes plus up to
+30 seconds, as before. A waiting PC always uses the 5-minute schedule, because the
+six digits ring it anyway. The network-error backoff, the 426 schedule and an
+update trial's own check-ins are unchanged. The PC reconnects after a close or
+an error with a backoff from 5 seconds, doubling to 5 minutes, which a ring
+that arrives resets. A PC that has not seen a pong within 60 seconds treats the
+doorbell as dead, reconnects, and uses the 5-minute schedule until it is back.
 
 ### Updates
 
@@ -876,6 +990,84 @@ of them and keeps working: see [Lanes](#lanes-screen-and-control-frames).
   answer any waiting poll with `{"type":"end"}`, fail the waiting command, and
   every later request gets 410.
 
+### Saved-PC sessions
+
+A technician starts one with `device_connect`. It is a Session object like a
+link's, with differences. It is named by a random 16-character code (the Session
+object's name and its key in the Registry), but nobody can use that code:
+`/consume` answers `not-pending` and `/j/<code>` shows an expired link. There is
+no attach key.
+
+States: `waiting`, `attached`, `ended`. The Session is created `waiting` for a
+device, with the technician as its `driver`. The PC must pick it up and the person
+at it answer within 510 seconds (a 330-second check-in without the doorbell, plus
+180); the deadline passing ends it as `timed_out`. The first `hello` attaches it
+and sets `expires_at` to that moment plus 24 hours, fixed; a later `hello` rejoins
+without extending it. There is no idle timeout. The 24 hours ending is
+`max_time`. The pointer's `expires_at` starts as the latest the session can end
+(the creation time, plus 510 seconds, plus 24 hours) and is set to the exact end at
+the first `hello`.
+
+The device's record holds the one live session as `devices.session`, JSON text
+`{"id","by","ask","expires_at","code","team"}` (`id` is the Session object's id,
+`by` the driver, `code` the Session object's name, `team` the name the PC
+shows). Connect claims it with one guarded `UPDATE` that holds only while the PC
+is active and has no pointer or one whose `expires_at` has passed, the caller
+still holds `sessions.control` (and `sessions.unattended` when the session does
+not ask), and the `device_session_started` row goes in; so two technicians cannot
+both connect, and a stale pointer is reclaimed. The Session object clears it with
+a `UPDATE` guarded on the session id when the session ends, in the same change as
+the `device_session_ended` row, and its alarm retries every 30 seconds until that
+works.
+
+`ask` is true unless the PC's access is `any`, the caller holds
+`sessions.unattended` (with its second factor for an OAuth caller), and did not
+pass `ask:true`. A caller without the permission is not refused: the session asks.
+The PC asks the person when `ask` is true or its own saved access is `ask`.
+
+**On the wire.** `POST /agent?sid=<sid>` with `Authorization: Bearer <device key>`.
+The relay checks the key against the database on every request and requires the
+PC's record to point at `sid`, else 401. The Session is called with the device id
+and the PC's control level from the record, never from the client. Messages are the
+app's ([above](#app-sessions-https-polling)), plus:
+
+```
+{"type":"decline","reason":"declined"|"nobody"|"busy"}
+```
+
+sent before `hello` only, answered `{"type":"end"}`, and the session ends with that
+reason. Anything else (another reason, after a `hello`, on a link session) is 400.
+A `hello` with `control: "full"` for a PC the record says is limited is 403 and
+changes nothing. `welcome` adds `"driver":"<identity>"`. Every poll answer for a
+saved-PC session, whether idle, a command frame or an end, carries `"driver"`, so the corner
+window shows a take-over at once. `end` from the PC ends the session with the
+reason `owner` (a `"reason":"owner"` in it is optional).
+
+**One driver.** A command (`run`, files, screen, control) from anyone but the
+driver is refused: `<driver> is driving this session; use device_connect with
+take_over`. `session_status`, `session_list` and `session_end` are not commands.
+`device_connect` with `take_over:true` moves the driver to the caller (always
+needs `sessions.unattended`), changes `by` in the pointer, wakes the PC's parked
+poll with the new driver, rings the PC and writes `device_session_taken_over`. It
+is not an end. Without the permission the error says to ask the driver to end the
+session and connect again, so the person at the PC is asked.
+
+**End reasons** (`ended_reason` in `session_status`, and the last word of the
+`device_session_ended` detail): `declined`, `nobody` and `busy` (the PC's decline),
+`timed_out` (the waiting deadline), `max_time` (the 24 hours), `owner` (the PC
+ended it), `technician` (`session_end`), `stopped` (a workspace stop or
+`EMERGENCY_STOP`), `removed` (the PC was removed or left) and `replaced` (made
+but never claimed: this one is not logged).
+
+`session_status` for a saved-PC session adds `device_id` and `driver`, and its
+`startup_expires_at` is the waiting deadline while it waits. `session_list` shows
+it with the label `PC <name> (<device id>)`. The log rows are
+`device_session_started` (actor the technician; detail the device id, its name,
+the first 8 characters of the session id and whether it asks), `device_session_taken_over`
+(actor the new driver; detail ends `from <old driver>`) and `device_session_ended`
+(actor the technician, `pc <id>` for the PC's own words, or `relay`; detail ends
+with the reason). They hold ids and names, never a code or a key.
+
 ### Lanes, screen and control frames
 
 **Lanes.** Every operation frame carries `"lane":"cmd"` or `"lane":"screen"`.
@@ -1133,6 +1325,8 @@ text content item, not JSON-RPC errors.
 | `put_file` | `session_id`, `path`, `data_b64`, `append?` | bytes |
 | `get_file` | `session_id`, `path`, `offset?`, `length?` | data_b64, size, eof |
 | `session_end` | `session_id` | `{ended:true}`; sends `end` to agent first |
+| `device_list` | `site?` (an id), `status?` (`active` or `pending`), `after?` (an id) | `{devices:[...], next, untrusted_text}`: the team's device shape plus `online` (true while the PC's doorbell is connected; false when the Registry cannot be read), from one Registry request per call. Names, contacts and custom field values come from people and are untrusted data |
+| `device_connect` | `device_id`, `ask?` (boolean), `take_over?` (boolean) | `{session_id, state:"waiting"\|"attached", asks, rang}`. `rang` is true when the PC's doorbell was connected (else the PC sees the request within about 5 minutes). Refused: an unknown PC or one in another workspace, a waiting PC, an `app_version` below 0.6.0 (`this PC updates itself to 0.6.0 first`), a PC already in a session without `take_over` (`<who> is connected`) and a stopped workspace. See [Saved-PC sessions](#saved-pc-sessions) |
 
 The tools above are in every connection, with the screen tools below. `?ui=0`
 hides `ui_tree` and `ui_act` (`?ui=1` is the default); any other value gets 400
@@ -1140,7 +1334,8 @@ hides `ui_tree` and `ui_act` (`?ui=1` is the default); any other value gets 400
 parameter no longer exists: a request that carries it, with any value, gets 400
 `{"error":"the shape parameter was removed; ..."}` rather than a silently
 different tool list. A tool that the connection does not list is `unknown tool`.
-Every tool except `session_create` and `session_list` requires `session_id`. When
+Every tool except `session_create`, `session_list`, `device_list` and
+`device_connect` requires `session_id`. When
 it is missing, empty or not a string, `tools/call` returns a tool error
 `session_id is required; call session_list to find it` and nothing reaches the
 backend. There is no default session.
@@ -1390,10 +1585,10 @@ never update themselves.
 1. `npm test` green; `npx wrangler deploy --dry-run` bundles without error
    and lists `env.DB` as a D1 database.
 2. Local stack (`wrangler dev`, `.dev.vars` with `DEV_SKIP_ACCESS=1`): MCP
-   `initialize` → `tools/list` returns the 7 base tools plus the nine screen
-   tools, `ui_tree`, `ui_act`, `block_input`, `send_sas`, `type_secret` and
-   `request_full_control` (22), `?ui=0` drops `ui_tree` and `ui_act`, and
-   `?shape=...` is a 400 (curl).
+   `initialize` → `tools/list` returns the 7 session tools and the two device
+   tools (`device_list`, `device_connect`) plus the nine screen tools, `ui_tree`,
+   `ui_act`, `block_input`, `send_sas`, `type_secret` and `request_full_control`
+   (24), `?ui=0` drops `ui_tree` and `ui_act`, and `?shape=...` is a 400 (curl).
 3. `/mcp` without the JWT on a non-localhost host → 403 (unit test with a fake
    host + a test for bad aud / expired / wrong sig using a locally generated
    RSA key).
@@ -1444,8 +1639,11 @@ never update themselves.
   session, at its own deadline, and through the backstop task, which never runs
   the app. A saved PC stays until its owner uninstalls it, and uninstalling
   removes the PC's key at the relay.
-- The service of a saved PC runs no command, takes no screenshot and opens no
-  file for anyone in this release, and nothing in the app turns the access mode
+- The service of a saved PC runs a command, takes a screenshot or opens a file
+  only inside a session its own record points at and that it accepted (asking the
+  person at the PC when the session or its own setting says ask), a limited PC
+  never acts as the system, a check-in never raises a PC from limited to full
+  control, and nothing in the app turns the access mode
   from `any` back to `ask` (the relay still accepts either mode from a holder of
   the key, as pinned earlier). It installs releases signed with the project's
   release key and nothing else, never a version lower than or equal to its own,
@@ -1456,7 +1654,11 @@ never update themselves.
   the audit log, the Session storage, the registry or the Worker log.
 - `ended` is terminal; no path reopens a session or extends `expires_at`.
 - Every `tools/call` checks the caller's role before it reaches a session; team
-  management is never an MCP tool.
+  management is never an MCP tool, and neither is stopping or resuming a
+  workspace.
+- A saved PC is connected without asking the person at it only for a caller who
+  holds `sessions.unattended`, which open mode never grants; and switching a PC to
+  `any` needs it too.
 - Customer, site, device and custom field data is never read when the relay
   decides who may do what. A device key is never in a URL, never logged, stored
   only as a hash, compared in constant time, and refused on a request with an

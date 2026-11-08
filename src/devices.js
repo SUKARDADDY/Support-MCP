@@ -21,6 +21,9 @@
 // or a log line.
 import { MIN_SECRET_LENGTH, base32Encode, hmacHex, randomBytes, randomToken, sha256Hex, timingSafeEqual } from './crypto.js';
 import { TeamError, normalizeIdentity, teamFromEnv } from './workspace.js';
+import { UNATTENDED_PERMISSION } from './permissions.js';
+import { compareVersions, validVersion } from './release.js';
+import { deviceHooks } from './device-sessions.js';
 
 export const ID_RE = /^[a-z2-7]{20}$/;
 // smd1.<workspace>.<device id>.<secret>. A mismatch is 401 device_unknown.
@@ -39,6 +42,15 @@ export const CHECK_IN_REFRESH_MS = 5 * MINUTE_MS;
 // Even a changed value is written at most this often, so a PC cannot flip its
 // details to force a write on every check-in.
 export const CHECK_IN_CHANGE_MS = MINUTE_MS;
+
+// The first release that picks up a session from the check-in and the doorbell.
+export const MIN_SESSION_VERSION = '0.6.0';
+// A saved-PC session waits this long for the PC to pick it up and its person to
+// answer (a 330-second check-in without the doorbell, plus 180), then lasts 24
+// hours from the first hello. The pointer's expires_at is the latest the
+// session can end, so it covers both.
+export const SESSION_WAIT_MS = 510_000;
+export const SESSION_LIFE_MS = 24 * HOUR_MS;
 
 export const LIMITS = Object.freeze({
   customers: 10_000, sites: 10_000, devices: 2_000, fieldDefs: 30, liveCodes: 20, pending: 20, requestsPerHour: 20,
@@ -157,13 +169,25 @@ const deviceOut = (r) => ({
 });
 // A device for the PC itself.
 const pcOut = (r) => ({ id: r.id, workspace: r.workspace, status: r.status, name: r.name, access: r.access, control: r.control, site_id: r.site_id });
+// The live session pointer on a device row, or null when there is none, it is
+// not valid JSON of the expected shape, or its end has passed.
+export function livePointer(row, now = Date.now()) {
+  if (!row || typeof row.session !== 'string') return null;
+  let p;
+  try { p = JSON.parse(row.session); } catch (_) { return null; }
+  if (!p || typeof p !== 'object' || typeof p.id !== 'string' || typeof p.by !== 'string' || !Number.isFinite(p.expires_at) || p.expires_at <= now) return null;
+  return p;
+}
 // A customer or site, without its workspace column.
 const recordOut = ({ workspace, ...r }) => ({ ...r, fields: JSON.parse(r.fields) });
 
 // deps: the team store (src/workspace.js), whose guarded change this builds on.
 // opts.authSecret is AUTH_SECRET: without one of MIN_SECRET_LENGTH characters
 // the pairing routes answer 503 unavailable.
-export function deviceStore(db, team, { authSecret = '' } = {}) {
+// opts.hooks reaches the Durable Objects (src/device-sessions.js): ringing a PC's
+// doorbell, making, ending and taking over a session. Without it the store
+// changes the database and touches nothing else.
+export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
   const { mutate, actorContext, actorHas, actorUnchanged, and, lit } = team;
   const q = (sql, ...params) => db.prepare(sql).bind(...params);
   const secretOk = typeof authSecret === 'string' && authSecret.length >= MIN_SECRET_LENGTH;
@@ -453,8 +477,16 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
       if (typeof confirm !== 'string' || !/^\d{6}$/.test(confirm)) throw bad('approve.confirm must be the six-digit number shown on the PC');
       needSecret();
     }
-    return mutate(slug, actor, async () => {
+    // Switching a PC to "any time" lets technicians in without asking the person
+    // at it, so it needs sessions.unattended as well as devices.manage.
+    const wantsAny = hasAccess && access === 'any';
+    let ring = false;
+    const out = await mutate(slug, actor, async () => {
+      ring = false;
       const ctx = await actorContext(slug, actor, 'devices.manage');
+      if (wantsAny && !ctx.permissions.includes(UNATTENDED_PERMISSION)) {
+        throw new TeamError(403, 'permission_denied', `your role does not allow ${UNATTENDED_PERMISSION} (switching a PC to any time)`);
+      }
       await purgePending(slug);
       const cur = await q('SELECT * FROM devices WHERE workspace = ? AND id = ?', slug, id).first();
       if (!cur) throw new TeamError(404, 'not_found', 'no such device');
@@ -464,6 +496,7 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
         if (cur.status !== 'pending') throw new TeamError(409, 'not_pending', 'this PC is not waiting for approval');
         const given = await hmacHex(authSecret, 'device-confirm', `${id}:${confirm}`);
         if (!timingSafeEqual(given, cur.confirm_hash)) throw new TeamError(403, 'confirm_wrong', 'that number does not match the one on the PC');
+        ring = true;
         return {
           entries: [{ kind: 'device_approved', detail: `${id} ${JSON.stringify(cur.name)}` }],
           guard: and(base, ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND status = 'pending' AND confirm_hash = ? AND expires_at > ?)", [slug, id, cur.confirm_hash, now]]),
@@ -489,10 +522,14 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
       if (contactChanges) { changed.push('owner_contact'); sets.push('owner_contact = ?'); values.push(contact); }
       if (merge.ids.length) { changed.push(...merge.ids.map((f) => `field ${f}`)); sets.push('fields = json_patch(fields, ?)'); values.push(merge.patch); }
       if (!changed.length) return { noop: true, result: deviceOut(cur) };
+      // A changed access mode is something the PC acts on, so it is rung.
+      ring = accessChanges;
       return {
         entries: [{ kind: 'device_changed', detail: `${id} ${changed.join(', ')}` }],
         guard: and(
           base,
+          // The permission is held at commit too, not only when it was read.
+          accessChanges && access === 'any' ? actorHas(slug, actor, UNATTENDED_PERMISSION) : lit(true),
           siteId ? rowExists('sites', slug, siteId) : lit(true),
           // The site a technician replaces is the one the plan read.
           siteChanges ? ['EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND site_id IS ?)', [slug, id, cur.site_id]] : lit(true),
@@ -507,15 +544,25 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
         }),
       };
     });
+    if (ring) await hooks?.ring(slug, id);
+    return out;
   }
 
   // A technician removes a saved PC, waiting or not. Its key ends with its row.
   async function removeDevice(slug, actorIdentity, id) {
     const actor = normalizeIdentity(actorIdentity);
-    return mutate(slug, actor, async () => {
+    let endedSession = false;
+    const out = await mutate(slug, actor, async () => {
       const ctx = await actorContext(slug, actor, 'devices.manage');
-      const cur = await q('SELECT id, name FROM devices WHERE workspace = ? AND id = ?', slug, id).first();
+      const cur = await q('SELECT id, name, session FROM devices WHERE workspace = ? AND id = ?', slug, id).first();
       if (!cur) throw new TeamError(404, 'not_found', 'no such device');
+      // The PC's live session ends first, with reason "removed": nothing would
+      // tell it once the row is gone. Done once, even if the change is retried.
+      const live = livePointer(cur);
+      if (live && !endedSession) {
+        endedSession = true;
+        await hooks?.endSession(slug, live.id, 'removed', actor);
+      }
       return {
         entries: [{ kind: 'device_removed', detail: `${id} ${JSON.stringify(cur.name)}` }],
         guard: and(actorHas(slug, actor, 'devices.manage'), actorUnchanged(slug, ctx), rowExists('devices', slug, id)),
@@ -523,6 +570,9 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
         result: { id },
       };
     });
+    // Rung after the row is gone, so the PC's check-in finds it removed. Its doorbell then closes.
+    await hooks?.ring(slug, id, { close: true });
+    return out;
   }
 
   // ---- pairing codes (the team side) ---------------------------------------------
@@ -749,7 +799,10 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
       await q('UPDATE devices SET os = ?, machine = ?, app_version = ?, protocol = 1, last_seen = ? WHERE workspace = ? AND id = ? AND key_hash = ? AND last_seen <= ?',
         next.os, next.machine, next.app_version, now, key.workspace, key.id, dev.key_hash, now - minAge).run();
     }
-    return { device: pcOut(dev), app_version: next.app_version };
+    // The session the PC should pick up, from the row already loaded: no further query.
+    const live = dev.status === 'active' ? livePointer(dev, now) : null;
+    const session = live ? { id: live.id, by: live.by, team: live.team, ask: live.ask, expires_at: live.expires_at } : null;
+    return { device: pcOut(dev), app_version: next.app_version, session };
   }
   const checkIn = async (key, body) => (await checkInFull(key, body)).device;
 
@@ -788,9 +841,15 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
 
   // The PC removes itself, waiting or active. Its key ends at once.
   async function leave(key) {
+    let endedSession = false;
     return mutate(key.workspace, `pc ${key.id}`, async () => {
       const dev = await authenticate(key);
       if (!dev) throw unknownDevice();
+      const live = livePointer(dev);
+      if (live && !endedSession) {
+        endedSession = true;
+        await hooks?.endSession(key.workspace, live.id, 'removed', `pc ${key.id}`);
+      }
       return {
         entries: [{ kind: 'device_left', detail: `${key.id} ${JSON.stringify(dev.name)}` }],
         guard: ['EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND key_hash = ?)', [key.workspace, key.id, dev.key_hash]],
@@ -800,7 +859,127 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
     });
   }
 
+  // ---- saved-PC sessions ---------------------------------------------------------
+  // Connect to a saved PC. args: { device_id, ask, take_over } (checked by the
+  // caller for type). caps.factor(permission) throws when the caller's sign-in
+  // lacks the second factor that permission needs.
+  //
+  // A new session: the Session object is made first (once, even if the change
+  // is retried), then one guarded change claims devices.session and writes the
+  // device_session_started row together. The change holds only while the PC is
+  // active, free (no pointer, or one past its end), and the caller still holds
+  // sessions.control and, when the session will not ask, sessions.unattended.
+  // Whoever loses the race is told who is connected, and the unused Session
+  // object is thrown away.
+  //
+  // A take-over moves the driver of a live session to the caller. It always
+  // needs sessions.unattended, and it is a log row, not an end.
+  async function connect(slug, actorIdentity, args, caps = {}) {
+    if (!hooks) throw new TeamError(503, 'unavailable', 'sessions are not configured');
+    const actor = normalizeIdentity(actorIdentity);
+    const id = validId(args.device_id, 'device_id');
+    const forceAsk = args.ask === true;
+    const takeOver = args.take_over === true;
+    let made = null;
+    let result;
+    try {
+      result = await mutate(slug, actor, async () => {
+        const ctx = await actorContext(slug, actor, 'sessions.control');
+        const cur = await q('SELECT * FROM devices WHERE workspace = ? AND id = ?', slug, id).first();
+        if (!cur || (cur.status === 'pending' && cur.expires_at <= Date.now())) throw new TeamError(404, 'not_found', 'no such PC in this team');
+        if (cur.status !== 'active') throw new TeamError(409, 'pending', 'this PC is waiting for approval; approve it first');
+        if (!validVersion(cur.app_version) || compareVersions(cur.app_version, MIN_SESSION_VERSION) < 0) {
+          throw new TeamError(409, 'needs_update', `this PC updates itself to ${MIN_SESSION_VERSION} first`);
+        }
+        const now = Date.now();
+        const live = livePointer(cur, now);
+        const base = and(actorHas(slug, actor, 'sessions.control'), actorUnchanged(slug, ctx), rowExists('devices', slug, id));
+        const unattended = () => holds(slug, actor, UNATTENDED_PERMISSION);
+        if (takeOver) {
+          if (!(await unattended())) {
+            throw new TeamError(403, 'permission_denied', `taking over needs ${UNATTENDED_PERMISSION}. Ask the driver to end the session, then connect again so the person at the PC is asked.`);
+          }
+          await caps.factor?.(UNATTENDED_PERMISSION);
+        }
+        if (live && !takeOver) throw new TeamError(409, 'connected', `${live.by} is connected`);
+        if (live) {
+          return {
+            entries: [{ kind: 'device_session_taken_over', detail: `${id} ${JSON.stringify(cur.name)} from ${live.by}` }],
+            guard: and(
+              base,
+              actorHas(slug, actor, UNATTENDED_PERMISSION),
+              ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND status = 'active' AND json_extract(session, '$.id') = ? AND json_extract(session, '$.expires_at') > ?)", [slug, id, live.id, now]],
+            ),
+            change: ([cond, params]) => [q(
+              `UPDATE devices SET session = json_set(session, '$.by', ?) WHERE workspace = ? AND id = ? AND ${cond}`,
+              actor, slug, id, ...params,
+            )],
+            result: { takeover: true, session_id: live.id, ask: live.ask },
+          };
+        }
+        // The session asks unless the PC is set to any time, the caller did not
+        // ask for a prompt, and they may connect without asking. Missing the
+        // permission (or its second factor) is not a refusal: the person is asked.
+        let ask = true;
+        if (!forceAsk && cur.access === 'any' && (await unattended())) {
+          try { await caps.factor?.(UNATTENDED_PERMISSION); ask = false; } catch (_) { ask = true; }
+        }
+        made ??= await hooks.createSession({ slug, actor, device: cur });
+        const pointer = {
+          id: made.sid, by: actor, ask, expires_at: now + SESSION_WAIT_MS + SESSION_LIFE_MS, code: made.code, team: await team.workspaceName(slug),
+        };
+        return {
+          entries: [{ kind: 'device_session_started', detail: `${id} ${JSON.stringify(cur.name)} ${made.sid.slice(0, 8)} ${ask ? 'asks' : 'does not ask'}` }],
+          guard: and(
+            base,
+            ask ? lit(true) : and(actorHas(slug, actor, UNATTENDED_PERMISSION), ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND access = 'any')", [slug, id]]),
+            ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND status = 'active' AND (session IS NULL OR json_extract(session, '$.expires_at') < ?))", [slug, id, now]],
+          ),
+          change: ([cond, params]) => [q('UPDATE devices SET session = ? WHERE workspace = ? AND id = ? AND ' + cond, JSON.stringify(pointer), slug, id, ...params)],
+          result: { takeover: false, session_id: made.sid, ask },
+        };
+      });
+    } catch (e) {
+      if (made) await hooks.discardSession(slug, made.sid);
+      throw e;
+    }
+    // A retried change can end up as a take-over, leaving the session made earlier unused.
+    if (made && result.session_id !== made.sid) await hooks.discardSession(slug, made.sid);
+    let state = 'waiting';
+    if (result.takeover) {
+      const t = await hooks.takeOver(slug, result.session_id, actor);
+      if (!t || t.ok !== true) throw new TeamError(409, 'ended', 'that session has just ended; connect again');
+      state = t.state === 'attached' ? 'attached' : 'waiting';
+    }
+    const rang = await hooks.ring(slug, id);
+    return { session_id: result.session_id, state, asks: result.ask, rang };
+  }
+
+  // The Session object calls this when a saved-PC session ends. It writes
+  // device_session_ended and clears the PC's pointer, guarded on the session id
+  // so it never clears a newer session. One change, so a retry after a failure
+  // either does both or neither. actor is who ended it, or "relay".
+  async function sessionEnded(slug, { deviceId, sid, name, reason, actor }) {
+    return mutate(slug, actor, async () => ({
+      entries: [{ kind: 'device_session_ended', detail: `${deviceId} ${JSON.stringify(name)} ${sid.slice(0, 8)} ${reason}` }],
+      guard: lit(true),
+      change: ([cond, params]) => [q(
+        `UPDATE devices SET session = NULL WHERE workspace = ? AND id = ? AND json_extract(session, '$.id') = ? AND ${cond}`,
+        slug, deviceId, sid, ...params,
+      )],
+      result: { ended: true },
+    }));
+  }
+
+  // The session's first hello fixes its end at 24 hours from then. The pointer
+  // held the latest it could be; this tightens it. Unlogged, guarded on the id.
+  async function pinSessionEnd(slug, deviceId, sid, expiresAt) {
+    await q("UPDATE devices SET session = json_set(session, '$.expires_at', ?) WHERE workspace = ? AND id = ? AND json_extract(session, '$.id') = ?",
+      expiresAt, slug, deviceId, sid).run();
+  }
+
   return {
+    connect, sessionEnded, pinSessionEnd,
     listRecords, getRecord, addRecord, updateRecord, removeRecord,
     listFields, addField, updateField, removeField,
     listDevices, getDevice, updateDevice, removeDevice,
@@ -810,4 +989,6 @@ export function deviceStore(db, team, { authSecret = '' } = {}) {
 }
 
 // The device store for this deployment, from the Worker env.
-export const devicesFromEnv = (env, team = teamFromEnv(env)) => deviceStore(env.DB, team, { authSecret: env.AUTH_SECRET });
+// opts.devTtlMs is the dev session-length override of the MCP address that called.
+export const devicesFromEnv = (env, team = teamFromEnv(env), { devTtlMs = 0 } = {}) =>
+  deviceStore(env.DB, team, { authSecret: env.AUTH_SECRET, hooks: deviceHooks(env, { devTtlMs }) });

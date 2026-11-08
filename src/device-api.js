@@ -13,9 +13,18 @@
 // A hello's answer, and a 426, may carry "update": the signed release this relay
 // offers (src/release.js). The relay only passes the signature on; the PC checks
 // it. Working out the offer reads nothing more from the database.
+//
+// A hello's answer may also carry "session": the one live session a technician
+// started for this PC, which it should pick up. It comes from the row the check-in
+// already loads, so it costs no query, and a waiting PC never gets it.
+//
+// GET /device/ring is the doorbell: a WebSocket the PC keeps open so the relay
+// can ring it when something changes (src/registry.js holds the sockets). It
+// carries no data either way, so it needs no body and no protocol field in one.
 import { readTextCapped } from './body.js';
 import { TeamError } from './workspace.js';
 import { devicesFromEnv, parseDeviceKey } from './devices.js';
+import { registryName } from './registry.js';
 import { offerAtCheckIn, offerOnRefusal, releaseFrom, updateField } from './release.js';
 
 export const PROTOCOL = 1;
@@ -49,10 +58,10 @@ const ROUTES = Object.freeze({
     return [202, await devs.requestJoin(body)];
   },
   async hello(devs, body, request, { env, appBundle }) {
-    const { device, app_version } = await devs.checkInFull(keyOf(request), body);
+    const { device, app_version, session } = await devs.checkInFull(keyOf(request), body);
     const release = await releaseFrom(appBundle, env);
     const offered = release && await offerAtCheckIn(release, { ...device, app_version }, env?.UPDATE_ROLLOUT);
-    return [200, offered ? { device, update: updateField(release) } : { device }];
+    return [200, { device, ...(offered ? { update: updateField(release) } : {}), ...(session ? { session } : {}) }];
   },
   async update(devs, body, request) {
     return [200, { device: await devs.updateOwn(keyOf(request), body) }];
@@ -62,11 +71,40 @@ const ROUTES = Object.freeze({
   },
 });
 
+// The doorbell. Same refusals as the other /device addresses, then the Worker
+// checks the key and hands the upgrade to the workspace's Registry object, which
+// holds the socket. Active and waiting PCs may connect. The key is stripped from
+// what the Registry sees.
+async function handleRing(request, env, url) {
+  if (request.method !== 'GET') return fail(405, 'method_not_allowed', 'use GET', { allow: 'GET' });
+  if (request.headers.has('origin')) return fail(403, 'forbidden', 'cross-site requests are refused');
+  if (url.searchParams.has('key') || url.searchParams.has('code')) return fail(400, 'bad_request', 'send the key in the Authorization header, not the URL');
+  const protocol = url.searchParams.get('protocol');
+  if (protocol === null || !/^\d{1,6}$/.test(protocol)) return fail(400, 'bad_request', 'protocol must be a whole number');
+  if (Number(protocol) < SUPPORTED.min || Number(protocol) > SUPPORTED.max) {
+    return fail(426, 'protocol_unsupported', `this relay speaks protocol ${SUPPORTED.min} to ${SUPPORTED.max}`, {});
+  }
+  try {
+    const key = keyOf(request);
+    if ((request.headers.get('upgrade') || '').toLowerCase() !== 'websocket') return fail(400, 'bad_request', 'this address is a WebSocket: send an Upgrade: websocket request');
+    const row = await devicesFromEnv(env).authenticate(key);
+    if (!row) throw new TeamError(401, 'device_unknown', 'this key is not valid');
+    if (!env.REGISTRY) return fail(503, 'unavailable', 'the doorbell is not configured', { 'retry-after': '60' });
+    const forward = new Request(`https://do/doorbell?device=${row.id}`, request);
+    forward.headers.delete('authorization');
+    return await env.REGISTRY.get(env.REGISTRY.idFromName(registryName(row.workspace))).fetch(forward);
+  } catch (e) {
+    if (e instanceof TeamError) return fail(e.status, e.code, e.message, e.status === 503 ? { 'retry-after': '1' } : {});
+    return fail(500, 'internal', 'internal error');
+  }
+}
+
 // deps: { isLoopback(hostname) -> bool, isJsonContentType(request) -> bool } from app.js, and appBundle, the
 // app this relay serves (null when it serves none, and then it offers no update).
 export async function handleDevice(request, env, url, { isLoopback, isJsonContentType, appBundle = null }) {
   if (url.protocol !== 'https:' && !isLoopback(url.hostname)) return fail(403, 'https_required', 'use https');
   const name = url.pathname.slice('/device/'.length);
+  if (name === 'ring') return handleRing(request, env, url);
   if (!Object.hasOwn(ROUTES, name)) return fail(404, 'not_found', 'not found');
   if (request.method !== 'POST') return fail(405, 'method_not_allowed', 'use POST', { allow: 'POST' });
   // The PC is not a browser, so any Origin header means a cross-site request.

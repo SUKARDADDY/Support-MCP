@@ -5,7 +5,59 @@ All notable changes to Support-MCP are listed here. The format follows
 [Semantic Versioning](https://semver.org). It stays at 0.x until Stage 1 is safe
 to run on unattended customer PCs.
 
-## [Unreleased]
+## [0.6.0] - 2026-11-08
+
+### Added
+
+- Connect to a saved PC. Two new MCP tools: `device_list` (the team's saved PCs
+  with `online`, and custom fields marked as untrusted text) and `device_connect`
+  (`{device_id, ask?, take_over?}`, which returns `{session_id, state: "waiting",
+  asks, rang}`). The tool count goes from 22 to 24. A PC set to ask first, a call
+  with `ask: true`, and a caller without the new permission all make the person at
+  the PC allow the session.
+- Migration `0005_device_sessions.sql` adds `devices.session`, the one live
+  session of a PC. The check-in answer (`/device/hello`) gets a new top-level
+  `session` key, `{id, by, team, ask, expires_at}`, only for an active PC.
+- The doorbell, `GET /device/ring?protocol=1`: a WebSocket each PC keeps open to
+  its workspace's Registry object, which rings it with `{"type":"ring"}` when a
+  technician connects or takes over, when a team change touches the PC's access or
+  approves it, when the PC is removed, and when the workspace stops. A PC with its
+  doorbell up checks in at connect, on each ring and every 6 hours; one without
+  keeps the 5-minute check-in. `device_list` reports `online` from it.
+- Sessions on saved PCs. A session starts `waiting` (510 seconds for the PC to
+  pick it up and its person to answer), attaches on the PC's `hello`, and ends 24
+  hours after that with no idle timeout. The PC joins with its device key in
+  `Authorization` and no attach key; the relay checks it against the database on
+  every request and lets it into only the session its record points at. A new
+  `decline` message before `hello` (`declined`, `nobody` or `busy`) ends the
+  session. A `hello` with full control from a limited PC is 403. `welcome` and
+  every poll answer carry the `driver`.
+- One driver at a time. A command from anyone else is refused with the driver's
+  name. `take_over` moves the driver and is logged, not an end. End reasons:
+  `declined`, `nobody`, `busy`, `timed_out`, `max_time`, `owner`, `technician`,
+  `stopped`, `removed` and `replaced`. New team log rows `device_session_started`,
+  `device_session_taken_over` and `device_session_ended`.
+- A new permission, `sessions.unattended` ("connect to a PC without asking the
+  person at it, and switch a PC to any time"). Admins hold it. It needs a second
+  factor and open mode never grants it.
+- Stop and resume. `POST` and `DELETE /api/v1/w/<slug>/stop` (and `GET` for the
+  state) stop a workspace, which ends every live session in it and refuses its
+  tool calls, and resume it. Stop needs `sessions.end`, resume needs
+  `members.manage`. Each session also checks the stop on its polls, at most every 20
+  seconds. New log rows `workspace_stopped` and `workspace_resumed`.
+- `EMERGENCY_STOP`, a deploy setting. Any non-empty value refuses every tool
+  call, every connect and every `/agent` request for the whole relay, and ends
+  live sessions on their next request.
+
+### Changed
+
+- Switching a PC to "any time" in the team API now needs `sessions.unattended` as
+  well as `devices.manage` (403 otherwise, checked again at commit). Switching to
+  "ask" needs only `devices.manage`. A change of access and an approval ring the
+  PC.
+- Removing a PC, or a PC leaving, ends its live session with the reason `removed`.
+- The README no longer says nobody can connect to a saved PC. The Stage 1 warning
+  stays: do not use a saved PC on a real customer's unattended machine yet.
 
 ## [0.5.0] - 2026-11-08
 

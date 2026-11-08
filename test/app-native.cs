@@ -127,6 +127,47 @@ sealed class FakeDevice : IDisposable {
     public volatile bool Refuse;
     // A hello can answer with its own body after a delay, so a test can hold one in flight while another request runs.
     public volatile string HelloBody; public volatile int HelloDelayMs;
+    // /agent, a saved PC's session (PR 6): every request is logged as {query, auth, attach, body}. A decline or an end is
+    // answered with end (DeclineStatus may make a decline fail), a hello with a welcome naming AgentDriver, a poll with
+    // the next queued frame or, after a short wait, idle, and a result with an ack (kept by id).
+    public readonly List<Dictionary<string, object>> AgentLog = new List<Dictionary<string, object>>();
+    public volatile string AgentDriver = "tech@example.com"; public volatile int DeclineStatus = 200;
+    readonly Queue<Dictionary<string, object>> agentFrames = new Queue<Dictionary<string, object>>();
+    readonly Dictionary<string, Dictionary<string, object>> agentResults = new Dictionary<string, Dictionary<string, object>>();
+    public string AgentQueue(Dictionary<string, object> frame) {
+        string type = Wire.Text(frame, "type"); frame["id"] = Guid.NewGuid().ToString(); frame["lane"] = type == "screen" || type == "control" ? "screen" : "cmd";
+        lock (agentFrames) agentFrames.Enqueue(frame); return (string)frame["id"];
+    }
+    public Dictionary<string, object> AgentResult(string id, int seconds) {
+        var until = DateTime.UtcNow.AddSeconds(seconds);
+        while (DateTime.UtcNow < until) { lock (agentResults) if (agentResults.ContainsKey(id)) return agentResults[id]; Thread.Sleep(50); }
+        throw new Exception("no result for " + id);
+    }
+    // The logged /agent requests of one type ("hello", "decline", "end", ...).
+    public List<Dictionary<string, object>> Agent(string type) {
+        var list = new List<Dictionary<string, object>>();
+        lock (AgentLog) foreach (var e in AgentLog) if (Wire.Text((Dictionary<string, object>)e["body"], "type") == type) list.Add(e);
+        return list;
+    }
+    public bool WaitAgent(string type, int count, int ms) { var until = DateTime.UtcNow.AddMilliseconds(ms); while (DateTime.UtcNow < until) { if (Agent(type).Count >= count) return true; Thread.Sleep(50); } return Agent(type).Count >= count; }
+    void AgentReply(HttpListenerContext ctx) {
+        string raw; using (var r = new StreamReader(ctx.Request.InputStream)) raw = r.ReadToEnd();
+        var b = Wire.Json().Deserialize<Dictionary<string, object>>(raw);
+        lock (AgentLog) AgentLog.Add(Wire.Map("query", ctx.Request.Url.Query, "auth", ctx.Request.Headers["Authorization"], "attach", ctx.Request.Headers["X-Attach-Key"], "body", b));
+        string type = Wire.Text(b, "type"); int code = 200; Dictionary<string, object> reply;
+        if (type == "decline") { code = DeclineStatus; reply = Wire.Map("type", "end"); }
+        else if (type == "end") reply = Wire.Map("type", "end");
+        else if (type == "hello") reply = Wire.Map("type", "welcome", "generation", 1, "server_time", Client.UnixNow(), "expires_at", Client.UnixNow() + 600000, "driver", AgentDriver);
+        else if (type == "result") { lock (agentResults) agentResults[Wire.Text(b, "id")] = b; reply = Wire.Map("type", "ack"); }
+        else {
+            Dictionary<string, object> next = null;
+            for (int i = 0; i < 6 && next == null; i++) { lock (agentFrames) if (agentFrames.Count > 0) next = agentFrames.Dequeue(); if (next == null) Thread.Sleep(50); }
+            reply = next ?? Wire.Map("type", "idle"); reply["driver"] = AgentDriver;
+        }
+        byte[] bytes = Encoding.UTF8.GetBytes(Wire.Json().Serialize(reply));
+        ctx.Response.StatusCode = code; ctx.Response.ContentType = "application/json"; ctx.Response.ContentLength64 = bytes.Length;
+        ctx.Response.OutputStream.Write(bytes, 0, bytes.Length); ctx.Response.Close();
+    }
     public FakeDevice() {
         var tcp = new TcpListener(IPAddress.Loopback, 0); tcp.Start(); int port = ((IPEndPoint)tcp.LocalEndpoint).Port; tcp.Stop();
         Origin = "http://127.0.0.1:" + port;
@@ -141,6 +182,7 @@ sealed class FakeDevice : IDisposable {
         try {
             if (Refuse) { ctx.Response.Abort(); return; }
             if (ctx.Request.Url.AbsolutePath == "/install") { Install(ctx); return; }
+            if (ctx.Request.Url.AbsolutePath == "/agent") { AgentReply(ctx); return; }
             string path = ctx.Request.Url.AbsolutePath, body = path == "/device/hello" && HelloBody != null ? HelloBody : Body;
             LastPath = path; LastAuth = ctx.Request.Headers["Authorization"];
             using (var r = new StreamReader(ctx.Request.InputStream)) LastJson = r.ReadToEnd();
@@ -168,6 +210,70 @@ sealed class FakeDevice : IDisposable {
     }
     public Dictionary<string, object> Sent() { return Wire.Json().Deserialize<Dictionary<string, object>>(LastJson); }
     public void Dispose() { try { listener.Close(); } catch (Exception) { } server.Join(1000); }
+}
+
+// A loopback WebSocket server for the doorbell (Doorbell), on plain TCP. It answers the upgrade (Status, or a wrong
+// accept value with BadAccept), records the request, counts the client's frames (Pings, Pongs, Unmasked: client
+// frames without a mask), answers its pings unless NoPong, and lets the test send raw server frames (Send) on the
+// newest connection. Opened and Closed are set per connection.
+sealed class FakeBell : IDisposable {
+    readonly TcpListener listener; readonly Thread acceptor;
+    public readonly string Origin;
+    public volatile int Status = 101; public volatile bool BadAccept, NoPong;
+    public volatile string LastRequest = "";
+    public int Upgrades, Pings, Pongs, Unmasked; public volatile string LastPong = "";
+    volatile NetworkStream current; readonly object writeGate = new object();
+    public readonly AutoResetEvent Opened = new AutoResetEvent(false), Closed = new AutoResetEvent(false);
+    public FakeBell() {
+        listener = new TcpListener(IPAddress.Loopback, 0); listener.Start();
+        Origin = "http://127.0.0.1:" + ((IPEndPoint)listener.LocalEndpoint).Port;
+        acceptor = new Thread(delegate() {
+            while (true) {
+                TcpClient c; try { c = listener.AcceptTcpClient(); } catch (Exception) { return; }
+                var t = new Thread(delegate() { Serve(c); }); t.IsBackground = true; t.Start();
+            }
+        });
+        acceptor.IsBackground = true; acceptor.Start();
+    }
+    static byte[] Read(Stream s, int n) { var b = new byte[n]; int got = 0; while (got < n) { int r = s.Read(b, got, n - got); if (r <= 0) throw new EndOfStreamException(); got += r; } return b; }
+    // The RFC 6455 accept value, computed here and not by the app.
+    public static string Accept(string key) { using (var sha = System.Security.Cryptography.SHA1.Create()) return Convert.ToBase64String(sha.ComputeHash(Encoding.ASCII.GetBytes(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))); }
+    void Serve(TcpClient c) {
+        using (c) {
+            try {
+                var s = c.GetStream(); var head = new StringBuilder(); var one = new byte[1];
+                while (!head.ToString().EndsWith("\r\n\r\n")) { if (s.Read(one, 0, 1) != 1) return; head.Append((char)one[0]); }
+                LastRequest = head.ToString(); string key = "";
+                foreach (string line in LastRequest.Split(new string[] { "\r\n" }, StringSplitOptions.None)) if (line.StartsWith("Sec-WebSocket-Key:", StringComparison.OrdinalIgnoreCase)) key = line.Substring(18).Trim();
+                if (Status != 101) { byte[] no = Encoding.ASCII.GetBytes("HTTP/1.1 " + Status + " Nope\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"); s.Write(no, 0, no.Length); return; }
+                byte[] yes = Encoding.ASCII.GetBytes("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + (BadAccept ? Accept(key + "x") : Accept(key)) + "\r\n\r\n");
+                s.Write(yes, 0, yes.Length);
+                Interlocked.Increment(ref Upgrades); current = s; Opened.Set();
+                while (true) {
+                    byte[] h = Read(s, 2); int op = h[0] & 0x0F, len = h[1] & 0x7F;
+                    if ((h[1] & 0x80) == 0) Interlocked.Increment(ref Unmasked);
+                    if (len == 126) { byte[] e = Read(s, 2); len = (e[0] << 8) | e[1]; }
+                    byte[] mask = (h[1] & 0x80) != 0 ? Read(s, 4) : new byte[4], data = Read(s, len);
+                    for (int i = 0; i < len; i++) data[i] ^= mask[i % 4];
+                    if (op == 9) { Interlocked.Increment(ref Pings); if (!NoPong) Send(Frame(10, data, true, false)); }
+                    else if (op == 10) { Interlocked.Increment(ref Pongs); LastPong = Encoding.UTF8.GetString(data); }
+                    else if (op == 8) break;
+                }
+            } catch (Exception) { }
+            finally { Closed.Set(); }
+        }
+    }
+    public void Send(byte[] raw) { var s = current; if (s == null) return; try { lock (writeGate) s.Write(raw, 0, raw.Length); } catch (Exception) { } }
+    // A server frame: unmasked unless mask, FIN unless !fin, with a 2-byte length above 125.
+    public static byte[] Frame(int op, byte[] payload, bool fin, bool mask) {
+        var ms = new MemoryStream(); ms.WriteByte((byte)((fin ? 0x80 : 0) | op));
+        int m = mask ? 0x80 : 0;
+        if (payload.Length > 125) { ms.WriteByte((byte)(m | 126)); ms.WriteByte((byte)(payload.Length >> 8)); ms.WriteByte((byte)(payload.Length & 0xFF)); } else ms.WriteByte((byte)(m | payload.Length));
+        if (mask) { var k = new byte[4]; ms.Write(k, 0, 4); } // a zero mask: the bytes stay as they are
+        ms.Write(payload, 0, payload.Length); return ms.ToArray();
+    }
+    public static byte[] Text(string t) { return Frame(1, Encoding.UTF8.GetBytes(t), true, false); }
+    public void Dispose() { try { listener.Stop(); } catch (Exception) { } var s = current; if (s != null) try { s.Dispose(); } catch (Exception) { } }
 }
 
 // A throwaway P-256 key made at run time, so the tests can sign any release note. Xy is its public key in the form the
@@ -474,7 +580,8 @@ public static class AppTests {
         // "ask", is refused (the connection closes).
         Func<string, Dictionary<string, object>> one = delegate(string json) { return Wire.Json().Deserialize<Dictionary<string, object>>(json); };
         Assert(Pipes.DeviceRequest(one("{\"type\":\"status\"}")) == "status" && Pipes.DeviceRequest(one("{\"type\":\"allow_any_time\"}")) == "allow_any_time" && Pipes.DeviceRequest(one("{\"type\":\"refresh\"}")) == "refresh", "the three frames");
-        foreach (string json in new string[] { "{}", "{\"type\":\"end\"}", "{\"type\":\"run\"}", "{\"type\":\"ask\"}", "{\"type\":\"allow_any_time\",\"access\":\"ask\"}", "{\"type\":\"set_access\",\"access\":\"ask\"}", "{\"Type\":\"status\"}", "{\"type\":[\"status\"]}" })
+        Assert(Pipes.DeviceRequest(one("{\"type\":\"end_session\"}")) == "end_session", "and end_session (PR 6)");
+        foreach (string json in new string[] { "{}", "{\"type\":\"end\"}", "{\"type\":\"run\"}", "{\"type\":\"ask\"}", "{\"type\":\"allow_any_time\",\"access\":\"ask\"}", "{\"type\":\"set_access\",\"access\":\"ask\"}", "{\"Type\":\"status\"}", "{\"type\":[\"status\"]}", "{\"type\":\"end_session\",\"session\":1}", "{\"type\":\"ask_session\"}" })
             Assert(Pipes.DeviceRequest(one(json)) == null, "refused: " + json);
 
         // A live pipe on the device ACL (the test account stands in for SYSTEM, which the tests do not run as): a
@@ -1644,6 +1751,7 @@ public static class AppTests {
         [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
         [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
         public bool SignedIn = true; public long WelcomedAt; public int Screens;
+        public bool Limited { get { return false; } }
         public string UserName { get { return "tester"; } }
         public Dictionary<string, object> ScreenOp(Dictionary<string, object> frame, WaitHandle stop) { Screens++; return Wire.Map("ok", true, "desktop", "secure"); }
         public IntPtr UserToken(out string profile) {
@@ -1940,6 +2048,9 @@ public static class AppTests {
         // backstop's PowerShell release must behave the same.
         string testKey = @"Software\SupportMcpTest-" + Guid.NewGuid().ToString("N");
         SasShare.MutexName = @"Local\SupportMcpTest-Sas-" + Guid.NewGuid().ToString("N"); // a Global one needs administrator rights
+        // The test account makes these mutexes itself, so it is trusted as their owner here (issue #22; OwnerCheckTests
+        // checks the refusal). An elevated account's objects are owned by Administrators anyway.
+        OwnerCheck.AlsoTrusted = WindowsIdentity.GetCurrent().User;
         Func<Microsoft.Win32.RegistryKey> root = delegate { return Microsoft.Win32.Registry.CurrentUser.CreateSubKey(testKey); };
         Func<object> sas = delegate { using (var r = root()) using (var k = r.OpenSubKey(SasShare.PolicyKey)) return k == null ? null : k.GetValue(SasShare.Value); };
         Action<object> setSas = delegate(object v) { using (var r = root()) using (var k = r.CreateSubKey(SasShare.PolicyKey)) { if (v == null) k.DeleteValue(SasShare.Value, false); else k.SetValue(SasShare.Value, v, Microsoft.Win32.RegistryValueKind.DWord); } };
@@ -2006,7 +2117,7 @@ public static class AppTests {
             // send_sas checks the value first, since Windows drops SendSAS without an error when it refuses it.
             foreach (object v in new object[] { null, 0, 2 }) { setSas(v); using (var r = root()) Assert(!SasShare.Allowed(r), "Services may not send SAS with " + (v ?? "no value")); }
             foreach (object v in new object[] { 1, 3 }) { setSas(v); using (var r = root()) Assert(SasShare.Allowed(r), "Services may send SAS with " + v); }
-        } finally { Microsoft.Win32.Registry.CurrentUser.DeleteSubKeyTree(testKey, false); }
+        } finally { OwnerCheck.AlsoTrusted = null; Microsoft.Win32.Registry.CurrentUser.DeleteSubKeyTree(testKey, false); }
         Console.WriteLine("PASS SoftwareSASGeneration: shared by sessions, put back by the last one, an administrator's change kept, the same in PowerShell, never changed without the mutex");
 
         // The backstop never runs agent.exe, releases the registry share, and deletes itself last.
@@ -2395,6 +2506,435 @@ public static class AppTests {
         return null;
     }
     [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr h);
+    // ---- PR 6: connect to a saved PC ---------------------------------------------------------------------------
+    static bool Until(Func<bool> condition, int ms) { var end = DateTime.UtcNow.AddMilliseconds(ms); while (DateTime.UtcNow < end) { if (condition()) return true; Thread.Sleep(25); } return condition(); }
+    static bool Elevated() { return new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator); }
+    static bool Interactive() { foreach (var g in WindowsIdentity.GetCurrent().Groups) if (g.Value == "S-1-5-4") return true; return false; }
+    static Dictionary<string, object> ReadJson(string file) { return Wire.Json().Deserialize<Dictionary<string, object>>(File.ReadAllText(file)); }
+    static string Hex64() { return Guid.NewGuid().ToString("N") + Guid.NewGuid().ToString("N"); }
+
+    // Issue #22: a mutex or event someone else made first is never trusted. The setup mutex refuses with the plain
+    // message (install, uninstall and the update lock), the SAS mutex is skipped as busy (C# and PowerShell), the
+    // service picks a new uninstall event name when someone holds its own, and a tray or the uninstaller opens only an
+    // event SYSTEM or Administrators own.
+    static void OwnerCheckTests(string dir) {
+        var me = WindowsIdentity.GetCurrent().User;
+        Assert(OwnerCheck.Trusted(FullAcl.SystemSid) && OwnerCheck.Trusted(FullAcl.AdminsSid), "SYSTEM and Administrators are trusted owners");
+        Assert(!OwnerCheck.Trusted((SecurityIdentifier)null) && !OwnerCheck.Trusted(FullAcl.UsersSid) && !OwnerCheck.Trusted(FullAcl.InteractiveSid), "Users, Interactive and no owner are not");
+        Assert(!OwnerCheck.Trusted(delegate { throw new UnauthorizedAccessException(); }), "an owner that cannot be read counts as hostile");
+        Assert(OwnerCheck.Blocked == "Another program is blocking Support. Restart the PC and try again." && DeviceSetup.ExitText(DeviceSetup.Blocked) == OwnerCheck.Blocked && DeviceSetup.After(DeviceSetup.Blocked) == DeviceSetup.Screen.Install, "setup says what blocks it and offers to try again");
+        Assert(DeviceUninstall.Map(DeviceUninstall.Blocked) == DeviceUninstall.Outcome.Blocked, "uninstall maps the blocked exit");
+        if (me.Equals(FullAcl.SystemSid)) { Console.WriteLine("SKIP the squatter checks: this test runs as SYSTEM, a trusted owner"); return; }
+
+        // A squatter: a Local mutex this account made first and owns.
+        var msec = new MutexSecurity(); msec.AddAccessRule(new MutexAccessRule(me, MutexRights.FullControl, AccessControlType.Allow)); msec.SetOwner(me);
+        string mn = "Local\\SupportMcpSquat-" + Guid.NewGuid().ToString("N"); bool made;
+        using (var squat = new System.Threading.Mutex(false, mn, out made, msec)) {
+            Assert(made, "the squatter made the mutex first");
+            try { DeviceInstall.SetupMutex(mn).Dispose(); throw new Exception("the setup used a mutex someone else made"); }
+            catch (DeviceInstall.BlockedException e) { Assert(e.Message == OwnerCheck.Blocked, "the refusal says what blocks it"); }
+            string lockName = DeviceUpdate.LockName; DeviceUpdate.LockName = mn;
+            try { Assert(DeviceUpdate.Lock(0) == null, "an update never takes a squatted lock"); } finally { DeviceUpdate.LockName = lockName; }
+            OwnerCheck.AlsoTrusted = me;
+            try { using (var ok = DeviceInstall.SetupMutex(mn)) Assert(ok != null, "the same mutex with a trusted owner is used"); } finally { OwnerCheck.AlsoTrusted = null; }
+        }
+        // The setup mutex this code makes is trusted by the next opener on any account that may open it at all.
+        if (Elevated()) {
+            string own = "Local\\SupportMcpOwn-" + Guid.NewGuid().ToString("N");
+            using (var first = DeviceInstall.SetupMutex(own)) {
+                var owner = first.GetAccessControl().GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
+                Assert(FullAcl.AdminsSid.Equals(owner), "an elevated install makes the setup mutex owned by Administrators: " + owner);
+                bool second = false; var t = new Thread(delegate() { try { using (DeviceInstall.SetupMutex(own)) second = true; } catch (Exception) { } }); t.Start(); t.Join();
+                Assert(second, "and a second elevated opener trusts it");
+            }
+        }
+
+        // The SAS mutex: skipped as busy when squatted, in C# and in the backstop's PowerShell.
+        string sasName = SasShare.MutexName, testKey = @"Software\SupportMcpTest-" + Guid.NewGuid().ToString("N");
+        SasShare.MutexName = "Local\\SupportMcpSquatSas-" + Guid.NewGuid().ToString("N");
+        int wait = SasShare.WaitMs; SasShare.WaitMs = 1000;
+        try {
+            using (var squat = new System.Threading.Mutex(false, SasShare.MutexName, out made, msec)) {
+                using (var r = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(testKey)) Assert(!SasShare.Acquire(r, "SupportMcp-aaaaaaaa"), "a squatted SAS mutex is skipped, as if busy");
+                using (var r = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(testKey)) Assert(r.OpenSubKey(SasShare.HoldersKey) == null, "and nothing is recorded");
+                var ps = Process.Start(new ProcessStartInfo("powershell.exe", "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"" + SasShare.ReleaseScript(@"HKCU:\" + testKey, "SupportMcp-aaaaaaaa") + "\"") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true });
+                string err = ps.StandardError.ReadToEnd(); ps.WaitForExit();
+                Assert(ps.ExitCode == 1 && err.Trim() == "", "the backstop's release refuses a squatted mutex and exits with 1: " + ps.ExitCode + " " + err);
+            }
+        } finally { SasShare.MutexName = sasName; SasShare.WaitMs = wait; Microsoft.Win32.Registry.CurrentUser.DeleteSubKeyTree(testKey, false); }
+
+        // The uninstall event.
+        string prefix = DeviceService.UninstallPrefix, legacy = DeviceService.UninstallEvent;
+        DeviceService.UninstallPrefix = "Local\\SupportMcpTestUninstall-" + Guid.NewGuid().ToString("N").Substring(0, 8) + "-";
+        DeviceService.UninstallEvent = "Local\\SupportMcpTestUninstallOld-" + Guid.NewGuid().ToString("N");
+        try {
+            string folder = NewServiceFolder(dir, "http://127.0.0.1:9"), part1 = new string('a', 32), file = Path.Combine(folder, "device.json");
+            var json = ReadJson(file); json["uninstall_event"] = part1; File.WriteAllText(file, Wire.Json().Serialize(json));
+            var esec = new EventWaitHandleSecurity(); esec.AddAccessRule(new EventWaitHandleAccessRule(me, EventWaitHandleRights.FullControl, AccessControlType.Allow)); esec.SetOwner(me);
+            using (var squat = new EventWaitHandle(false, EventResetMode.ManualReset, DeviceService.UninstallPrefix + part1, out made, esec)) {
+                var svc = new DeviceService(Path.Combine(folder, "support.exe")); Assert(svc.TestInit(), "init");
+                Assert(Wire.Text(svc.TestStatus(), "uninstall_event") == part1, "the status frame names the part from device.json");
+                using (var own = svc.TestCreateUninstall()) {
+                    string part2 = Wire.Text(svc.TestStatus(), "uninstall_event");
+                    Assert(own != null && part2 != part1 && DeviceService.ValidPart(part2), "a squatted name is never used: the service picks a new one");
+                    Assert(Wire.Text(ReadJson(file), "uninstall_event") == part2, "and keeps it in device.json");
+                    Assert(DeviceService.WatchUninstall(part1) == null && DeviceService.WatchUninstall("../x") == null, "a tray never watches the squatter's event, or a bad name");
+                    DeviceService.SignalUninstall(part1);
+                    Assert(!squat.WaitOne(0), "the uninstaller never sets the squatter's event");
+                    OwnerCheck.AlsoTrusted = me; // this account made the service's event, so it stands in for SYSTEM here
+                    try {
+                        if (Elevated() || Interactive()) using (var watch = DeviceService.WatchUninstall(part2)) Assert(watch != null, "a tray watches the service's own event");
+                        if (Elevated()) { DeviceService.SignalUninstall(part2); Assert(own.WaitOne(2000), "the uninstaller sets it"); }
+                        else Console.WriteLine("SKIP setting the uninstall event: only SYSTEM and Administrators may set it");
+                    } finally { OwnerCheck.AlsoTrusted = null; }
+                }
+            }
+        } finally { DeviceService.UninstallPrefix = prefix; DeviceService.UninstallEvent = legacy; }
+        Console.WriteLine("PASS issue #22: squatted setup, update and SAS mutexes are refused, the uninstall event gets a new name, and trays and the uninstaller trust only SYSTEM or Administrators");
+    }
+
+    // Call 10: a check-in never raises control; it may lower full to limited, with a history line. Access follows the team.
+    static void ControlTests(string dir) {
+        Assert(DeviceService.NextControl("limited", "full") == "limited" && DeviceService.NextControl("full", "limited") == "limited" && DeviceService.NextControl("full", "full") == "full"
+            && DeviceService.NextControl("limited", "limited") == "limited" && DeviceService.NextControl("full", "") == "full" && DeviceService.NextControl("", "full") == "limited", "control only ever goes down");
+        using (var relay = new FakeDevice()) {
+            Func<string, string, string> dev = delegate(string ac, string ct) { return Wire.Json().Serialize(Wire.Map("protocol", 1, "device", Wire.Map("id", "d", "workspace", "default", "status", "active", "name", "PC", "access", ac, "control", ct, "site_id", null))); };
+            Func<DeviceService, int> lines = delegate(DeviceService x) { var hl = x.TestStatus()["history"] as System.Collections.ArrayList; return hl == null ? 0 : hl.Count; };
+            string folder = NewServiceFolder(dir, relay.Origin), file = Path.Combine(folder, "device.json"); // limited, ask
+            var svc = new DeviceService(Path.Combine(folder, "support.exe")); Assert(svc.TestInit(), "init limited");
+            relay.Status = 200; relay.Body = dev("ask", "full"); int n = lines(svc);
+            svc.TestCheckInOnce();
+            Assert(Wire.Text(svc.TestStatus(), "control") == "limited" && Wire.Text(ReadJson(file), "control") == "limited" && lines(svc) == n, "a check-in saying full leaves a limited PC limited, with no line");
+            relay.Body = dev("any", "full"); svc.TestCheckInOnce();
+            Assert(Wire.Text(svc.TestStatus(), "access") == "any" && Wire.Text(svc.TestStatus(), "control") == "limited", "access follows the team to any time, control stays");
+            relay.Body = dev("ask", "full"); svc.TestCheckInOnce();
+            Assert(Wire.Text(svc.TestStatus(), "access") == "ask", "and back to ask");
+
+            var full = ReadJson(file); full["control"] = "full"; full["access"] = "any"; File.WriteAllText(file, Wire.Json().Serialize(full));
+            svc = new DeviceService(Path.Combine(folder, "support.exe")); Assert(svc.TestInit(), "init full");
+            relay.Body = dev("any", "limited"); n = lines(svc);
+            svc.TestCheckInOnce();
+            var h = svc.TestStatus()["history"] as System.Collections.ArrayList;
+            Assert(Wire.Text(svc.TestStatus(), "control") == "limited" && Wire.Text(ReadJson(file), "control") == "limited" && lines(svc) == n + 1
+                && Wire.Text((Dictionary<string, object>)h[h.Count - 1], "text") == "Control set to limited support.", "a check-in may lower full control to limited, with a history line");
+            relay.Body = dev("any", "full"); svc.TestCheckInOnce();
+            Assert(Wire.Text(svc.TestStatus(), "control") == "limited" && Wire.Text(ReadJson(file), "control") == "limited", "and never raises it again");
+        }
+        Console.WriteLine("PASS control comes from the PC: a check-in only lowers it, with a line; access follows the team both ways");
+    }
+
+    // The check-in schedule: six hours plus up to ten minutes while the doorbell is up and the PC is active, five minutes
+    // plus up to thirty seconds otherwise or while pending; backoff and the 426 schedule unchanged.
+    static void ScheduleTests() {
+        var r = new Random(7); var S = DeviceService.Schedule.Normal;
+        for (int i = 0; i < 500; i++) {
+            long up = DeviceService.NextDelay(S, true, DeviceState.Active, 0, r), down = DeviceService.NextDelay(S, false, DeviceState.Active, 0, r), pending = DeviceService.NextDelay(S, true, DeviceState.Pending, 0, r);
+            Assert(up >= DeviceService.DoorbellEveryMs && up <= DeviceService.DoorbellEveryMs + DeviceService.DoorbellJitterMaxMs, "doorbell up: 6 h plus up to 10 min: " + up);
+            Assert(down >= DeviceService.CheckEveryMs && down <= DeviceService.CheckEveryMs + DeviceService.JitterMaxMs, "doorbell down: 5 min plus up to 30 s: " + down);
+            Assert(pending >= DeviceService.CheckEveryMs && pending <= DeviceService.CheckEveryMs + DeviceService.JitterMaxMs, "a pending PC keeps 5 min: " + pending);
+        }
+        Assert(DeviceService.DoorbellEveryMs == 6 * 3600 * 1000L && DeviceService.DoorbellJitterMaxMs == 600000, "six hours and ten minutes");
+        Assert(DeviceService.NextDelay(DeviceService.Schedule.Backoff, true, DeviceState.Active, 120000, r) == 120000 && DeviceService.NextDelay(DeviceService.Schedule.Update, true, DeviceState.Active, 0, r) == DeviceService.UpdateEveryMs, "backoff and the 426 schedule are unchanged");
+        Console.WriteLine("PASS the check-in schedule follows the doorbell");
+    }
+
+    // The session pointer, the target session and the decision, without a live service.
+    static void SessionRuleTests() {
+        string id = new string('a', 64);
+        Func<string, DeviceService.SessionPointer> read = delegate(string json) { return DeviceService.ReadSession(Wire.Json().Deserialize<Dictionary<string, object>>(json)); };
+        var p = read("{\"protocol\":1,\"session\":{\"id\":\"" + id + "\",\"by\":\"tech@example.com\",\"team\":\"Acme\",\"ask\":false,\"expires_at\":1794000000000}}");
+        Assert(p != null && p.Id == id && p.By == "tech@example.com" && p.Team == "Acme" && !p.Ask && p.ExpiresAt == 1794000000000, "the pointer is read");
+        Assert(read("{\"session\":{\"id\":\"" + id + "\"}}").Ask && read("{\"session\":{\"id\":\"" + id + "\",\"ask\":\"false\"}}").Ask && read("{\"session\":{\"id\":\"" + id + "\",\"ask\":0}}").Ask, "an ask that is not exactly false asks");
+        foreach (string bad in new string[] { "{\"protocol\":1}", "{\"session\":null}", "{\"session\":\"x\"}", "{\"session\":{}}", "{\"session\":{\"id\":\"abc\"}}", "{\"session\":{\"id\":\"" + new string('A', 64) + "\"}}", "{\"session\":{\"id\":7}}" })
+            Assert(read(bad) == null, "no or a malformed session is none: " + bad);
+        Assert(DeviceService.ReadSession(null) == null, "no body, no session");
+        var cleaned = read("{\"session\":{\"id\":\"" + id + "\",\"by\":\"a\\nb" + new string('x', 300) + "\",\"team\":5}}");
+        Assert(cleaned.By.Length == 200 && cleaned.By.IndexOf('\n') < 0 && cleaned.Team == "", "by and team are cleaned for display");
+
+        var T = DeviceService.Target.Console;
+        var t = DeviceService.PickTarget(1, true, new List<uint> { 2, 3 }); Assert(t.Kind == T && t.Session == 1, "a user at the console: the console");
+        t = DeviceService.PickTarget(1, false, new List<uint> { 2 }); Assert(t.Kind == DeviceService.Target.Remote && t.Session == 2, "else the one Remote Desktop session");
+        t = DeviceService.PickTarget(1, false, new List<uint> { 2, 3 }); Assert(t.Kind == DeviceService.Target.Busy, "several: busy");
+        t = DeviceService.PickTarget(1, false, new List<uint>()); Assert(t.Kind == DeviceService.Target.Nobody && t.Session == 1, "none: nobody, at the console");
+        t = DeviceService.PickTarget(1, false, new List<uint> { 0, 1 }); Assert(t.Kind == DeviceService.Target.Nobody, "session 0 and the console are never remote");
+
+        var D = DeviceService.Start.Host;
+        Assert(DeviceService.Decide(true, "any", "full", T, false) == DeviceService.Start.Ask, "the session asks: ask");
+        Assert(DeviceService.Decide(false, "ask", "full", T, false) == DeviceService.Start.Ask, "the PC's own ask asks, whatever the session says");
+        Assert(DeviceService.Decide(false, "any", "full", T, false) == D && DeviceService.Decide(false, "any", "limited", DeviceService.Target.Remote, false) == D, "any time and no ask: host");
+        Assert(DeviceService.Decide(true, "ask", "limited", T, true) == D, "a session the person already allowed rejoins without asking");
+        Assert(DeviceService.Decide(false, "any", "full", DeviceService.Target.Nobody, false) == D, "only full control any time runs at the sign-in screen");
+        Assert(DeviceService.Decide(true, "any", "full", DeviceService.Target.Nobody, false) == DeviceService.Start.DeclineNobody && DeviceService.Decide(false, "ask", "full", DeviceService.Target.Nobody, false) == DeviceService.Start.DeclineNobody
+            && DeviceService.Decide(false, "any", "limited", DeviceService.Target.Nobody, false) == DeviceService.Start.DeclineNobody && DeviceService.Decide(true, "ask", "full", DeviceService.Target.Nobody, true) == DeviceService.Start.DeclineNobody, "nobody signed in: an asking or a limited session is declined as nobody");
+        Assert(DeviceService.Decide(false, "any", "full", DeviceService.Target.Busy, false) == DeviceService.Start.DeclineBusy, "several Remote Desktop users: busy");
+
+        // The question's argument: who and the team only, base64url JSON, checked again on the way in.
+        string arg = DeviceAsk.Encode("tech@example.com", "Acme", false);
+        var back = DeviceAsk.Decode(arg);
+        Assert(System.Text.RegularExpressions.Regex.IsMatch(arg, "^[A-Za-z0-9_-]+$") && back != null && Wire.Text(back, "by") == "tech@example.com" && Wire.Text(back, "team") == "Acme" && Wire.Text(back, "control") == "limited", "the question's argument round-trips");
+        Func<object, string> enc = delegate(object o) { return Convert.ToBase64String(Encoding.UTF8.GetBytes(Wire.Json().Serialize(o))).TrimEnd('=').Replace('+', '-').Replace('/', '_'); };
+        Assert(DeviceAsk.Decode("") == null && DeviceAsk.Decode("!!") == null && DeviceAsk.Decode(new string('a', DeviceAsk.MaxArg + 1)) == null
+            && DeviceAsk.Decode(enc(Wire.Map("by", "a", "team", "b", "control", "full", "key", "smd1.x"))) == null && DeviceAsk.Decode(enc(Wire.Map("by", "a", "team", "b", "control", "system"))) == null, "anything else is refused");
+        Assert(DeviceAsk.Heading("tech@example.com") == "Allow tech@example.com to connect to this PC?" && DeviceAsk.Text("tech@example.com", "Acme", false).Contains("tech@example.com from Acme") && DeviceAsk.Text("a", "b", true).Contains("sign-in screen")
+            && DeviceAsk.Text("", "", false).StartsWith("Someone from your support team") && DeviceAsk.AnswerMs == 120000 && ConsentDialog.ArmMs == 500, "the question names who and the team, and what they can do");
+        Console.WriteLine("PASS the session rules: the pointer, the target session, ask, host or decline, and the question's argument");
+    }
+
+    // The status frame's new fields and the tray's words (no action id or label contains "ask").
+    static void TrayPr6Tests() {
+        var f = DeviceService.StatusFrame("PC", "ask", "limited", DeviceState.Active, "", 1, new System.Collections.ArrayList(), "tech@example.com", 42, new string('b', 32));
+        var live = f["session"] as Dictionary<string, object>;
+        Assert(live != null && Wire.Text(live, "by") == "tech@example.com" && Wire.Number(live, "since") == 42 && Wire.Text(f, "uninstall_event") == new string('b', 32), "the status frame carries the live session and the uninstall event's part");
+        var g = DeviceService.StatusFrame("PC", "ask", "limited", DeviceState.Active, "", 1, new System.Collections.ArrayList());
+        Assert(!g.ContainsKey("session") && !g.ContainsKey("uninstall_event"), "neither when there is none");
+        Assert(TrayText.Mode("ask").Contains("asks you") && TrayText.Mode("ask").Contains("Your support team's admins can change this.") && !TrayText.Mode("any").Contains("admins"), "the tray's ask line says the team's admins can change it");
+        Assert(DeviceSetup.ModeText("ask") == "Support asks you here, on this PC, before each connection. Your support team's admins can change this.", "so does the wizard's");
+        Assert(TrayText.SessionLine("tech@example.com") == "Connected: tech@example.com" && TrayText.EndSession == "End session", "who is connected, and End session");
+        foreach (bool on in new bool[] { false, true })
+            foreach (string access in new string[] { "ask", "any" }) {
+                var actions = TrayText.Actions(DeviceState.Active, access, on);
+                Assert(actions.Contains("end_session") == on && actions.Contains("uninstall"), "end_session only while a session is live");
+                foreach (string a in actions) Assert(a.IndexOf("ask") < 0, "no action id contains ask: " + a);
+            }
+        foreach (string label in new string[] { TrayText.EndSession, TrayText.Uninstall, TrayText.AllowAction }) Assert(label.IndexOf("ask", StringComparison.OrdinalIgnoreCase) < 0, "no label contains ask: " + label);
+        Console.WriteLine("PASS the tray: the live session, End session, the uninstall event's part, and the admins line");
+    }
+
+    // The doorbell against a loopback WebSocket server: the upgrade (path, Bearer key, no Origin, the accept check),
+    // masked pings, a pong for the relay's ping, rings that wake the check-in at most once per gap without losing the
+    // last, a reconnect after a close, an oversized, fragmented, binary or masked frame, a missing pong, a wrong accept
+    // or a refusal, and a stop that stays stopped.
+    static void DoorbellTests() {
+        long b = 0; var seen = new List<long>();
+        for (int i = 0; i < 8; i++) { b = Doorbell.NextBackoff(b, 5000, 300000); seen.Add(b); }
+        Assert(seen[0] == 5000 && seen[1] == 10000 && seen[2] == 20000 && seen[5] == 160000 && seen[6] == 300000 && seen[7] == 300000, "reconnects wait 5 s, doubling to 5 min");
+        Assert(Doorbell.AcceptFor("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "the accept value of RFC 6455's example");
+        using (var server = new FakeBell()) {
+            var wakes = new List<long>();
+            var bell = new Doorbell(server.Origin, "smd1.test.key", delegate { lock (wakes) wakes.Add(PauseClock.Now()); });
+            bell.PingMs = 200; bell.PongMs = 1500; bell.RingGapMs = 600; bell.MinBackoffMs = 100; bell.MaxBackoffMs = 400; bell.ConnectMs = 5000;
+            Func<int> count = delegate { lock (wakes) return wakes.Count; };
+            try {
+                bell.Start();
+                Assert(server.Opened.WaitOne(5000) && Until(delegate { return bell.Connected; }, 3000), "the doorbell connects");
+                string req = server.LastRequest;
+                Assert(req.StartsWith("GET /device/ring?protocol=1 HTTP/1.1\r\n") && req.Contains("\r\nAuthorization: Bearer smd1.test.key\r\n") && req.Contains("\r\nUpgrade: websocket\r\n")
+                    && req.Contains("\r\nSec-WebSocket-Version: 13\r\n") && req.IndexOf("\r\nOrigin:", StringComparison.OrdinalIgnoreCase) < 0 && req.IndexOf("smd1.test.key", StringComparison.Ordinal) == req.IndexOf("Bearer ", StringComparison.Ordinal) + 7, "the upgrade: the ring path, the key in the Bearer header only, no Origin:\n" + req);
+                Assert(Until(delegate { return count() >= 1; }, 2000), "a connect wakes the check-in");
+                Assert(Until(delegate { return server.Pings >= 3; }, 4000) && server.Unmasked == 0 && bell.Connected, "masked pings every PingMs keep it up");
+                server.Send(FakeBell.Frame(9, Encoding.UTF8.GetBytes("hi"), true, false));
+                Assert(Until(delegate { return server.LastPong == "hi"; }, 2000) && server.Unmasked == 0, "a ping from the relay gets a masked pong with its payload");
+
+                Thread.Sleep(800); // past the gap of the connect's wake
+                int before = count();
+                for (int i = 0; i < 5; i++) server.Send(FakeBell.Text("{\"type\":\"ring\"}"));
+                Assert(Until(delegate { return count() >= before + 1; }, 1000), "a ring wakes the check-in at once");
+                Thread.Sleep(1600);
+                long gap; int got; lock (wakes) { got = wakes.Count - before; gap = wakes[wakes.Count - 1] - wakes[wakes.Count - 2]; }
+                Assert(got == 2 && gap >= 550, "five rings at once wake it twice, now and at the end of the gap: " + got + " wakes, " + gap + " ms apart");
+                Assert(bell.Connected && server.Upgrades == 1, "rings and pings kept the one connection");
+
+                Action<string, byte[]> closes = delegate(string what, byte[] frame) {
+                    server.Closed.Reset(); server.Opened.Reset(); int ups = server.Upgrades;
+                    server.Send(frame);
+                    Assert(server.Closed.WaitOne(3000), "the doorbell closes on " + what);
+                    Assert(server.Opened.WaitOne(5000) && Until(delegate { return bell.Connected; }, 3000) && server.Upgrades == ups + 1, "and connects again after " + what);
+                };
+                closes("a close frame", FakeBell.Frame(8, new byte[] { 3, 232 }, true, false));
+                closes("a frame over 1 KB", FakeBell.Frame(1, new byte[Doorbell.FrameMax + 1], true, false));
+                closes("a fragment", FakeBell.Frame(1, Encoding.UTF8.GetBytes("ring"), false, false));
+                closes("a binary frame", FakeBell.Frame(2, new byte[] { 1 }, true, false));
+                closes("a masked frame", FakeBell.Frame(1, Encoding.UTF8.GetBytes("ring"), true, true));
+                // A frame of exactly 1 KB is still read: a ring.
+                before = count(); Thread.Sleep(700);
+                server.Send(FakeBell.Frame(1, new byte[Doorbell.FrameMax], true, false));
+                Assert(Until(delegate { return count() > before; }, 1500) && bell.Connected, "a 1 KB frame is a ring");
+
+                server.NoPong = true; server.Closed.Reset(); server.Opened.Reset(); var quiet = Stopwatch.StartNew();
+                Assert(server.Closed.WaitOne(6000) && quiet.ElapsedMilliseconds >= 900, "no pong within PongMs: the doorbell drops the connection");
+                server.NoPong = false;
+                Assert(server.Opened.WaitOne(5000) && Until(delegate { return bell.Connected; }, 3000), "and connects again");
+
+                int good = bell.Connections; server.BadAccept = true; server.Closed.Reset();
+                server.Send(FakeBell.Frame(8, new byte[0], true, false));
+                Assert(server.Closed.WaitOne(3000), "closed for the next test");
+                Thread.Sleep(1500);
+                Assert(!bell.Connected && bell.Connections == good && server.Upgrades > good, "a wrong Sec-WebSocket-Accept is refused");
+                server.BadAccept = false;
+                Assert(Until(delegate { return bell.Connected; }, 5000), "a right one connects");
+                good = bell.Connections; server.Status = 401; server.Closed.Reset();
+                server.Send(FakeBell.Frame(8, new byte[0], true, false));
+                Assert(server.Closed.WaitOne(3000), "closed for the refusal test");
+                Thread.Sleep(1500);
+                Assert(!bell.Connected && bell.Connections == good, "a refused upgrade does not connect");
+                server.Status = 101;
+                Assert(Until(delegate { return bell.Connected; }, 5000), "and it keeps trying");
+
+                bell.Stop();
+                Assert(!bell.Connected, "a stopped doorbell is not connected");
+                int after = server.Upgrades; Thread.Sleep(1000);
+                Assert(server.Upgrades == after, "and stays closed");
+            } finally { bell.Stop(); }
+        }
+        Console.WriteLine("PASS the doorbell: the upgrade, pings and pongs, rings at most once per gap, every close case, a missing pong, a bad accept, and stop");
+    }
+
+    sealed class OwnToken {
+        [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+        [DllImport("advapi32.dll", SetLastError = true)] static extern bool DuplicateTokenEx(IntPtr token, uint access, IntPtr attributes, int level, int type, out IntPtr result);
+        [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+        // A primary token of this test account: stands in for the signed-in user's (WTSQueryUserToken needs SYSTEM).
+        public static IntPtr Get(uint session) {
+            IntPtr own, dup;
+            if (!OpenProcessToken(GetCurrentProcess(), 0x02000000, out own)) return IntPtr.Zero;
+            try { if (!DuplicateTokenEx(own, 0x02000000, IntPtr.Zero, 2, 1, out dup)) return IntPtr.Zero; } finally { CloseHandle(own); }
+            return dup;
+        }
+    }
+    static string HelloWith(string access, string control, Dictionary<string, object> session, Dictionary<string, object> update) {
+        var m = Wire.Map("protocol", 1, "device", Wire.Map("id", "d", "workspace", "default", "status", "active", "name", "PC", "access", access, "control", control, "site_id", null));
+        if (session != null) m["session"] = session; if (update != null) m["update"] = update;
+        return Wire.Json().Serialize(m);
+    }
+    static Dictionary<string, object> Pointer(string id, bool ask) { return Wire.Map("id", id, "by", "tech@example.com", "team", "Acme", "ask", ask, "expires_at", Client.UnixNow() + 3600000); }
+    // A service on a fresh folder with this access and control, and the test hooks: the target session, the user token
+    // (this account's) and the corner pipe's ACL (this account may add instances). Asker is set by each case.
+    static DeviceService SessionService(string dir, string origin, string access, string control, DeviceService.Target kind, out string folder) {
+        folder = NewServiceFolder(dir, origin); string file = Path.Combine(folder, "device.json");
+        var json = ReadJson(file); json["access"] = access; json["control"] = control; File.WriteAllText(file, Wire.Json().Serialize(json));
+        var svc = new DeviceService(Path.Combine(folder, "support.exe"));
+        Assert(svc.TestInit(), "init a session service");
+        uint mine = (uint)Process.GetCurrentProcess().SessionId;
+        svc.Targets = delegate { return new DeviceService.TargetChoice { Kind = kind, Session = kind == DeviceService.Target.Busy ? 0xFFFFFFFF : mine }; };
+        svc.UserTokens = OwnToken.Get;
+        svc.CornerSddl = "D:P(A;;GA;;;" + WindowsIdentity.GetCurrent().User.Value + ")(A;;0x12008B;;;IU)";
+        svc.Asker = delegate { throw new Exception("this case must not ask"); };
+        return svc;
+    }
+    static List<Dictionary<string, object>> AgentFor(FakeDevice relay, string type, string id) { return relay.Agent(type).FindAll(delegate(Dictionary<string, object> e) { return Wire.Text(e, "query") == "?sid=" + id; }); }
+    static Dictionary<string, object> Body(Dictionary<string, object> logged) { return (Dictionary<string, object>)logged["body"]; }
+
+    // Sessions on a saved PC against the fake relay's /agent: the decline paths (nobody, busy, declined, sent again only
+    // when it failed), the question asked once, the accepted id saved and rejoined without asking, the Bearer key and no
+    // X-Attach-Key, limited support acting as the user (run, as: system refused, files, no block_input or control),
+    // the driver, end_session from the tray's session only with reason owner, a session gone from the answer ending
+    // locally, full control at the sign-in screen, and updates held while a session is waiting or live.
+    static void SessionLiveTests(string dir) {
+        uint mine = (uint)Process.GetCurrentProcess().SessionId; string folder;
+        var started = new List<DeviceService>();
+        using (var relay = new FakeDevice())
+        using (var signer = new TestSigner()) {
+            relay.Status = 200;
+            try {
+                // Nobody signed in, an asking session on a limited PC: declined as nobody with the device key, nothing asked.
+                string id = Hex64();
+                var svc = SessionService(dir, relay.Origin, "ask", "limited", DeviceService.Target.Nobody, out folder); started.Add(svc);
+                relay.Body = HelloWith("ask", "limited", Pointer(id, true), null);
+                svc.TestCheckInOnce();
+                Assert(Until(delegate { return AgentFor(relay, "decline", id).Count == 1; }, 5000), "nobody signed in: a decline");
+                var d = AgentFor(relay, "decline", id)[0];
+                Assert(Wire.Text(Body(d), "reason") == "nobody" && Wire.Text(d, "auth") == "Bearer smd1.default.id.secret" && d["attach"] == null && AgentFor(relay, "hello", id).Count == 0, "declined as nobody, with the device key as a Bearer header and no X-Attach-Key");
+                Assert(svc.TestHoldUpdates, "updates wait while the pointer is there");
+                svc.TestCheckInOnce(); Thread.Sleep(500);
+                Assert(AgentFor(relay, "decline", id).Count == 1, "the same pointer again: no second decline");
+                relay.Body = HelloWith("ask", "limited", null, null); svc.TestCheckInOnce();
+                Assert(!svc.TestHoldUpdates, "the pointer gone: updates may go on");
+
+                // A limited PC set to any time, a session that does not ask, nobody signed in: still declined as nobody.
+                id = Hex64(); svc = SessionService(dir, relay.Origin, "any", "limited", DeviceService.Target.Nobody, out folder); started.Add(svc);
+                relay.Body = HelloWith("any", "limited", Pointer(id, false), null); svc.TestCheckInOnce();
+                Assert(Until(delegate { return AgentFor(relay, "decline", id).Count == 1; }, 5000) && Wire.Text(Body(AgentFor(relay, "decline", id)[0]), "reason") == "nobody", "a limited PC never runs at the sign-in screen");
+
+                // Several Remote Desktop users: busy.
+                id = Hex64(); svc = SessionService(dir, relay.Origin, "any", "full", DeviceService.Target.Busy, out folder); started.Add(svc);
+                relay.Body = HelloWith("any", "full", Pointer(id, false), null); svc.TestCheckInOnce();
+                Assert(Until(delegate { return AgentFor(relay, "decline", id).Count == 1; }, 5000) && Wire.Text(Body(AgentFor(relay, "decline", id)[0]), "reason") == "busy", "several Remote Desktop users: busy");
+
+                // The person says Don't allow: declined, asked once. A decline that fails is sent again without asking.
+                id = Hex64(); svc = SessionService(dir, relay.Origin, "ask", "full", DeviceService.Target.Console, out folder); started.Add(svc);
+                int asked = 0; bool fullAsked = false;
+                svc.Asker = delegate(uint s, DeviceService.SessionPointer p, bool full, WaitHandle w) { asked++; fullAsked = full; Assert(s == mine && p.By == "tech@example.com" && p.Team == "Acme", "the question names who and the team, in the target session"); return false; };
+                relay.DeclineStatus = 500;
+                relay.Body = HelloWith("ask", "full", Pointer(id, false), null); svc.TestCheckInOnce();
+                Assert(Until(delegate { return svc.TestDeclined == "declined" && svc.TestSessionFinished; }, 5000) && asked == 1 && fullAsked, "the PC's own ask asks even when the session does not; Don't allow is declined");
+                relay.DeclineStatus = 200;
+                relay.Body = HelloWith("ask", "full", Pointer(id, false), null); svc.TestCheckInOnce();
+                Assert(Until(delegate { return AgentFor(relay, "decline", id).Count == 2; }, 5000) && asked == 1, "a decline the relay did not take is sent again, without asking again");
+                svc.TestCheckInOnce(); Thread.Sleep(500);
+                Assert(AgentFor(relay, "decline", id).Count == 2 && asked == 1, "and only until it got through");
+
+                // Allow on a limited PC: hosted as the user, with the accepted id saved.
+                id = Hex64(); svc = SessionService(dir, relay.Origin, "ask", "limited", DeviceService.Target.Console, out folder); started.Add(svc);
+                string limitedFolder = folder, limitedId = id; asked = 0;
+                svc.Asker = delegate(uint s, DeviceService.SessionPointer p, bool full, WaitHandle w) { asked++; fullAsked = full; return true; };
+                relay.AgentDriver = "tech@example.com";
+                relay.Body = HelloWith("ask", "limited", Pointer(id, true), null); svc.TestCheckInOnce();
+                Assert(Until(delegate { return AgentFor(relay, "hello", id).Count == 1; }, 8000), "Allow: the session connects");
+                var hello = AgentFor(relay, "hello", id)[0];
+                Assert(asked == 1 && !fullAsked && Wire.Text(Body(hello), "control") == "normal" && !Wire.Flag(Body(hello), "elevated") && Wire.Text(hello, "auth") == "Bearer smd1.default.id.secret" && hello["attach"] == null, "a limited PC says hello with control normal and the Bearer key only");
+                Assert(Wire.Text(ReadJson(Path.Combine(folder, "device.json")), "accepted_session") == id && svc.TestAccepted == id, "the accepted id is saved in device.json");
+                Assert(Until(delegate { var st = svc.TestStatus(); return st.ContainsKey("session") && Wire.Text((Dictionary<string, object>)st["session"], "by") == "tech@example.com" && Wire.Number((Dictionary<string, object>)st["session"], "since") > 0; }, 3000), "the status frame shows who is connected");
+                Assert(svc.TestHoldUpdates, "updates wait while a session is live");
+                var r = relay.AgentResult(relay.AgentQueue(Wire.Map("type", "run", "command", "[Console]::Write([Environment]::UserName)", "timeout_s", 60)), 90);
+                Assert(Wire.Flag(r, "ok") && Decode(r, "stdout_b64") == Environment.UserName, "run runs as the user: " + Wire.Text(r, "error") + Decode(r, "stdout_b64"));
+                r = relay.AgentResult(relay.AgentQueue(Wire.Map("type", "run", "command", "whoami", "as", "system", "timeout_s", 30)), 30);
+                Assert(!Wire.Flag(r, "ok") && Wire.Text(r, "error").Contains("needs full control"), "as: system is refused with limited support");
+                string probe = Path.Combine(dir, "limited-" + Guid.NewGuid().ToString("N") + ".txt"); File.WriteAllText(probe, "hello");
+                r = relay.AgentResult(relay.AgentQueue(Wire.Map("type", "get_file", "path", probe, "length", 100)), 30);
+                Assert(Wire.Flag(r, "ok") && Decode(r, "data_b64") == "hello", "a file is read as the user: " + Wire.Text(r, "error"));
+                string written = probe + ".put";
+                r = relay.AgentResult(relay.AgentQueue(Wire.Map("type", "put_file", "path", written, "data_b64", Convert.ToBase64String(Encoding.UTF8.GetBytes("put")))), 30);
+                Assert(Wire.Flag(r, "ok") && File.ReadAllText(written) == "put", "a file is written as the user: " + Wire.Text(r, "error"));
+                r = relay.AgentResult(relay.AgentQueue(Wire.Map("type", "screen", "action", Wire.Map("name", "block_input", "on", true))), 30);
+                Assert(!Wire.Flag(r, "ok") && Wire.Text(r, "error") == Screen.NoFull, "block_input needs full control");
+                r = relay.AgentResult(relay.AgentQueue(Wire.Map("type", "control")), 30);
+                Assert(!Wire.Flag(r, "ok"), "a limited PC never takes full control: " + Wire.Text(r, "error"));
+                relay.AgentDriver = "other@example.com";
+                Assert(Until(delegate { var st = svc.TestStatus(); return st.ContainsKey("session") && Wire.Text((Dictionary<string, object>)st["session"], "by") == "other@example.com"; }, 5000), "a take-over shows the new driver");
+                // end_session from a tray in another session does nothing; from the session's own, it ends with reason owner.
+                svc.TestHandle(Wire.Map("type", "end_session"), mine + 1); Thread.Sleep(500);
+                Assert(svc.TestSessionHosting && AgentFor(relay, "end", id).Count == 0, "end_session from another session is ignored");
+                var after = svc.TestHandle(Wire.Map("type", "end_session"), mine);
+                Assert(after != null, "end_session is answered with the status");
+                Assert(Until(delegate { return AgentFor(relay, "end", id).Count == 1 && svc.TestSessionFinished; }, 8000) && Wire.Text(Body(AgentFor(relay, "end", id)[0]), "reason") == "owner", "End session ends it with reason owner");
+                Assert(!svc.TestTerminal && !svc.TestStatus().ContainsKey("session"), "and the PC goes back to checking in");
+                svc.TestCheckInOnce(); Thread.Sleep(500);
+                Assert(AgentFor(relay, "hello", id).Count == 1 && asked == 1, "the same pointer does not start it again");
+
+                // A restarted service rejoins the session the person allowed, without asking.
+                var again = new DeviceService(Path.Combine(limitedFolder, "support.exe")); Assert(again.TestInit(), "reload"); started.Add(again);
+                again.Targets = svc.Targets; again.UserTokens = OwnToken.Get; again.CornerSddl = svc.CornerSddl;
+                again.Asker = delegate { throw new Exception("a rejoin must not ask"); };
+                relay.Body = HelloWith("ask", "limited", Pointer(limitedId, true), null); again.TestCheckInOnce();
+                Assert(Until(delegate { return AgentFor(relay, "hello", limitedId).Count == 2; }, 8000), "a restarted service rejoins the accepted session without asking");
+                again.TestStopSession();
+
+                // Full control, any time, nobody signed in: hosted with control full. Then the session goes from the answer: it ends here.
+                id = Hex64(); svc = SessionService(dir, relay.Origin, "any", "full", DeviceService.Target.Nobody, out folder); started.Add(svc);
+                relay.Body = HelloWith("any", "full", Pointer(id, false), null); svc.TestCheckInOnce();
+                Assert(Until(delegate { return AgentFor(relay, "hello", id).Count == 1; }, 8000) && Wire.Text(Body(AgentFor(relay, "hello", id)[0]), "control") == "full", "full control any time runs with nobody signed in, as full");
+                relay.Body = HelloWith("any", "full", null, null); svc.TestCheckInOnce();
+                Assert(Until(delegate { return svc.TestSessionFinished && AgentFor(relay, "end", id).Count == 1; }, 8000), "a session gone from the answer ends locally");
+                Assert(!svc.TestTerminal && Wire.Text(ReadJson(Path.Combine(folder, "device.json")), "accepted_session") == "" && File.Exists(Path.Combine(folder, "device.json")), "nothing is uninstalled, and the accepted id is cleared");
+
+                // Updates wait while a pointer is there, and go on once it is gone.
+                byte[] exe = FakeExe(60000, 9); relay.InstallBody = WithFooter(exe, relay.Origin);
+                string note = NoteFor("99.0.0", Sha(exe), exe.Length); var update = Wire.Map("version", "99.0.0", "note", note, "signature", signer.Sign(note));
+                id = Hex64(); svc = SessionService(dir, relay.Origin, "any", "full", DeviceService.Target.Busy, out folder); started.Add(svc);
+                svc.TestUpdates(signer.Xy, delegate(string f, string a) { return null; });
+                try {
+                    int hits = relay.InstallHits;
+                    relay.Body = HelloWith("any", "full", Pointer(id, false), update); svc.TestCheckInOnce();
+                    Assert(relay.InstallHits == hits && svc.TestStaged == "", "an update offered with a session waiting is held");
+                    relay.Body = HelloWith("any", "full", null, update); svc.TestCheckInOnce();
+                    Assert(relay.InstallHits == hits + 1 && svc.TestStaged.Length > 0, "and taken once the session is gone");
+                } finally { svc.TestDropStaged(); }
+            } finally { foreach (var x in started) x.TestStopSession(); }
+        }
+        Console.WriteLine("PASS sessions on a saved PC: declines, the question, Allow and rejoin, limited support as the user, the driver, End session, a session gone, full control at the sign-in screen, and updates held");
+    }
+
     static void Press(System.Windows.Controls.Button button) { button.RaiseEvent(new System.Windows.RoutedEventArgs(System.Windows.Controls.Primitives.ButtonBase.ClickEvent)); }
     [DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(int pid);
     // A window of another process: the focus-return test starts this exe again with --peer <parent pid>. It lets the
@@ -2585,6 +3125,13 @@ public static class AppTests {
             UpdateTrialTests(dir);
             UninstallUpdateTests(dir);
             ScmCallTests();
+            OwnerCheckTests(dir);
+            ControlTests(dir);
+            ScheduleTests();
+            SessionRuleTests();
+            TrayPr6Tests();
+            DoorbellTests();
+            SessionLiveTests(dir);
             // The downloaded PE overlay must be readable by the actual .NET client.
             string overlay = Path.Combine(dir, "overlay.exe"); byte[] cfg = Encoding.UTF8.GetBytes(Wire.Json().Serialize(Wire.Map("sid", new string('a', 64), "key", new string('b', 64), "origin", "https://support.example.com", "startup_expires_at", Client.UnixNow() + 10000)));
             using (var f = File.Create(overlay)) { f.WriteByte(77); f.WriteByte(90); f.Write(cfg, 0, cfg.Length); byte[] n = BitConverter.GetBytes(cfg.Length); f.Write(n, 0, n.Length); byte[] footer = Encoding.ASCII.GetBytes(Wire.Footer); f.Write(footer, 0, footer.Length); }

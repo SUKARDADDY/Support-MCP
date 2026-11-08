@@ -329,7 +329,8 @@ apply to only one client say which.
   admin.
 - **The `default` team is open until its first member.** With no members, every caller
   Access admits holds the session permissions (`sessions.create`,
-  `sessions.view`, `sessions.control`, `sessions.end`), as before teams existed,
+  `sessions.view`, `sessions.control`, `sessions.end`), as before teams existed
+  (not `sessions.unattended`),
   and the relay records who called so an admin can add them. It writes a
   caller's row at most once a minute. While the team is open nobody holds a
   team permission: editing or adding a role, or changing or removing a member,
@@ -400,8 +401,11 @@ apply to only one client say which.
   - *Uninstalling revokes.* A PC removes itself with `/device/leave`, which
     deletes its row and so its key. A technician with `devices.manage` can remove
     any PC the same way. Either takes effect on the PC's next request.
-  - *Access mode.* A technician with `devices.manage` can change a PC between
-    `ask` and `any`, either way. The log records who and the old and new mode. A
+  - *Access mode.* A technician with `devices.manage` can set a PC to `ask`. Setting
+    it to `any` also needs `sessions.unattended`, which only admins hold by default
+    (403 otherwise, checked again when the change commits), because `any` lets
+    technicians in without asking the person at the PC. Either way the PC's
+    doorbell is rung. The log records who and the old and new mode. A
     technician cannot change the control level or the name; a request that sends
     either is 400, not ignored. On the PC the switch is one way: anyone signed in
     can turn `ask` to `any`, and nobody at the PC can turn it back (see "A saved
@@ -477,14 +481,15 @@ apply to only one client say which.
     much control (full control or limited support). Nothing is preselected for
     either, so the owner must choose. The Windows permission prompt is the
     second consent. No other path installs a saved PC.
-  - *The service checks in, and installs only signed releases.* In this release
-    it contacts the relay every few minutes with the PC's key and writes local
-    history. It runs no commands, takes no screenshots and opens no files for
-    anyone, and it never reads a session footer. It also installs new versions of
-    itself, but only releases signed with the project's release key, below.
-    Nobody can connect to a saved PC yet, and Stage 1 stays off real customers'
-    unattended PCs until the release that enforces rules about who may connect
-    and when.
+  - *The service checks in, rings, and installs only signed releases.* It
+    contacts the relay with the PC's key, keeps a doorbell open so the relay can
+    tell it to check in at once (below), and writes local history. It never reads
+    a session footer. It runs a command, takes a screenshot or opens a file only in
+    a session that its own record at the relay points at, as the next bullet but
+    one describes. It also installs new versions of itself, but only releases
+    signed with the project's release key, below. Technicians can now connect to a
+    saved PC, but Stage 1 stays off real customers' unattended PCs until the
+    release that enforces rules about who may connect and when.
   - *Updates come signed, and only forward.* A release note (version, the exe's
     SHA-256 and size, and a date) is signed with an ECDSA P-256 key that is kept
     offline in a secrets manager and read into the signer only at deploy time. It
@@ -561,9 +566,9 @@ apply to only one client say which.
     tray says so plainly ("Only your support team can change this."). The rule
     is the app's, not the relay's: `/device/update` takes either mode from the
     holder of the key, and only SYSTEM or an elevated administrator process holds
-    it. Nothing can
-    connect to a saved PC yet, so this has no effect today, but weigh it before
-    you use a saved PC where a stranger can sign in.
+    it. A technician who holds `sessions.unattended`
+    can then connect to that PC without asking, so weigh this before you use a
+    saved PC where a stranger can sign in.
   - *Uninstall revokes and removes.* Uninstalling from Settings > Apps or the
     tray asks for one Windows permission prompt. It runs from a temporary copy,
     so nothing in the install folder stays open. It tells the relay to forget the
@@ -580,6 +585,70 @@ apply to only one client say which.
     minutes." If the relay cannot be
     reached, the PC is still removed locally, the key stays valid on the relay,
     and the team must remove the PC from their list to end it.
+- **Connecting to a saved PC.** A technician's agent connects with
+  `device_connect`; the PC's own service decides what happens next. A one-off
+  link is unchanged. These rules hold:
+  - *The relay can only add asking.* A PC asks the person at it whenever its own
+    saved setting is "ask", and also whenever the relay's session says `ask`. The
+    relay says `ask: false` only for a PC set to "any time", and only when the
+    caller holds `sessions.unattended` and did not pass `ask:true`. A caller
+    without that permission is not refused: the person is asked. A PC set to "ask
+    each time" asks for every session, whoever connects. The permission is checked
+    in the tool after the PC is read and again when the claim commits, so a role
+    that loses it in between gets the prompt, not a skipped one.
+  - *`sessions.unattended` is its own permission.* "Connect to a PC without asking
+    the person at it, and switch a PC to any time." Admins hold it; the
+    technician and viewer roles do not. It needs a second factor like
+    `sessions.control`. Open mode (a `default` team with no members) grants every
+    `sessions.*` permission except this one, which is excluded by name, and a test
+    keeps it so. Switching a PC to "any time" in the team API needs it as well as
+    `devices.manage`; switching to "ask" needs only `devices.manage`.
+  - *Limited support is the signed-in user.* A PC set up for limited support never
+    runs a session as the system. The relay refuses a `hello` with `control: "full"`
+    for such a PC (403), judged from the PC's record, not from what the client
+    says. A check-in can lower a PC from full to limited and never raise it, so a
+    hostile or mistaken relay cannot turn a limited PC into a full-control one.
+    What the PC does with the user's identity is the app's rule; the live run
+    checks that a file only the system can read is refused.
+  - *One driver, and taking over is not a back door.* One technician drives a
+    session at a time. A command from anyone else is refused with the driver's
+    name. Taking the session over (`take_over`) needs `sessions.unattended` and
+    is logged as a take-over, not an end; someone without it ends the session and
+    connects again, so the person at the PC is asked again.
+  - *The session reaches only its own PC.* The PC authenticates to `/agent` with
+    its own device key, checked against the database on every request, and only
+    for the one session its record points at. There is no attach key, the code that
+    names the session opens nothing (`/j/` and `/consume` refuse it), and the
+    Worker, not the client, tells the session which device it is.
+  - *The doorbell carries no authority.* Each PC holds one WebSocket to its
+    workspace's Registry object. The relay sends `{"type":"ring"}` and nothing
+    else; the PC reads no content, so a forged ring can only make it check in
+    early. The PC sends nothing the relay reads, and a frame over 1 KB closes the
+    socket. An idle doorbell costs nothing on Cloudflare; only a ring wakes the
+    object. The 5-minute check-in is the fallback when it is not connected.
+  - *A session lasts 24 hours at most.* From the first `hello`, with no idle
+    timeout, as a link does. Waiting for the PC and its person takes at most 510
+    seconds. The person at the PC can always end it (the end reason is `owner`).
+    Removing a PC or uninstalling it ends its live session with the reason
+    `removed`.
+  - *A stop is immediate and cannot be undone by a technician.* Anyone who can end
+    sessions can stop a workspace: every live session in it ends, every doorbell
+    rings, and no tool call works until someone with `members.manage` resumes it.
+    The state is the newest of two chained log rows, so it has no column to edit,
+    and each session also checks it on its own polls (at most every 20 seconds),
+    which catches a session the session list missed. `EMERGENCY_STOP`, a deploy
+    setting, does the same for the whole relay and no team can lift it. Stop and
+    resume are team API calls only, never MCP tools, so text on a customer's
+    screen cannot make an agent resume a workspace.
+  - *The log names ids, not secrets.* `device_session_started`,
+    `device_session_taken_over` and `device_session_ended` (with the reason) hold
+    a PC's id and name, the first 8 characters of the session id and identities.
+    They never hold a code, a key, typed text or a screenshot. A session's own log
+    keeps what a session's log always kept.
+  - *What is still open.* Invites, handover, the escalation queue, notifications,
+    the built-in agent, owner messages and screenshot storage are later releases.
+    Stage 1 stays off real customers' unattended PCs until the release that
+    enforces rules about who may connect and when.
 - **Each session belongs to its workspace.** A session stores the workspace that
   created it, and operator calls name their workspace. A call from another
   workspace gets the same answer as a session that does not exist. A session
@@ -658,7 +727,7 @@ apply to only one client say which.
   is `localhost` or `127.0.0.1`. In that mode only, the page does show whether
   an address was invited.
 - **A second factor for roles that can control sessions or manage the team.**
-  A role that holds `sessions.control`, `members.manage`, `roles.manage`,
+  A role that holds `sessions.control`, `sessions.unattended`, `members.manage`, `roles.manage`,
   `devices.manage` or `fields.manage`, and a deployment admin, must enrol an authenticator app (TOTP, RFC 6238: SHA-1,
   30 seconds, six digits, one step either side). `authorizeSignIn` in
   `src/auth.js` refuses a sign-in that has not passed a code with "a second

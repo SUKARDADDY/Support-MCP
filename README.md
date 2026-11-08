@@ -10,7 +10,7 @@ An MCP server on Cloudflare Workers that lets your AI agent see, control and run
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers%20%2B%20Durable%20Objects-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/durable-objects/)
 [![.NET Framework 4.5.2+](https://img.shields.io/badge/.NET%20Framework-4.5.2%2B-512BD4)](src/agent-app.cs)
 [![PowerShell 5.1](https://img.shields.io/badge/PowerShell-5.1-5391FE)](src/agent.ps1)
-[![MCP](https://img.shields.io/badge/MCP-22%20tools-d97757)](#mcp-tools)
+[![MCP](https://img.shields.io/badge/MCP-24%20tools-d97757)](#mcp-tools)
 
 <img src="docs/hero.svg" alt="Claude Code calls session_create, run and put_file. A Cloudflare Worker relays them to the customer's PC, where a small Remote support window in the corner of the screen shows that an agent is connected, with an End session button." width="100%">
 
@@ -40,9 +40,11 @@ AI agent does the diagnosis and the fix while a person watches.
   commands as the signed-in user, but no Windows security prompts.
 - A small window in the corner shows that the session is live.
 - A PC's owner can also install the app permanently as a saved PC, so the
-  support team keeps it on their list. Nobody can connect to a saved PC yet. A
-  saved PC updates itself, but only to a release signed with the project's
-  offline release key. See [Saved devices](#saved-devices).
+  support team keeps it on their list and its agent can connect to it with one
+  tool call (`device_connect`). The PC asks the person at it first when it is set
+  to ask, one technician drives at a time, and a workspace or the whole relay can
+  be stopped at once. A saved PC updates itself, but only to a release signed with
+  the project's offline release key. See [Saved devices](#saved-devices).
 - When the customer uses the mouse or keyboard, support's input pauses for 3
   seconds.
 - Access ends 24 hours after the PC connects, or sooner if either side ends it.
@@ -210,6 +212,8 @@ an error.
 | `put_file` | writes base64 data to a path, with append for chunking. As SYSTEM under full control |
 | `get_file` | reads a byte range as base64, with `eof` for chunking. As SYSTEM under full control |
 | `session_end` | tells the client to stop and marks the session ended |
+| `device_list` | the team's saved PCs with their fields and `online` (true while the PC's doorbell is connected). Needs `devices.view`. Names and custom field values are untrusted text |
+| `device_connect` | connect to a saved PC by its id: `{device_id, ask?, take_over?}`. Returns `{session_id, state: "waiting", asks, rang}`; poll `session_status` until it is attached, then use the session tools. The PC asks its person first when it is set to ask, when you pass `ask: true`, or when your role may not connect without asking. `take_over: true` takes the driving seat of a session another technician started |
 | `screenshot`, `click`, `move_mouse`, `drag`, `scroll`, `type_text`, `press_key`, `wait`, `zoom` | the screen, mouse and keyboard, one tool per action. A screenshot comes back as an image, then the size, display and desktop (`default`, or `secure` for UAC, the lock and sign-in screens and Ctrl+Alt+Del) as JSON. Every input takes `screenshot:false` to skip the screenshot that follows it. An input that switched the desktop and left no screenshot still succeeds, with the note "input sent; no screenshot". `press_key` refuses Win+L, which Windows ignores: lock with `run` as `user` and `rundll32.exe user32.dll,LockWorkStation` |
 | `ui_tree`, `ui_act` | a fallback for when a screenshot and zoom are not enough: read a window's controls and act on one by its ref, through UI Automation. Each `ui_tree` line ends with the verbs `ui_act` can use on that control (`[12] Button "OK" (640,412) invoke,focus`), or with `disabled` for a greyed-out control; a verb the control does not support is refused, so click its coordinates instead. Agents do better working from screenshots, zoom for small text and Ctrl+F in the app for text on a long page |
 | `block_input` | lock the customer's mouse and keyboard for up to 10 minutes; it lifts by itself, and Ctrl+Alt+Del lifts it at once. Full control only |
@@ -220,7 +224,7 @@ an error.
 Add `?ui=0` to the MCP URL to hide `ui_tree` and `ui_act`; any other value is a
 400 error. The old `?shape=` parameter is gone: the server offers only the tools
 above, and a request that still sends `shape` gets a 400 error. Every tool except
-`session_create` and `session_list` needs a `session_id`; a call without one
+`session_create`, `session_list`, `device_list` and `device_connect` needs a `session_id`; a call without one
 fails with `session_id is required; call session_list to find it`, and the relay
 never picks a session for you. `run`, `put_file` and `get_file` use their own
 lane, so a long command does not block the screen.
@@ -264,7 +268,9 @@ an attempt to edit or add a role, or to change or remove a member, gets a 409
   while no member holds them, and add roles of their own from these permissions:
   `members.manage`, `roles.manage`, `audit.view`, `devices.view`,
   `devices.manage`, `fields.manage`, `sessions.create`, `sessions.view`,
-  `sessions.control`, `sessions.end`. A workspace that edited `technician` or
+  `sessions.control`, `sessions.end`, `sessions.unattended`. Only `admin` holds
+  `sessions.unattended` ("connect to a PC without asking the person at it, and
+  switch a PC to any time") by default, and open mode never grants it. A workspace that edited `technician` or
   `viewer` before the device permissions existed keeps its edit, without them
   (admins hold every permission). Because `technician` and `viewer` now hold
   more, a custom role with `members.manage` but no device permissions can no
@@ -285,7 +291,9 @@ an attempt to edit or add a role, or to change or remove a member, gets a 409
   to them is a 409 `role_missing`.
 - **Which tool needs what.** `session_create` needs `sessions.create`,
   `session_list` and `session_status` need `sessions.view`, `session_end` needs
-  `sessions.end`, and every other tool needs `sessions.control`. Controlling a
+  `sessions.end`, `device_list` needs `devices.view`, and every other tool needs
+  `sessions.control` (`device_connect` also needs `sessions.unattended` to connect
+  without asking or to take over). Controlling a
   full-control session is administrator-level on the customer's PC, so give
   `sessions.control` only to people you would trust with that.
 - **A refused call** is a tool error: `you are not a member of this team`, or
@@ -335,13 +343,14 @@ The routes, bodies and errors are in
 Each workspace can keep customers, their sites and their saved PCs, so a team
 knows which PC is whose. A PC joins with its own long-lived key, which is not
 tied to a 24-hour session. A PC's owner can install the Windows app on it
-permanently, as a saved PC. This release stores, pairs and installs PCs; it does
-not yet connect to them. One-off support links work as before.
+permanently, as a saved PC. The support team lists, pairs and connects to saved
+PCs. One-off support links work as before.
 
-> **Not for real customers' unattended PCs yet.** Nobody can connect to a saved
-> PC in this release, and the rules that decide who may connect, and when, are not
-> enforced yet. Until a later release ships them, do not install a saved PC on a
-> real customer's unattended machine. Use it on your own test machines.
+> **Not for real customers' unattended PCs yet.** Technicians can connect to a
+> saved PC, but the rules that decide who may connect, and when, beyond the ones
+> below are not enforced yet. Until a later release ships them, do not install a
+> saved PC on a real customer's unattended machine. Use it on your own test
+> machines.
 
 - **Records.** A customer has a name, phone, email and notes. A site belongs to
   one customer and has a name, address and notes. A saved PC has the name its
@@ -377,17 +386,37 @@ not yet connect to them. One-off support links work as before.
   removes itself when it is uninstalled (`/device/leave`), and a technician can
   remove any saved PC, which ends its key at once.
 - **Access mode.** `ask` means support asks first; `any` means support may
-  connect at any time. A technician with `devices.manage` can switch it either
-  way; that change is logged with the technician as the actor and the old and new
-  mode. On the PC the switch goes one way only: see [The tray](#the-tray). The
-  control level and the PC's name stay the owner's.
+  connect at any time. A technician with `devices.manage` can switch it to `ask`.
+  Switching it to `any` also needs `sessions.unattended`, which admins hold by
+  default. Either change is logged with the person as the actor and the old and
+  new mode, and rings the PC. On the PC the switch goes one way only: see
+  [The tray](#the-tray). The control level and the PC's name stay the owner's, and
+  a check-in can lower a PC from full to limited control but never raise it.
+- **Connecting.** `device_connect` starts a session that waits for the PC. A PC
+  that keeps its doorbell connected (one quiet connection to the relay, which costs
+  nothing while idle) notices within seconds, checks in every 6 hours and when
+  rung, about 10 requests a day. A PC whose doorbell cannot connect checks in
+  every 5 minutes instead, so `device_connect` can take up to that long. The PC
+  asks the person at it when it is set to ask, or when the caller may not connect
+  without asking; the person has 2 minutes, and a refusal, no answer or nobody
+  signed in ends the session. With full control the session works as the system on
+  the screen in front of the PC, even at the sign-in screen. With limited support
+  everything runs as the signed-in person. One technician drives a session at a
+  time; a command from anyone else is refused with the driver's name. A technician
+  with `sessions.unattended` can take over. A session lasts at most 24 hours, and
+  the person at the PC can end it from the corner window or the tray. Removing a
+  PC ends its session.
+- **Stopping.** `POST /api/v1/w/<slug>/stop` (needs `sessions.end`) ends every live
+  session in a workspace and refuses its tool calls until `DELETE .../stop` (needs
+  `members.manage`) resumes it. Neither is an MCP tool. The `EMERGENCY_STOP`
+  deploy setting, any non-empty value, does the same for the whole relay.
 - **The team log** records every change to customers, sites, custom fields,
   pairing codes and PCs, with names and ids but never a code, a key or a field
   value. A detail can hold customer, site and PC names, so anyone with
   `audit.view` can read them. A PC's routine check-ins are not logged.
 
-`/device/pair`, `/device/hello`, `/device/update` and `/device/leave` are public
-addresses for the PC and are not behind Access. Their request and answer shapes
+`/device/pair`, `/device/hello`, `/device/update`, `/device/leave` and the
+doorbell `/device/ring` are public addresses for the PC and are not behind Access. Their request and answer shapes
 are in [docs/relay-v1-spec.md](docs/relay-v1-spec.md#the-pc-wire-device).
 Pairing needs `AUTH_SECRET` (at least 32 characters) to be set, as sign-in does.
 Rotating `AUTH_SECRET` ends every live pairing code and every waiting PC's
@@ -483,7 +512,8 @@ key (which only SYSTEM or an elevated administrator can read), as PR 3 pinned.
 This means **any user signed in at the PC, including a standard user or a guest,
 can turn on unattended access.** Windows asks for no administrator prompt for
 this. It is the owner's call, made with that in mind, and it is one more reason
-not to use a saved PC on a real customer's unattended machine yet.
+not to use a saved PC on a real customer's unattended machine yet. A technician
+who holds `sessions.unattended` can then connect to that PC without asking.
 
 ### Uninstalling
 
@@ -574,13 +604,14 @@ flowchart LR
 | `GET /j/<code>?client=app` | public, https only | the download page. Never uses the code up |
 | `POST /j/<code>?client=app` | public, single use, https only, same origin | returns the session's executable and uses the code up |
 | `GET /j/<code>` | public, single use, https only | serves the PowerShell agent script with the session values filled in, to PowerShell clients only |
-| `POST /agent?sid=` | attach key in a header, https only | the app's transport: hello, long poll, results and end, as JSON |
+| `POST /agent?sid=` | attach key in a header, or (for a saved PC's session) the PC's device key in `Authorization`, https only | the app's transport: hello, long poll, results and end, as JSON |
 | `GET /install`, `POST /install` | public, https only | `GET` shows the setup page for a saved PC and never downloads. `POST` from that page returns `support-setup.exe` with a device footer. `?code=` or `?workspace=`, at most one. It uses no code up: the PC redeems the code over `/device/pair`. Not behind Access |
 | `GET /ws?sid=` | attach key in a header, https only | PowerShell agent WebSocket, using the hibernation API |
 | `POST /mcp` | Cloudflare Access, then the caller's role | MCP JSON-RPC 2.0, stateless HTTP, for the `default` workspace |
 | `POST /w/<slug>/mcp` | Cloudflare Access, then the caller's role | the same endpoint for another workspace |
-| `/api/v1/w/<slug>/...` | Cloudflare Access, then the caller's role | the team API: members, roles, the team log, customers, sites, saved PCs, custom fields and pairing codes |
+| `/api/v1/w/<slug>/...` | Cloudflare Access, then the caller's role | the team API: members, roles, the team log, stop and resume, customers, sites, saved PCs, custom fields and pairing codes |
 | `POST /device/pair`, `hello`, `update`, `leave` | public, https only; a saved PC's key in a header (pair: a pairing code or a workspace in the body) | the PC's side of saved devices. Not behind Access |
+| `GET /device/ring?protocol=1` | public, https only; a saved PC's key in a header | the doorbell: a WebSocket the relay rings when the PC should check in. Not behind Access |
 | `POST /api/v1/w`, `GET /api/v1/w` | Cloudflare Access, a deployment admin to create | create a workspace, list yours |
 
 The Worker itself is the MCP server. There is no local bridge process. Each
@@ -594,13 +625,14 @@ keyed by workspace.
 |---|---|
 | `src/app.js` | router, Access JWT gate, MCP handler, download page |
 | `src/session.js` | `Session` Durable Object: states, audit log, alarm, tagged sockets, the app's polling transport |
-| `src/registry.js` | `Registry` Durable Object for `session_list`, one per workspace |
+| `src/registry.js` | `Registry` Durable Object for `session_list`, one per workspace. It also holds the saved PCs' doorbell sockets |
+| `src/device-sessions.js` | how the relay reaches the Durable Objects for a saved PC: ringing a doorbell, making, ending and taking over a session, and ending every session on a stop |
 | `src/permissions.js` | the permission keys, the built-in roles, and the permission each MCP tool needs |
 | `src/workspace.js` | team data in D1: members, roles, recent callers, the chained team log, and the role check. All team SQL is here |
 | `src/api.js` | the team API under `/api/v1/w/<slug>`, and workspace creation and listing |
 | `src/devices.js` | customers, sites, saved PCs, custom fields and pairing codes in D1. All their SQL is here; each change goes through `src/workspace.js`'s guarded change |
-| `src/device-api.js` | the PC wire under `/device/`: pair, hello, update and leave |
-| `migrations/` | the D1 tables, applied in name order: `0001_team.sql` (members, roles, callers, the team log, each keyed by workspace), `0002_workspaces.sql` (the workspaces table and an index on members by identity), `0003_signin.sql` (people, sign-ins, links and authenticators) and `0004_devices.sql` (customers, sites, devices, custom field definitions and pairing codes) |
+| `src/device-api.js` | the PC wire under `/device/`: pair, hello, update, leave and the doorbell |
+| `migrations/` | the D1 tables, applied in name order: `0001_team.sql` (members, roles, callers, the team log, each keyed by workspace), `0002_workspaces.sql` (the workspaces table and an index on members by identity), `0003_signin.sql` (people, sign-ins, links and authenticators) `0004_devices.sql` (customers, sites, devices, custom field definitions and pairing codes) and `0005_device_sessions.sql` (the live session pointer on a device) |
 | `src/mcp.js` | JSON-RPC dispatch, the tool schemas, and the mapping of each screen tool to one normalized action |
 | `src/screen.js` | the screen actions, their audit text, and the strict check of every field an app result may carry |
 | `src/jwt.js` | RS256 verification of the Access JWT with WebCrypto |

@@ -451,6 +451,45 @@ binding that records every call.
 `test/app.test.js` covers the app: the bundle's hashes, the download flow and
 its security headers, the polling transport, and the default mode and aliases.
 
+### Connecting to a saved PC locally
+
+With a paired PC (above) whose `app_version` is 0.6.0 or later, `device_connect`
+starts a session and `GET /device/hello` shows it as `session`. Play the PC with
+`curl`. An authenticated MCP client (not the bare local bypass, which is one
+identity) is easiest for the tools; the team API calls below need no client.
+
+```sh
+# The check-in answer carries the session once a technician has connected.
+curl -s localhost:8787/device/hello -H 'content-type: application/json' \
+  -H "authorization: Bearer $key" -d '{"protocol":1,"app_version":"0.6.0"}'
+# {"protocol":1,"device":{...},"session":{"id":"<64 hex>","by":"...","team":"Default","ask":true,"expires_at":...}}
+
+# The PC joins its session with its own key: no X-Attach-Key.
+curl -s "localhost:8787/agent?sid=<id>" -H 'content-type: application/json' \
+  -H "authorization: Bearer $key" -d '{"type":"hello","machine":"POS-1","control":"full","caps":["lanes","screen"]}'
+# or say no: {"type":"decline","reason":"declined"}
+
+# Stop a workspace (ends its sessions), and resume it.
+curl -s -X POST   $api/stop -H 'content-type: application/json' -d '{}'
+curl -s -X DELETE $api/stop -H 'content-type: application/json' -d '{}'
+```
+
+The doorbell is a WebSocket: `wscat -c "ws://localhost:8787/device/ring?protocol=1"
+-H "authorization: Bearer $key"` stays quiet until a `device_connect`, a team
+change to the PC's access, or a stop, then prints `{"type":"ring"}`. `device_list`
+shows `online: true` while it is open. `EMERGENCY_STOP` is a variable like any other
+in `.dev.vars`: set it to `1` and restart `wrangler dev` to see every tool call
+refused and every live session end on its next request.
+
+`test/device-sessions-world.js` builds a whole relay for the tests of these
+paths: the real router, the real `Session` and `Registry` classes behind small
+Durable Object stand-ins, the D1 stand-in and Access logins signed by a local key.
+`test/device-connect.test.js`, `test/device-session-wire.test.js`,
+`test/doorbell.test.js` and `test/stop.test.js` use it. Time moves only when a test
+moves it. The one thing Node cannot do is a WebSocket upgrade, so the doorbell
+tests give the Worker a recording Registry and test the Registry's own sockets
+directly.
+
 ### Installing a saved PC on a test machine
 
 The native tests do not install the service, so check a saved PC by hand on a
