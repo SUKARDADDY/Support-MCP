@@ -4797,7 +4797,7 @@ namespace SupportMcp {
     // root (test/release.test.js checks they are equal). Self-hosters who build their own app put their own key in both.
     // A base64 string, not a byte array: a constant array initializer would break the reproducible build.
     public static class ReleaseKey {
-        public const string ProjectKey = "EIVL0HmT752JhnLYiey2OvyNAoKvG/GA7kJWMJABU2pxweY7hn0EzmZlSmF6584sb8cYDZBGRK1E5bOIckyGgg==";
+        public const string ProjectKey = "6oEnKHINMEr2HVlmklxxL9XEcvq1439e1rdY004x54yOw0fVCqNn+OPrtWpENnHQ+blljSYk+GCVIavvxiH5DA==";
         public static bool Verify(byte[] data, byte[] signature) { return Verify(data, signature, ProjectKey); }
         // ECDSA over SHA-256 of data. The signature must be exactly 64 bytes r||s (IEEE P1363): .NET 4.5.2's ECDsaCng takes
         // only that form, and never a DER one (checked on Windows 7 SP1 x86 and Windows 11 x64). xyBase64 is the key.

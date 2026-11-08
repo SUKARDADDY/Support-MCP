@@ -261,28 +261,26 @@ from the CHANGELOG entry. Then sign the release and deploy it, as below.
 ### Sign and deploy a release
 
 Saved PCs update themselves only to a release signed with the project's release
-key ([Updates](relay-v1-spec.md#updates)). The private key lives in Bitwarden
-Secrets Manager and is never written to disk: not on your computer, not in
-Cloudflare, not in CI. You sign at deploy time, because the stages (10% of PCs
+key ([Updates](relay-v1-spec.md#updates)). The private key is a secure note,
+"Support MCP release key", in the maintainers' Bitwarden organisation vault. It is
+never written to disk: not on your computer, not in Cloudflare, not in CI. You sign at deploy time, because the stages (10% of PCs
 for a day, then half for a day, then all) count from the signing time; a
 release signed long before its deploy would skip them.
 
 1. Make sure `src/app-bundle.json` is the bundle built from the merged source
    (CI's `verify-app-binary` passed on the PR).
-2. Sign. Pipe the key from Bitwarden Secrets Manager straight into the signer
-   with the `bws` CLI and a machine-account token that may read only that secret:
+2. Sign. Open the note in the Bitwarden web vault, click **Copy notes**, and
+   pipe the clipboard straight into the signer, then clear the clipboard:
 
    ```sh
-   export BWS_ACCESS_TOKEN=...   # from a secure prompt; unset it afterwards
-   bws secret get <secret id> --output json \
-     | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).value))' \
-     | node scripts/sign-release.mjs --out release-files
-   unset BWS_ACCESS_TOKEN
+   wl-paste | node scripts/sign-release.mjs --out release-files   # pbpaste on macOS
+   wl-copy --clear
    ```
 
-   `bws` prints the secret as JSON; the one-line `node` step passes on only its
-   `value`, the PEM, so the key goes from pipe to pipe and is never on a command
-   line or on disk.
+   With the Bitwarden CLI signed in and unlocked, `bw get notes "Support MCP
+   release key" | node scripts/sign-release.mjs --out release-files` does the
+   same. Either way the key goes from pipe to pipe and is never on a command line
+   or on disk.
 
    `scripts/sign-release.mjs` reads the key from stdin only. It checks that the
    bundle was built from `src/agent-app.cs` and carries `VERSION`, builds the
@@ -323,12 +321,12 @@ name. It refuses to print the key to a terminal, so pipe it to the clipboard:
 node scripts/release-key.mjs release-key.pub | pbcopy   # macOS; clip on Windows, wl-copy on Linux
 ```
 
-Paste it, from `-----BEGIN` to `-----END ... -----` inclusive, into the value of
-a new secret in the Bitwarden Secrets Manager web app, then clear the clipboard
-(and any clipboard history). Do not pass it to `bws secret create`: that puts the
-key on a command line, where other processes and the shell history can see it.
-Any other way of storing it works if it never puts the key on a command line or
-on disk.
+Paste it, from `-----BEGIN` to `-----END ... -----` inclusive, into the Notes of
+a new secure note in the Bitwarden web vault, owned by the organisation, then
+clear the clipboard (and any clipboard history). Do not pass it to a command such
+as `bw create`: that puts the key on a command line, where other processes and the
+shell history can see it. Any other way of storing it works if it never puts the
+key on a command line or on disk.
 
 The same public key is the constant `ReleaseKey.ProjectKey` in
 `src/agent-app.cs`; `test/release.test.js` fails when the two differ. To move to a

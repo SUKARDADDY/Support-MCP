@@ -740,9 +740,9 @@ public static class AppTests {
     const string TestNote = "support-mcp-release 1\nversion 0.5.1\nsha256 abababababababababababababababababababababababababababababababab\nsize 229376\nreleased 1794000000\n";
     const string TestSig = "fLoDvxmMWPIAhN3RyHweH44dJX+aDX7jD2s8SnZ8iCdUhPjPnC0aGna+3dtLT1WjwhgDHZiYpE+tLglfCh0ZFg==";
     const string TestSigDer = "MEUCIGHh+cKtdr8sMRGKhXlqNwjVm95i/pDDpU0IEZ0/SQZTAiEA1wmbyICv4E4TMPnKjkA13XNQOR7giPBFAxokivEa2HQ=";
-    // Set to true in the same change that puts the real project key in ReleaseKey.ProjectKey; it turns on the guard in
-    // ReleaseKeyTests. static readonly, not const, so the compiler does not flag the branch it skips as unreachable.
-    static readonly bool RealKeyEmbedded = false;
+    // The real-key vector: a note signed by the real project key, for a version and hash no release can carry.
+    const string RealNote = "support-mcp-release 1\nversion 0.0.1\nsha256 0000000000000000000000000000000000000000000000000000000000000000\nsize 1\nreleased 1794000000\n";
+    const string RealSig = "tggCO4NlR1GiGwMYh2C2xtwbIQK9e5cO8Y3PCNM4QcPKuKOjk+Hibnv3Q6BbSaKynp1Uu2+O89jobT62EhGXNQ==";
     // Another P-256 public key, for "the wrong key".
     const string OtherKeyXy = "ryQntQ49C0HNyTj3BmEGPnJdHRhDVRjA+hU5AldhahWNhLCnnfyQ2OV+bfi+Td4QXhoXHdxWOZ9Q6lPUw/s2ug==";
 
@@ -781,13 +781,12 @@ public static class AppTests {
         }
         Assert(ReleaseKey.Sha256Hex(Encoding.ASCII.GetBytes("abc"), 0, 3) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "SHA-256 in lowercase hex");
         Assert(ReleaseKey.ProjectKey.Length == 88 && Convert.FromBase64String(ReleaseKey.ProjectKey).Length == 64, "the embedded key is 64 bytes X||Y");
-        // REAL-KEY VECTOR: a note signed by the real project key goes here, checked with the embedded key:
-        // Assert(ReleaseKey.Verify(Encoding.UTF8.GetBytes(RealNote), Convert.FromBase64String(RealSig)), "...");
-        // REAL-KEY GUARD, which CI must pass once the real key is embedded: the test-key vector must NOT verify with the
-        // embedded key, so a build that still carries the test key can never ship. Turned on by RealKeyEmbedded.
-        if (RealKeyEmbedded) Assert(!ReleaseKey.Verify(note, sig), "the embedded release key is still the test key: put the real project key in ReleaseKey.ProjectKey and release-key.pub");
-        else Console.WriteLine("SKIP real release key not embedded yet");
-        Console.WriteLine("PASS the release key: the test-key vector verifies; tampered, flipped, DER, wrong-key and malformed input fail");
+        // The real-key vector verifies with the embedded key, and the test-key vector does not, so a build that carries
+        // the test key, or a mistyped real key, can never ship.
+        Assert(ReleaseKey.Verify(Encoding.UTF8.GetBytes(RealNote), Convert.FromBase64String(RealSig)), "the real-key vector verifies with the embedded release key");
+        Assert(!ReleaseKey.Verify(Encoding.UTF8.GetBytes(RealNote), Convert.FromBase64String(RealSig), TestKeyXy), "and not with the test key");
+        Assert(!ReleaseKey.Verify(note, sig), "the embedded release key is still the test key: put the real project key in ReleaseKey.ProjectKey and release-key.pub");
+        Console.WriteLine("PASS the release key: the test-key and real-key vectors verify; tampered, flipped, DER, wrong-key and malformed input fail");
     }
 
     // The note parser takes the exact five lines and nothing else.
