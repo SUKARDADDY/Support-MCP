@@ -1173,6 +1173,16 @@ public static class AppTests {
                     Assert(!st.InTrial && seen.Contains("point " + old + " 0.4.0") && seen.Contains("actions restart"), "a later run points back and finishes: " + show(seen));
                     Assert(history(folder).Contains("couldn't update to version 99.0.0"), "and only then says so");
                 }
+                // A rollback with the old file gone has nothing to go back to: the trial closes on the new version, the
+                // normal restarts come back, nothing is pointed, and the history does not claim it went back.
+                {
+                    string folder = fresh(), old = Path.Combine(folder, "support.exe"), neu = Path.Combine(folder, "support-99.0.0-abcdef12.exe");
+                    openTrial(folder, old, neu); File.Delete(old); log();
+                    DeviceUpdate.RollBack(folder);
+                    var seen = log(); var st = UpdateState.Load(folder);
+                    Assert(!st.InTrial && seen.Contains("actions restart") && !seen.Exists(delegate(string l) { return l.StartsWith("point "); }), "a missing old file closes the trial without pointing: " + show(seen));
+                    Assert(history(folder).Contains("couldn't update to version 99.0.0") && !history(folder).Contains("went back"), "and the history does not claim it went back");
+                }
                 // Refusals: a file that was not staged, outside the folder, the running exe, changed since staging, or the lock held.
                 {
                     string folder = fresh(), old = Path.Combine(folder, "support.exe"), neu = Path.Combine(folder, "support-99.0.0-abcdef12.exe");

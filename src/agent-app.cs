@@ -5251,11 +5251,12 @@ namespace SupportMcp {
                 // Only a rollback that pointed everything back finishes. Otherwise the trial stays in its rollback phase and the
                 // rollback command stays the failure action, so the new version's next failure (or the old version's next
                 // start) runs it again; nothing claims a rollback that did not happen.
-                bool pointed = false;
-                try { if (File.Exists(from)) { Repoint(from, fromVersion, folder); pointed = true; } } catch (Exception) { }
+                // With the old file gone there is nothing to go back to: the trial ends on the new version.
+                bool gone = !File.Exists(from), pointed = gone;
+                if (!gone) { try { Repoint(from, fromVersion, folder); pointed = true; } catch (Exception) { } }
                 if (!pointed) return true;
                 try { SetActions(null); } catch (Exception) { }
-                DeviceService.AppendHistory(folder, "Support couldn't update to version " + version + ", so it went back to version " + fromVersion + ".");
+                DeviceService.AppendHistory(folder, gone ? "Support couldn't update to version " + version + "." : "Support couldn't update to version " + version + ", so it went back to version " + fromVersion + ".");
                 st = UpdateState.TryLoad(folder);
                 if (st == null) throw new IOException("update.json cannot be read now"); // the next start of the old version finishes it
                 st.ClearTrial(); st.Save(folder);
@@ -5292,19 +5293,20 @@ namespace SupportMcp {
         static void Repoint(string exe, string version, string folder) {
             if (Dry) { if (DryRepointFails) throw new Win32Exception(1055); Log("point " + exe + " " + version); return; }
             Retrying(delegate { Scm.SetBinary(DeviceSetup.ServiceName, DeviceInstall.ServiceBinary(exe)); });
-            Retrying(delegate { DeviceInstall.WriteRegistry(exe, version, folder, (int)((new System.IO.FileInfo(exe).Length + 1023) / 1024)); });
+            // The service's command line is what counts; the tray's startup value and the Apps entry are best effort.
+            try { DeviceInstall.WriteRegistry(exe, version, folder, (int)((new System.IO.FileInfo(exe).Length + 1023) / 1024)); } catch (Exception) { }
         }
         static void SetActions(string rollbackCommand) {
             if (Dry) { Log(rollbackCommand == null ? "actions restart" : "actions " + rollbackCommand); return; }
             Retrying(delegate { Scm.SetFailureActions(DeviceSetup.ServiceName, rollbackCommand); });
         }
-        // Runs a configuration change, retrying for ConfigRetryMs (waiting 1 s, then 2, 4 and so on up to 15 s) and
-        // throwing the last error after that.
+        // Runs a configuration change, retrying only while the service database is locked (1055) for ConfigRetryMs
+        // (waiting 1 s, then 2, 4 and so on up to 15 s). Any other error, and the last one, is thrown.
         static void Retrying(Action change) {
             var clock = Stopwatch.StartNew(); int wait = 1000;
             while (true) {
                 try { change(); return; }
-                catch (Exception) { if (clock.ElapsedMilliseconds >= ConfigRetryMs) throw; }
+                catch (Win32Exception e) { if (e.NativeErrorCode != 1055 || clock.ElapsedMilliseconds >= ConfigRetryMs) throw; }
                 Thread.Sleep(wait); wait = Math.Min(wait * 2, 15000);
             }
         }
