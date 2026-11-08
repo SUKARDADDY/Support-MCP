@@ -29,7 +29,9 @@ export const OPERATOR_END_REASONS = Object.freeze(['stopped', 'removed', 'replac
 
 // The most live sessions one stop ends directly. A Worker call may make 50
 // subrequests on the free plan; any session past this ends by its own check of
-// the stop within about 25 seconds.
+// the stop. A saved-PC (app) session makes that check on its next request, within
+// about 25 seconds. A PowerShell session makes it on its next message, on its next
+// attach, or when its alarm fires, which is every 30 seconds while attached.
 export const STOP_FANOUT_MAX = 40;
 
 // env: the Worker env. devTtlMs: the dev session-length override (0 in production).
@@ -84,6 +86,19 @@ export function deviceHooks(env, { devTtlMs = 0 } = {}) {
       const out = await r.json();
       if (!out.ok) throw new Error(out.error || 'could not make the session');
       return { sid, code, waiting_until: out.waiting_until ?? null };
+    },
+
+    // The state a Session object reports ("waiting", "attached", "ended", or
+    // "unknown" for one that was never made here), or null when it cannot be
+    // reached. A caller treats null as live, so a hiccup never frees a PC.
+    async sessionState(slug, sid) {
+      try {
+        const r = await session(sid).fetch(`https://do/status?workspace=${encodeURIComponent(slug)}&log_tail=0`);
+        const { state } = await r.json();
+        return typeof state === 'string' ? state : null;
+      } catch (_) {
+        return null;
+      }
     },
 
     // End a session by the team's hand. Best effort.

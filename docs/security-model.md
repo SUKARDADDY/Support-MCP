@@ -401,8 +401,8 @@ apply to only one client say which.
   - *Uninstalling revokes.* A PC removes itself with `/device/leave`, which
     deletes its row and so its key. A technician with `devices.manage` can remove
     any PC the same way. Either takes effect on the PC's next request.
-  - *Access mode.* A technician with `devices.manage` can set a PC to `ask`. Setting
-    it to `any` also needs `sessions.unattended`, which only admins hold by default
+  - *Access mode.* A technician with `devices.manage` can set a PC to `ask`. Changing
+    it from `ask` to `any` also needs `sessions.unattended`, which only admins hold by default
     (403 otherwise, checked again when the change commits), because `any` lets
     technicians in without asking the person at the PC. Either way the PC's
     doorbell is rung. The log records who and the old and new mode. A
@@ -684,8 +684,11 @@ apply to only one client say which.
     sessions can stop a workspace: every live session in it ends, every doorbell
     rings, and no tool call works until someone with `members.manage` resumes it.
     The state is the newest of two chained log rows, so it has no column to edit,
-    and each session also checks it on its own polls (at most every 20 seconds),
-    which catches a session the session list missed. `EMERGENCY_STOP`, a deploy
+    and each session also checks it itself (at most every 20 seconds), which catches
+    a session the session list missed: an app session on its polls, and a PowerShell
+    session on its attach, on each message and from an alarm every 30 seconds, so
+    even a silent one ends within about 30 seconds. A connect that was under way
+    when the stop landed cannot claim the PC afterwards. `EMERGENCY_STOP`, a deploy
     setting, does the same for the whole relay and no team can lift it. Stop and
     resume are team API calls only, never MCP tools, so text on a customer's
     screen cannot make an agent resume a workspace.

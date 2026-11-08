@@ -1,7 +1,7 @@
 // Stopping a workspace, resuming it, and the relay-wide EMERGENCY_STOP.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { world, BOSS, TECH, VIEW, LEAD } from './device-sessions-world.js';
+import { world, socket, BOSS, TECH, VIEW, LEAD } from './device-sessions-world.js';
 
 const tick = () => new Promise((r) => setImmediate(r));
 // Waits on the event itself, with a wall-clock bound. A count of event-loop turns is not a time: the work in
@@ -263,4 +263,119 @@ test('a connect started before a stop cannot be claimed after it: the tool check
   assert.equal((await w.tool(TECH, 'device_connect', { device_id: pc.id })).error, 'this workspace is stopped; someone who can manage members must resume it');
   assert.equal((await w.tool(BOSS, 'device_connect', { device_id: pc.id, take_over: true })).error, 'this workspace is stopped; someone who can manage members must resume it');
   assert.equal(w.sessionCalls.filter((c) => c.path === '/create').length, 0);
+});
+
+// ---- PowerShell sessions -------------------------------------------------------------------
+// Node's Response refuses status 101 and has no WebSocketPair. Stand in for both so a PowerShell session can
+// attach through the real doWs.
+function upgradeResponses(t) {
+  const Real = globalThis.Response;
+  const realPair = globalThis.WebSocketPair;
+  globalThis.Response = class extends Real {
+    constructor(body, init) {
+      if (init && init.status === 101) {
+        super(null, { status: 200 });
+        Object.defineProperty(this, 'status', { value: 101 });
+        this.webSocket = init.webSocket;
+      } else super(body, init);
+    }
+  };
+  globalThis.WebSocketPair = class { constructor() { this[0] = { client: true }; this[1] = socket([]); } };
+  t.after(() => { globalThis.Response = Real; if (realPair) globalThis.WebSocketPair = realPair; else delete globalThis.WebSocketPair; });
+}
+// A PowerShell session, consumed and attached: returns what a test needs to drive it.
+async function attachedPowerShell(w) {
+  const ps = await w.tool(BOSS, 'session_create', { windows_mode: 'powershell' });
+  const { ctx, session } = w.sessionFor(ps.session_id);
+  const key = (await (await session.fetch(new Request('https://do/consume', { method: 'POST', body: JSON.stringify({ windows_mode: 'powershell' }) }))).json()).key;
+  const ws = (headers = {}) => session.fetch(new Request('https://do/ws', { headers: { 'x-attach-key': key, upgrade: 'websocket', ...headers } }));
+  assert.equal((await ws()).status, 101);
+  assert.equal(w.stateOf(ps.session_id), 'attached');
+  return { sid: ps.session_id, ctx, session, key, ws, socket: () => ctx.sockets.at(-1) };
+}
+const endFrame = { type: 'end', reason: 'stopped' };
+
+test('a PowerShell session past the 40 a stop ends directly still ends as stopped, and its reattach gets 410', async (t) => {
+  upgradeResponses(t);
+  const w = await world(t);
+  const ps = await attachedPowerShell(w);
+  w.advance(1000);
+  for (let i = 0; i < 40; i++) await w.tool(BOSS, 'session_create', {});
+  const res = await w.api(BOSS, 'POST', '/stop', {});
+  assert.equal(res.body.sessions_ended, 40);
+  assert.equal(w.stateOf(ps.sid), 'attached', 'the stop did not reach it');
+  w.advance(60_000);
+  const again = await ps.ws();
+  assert.equal(again.status, 410);
+  assert.deepEqual([w.stateOf(ps.sid), w.reasonOf(ps.sid)], ['ended', 'stopped']);
+  // The reconnect probe (a plain GET) says the same.
+  const probe = await ps.session.fetch(new Request('https://do/ws', { headers: { 'x-attach-key': ps.key } }));
+  assert.equal(probe.status, 410);
+});
+
+test('a PowerShell attach is refused with 410 after a stop the fan-out missed, for the probe and the upgrade alike', async (t) => {
+  upgradeResponses(t);
+  const w = await world(t);
+  const ps = await attachedPowerShell(w);
+  await w.team.stopWorkspace('default', BOSS);
+  w.advance(20_000);
+  const probe = await ps.session.fetch(new Request('https://do/ws', { headers: { 'x-attach-key': ps.key } }));
+  assert.equal(probe.status, 410);
+  assert.deepEqual(JSON.parse(ps.socket().sent.at(-1)), endFrame, 'the old socket is told');
+  assert.equal(ps.socket().closed, true);
+  assert.deepEqual([w.stateOf(ps.sid), w.reasonOf(ps.sid)], ['ended', 'stopped']);
+  assert.equal((await ps.ws()).status, 410);
+});
+
+test('a message on a PowerShell socket after a stop ends the session with an end frame, at most one stop read every 20 seconds', async (t) => {
+  upgradeResponses(t);
+  const w = await world(t);
+  const ps = await attachedPowerShell(w);
+  const sock = ps.socket();
+  await w.team.stopWorkspace('default', BOSS);
+  w.advance(5000);
+  let from = w.db.seen.length;
+  await ps.session.webSocketMessage(sock, JSON.stringify({ type: 'hello', machine: 'M1', user: 'dana' }));
+  assert.equal(stopReads(w, from), 0, 'inside the 20 seconds nobody looks');
+  assert.equal(w.stateOf(ps.sid), 'attached');
+  w.advance(15_000);
+  from = w.db.seen.length;
+  await ps.session.webSocketMessage(sock, JSON.stringify({ type: 'result', id: 'r1' }));
+  assert.equal(stopReads(w, from), 1);
+  assert.deepEqual([w.stateOf(ps.sid), w.reasonOf(ps.sid)], ['ended', 'stopped']);
+  assert.deepEqual(JSON.parse(sock.sent.at(-1)), endFrame);
+  assert.equal(sock.closed, true);
+});
+
+test('a quiet PowerShell socket is checked by the session alarm every 30 seconds and ends as stopped within that', async (t) => {
+  upgradeResponses(t);
+  const w = await world(t);
+  const ps = await attachedPowerShell(w);
+  assert.equal(ps.ctx.alarm(), w.now() + 30_000, 'the alarm is set to look, not only to expire');
+  w.advance(30_000);
+  await ps.session.alarm();
+  assert.equal(w.stateOf(ps.sid), 'attached', 'not stopped: it carries on');
+  assert.equal(ps.ctx.alarm(), w.now() + 30_000, 'and looks again');
+  await w.team.stopWorkspace('default', BOSS);
+  w.advance(30_000);
+  await ps.session.alarm();
+  assert.deepEqual([w.stateOf(ps.sid), w.reasonOf(ps.sid)], ['ended', 'stopped']);
+  assert.deepEqual(JSON.parse(ps.socket().sent.at(-1)), endFrame);
+  assert.equal(ps.ctx.alarm(), null);
+});
+
+test('an unreadable stop state does not end a quiet PowerShell session: the alarm fails open and looks again', async (t) => {
+  upgradeResponses(t);
+  const w = await world(t);
+  const ps = await attachedPowerShell(w);
+  const prepare = w.db.prepare;
+  w.db.prepare = (text) => {
+    if (/workspace_stopped/.test(text)) throw new Error('D1 is down');
+    return prepare(text);
+  };
+  w.advance(30_000);
+  await ps.session.alarm();
+  w.db.prepare = prepare;
+  assert.equal(w.stateOf(ps.sid), 'attached');
+  assert.equal(ps.ctx.alarm(), w.now() + 30_000);
 });

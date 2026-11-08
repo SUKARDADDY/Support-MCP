@@ -297,3 +297,157 @@ test('every statement the connect path runs names a workspace', async (t) => {
     assert.match(sql, /workspace/, sql);
   }
 });
+
+// ---- a session that ends before its pointer is written, and a stop in that window ---------
+const STOPPED = 'this workspace is stopped; someone who can manage members must resume it';
+// After the real /create of the next saved-PC Session returns, run `then` once. This is the window between
+// createSession and the claim: the Session exists, devices.session is not written yet.
+function afterCreate(w, then) {
+  const realGet = w.env.SESSION.get;
+  let fired = false;
+  w.env.SESSION.get = (id) => {
+    const stub = realGet(id);
+    return {
+      fetch: async (u, init) => {
+        const r = await stub.fetch(u, init);
+        if (!fired && String(u).endsWith('/create')) { fired = true; await then(); }
+        return r;
+      },
+    };
+  };
+  return () => { w.env.SESSION.get = realGet; };
+}
+
+test('a stop between createSession and the claim ends the connect: nothing is claimed, the new Session is gone, and a connect after resume works', async (t) => {
+  const w = await world(t);
+  const pc = await w.addPc();
+  const restore = afterCreate(w, () => w.api(BOSS, 'POST', '/stop', {}));
+  const out = await w.tool(TECH, 'device_connect', { device_id: pc.id });
+  restore();
+  assert.equal(out.error, STOPPED);
+  assert.equal(w.pointer(pc.id), null, 'no pointer to a dead session');
+  assert.equal((await w.kinds()).includes('device_session_started'), false);
+  const made = [...w.sessions.keys()];
+  assert.equal(made.length, 1);
+  assert.equal(w.stateOf(made[0]), 'ended');
+  // Resume: the PC is free, and the next connect is a normal one, not "<actor> is connected".
+  await w.api(BOSS, 'DELETE', '/stop', {});
+  const again = await w.tool(TECH, 'device_connect', { device_id: pc.id });
+  assert.equal(again.state, 'waiting');
+  assert.deepEqual([w.pointer(pc.id).id, w.stateOf(again.session_id)], [again.session_id, 'waiting']);
+});
+
+test('a retry never reuses a Session that has ended: a stop and a resume in the window make a fresh one', async (t) => {
+  const w = await world(t);
+  const pc = await w.addPc();
+  const restore = afterCreate(w, async () => {
+    await w.api(BOSS, 'POST', '/stop', {});
+    await w.api(BOSS, 'DELETE', '/stop', {});
+  });
+  const out = await w.tool(TECH, 'device_connect', { device_id: pc.id });
+  restore();
+  assert.equal(out.state, 'waiting');
+  assert.equal(w.stateOf(out.session_id), 'waiting', 'the Session the PC is told about is live');
+  assert.equal(w.pointer(pc.id).id, out.session_id);
+  const first = [...w.sessions.keys()].filter((sid) => sid !== out.session_id);
+  assert.equal(first.length, 1, 'the first Session was thrown away, not reused');
+  assert.equal(w.stateOf(first[0]), 'ended');
+  assert.equal((await w.kinds()).filter((k) => k === 'device_session_started').length, 1);
+});
+
+test('the claim itself refuses a stopped workspace, even if the plan did not see the stop', async (t) => {
+  const w = await world(t);
+  const pc = await w.addPc();
+  // Make the plan blind to the stop: the stop row is written after the plan read and the batch then names that
+  // same log number, so the only thing left to refuse is the guard.
+  const prepare = w.db.prepare;
+  w.db.prepare = (text) => (/workspace_stopped/.test(text) && /MAX\(seq\)[\s\S]*workspace_resumed/.test(text) && !/COALESCE/.test(text)
+    ? { bind: () => ({ first: async () => ({ stopped: null, resumed: null }) }) } : prepare(text));
+  const batch = w.db.batch;
+  w.db.batch = async (statements) => {
+    // A stop row in the log, written straight to the table, one number after the head the plan read.
+    const head = w.db.sqlite.prepare("SELECT seq, hash FROM audit WHERE workspace = 'default' ORDER BY seq DESC LIMIT 1").get();
+    w.db.sqlite.prepare("INSERT INTO audit(workspace, seq, ts, actor, kind, detail, prev_hash, hash) VALUES ('default', ?, ?, ?, 'workspace_stopped', 'stopped', ?, ?)")
+      .run(head.seq + 1, Date.now(), BOSS, head.hash, 'x'.repeat(64));
+    w.db.batch = batch;
+    return batch(statements);
+  };
+  const out = await w.tool(TECH, 'device_connect', { device_id: pc.id });
+  w.db.prepare = prepare;
+  w.db.batch = batch;
+  // The plan never saw the stop, so only the guard stopped the claim (the connect then runs out of retries).
+  assert.match(out.error, /being changed by someone else/);
+  assert.equal(w.pointer(pc.id), null, 'no claim after a stop row');
+  assert.equal((await w.kinds()).includes('device_session_started'), false);
+});
+
+test('a pointer whose Session ended or never existed is reclaimed by the next connect, in the same guarded change', async (t) => {
+  const w = await world(t);
+  const pc = await w.addPc({ access: 'any' });
+  // 1. The Session ended but its pointer was never cleared.
+  const first = await w.tool(BOSS, 'device_connect', { device_id: pc.id });
+  w.sessionFor(first.session_id).ctx.values.set('state', 'ended');
+  assert.equal(w.pointer(pc.id).id, first.session_id);
+  const second = await w.tool(TECH, 'device_connect', { device_id: pc.id });
+  assert.equal(second.state, 'waiting');
+  assert.notEqual(second.session_id, first.session_id);
+  assert.deepEqual([w.pointer(pc.id).id, w.pointer(pc.id).by], [second.session_id, TECH]);
+  // 2. The pointer names a Session that does not exist.
+  const ghost = 'f'.repeat(64);
+  w.db.sqlite.prepare('UPDATE devices SET session = ? WHERE id = ?').run(JSON.stringify({ ...w.pointer(pc.id), id: ghost }), pc.id);
+  const third = await w.tool(BOSS, 'device_connect', { device_id: pc.id });
+  assert.equal(third.state, 'waiting');
+  assert.equal(w.pointer(pc.id).id, third.session_id);
+  assert.equal((await w.kinds()).filter((k) => k === 'device_session_started').length, 3);
+  // 3. A live Session still holds the PC, and one that cannot be reached counts as live.
+  assert.equal((await w.tool(TECH, 'device_connect', { device_id: pc.id })).error, `${BOSS} is connected`);
+  const realGet = w.env.SESSION.get;
+  w.env.SESSION.get = (id) => ({ fetch: async (u, init) => { if (String(u).includes('/status')) throw new Error('unreachable'); return realGet(id).fetch(u, init); } });
+  assert.equal((await w.tool(TECH, 'device_connect', { device_id: pc.id })).error, `${BOSS} is connected`);
+  w.env.SESSION.get = realGet;
+});
+
+test('a claim on a stranded pointer loses to a newer pointer: it is guarded on the old pointer value', async (t) => {
+  const w = await world(t);
+  const pc = await w.addPc();
+  const first = await w.tool(BOSS, 'device_connect', { device_id: pc.id });
+  w.sessionFor(first.session_id).ctx.values.set('state', 'ended');
+  // Between the plan and the claim another connect reclaims the PC.
+  const batch = w.db.batch;
+  let done = false;
+  let rival = null;
+  w.db.batch = async (statements) => {
+    if (!done) {
+      done = true;
+      w.db.batch = batch;
+      rival = await w.tool(LEAD, 'device_connect', { device_id: pc.id });
+    }
+    return batch(statements);
+  };
+  const out = await w.tool(TECH, 'device_connect', { device_id: pc.id });
+  w.db.batch = batch;
+  assert.equal(rival.state, 'waiting');
+  assert.equal(out.error, `${LEAD} is connected`);
+  assert.equal(w.pointer(pc.id).id, rival.session_id);
+});
+
+// ---- the access mode needs sessions.unattended only when it changes to any time ------------
+test('resending access "any" for a PC that is already any time needs only devices.manage; switching ask to any still needs sessions.unattended', async (t) => {
+  const w = await world(t);
+  const any = await w.addPc({ name: 'Any', access: 'any' });
+  const ask = await w.addPc({ name: 'Ask', access: 'ask' });
+  const resend = await w.api(TECH, 'PATCH', `/devices/${any.id}`, { access: 'any', owner_contact: 'Dana' });
+  assert.equal(resend.status, 200);
+  assert.deepEqual([resend.body.device.access, resend.body.device.owner_contact], ['any', 'Dana']);
+  // Nothing changes at all: an answer, and no log row.
+  const rows = (await w.kinds()).length;
+  assert.equal((await w.api(TECH, 'PATCH', `/devices/${any.id}`, { access: 'any' })).status, 200);
+  assert.equal((await w.kinds()).length, rows);
+  const refused = await w.api(TECH, 'PATCH', `/devices/${ask.id}`, { access: 'any', owner_contact: 'Dana' });
+  assert.deepEqual([refused.status, refused.body.error.code], [403, 'permission_denied']);
+  assert.match(refused.body.error.message, /sessions\.unattended/);
+  assert.equal((await w.api(TECH, 'GET', `/devices/${ask.id}`)).body.device.access, 'ask');
+  assert.equal((await w.api(LEAD, 'PATCH', `/devices/${ask.id}`, { access: 'any' })).body.device.access, 'any');
+  // Going back to ask needs nothing extra.
+  assert.equal((await w.api(TECH, 'PATCH', `/devices/${ask.id}`, { access: 'ask' })).body.device.access, 'ask');
+});

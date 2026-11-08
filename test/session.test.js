@@ -336,7 +336,8 @@ test('a websocket upgrade with the right key attaches, welcomes, and sets the 24
   assert.equal(f.values.get('ws_tag'), 'g1');
   const expiresAt = f.now() + 24 * 60 * 60 * 1000;
   assert.equal(f.values.get('expires_at'), expiresAt);
-  assert.equal(f.alarm(), expiresAt);
+  // The alarm wakes every 30 seconds to look for a stop, since a quiet socket sends nothing; the 24 hours still end it.
+  assert.equal(f.alarm(), f.now() + 30 * 1000);
   assert.equal(f.sockets.length, 1);
   assert.deepEqual(f.sockets[0].tags, ['g1']);
   assert.deepEqual(JSON.parse(f.sockets[0].sent[0]), { type: 'welcome', expires_at: expiresAt });

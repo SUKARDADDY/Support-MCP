@@ -59,8 +59,11 @@ to run on unattended customer PCs.
 - Stop and resume. `POST` and `DELETE /api/v1/w/<slug>/stop` (and `GET` for the
   state) stop a workspace, which ends every live session in it and refuses its
   tool calls, and resume it. Stop needs `sessions.end`, resume needs
-  `members.manage`. Each session also checks the stop on its polls, at most every 20
-  seconds. New log rows `workspace_stopped` and `workspace_resumed`.
+  `members.manage`. Each session also checks the stop itself, at most every 20
+  seconds: an app session on its polls, a PowerShell session on its attach, its
+  messages and an alarm every 30 seconds. A connect under way when the stop lands
+  cannot claim the PC, and a pointer to a Session that has ended is replaced by the
+  next connect. New log rows `workspace_stopped` and `workspace_resumed`.
 - `EMERGENCY_STOP`, a deploy setting. Any non-empty value refuses every tool
   call, every connect and every `/agent` request for the whole relay, and ends
   live sessions on their next request.

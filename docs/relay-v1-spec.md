@@ -420,7 +420,7 @@ commit together, and a permission lost between the read and the commit is a 403.
 | `GET`, `PATCH`, `DELETE .../sites/<id>` | as customers | `PATCH`: `name, address, notes, fields` | `{site}`; `DELETE` is 409 `in_use` with PCs or live codes |
 | `GET .../devices?site=&status=&after=&limit=` | `devices.view` | | `{devices:[...], next}`; `status` is `pending` or `active` |
 | `GET .../devices/<id>` | `devices.view` | | `{device}` |
-| `PATCH .../devices/<id>` | `devices.manage`; `access: "any"` also needs `sessions.unattended` (403 `permission_denied` otherwise, checked again at commit) | `{site_id?, fields?, access?, owner_contact?, approve?:{confirm}}`; `owner_contact` is at most 200 characters and an empty string clears it; `name`, `control`, `os`, `machine` or `app_version` is 400 `bad_request` | `{device}` |
+| `PATCH .../devices/<id>` | `devices.manage`; a change of `access` from `ask` to `any` also needs `sessions.unattended` (403 `permission_denied` otherwise, checked again at commit). Sending `access: "any"` for a PC that is already `any` changes nothing and needs only `devices.manage` | `{site_id?, fields?, access?, owner_contact?, approve?:{confirm}}`; `owner_contact` is at most 200 characters and an empty string clears it; `name`, `control`, `os`, `machine` or `app_version` is 400 `bad_request` | `{device}` |
 | `DELETE .../devices/<id>` | `devices.manage` | | `{removed:{id}}`; the PC's key ends with its row |
 | `GET .../fields` | `devices.view` | | `{fields:[{id,entity,label,position,created_at}]}` |
 | `POST .../fields` | `fields.manage` | `{entity, label}` | 201 `{field}`; `entity` is `customer`, `site` or `device` |
@@ -502,11 +502,18 @@ A stop ends every live session in the workspace's Registry list with the reason
 `stopped` (at most 40 in one call; the free plan allows 50 subrequests a call),
 rings every doorbell in the workspace, and from then on each tool call is
 refused. A second `POST` ends any session the first one missed. A session also
-checks for itself: on its polls, at most once every 20 seconds, it reads the
-stop state, and a stopped workspace ends it with the reason `stopped`. That read
-failing counts as not stopped, because the stop also ends sessions directly. Link
-sessions are checked the same way. `/agent` requests and tool calls to other
-workspaces are not affected.
+checks for itself, reading the stop state at most once every 20 seconds, and a
+stopped workspace ends it with the reason `stopped`. An app session (a saved PC or
+a link session in app mode) checks on each `/agent` request. A PowerShell session
+checks on each `/ws` attach, including the reconnect probe (answered 410), on each
+message from its socket (an end frame goes to every socket and they close), and
+from its own alarm, which fires every 30 seconds while it is attached, so a
+PowerShell session with no traffic ends within about 30 seconds of the 20-second
+window. That read failing counts as not stopped, because the stop also ends
+sessions directly. Requests and tool calls to other workspaces are not affected.
+A connect that was under way when the workspace stopped cannot claim the PC: the
+claim holds only while the workspace is not stopped, and the connect then fails
+with the stopped error.
 
 `EMERGENCY_STOP` is a deploy setting for the whole relay. Any non-empty value
 refuses every tool call (before any database read) and every connect to a saved
@@ -1017,11 +1024,21 @@ the first `hello`.
 The device's record holds the one live session as `devices.session`, JSON text
 `{"id","by","ask","expires_at","code","team"}` (`id` is the Session object's id,
 `by` the driver, `code` the Session object's name, `team` the name the PC
-shows). Connect claims it with one guarded `UPDATE` that holds only while the PC
-is active and has no pointer or one whose `expires_at` has passed, the caller
-still holds `sessions.control` (and `sessions.unattended` when the session does
-not ask), and the `device_session_started` row goes in; so two technicians cannot
-both connect, and a stale pointer is reclaimed. The Session object clears it with
+shows). Connect claims it with one guarded `UPDATE` that holds only while the
+workspace is not stopped, the PC is active and has no pointer or one whose
+`expires_at` has passed, the caller still holds `sessions.control` (and
+`sessions.unattended` when the session does not ask), and the
+`device_session_started` row goes in; so two technicians cannot both connect, and
+a stale pointer is reclaimed. A pointer also counts as free when its Session
+object is not live: before refusing with `<who> is connected`, connect asks that
+Session for its state, and one that has ended or does not exist (a stop can end a
+new Session before its pointer is written) is replaced, with the claim guarded on
+the old pointer's id. A Session that cannot be reached counts as live. A connect
+retried after losing the log number keeps the Session it made only while that
+Session is still waiting; otherwise it makes a new one. The check-in does not
+make this check, because it must cost no further request: a PC that is handed a
+pointer to an ended Session gets 410 on its first request and ends it, and the next
+connect replaces the pointer. The Session object clears it with
 a `UPDATE` guarded on the session id when the session ends, in the same change as
 the `device_session_ended` row, and its alarm retries every 30 seconds until that
 works.

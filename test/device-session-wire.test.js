@@ -313,16 +313,31 @@ test('take_over wakes a parked poll at once, so the corner window shows the new 
   assert.deepEqual((await parked).body, { type: 'idle', driver: BOSS });
 });
 
-test('take_over with no session is a plain connect that still needs sessions.unattended; a session that just ended is an error', async (t) => {
+test('take_over with no session is a plain connect that still needs sessions.unattended; a session that ends under the take-over is an error', async (t) => {
   const w = await world(t);
   const pc = await w.addPc({ access: 'any' });
   assert.match((await w.tool(TECH, 'device_connect', { device_id: pc.id, take_over: true })).error, /^taking over needs sessions\.unattended/);
   assert.equal(w.pointer(pc.id), null);
   const out = await w.tool(BOSS, 'device_connect', { device_id: pc.id, take_over: true });
   assert.deepEqual([out.state, out.asks], ['waiting', false]);
-  // The Session object ended without clearing the pointer (its clear is still to retry).
+  // The Session object ended without clearing the pointer (its clear is still to retry): the pointer is stranded,
+  // so the take-over is a plain connect that makes a new session.
   w.sessionFor(out.session_id).ctx.values.set('state', 'ended');
-  const gone = await w.tool(LEAD, 'device_connect', { device_id: pc.id, take_over: true });
+  const fresh = await w.tool(LEAD, 'device_connect', { device_id: pc.id, take_over: true });
+  assert.equal(fresh.state, 'waiting');
+  assert.notEqual(fresh.session_id, out.session_id);
+  assert.equal(w.pointer(pc.id).id, fresh.session_id);
+  // The Session reports waiting, then ends before the take-over reaches it.
+  const realGet = w.env.SESSION.get;
+  w.env.SESSION.get = (id) => ({
+    fetch: async (u, init) => {
+      const r = await realGet(id).fetch(u, init);
+      if (String(u).includes('/status')) w.sessionFor(fresh.session_id).ctx.values.set('state', 'ended');
+      return r;
+    },
+  });
+  const gone = await w.tool(BOSS, 'device_connect', { device_id: pc.id, take_over: true });
+  w.env.SESSION.get = realGet;
   assert.equal(gone.error, 'that session has just ended; connect again');
 });
 

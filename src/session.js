@@ -52,6 +52,7 @@ const CONSUMED_TTL_MS = 2 * 60 * 60 * 1000;
 const ATTACHED_LIFE_MS = 24 * 60 * 60 * 1000; // attach -> expiry, fixed
 const WAITING_MS = 510 * 1000; // saved PC: create -> the PC has picked it up and answered
 const STOP_CHECK_MS = 20 * 1000; // at most this often a poll reads whether the workspace is stopped
+const STOP_ALARM_MS = 30 * 1000; // an attached PowerShell session wakes this often to check, since a quiet socket sends nothing
 const CLEANUP_RETRY_MS = 30 * 1000; // a saved-PC session retries clearing its pointer this often
 const DECLINE_REASONS = ['declined', 'nobody', 'busy']; // what a PC may say before hello
 const RESULT_SLACK_MS = 15 * 1000; // relay waits timeout_s + this
@@ -360,9 +361,7 @@ export class Session {
     if ((await this.get('windows_mode', 'powershell')) === 'app') return new Response('wrong transport', { status: 401 });
     // EMERGENCY_STOP ends a session that reaches this object instead of serving it.
     if (String(this.env.EMERGENCY_STOP ?? '') !== '') {
-      this.closeAll({ type: 'end', reason: 'stopped' }, 'stopped');
-      this.failPending(() => true, 'session ended');
-      await this.markEnded('stopped');
+      await this.endStopped();
       return new Response('gone', { status: 410 });
     }
     const key = request.headers.get('X-Attach-Key') || '';
@@ -375,6 +374,12 @@ export class Session {
     await this.expireIfDue();
     state = await this.get('state');
     if (state === 'ended' || state === undefined) return new Response('gone', { status: 410 });
+    // A workspace's stop ends this session here too, for the reconnect probe as
+    // well as the upgrade. Read at most every 20 seconds; a failed read fails open.
+    if (await this.stopped()) {
+      await this.endStopped();
+      return new Response('gone', { status: 410 });
+    }
     if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('expected websocket', { status: 426 });
     }
@@ -393,12 +398,12 @@ export class Session {
       expiresAt = now + this.ttlMs(ATTACHED_LIFE_MS);
       await this.setMany({ state: 'attached', attached_first_at: now, expires_at: expiresAt, ws_gen: gen, ws_tag: tag });
       this.logRow('attached', tag);
-      await this.ctx.storage.setAlarm(expiresAt);
     } else {
       // reattach: do NOT extend expiry
       await this.setMany({ ws_gen: gen, ws_tag: tag });
       this.logRow('attached', `reattach ${tag}`);
     }
+    await this.ctx.storage.setAlarm(this.wakeFor(expiresAt));
 
     const pair = new WebSocketPair();
     const client = pair[0];
@@ -610,6 +615,21 @@ export class Session {
     }
   }
 
+  // The relay or the workspace is stopped: tell every socket and poll, fail what
+  // is waiting, and end with reason "stopped".
+  async endStopped() {
+    this.closeAll({ type: 'end', reason: 'stopped' }, 'stopped');
+    this.failPending(() => true, 'session ended');
+    await this.markEnded('stopped');
+  }
+
+  // When this session's alarm next fires. An attached PowerShell session (a
+  // websocket) can sit quiet for hours, so it wakes every STOP_ALARM_MS to check
+  // for a stop; its deadline still ends it on time.
+  wakeFor(deadline) {
+    return Math.min(deadline, Date.now() + STOP_ALARM_MS);
+  }
+
   // A command was queued for `lane`. Hand it to the parked poll if that poll
   // says the lane is free. Otherwise the next poll that does will pick it up.
   dispatchHttp(lane) {
@@ -672,9 +692,7 @@ export class Session {
     // A stopped relay or workspace ends the session at the next request, and a
     // workspace's stop is read at most every 20 seconds.
     if (await this.stopped()) {
-      this.closeAll({ type: 'end', reason: 'stopped' }, 'stopped');
-      this.failPending(() => true, 'session ended');
-      await this.markEnded('stopped');
+      await this.endStopped();
       return Response.json({ type: 'end', reason: 'stopped' }, { status: 410 });
     }
     // A PC says no before it says hello: the person declined, nobody was there
@@ -899,6 +917,13 @@ export class Session {
     } catch (_) {
       return;
     }
+    // A message from a socket of a stopped workspace ends the session, results
+    // included, with an end frame to every socket. Read at most every 20 seconds;
+    // a failed read fails open.
+    if ((await this.get('state')) !== 'ended' && (await this.stopped())) {
+      await this.endStopped();
+      return;
+    }
     if (msg.type === 'result' && msg.id) {
       const p = this.pending.get(msg.id);
       if (p && p.tag === this.socketTag(ws)) {
@@ -963,10 +988,17 @@ export class Session {
     if (dl === null) return; // ended (or never created): nothing to do
     if (Date.now() >= dl) {
       await this.expire(await this.expiryReason(state));
-    } else {
-      // fired early (clock skew / rescheduling): re-arm for the real deadline
-      await this.ctx.storage.setAlarm(dl);
+      return;
     }
+    // An attached PowerShell session may have no traffic to check the stop on, so
+    // the alarm does it. An app session checks on each of its polls.
+    const ps = state === 'attached' && (await this.get('windows_mode', 'powershell')) === 'powershell';
+    if (ps && (await this.stopped())) {
+      await this.endStopped();
+      return;
+    }
+    // Re-arm: for the next stop check, or (fired early, clock skew) the real deadline.
+    await this.ctx.storage.setAlarm(ps ? this.wakeFor(dl) : dl);
   }
 }
 
