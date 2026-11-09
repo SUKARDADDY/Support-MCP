@@ -11,13 +11,23 @@
 // only; this object ignores any text it gets and closes a socket that sends a
 // frame over 1 KB. An idle doorbell is a hibernated socket, which Cloudflare
 // does not bill, and only a ring wakes the object.
+//
+// It also notes when a PC's doorbell went away (the `doorbells` table, written only
+// when no other socket of that PC is still open). A PC that connects again after 10
+// minutes or more raises "came online" for the people who watch it (src/notify.js).
+// The Worker tells this object which workspace it serves when it hands over a doorbell.
+import { teamFromEnv } from './workspace.js';
+import { notifyStore } from './notify.js';
 
 // The Registry object name for a workspace. A session with no workspace stored
 // (made before workspaces) counts as default.
 export const registryName = (workspace) => (workspace && workspace !== 'default' ? `registry:${workspace}` : 'registry');
 
 const DEVICE_ID = /^[a-z2-7]{20}$/;
+const WORKSPACE = /^[a-z0-9-]{1,40}$/;
 const DOORBELL_TAG = 'dev:';
+// A PC that was away at least this long raises "came online" when its doorbell returns.
+export const ONLINE_AFTER_MS = 10 * 60 * 1000;
 export const DOORBELL_FRAME_MAX = 1024; // bytes; a larger frame closes the doorbell
 const RING = JSON.stringify({ type: 'ring' });
 
@@ -39,6 +49,7 @@ export class Registry {
          updated_at INTEGER
        )`,
     );
+    this.sql.exec('CREATE TABLE IF NOT EXISTS doorbells(device_id TEXT PRIMARY KEY, gone_at INTEGER NOT NULL)');
   }
 
   async fetch(request) {
@@ -75,8 +86,9 @@ export class Registry {
 
   // ---- the doorbell ----------------------------------------------------------
   // The Worker has already checked the PC's key. A new socket for the same PC
-  // closes the older one, so a PC that reconnects never has two.
-  doorbell(request, url) {
+  // closes the older one, so a PC that reconnects never has two. `workspace` is the
+  // team this object serves, for the "came online" notification.
+  async doorbell(request, url) {
     const id = url.searchParams.get('device') || '';
     if (!DEVICE_ID.test(id)) return new Response('bad device', { status: 400 });
     if (request.headers.get('Upgrade') !== 'websocket') return new Response('expected websocket', { status: 426 });
@@ -86,7 +98,42 @@ export class Registry {
     }
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1], [tag]);
+    // A doorbell is back: if the PC was away long enough, tell its watchers.
+    const gone = this.sql.exec('SELECT gone_at FROM doorbells WHERE device_id = ?', id).toArray()[0];
+    if (gone) {
+      this.sql.exec('DELETE FROM doorbells WHERE device_id = ?', id);
+      const workspace = url.searchParams.get('workspace') || '';
+      if (WORKSPACE.test(workspace) && Date.now() - gone.gone_at >= ONLINE_AFTER_MS) await this.announceOnline(workspace, id, gone.gone_at);
+    }
     return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  // "Came online" for the PC's watchers. Best effort: a database that cannot be reached
+  // must never stop the doorbell from connecting.
+  async announceOnline(workspace, id, goneAt) {
+    try {
+      const name = await this.env.DB.prepare("SELECT name FROM devices WHERE workspace = ? AND id = ? AND status = 'active'").bind(workspace, id).first('name');
+      if (name === null || name === undefined) return;
+      const notify = notifyStore(this.env.DB, teamFromEnv(this.env));
+      await notify.write(workspace, await notify.rows(workspace, 'device_online', { watching: id }, {
+        device_id: id, title: 'A PC is online', body: name, dedupe: `online:${id}:${goneAt}`,
+      }));
+    } catch (_) { /* the watchers miss one notification */ }
+  }
+
+  // A doorbell closed. When no other socket of that PC is open, it is away from now.
+  // A socket replaced by a newer one, and one closed because the PC was removed, do not count.
+  noteGone(ws, reason) {
+    if (reason === 'removed') return;
+    let tags;
+    try { tags = this.ctx.getTags(ws); } catch (_) { return; }
+    for (const tag of tags) {
+      if (!tag.startsWith(DOORBELL_TAG)) continue;
+      const stillOpen = this.ctx.getWebSockets(tag).some((other) => other !== ws && (other.readyState === undefined || other.readyState === 1));
+      if (!stillOpen) {
+        this.sql.exec('INSERT INTO doorbells(device_id, gone_at) VALUES (?, ?) ON CONFLICT(device_id) DO UPDATE SET gone_at = excluded.gone_at', tag.slice(DOORBELL_TAG.length), Date.now());
+      }
+    }
   }
 
   // The ids of the PCs whose doorbell is connected.
@@ -121,9 +168,12 @@ export class Registry {
     }
   }
 
-  async webSocketClose(ws) {
+  async webSocketClose(ws, code, reason) {
+    this.noteGone(ws, reason);
     try { ws.close(1000, 'bye'); } catch (_) { /* already closed */ }
   }
 
-  async webSocketError() {}
+  async webSocketError(ws) {
+    this.noteGone(ws, '');
+  }
 }

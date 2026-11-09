@@ -22,7 +22,8 @@ import { AccessDenied, checkAgentStarter, runAgentTool } from './app.js';
 import { agentStoreFromEnv } from './agent-store.js';
 import { devicesFromEnv } from './devices.js';
 import { deviceHooks, sessionWatch } from './device-sessions.js';
-import { normalizeIdentity } from './workspace.js';
+import { normalizeIdentity, teamFromEnv } from './workspace.js';
+import { notifyStore } from './notify.js';
 import { INPUT_SOFT_MAX, costMicro, fitOutput, reserveMicro } from './agent-models.js';
 import { MESSAGES, ProviderError, adapterFor, classify, estimateTokens } from './agent-providers.js';
 import { runModelCheck } from './agent-check.js';
@@ -291,6 +292,7 @@ export class AgentTask {
     if (st.cleanup_tries >= CLEANUP_TRIES_MAX) {
       // A reservation left uncharged stays counted against the caps.
       this.giveUp();
+      await this.tellGiveUp();
       await this.ctx.storage.deleteAlarm();
       await this.save().catch(() => {});
       return;
@@ -317,6 +319,7 @@ export class AgentTask {
         return;
       }
       this.giveUp();
+      await this.tellGiveUp();
     }
     st.done = true;
     await this.ctx.storage.deleteAlarm();
@@ -333,6 +336,19 @@ export class AgentTask {
     st.phase = 'ended';
     st.notes.push({ ts: Date.now(), text: note });
     this.addStep('cleanup', note, false);
+  }
+
+  // The task's end was already recorded, so this is a notification of its own: the starter
+  // is told the PC's session may still be open. Best effort; the task's notes say it too.
+  async tellGiveUp() {
+    const { workspace, task_id: id, starter, device_id: deviceId } = this.cfg;
+    try {
+      const notify = notifyStore(this.env.DB, teamFromEnv(this.env));
+      await notify.write(workspace, await notify.rows(workspace, 'task_problem', { to: [starter] }, {
+        device_id: deviceId, task_id: id, session_id: this.st.sid,
+        title: 'Task needs attention', body: 'Could not confirm that the PC\'s session ended. End it by hand.', dedupe: `task:${id}:cleanup`,
+      }));
+    } catch (_) { /* the notes carry the same words */ }
   }
 
   // End the saved-PC session the task made. True when none of it is left to end: it is

@@ -16,6 +16,7 @@ import { ID_RE, devicesFromEnv, linkCode, livePointer, parseDeviceKey } from './
 import { deviceHooks, newCode } from './device-sessions.js';
 import { agentService } from './agent.js';
 import { agentStoreFromEnv } from './agent-store.js';
+import { sweep } from './sweep.js';
 import { handleAuth } from './auth.js';
 import {
   AS_METADATA_PATH, PROTECTED_RESOURCE_PREFIX, REGISTER_PATH, TOKEN_PATH, assertPersonActive, assertSecondFactor, bearerToken,
@@ -760,6 +761,12 @@ async function oauthRoute(serve) {
 export function createHandler(agentText, appBundle = null, options = {}) {
   const oauth = options.oauth ? createOAuth(options.oauth, options.oauthTuning) : null;
   return {
+    // The hourly Cron Trigger (wrangler.toml): PCs missing for 7 days, and old notifications.
+    async scheduled(event, env, ctx) {
+      const run = sweep(env).catch(() => {});
+      if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(run);
+      await run;
+    },
     async fetch(request, env, ctx) {
       const url = new URL(request.url);
       const p = url.pathname;
