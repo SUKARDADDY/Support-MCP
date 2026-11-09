@@ -8,10 +8,18 @@
 // caller. A browser sign-in cookie is not accepted here. Team management is
 // never an MCP tool, so text on a customer's screen can't make an agent add a
 // member. A PC pairs and checks in at /device/ (src/device-api.js), not here.
+//
+// The technician app reaches a part of this router through /app/w/<slug>/api/...
+// (src/app.js), which has already checked its bearer token and rewritten the path.
+// There the caller is an OAuth caller, held to the rules MCP gives one: a real
+// member (never open mode), the second factor for a permission that needs one,
+// and only the routes the app uses (APP_ROUTES). Members, roles, the team log,
+// the stop switch and the agent's settings and models are not among them.
 import { TeamError, teamFromEnv } from './workspace.js';
 import { ID_RE, devicesFromEnv } from './devices.js';
 import { deviceHooks } from './device-sessions.js';
 import { handleAgentApi } from './agent-api.js';
+import { assertSecondFactor } from './oauth.js';
 
 const ROOT = '/api/v1/w';
 const PREFIX = '/api/v1/w/';
@@ -23,10 +31,10 @@ const AUDIT_LIMIT_DEFAULT = 100;
 
 const json = (obj, status = 200, extra = {}) =>
   new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json', 'cache-control': 'no-store', ...extra } });
-const fail = (status, code, message, extra) => json({ error: { code, message } }, status, extra);
+export const fail = (status, code, message, extra) => json({ error: { code, message } }, status, extra);
 const notAllowed = (allow) => fail(405, 'method_not_allowed', `use ${allow}`, { allow });
 
-async function readBody(request, max = BODY_MAX) {
+export async function readBody(request, max = BODY_MAX) {
   const declared = request.headers.get('content-length');
   if (declared !== null && Number(declared) > max) throw new TeamError(400, 'bad_request', 'the request body is too large');
   const text = await request.text();
@@ -41,7 +49,7 @@ function decodeSegment(s) {
   try { return decodeURIComponent(s); } catch (_) { throw new TeamError(400, 'bad_request', 'bad path'); }
 }
 
-function intParam(url, name, def, min, max) {
+export function intParam(url, name, def, min, max) {
   const v = url.searchParams.get(name);
   if (v === null || v === '') return def;
   if (!/^\d+$/.test(v) || Number(v) < min || Number(v) > max) throw new TeamError(400, 'bad_request', `${name} must be a whole number from ${min} to ${max}`);
@@ -68,11 +76,16 @@ function itemId(segment) {
 // workspace means for the route: 'allow' (a read open to anyone, or the add
 // that the store itself limits to the first member), 'first_member' (a team
 // write: 409, add yourself as the first admin), or 'deny' (403, the default).
-async function need(team, slug, caller, permissions, onOpen = 'deny') {
+// `app` is { env, caller } for an app caller (see handleApi): then only a real
+// member passes, and a permission that needs a second factor needs the grant's.
+async function needRole(team, slug, caller, permissions, onOpen = 'deny', app = null) {
   let refusal = null;
   for (const p of permissions) {
-    const a = await team.authorize(slug, caller, p);
-    if (a.ok) return;
+    const a = await team.authorize(slug, caller, p, { membersOnly: app !== null });
+    if (a.ok) {
+      if (app) await needSecondFactor(app, p);
+      return;
+    }
     if (a.reason === 'not_member') throw new TeamError(403, 'not_member', 'you are not a member of this team');
     if (a.reason === 'open') {
       if (onOpen === 'allow') return;
@@ -83,15 +96,38 @@ async function need(team, slug, caller, permissions, onOpen = 'deny') {
   throw new TeamError(403, 'permission_denied', `your role does not allow ${refusal}`);
 }
 
+// The same check MCP makes for an OAuth caller (assertSecondFactor, src/oauth.js),
+// as a refusal the API can answer.
+async function needSecondFactor(app, permission) {
+  try {
+    await assertSecondFactor(app.env, app.caller, permission);
+  } catch (e) {
+    throw new TeamError(403, 'second_factor', e.message);
+  }
+}
+
+// What the technician app may reach, by collection (the segment after the
+// workspace) and method. Anything else answers 404, as if the route did not exist.
+function appAllows(collection, item, method) {
+  if (collection === undefined) return true; // who am I
+  if (collection === 'fields') return method === 'GET' && item === undefined;
+  if (collection === 'agent') return item === 'tasks'; // never settings or models
+  return ['customers', 'sites', 'devices', 'pairing'].includes(collection);
+}
+
 // deps: { accessCaller(request, env, url) -> identity|null, isJsonContentType(request) -> bool, origin } from app.js.
 // origin is this relay's address, for the install link in a pairing answer.
-export async function handleApi(request, env, url, { accessCaller, isJsonContentType, origin }) {
+// app is { caller } for a call from the technician app: the OAuth caller src/app.js
+// checked. Then Access is not consulted; the caller is that person.
+export async function handleApi(request, env, url, { accessCaller, isJsonContentType, origin, app = null }) {
   const method = request.method;
   if (request.headers.has('origin')) return fail(403, 'forbidden', 'cross-site requests are refused');
   if (!['GET', 'POST', 'PATCH', 'DELETE'].includes(method)) return notAllowed('GET, POST, PATCH, DELETE');
   if (method !== 'GET' && !isJsonContentType(request)) return fail(415, 'unsupported_media_type', 'send content-type: application/json');
-  const caller = await accessCaller(request, env, url);
+  const caller = app ? app.caller.email : await accessCaller(request, env, url);
   if (!caller) return fail(403, 'forbidden', 'Cloudflare Access did not admit this request');
+  const appCheck = app ? { env, caller: app.caller } : null;
+  const need = (team, slug, who, permissions, onOpen) => needRole(team, slug, who, permissions, onOpen, appCheck);
 
   try {
     if (url.pathname === ROOT) {
@@ -104,16 +140,19 @@ export async function handleApi(request, env, url, { accessCaller, isJsonContent
     const team = teamFromEnv(env);
     // A slug that was never created, or is malformed, is 404 for everyone.
     if (!(await team.workspaceExists(slug))) throw new TeamError(404, 'not_found', 'no such workspace');
+    if (app && !appAllows(collection, item, method)) throw new TeamError(404, 'not_found', 'not found');
     // The built-in agent has routes more than one segment deep (src/agent-api.js).
     if (collection === 'agent') {
       const segments = url.pathname.slice(PREFIX.length).split('/').slice(2);
       return await handleAgentApi({ json, notAllowed, readBody, need, decodeSegment },
-        { env, team, slug, caller, method, request, url, origin, segments });
+        { env, team, slug, caller, method, request, url, origin, segments, app });
     }
     if (extra.length || item === '') throw new TeamError(404, 'not_found', 'not found');
 
     if (collection === undefined) {
       if (method !== 'GET') return notAllowed('GET');
+      // The app never uses open mode, and reading who is a member must not record it as a caller.
+      if (app && !(await team.getMember(slug, caller))) throw new TeamError(403, 'not_member', 'you are not a member of this team');
       const me = await team.whoami(slug, caller);
       if (!me.open && !me.member) throw new TeamError(403, 'not_member', 'you are not a member of this team');
       return json({

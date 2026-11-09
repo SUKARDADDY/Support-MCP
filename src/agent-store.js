@@ -7,9 +7,14 @@
 // A key is sealed here and never opened here. Only an AgentTask object opens it.
 // Nothing this file returns carries a key, sealed or not: the hint is the last four
 // characters. A team log detail holds field names and ids, never a key or a price.
+//
+// A task that ends raises a notification for its starter (src/notify.js), written in
+// the same batch as the end: "finished" when it is done, "needs attention" when it is
+// stuck, failed or stopped by the relay itself (not when a person stopped it).
 import { MIN_SECRET_LENGTH, seal } from './crypto.js';
 import { TeamError, normalizeIdentity, teamFromEnv } from './workspace.js';
 import { MAX_ADDED_MODELS, PROVIDERS, findSpec, monthBounds, usd } from './agent-models.js';
+import { notifyStore } from './notify.js';
 
 export const MODES = Object.freeze(['mcp', 'agent', 'both']);
 const KEY_RE = /^[\x21-\x7e]{16,400}$/;
@@ -60,6 +65,7 @@ export const taskOut = (r) => ({
 export function agentStore(db, team, { authSecret = '' } = {}) {
   const { mutate, actorContext, actorHas, actorUnchanged, and } = team;
   const q = (sql, ...params) => db.prepare(sql).bind(...params);
+  const notify = notifyStore(db, team);
   const notStopped = (slug) => [
     "COALESCE((SELECT MAX(seq) FROM audit WHERE workspace = ? AND kind = 'workspace_stopped'), 0) <= COALESCE((SELECT MAX(seq) FROM audit WHERE workspace = ? AND kind = 'workspace_resumed'), 0)",
     [slug, slug],
@@ -297,14 +303,25 @@ export function agentStore(db, team, { authSecret = '' } = {}) {
       const cur = await getTask(slug, id);
       if (!cur || cur.ended_at !== null) return { noop: true, result: { ended: false } };
       const now = Date.now();
+      // A person who stops their own task knows. Everything else the starter should hear about.
+      const finished = state === 'done';
+      const problem = state === 'stuck' || state === 'failed' || (state === 'stopped' && actor === 'relay');
+      const heard = finished || problem ? await notify.rows(slug, finished ? 'task_finished' : 'task_problem', { to: [cur.started_by] }, {
+        device_id: cur.device_id, task_id: id, session_id: cur.sid,
+        title: finished ? 'Task finished' : 'Task needs attention', body: finished ? cur.title : `${cur.title}: ${reason}`, dedupe: `task:${id}:ended`,
+      }) : [];
       return {
         entries: [{ kind: 'agent_task_ended', detail: `${id} ${state} ${reason}` }],
         guard: taskLive(slug, id),
-        change: ([cond, params]) => [q(
-          `UPDATE agent_tasks SET state = ?, ended_at = ?, end_reason = ?, summary = COALESCE(?, summary), steps = COALESCE(?, steps)
-           WHERE workspace = ? AND id = ? AND ended_at IS NULL AND ${cond}`,
-          state, now, reason, summary, steps, slug, id, ...params,
-        )],
+        // The notifications come first: the update ends the task the guard asks to be live.
+        change: (cond) => [
+          ...notify.statements(slug, heard, cond),
+          q(
+            `UPDATE agent_tasks SET state = ?, ended_at = ?, end_reason = ?, summary = COALESCE(?, summary), steps = COALESCE(?, steps)
+             WHERE workspace = ? AND id = ? AND ended_at IS NULL AND ${cond[0]}`,
+            state, now, reason, summary, steps, slug, id, ...cond[1],
+          ),
+        ],
         result: { ended: true },
       };
     });

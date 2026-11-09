@@ -648,7 +648,7 @@ test('/mcp checks the role with the permission key only: no tool argument reache
     const f = await attach({ control: 'full' });
     // As a member the check reads the role too, not just the open-mode shortcut.
     if (member) {
-      f.env.DB.sqlite.exec(`INSERT INTO members VALUES ('default', 'local-dev', 'service', NULL, 'technician', 1, 'local-dev')`);
+      f.env.DB.sqlite.exec(`INSERT INTO members(workspace, identity, kind, name, role_id, added_at, added_by) VALUES ('default', 'local-dev', 'service', NULL, 'technician', 1, 'local-dev')`);
     }
     f.env.DB.seen.length = 0;
     const secret = 'pw-TOPSECRET-42';

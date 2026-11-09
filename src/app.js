@@ -8,14 +8,16 @@ import { verifyAccessJwt, jwksKeyResolver, localBypassAllowed, callerIdentity } 
 import { handleRpc, parseToolOptions } from './mcp.js';
 import { VERSION } from './version.js';
 import { permissionForTool } from './permissions.js';
-import { DEFAULT_WORKSPACE, teamFromEnv } from './workspace.js';
+import { DEFAULT_WORKSPACE, TeamError, teamFromEnv } from './workspace.js';
 import { registryName } from './registry.js';
-import { handleApi } from './api.js';
+import { fail, handleApi, intParam, readBody } from './api.js';
 import { handleDevice } from './device-api.js';
 import { ID_RE, devicesFromEnv, linkCode, livePointer, parseDeviceKey } from './devices.js';
 import { deviceHooks, newCode } from './device-sessions.js';
 import { agentService } from './agent.js';
 import { agentStoreFromEnv } from './agent-store.js';
+import { sweep } from './sweep.js';
+import { WAIT_MAX_S, notifyStore, waitForFeed } from './notify.js';
 import { handleAuth } from './auth.js';
 import {
   AS_METADATA_PATH, PROTECTED_RESOURCE_PREFIX, REGISTER_PATH, TOKEN_PATH, assertPersonActive, assertSecondFactor, bearerToken,
@@ -383,6 +385,7 @@ function isJsonContentType(request) {
 
 // ---- routes ----------------------------------------------------------------
 const WORKSPACE_MCP = /^\/w\/([a-z0-9-]{1,40})\/mcp$/;
+const APP_ROUTE = /^\/app\/w\/([a-z0-9-]{1,40})(\/.*)?$/;
 const isLoopback = (hostname) => hostname === 'localhost' || hostname === '127.0.0.1';
 
 // `irm` sends WindowsPowerShell/5.1.x (Windows PowerShell) or PowerShell/7.x.
@@ -603,10 +606,11 @@ function handleWs(request, env, url) {
 // A missing or failed credential on an MCP address is 401, with a challenge that
 // points an MCP client at this address's protected resource document, so it can
 // find the authorization server and sign in. `invalid` is a token that was sent
-// and failed (expired, revoked, for another address, malformed).
-function unauthorized(issuer, workspace, invalid) {
+// and failed (expired, revoked, for another address, malformed). `app` is the
+// technician app's address, whose challenge names the app's resource document.
+function unauthorized(issuer, workspace, invalid, app = false) {
   return json({ error: invalid ? 'invalid_token' : 'unauthorized' }, 401, {
-    'www-authenticate': challengeHeader(issuer, workspace, { invalid }),
+    'www-authenticate': challengeHeader(issuer, workspace, { invalid, app }),
     'cache-control': 'no-store',
   });
 }
@@ -636,6 +640,13 @@ async function handleMcp(request, env, url, origin, devTtlMs, workspace = DEFAUL
     actor = await accessCaller(request, env, url, { mcp: true });
     if (!actor) return unauthorized(oauthOn && oauthOn.origin, workspace, false);
   }
+  return runMcp(request, env, url, origin, devTtlMs, workspace, actor, oauthCaller);
+}
+
+// An MCP call once the caller is known: from /mcp, /w/<slug>/mcp, or the
+// technician app's /app/w/<slug>/mcp. All three run the same tools with the same
+// role, mode and stop checks.
+async function runMcp(request, env, url, origin, devTtlMs, workspace, actor, oauthCaller) {
   // ?ui=0|1 picks this connection's tools. The old ?shape parameter is a 400.
   let options;
   try {
@@ -672,6 +683,82 @@ async function handleMcp(request, env, url, origin, devTtlMs, workspace = DEFAUL
   return json(body, status);
 }
 
+// ---- the technician app: /app/w/<slug>/... -------------------------------------
+// Routes behind one gate. The gate is stricter than /mcp's: a bearer token for this
+// workspace's app address and nothing else (no Access login, and an MCP client's
+// token is refused), no Origin header, and JSON on every write. Past the gate,
+//   /mcp     the same tools as /mcp, with the same checks for an OAuth caller
+//   /api/... the team API, limited to the routes the app uses (src/api.js)
+//   /teams   the teams the person belongs to
+//   /notifications            the person's feed, held open for up to 25 seconds
+//   /notifications/settings   which events they hear of, and which PCs they watch
+// and every route but /mcp first checks that the person is still a member.
+
+// The person behind an app token is still enabled and invited somewhere, and a
+// real member of this workspace (open mode never counts for the app).
+async function assertAppMember(env, team, workspace, caller) {
+  try {
+    await assertPersonActive(env, team, caller);
+  } catch (e) {
+    if (e.message !== 'you are not a member of this team') throw new TeamError(503, 'unavailable', 'try again');
+    throw new TeamError(403, 'not_member', e.message);
+  }
+  if (!(await team.getMember(workspace, caller.email))) throw new TeamError(403, 'not_member', 'you are not a member of this team');
+}
+
+async function handleApp(request, env, url, origin, devTtlMs, workspace, rest, oauth, notifyTuning) {
+  if (request.headers.has('origin')) return fail(403, 'forbidden', 'cross-site requests are refused');
+  const oauthOn = oauth ? oauth.available(env, url) : null;
+  if (!oauthOn) return new Response('not found', { status: 404 });
+  if (!['GET', 'POST', 'PATCH', 'DELETE'].includes(request.method)) return fail(405, 'method_not_allowed', 'use GET, POST, PATCH, DELETE', { allow: 'GET, POST, PATCH, DELETE' });
+  if (request.method !== 'GET' && !isJsonContentType(request)) return fail(415, 'unsupported_media_type', 'send content-type: application/json');
+  const bearer = bearerToken(request);
+  if (bearer === null) return unauthorized(oauthOn.origin, workspace, false, true);
+  const caller = await oauth.checkBearer(env, oauthOn.origin, workspace, bearer, { app: true });
+  if (caller.unavailable) return json({ error: 'temporarily_unavailable' }, 503, { 'retry-after': '60', 'cache-control': 'no-store' });
+  if (!caller.ok) return unauthorized(oauthOn.origin, workspace, true, true);
+
+  if (rest === '/mcp') {
+    if (request.method !== 'POST') return json({ error: 'method not allowed' }, 405, { allow: 'POST' });
+    return runMcp(request, env, url, origin, devTtlMs, workspace, caller.email, caller);
+  }
+  try {
+    const team = teamFromEnv(env);
+    if (rest === '/api' || rest.startsWith('/api/')) {
+      await assertAppMember(env, team, workspace, caller);
+      // The team API router serves the same paths as /api/v1/w/<slug>/..., limited to
+      // the routes the app uses. It checks the caller's role, second factor and person.
+      const inner = new URL(url);
+      inner.pathname = `/api/v1/w/${workspace}${rest.slice('/api'.length)}`;
+      return await handleApi(request, env, inner, { accessCaller, isJsonContentType, origin, app: { caller } });
+    }
+    if (rest === '/teams') {
+      if (request.method !== 'GET') return fail(405, 'method_not_allowed', 'use GET', { allow: 'GET' });
+      await assertAppMember(env, team, workspace, caller);
+      return json({ teams: (await team.memberships(caller.email)).map(({ slug, name }) => ({ slug, name })) }, 200, noStore);
+    }
+    if (rest === '/notifications') {
+      if (request.method !== 'GET') return fail(405, 'method_not_allowed', 'use GET', { allow: 'GET' });
+      await assertAppMember(env, team, workspace, caller);
+      const after = intParam(url, 'after', 0, 0, Number.MAX_SAFE_INTEGER);
+      const waitS = intParam(url, 'wait_s', 0, 0, notifyTuning?.maxWaitS ?? WAIT_MAX_S);
+      return json(await waitForFeed(notifyStore(env.DB, team), workspace, caller.email, { after, waitS }, notifyTuning), 200, noStore);
+    }
+    if (rest === '/notifications/settings') {
+      if (request.method !== 'GET' && request.method !== 'PATCH') return fail(405, 'method_not_allowed', 'use GET or PATCH', { allow: 'GET, PATCH' });
+      await assertAppMember(env, team, workspace, caller);
+      const store = notifyStore(env.DB, team);
+      return json(request.method === 'GET'
+        ? await store.settings(workspace, caller.email)
+        : await store.patchSettings(workspace, caller.email, await readBody(request)), 200, noStore);
+    }
+    throw new TeamError(404, 'not_found', 'not found');
+  } catch (e) {
+    if (e instanceof TeamError) return fail(e.status, e.code, e.message, e.status === 503 ? { 'retry-after': '1' } : undefined);
+    return fail(500, 'internal', 'internal error');
+  }
+}
+
 // An OAuth route that cannot reach the database or KV answers 503, not a crash.
 async function oauthRoute(serve) {
   try {
@@ -688,10 +775,18 @@ async function oauthRoute(serve) {
 // addresses admit only Access logins, service tokens and the local bypass.
 // For tests: fetch replaces the network for the sign-in providers and the mail
 // provider; mailer replaces the one chosen by MAIL_PROVIDER (null = none);
-// oauthTuning sets how long OAuth keeps its list of workspace addresses.
+// oauthTuning sets how long OAuth keeps its list of workspace addresses; notify
+// ({ pollMs, sleep, maxWaitS }) sets how often a waiting notification feed looks
+// again and the longest wait it accepts.
 export function createHandler(agentText, appBundle = null, options = {}) {
   const oauth = options.oauth ? createOAuth(options.oauth, options.oauthTuning) : null;
   return {
+    // The hourly Cron Trigger (wrangler.toml): PCs missing for 7 days, and old notifications.
+    async scheduled(event, env, ctx) {
+      const run = sweep(env).catch(() => {});
+      if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(run);
+      await run;
+    },
     async fetch(request, env, ctx) {
       const url = new URL(request.url);
       const p = url.pathname;
@@ -713,6 +808,9 @@ export function createHandler(agentText, appBundle = null, options = {}) {
       // default has one address, /mcp, so /w/default/mcp is unknown too.
       const wm = WORKSPACE_MCP.exec(p);
       if (wm && wm[1] !== DEFAULT_WORKSPACE) return handleMcp(request, env, url, origin, devTtlMs, wm[1], oauth);
+      // The technician app's own address: a bearer token for it, never an Access login.
+      const am = APP_ROUTE.exec(p);
+      if (am) return handleApp(request, env, url, origin, devTtlMs, am[1], am[2] ?? '', oauth, options.notify);
       // OAuth: the authorization server's own addresses and the protected
       // resource documents. They answer 404 when OAuth is not set up.
       if (p === AS_METADATA_PATH || p === TOKEN_PATH || p === REGISTER_PATH) {

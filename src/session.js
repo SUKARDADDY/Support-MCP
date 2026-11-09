@@ -53,6 +53,7 @@ const ATTACHED_LIFE_MS = 24 * 60 * 60 * 1000; // attach -> expiry, fixed
 const WAITING_MS = 510 * 1000; // saved PC: create -> the PC has picked it up and answered
 const STOP_CHECK_MS = 20 * 1000; // at most this often a poll reads whether the workspace is stopped
 const STOP_ALARM_MS = 30 * 1000; // an attached PowerShell session wakes this often to check, since a quiet socket sends nothing
+const SCREENSHOT_FOLD_MS = 60 * 1000; // a screenshot this soon after the same person's last one joins its log row
 const CLEANUP_RETRY_MS = 30 * 1000; // a saved-PC session retries clearing its pointer this often
 const DECLINE_REASONS = ['declined', 'nobody', 'busy']; // what a PC may say before hello
 const RESULT_SLACK_MS = 15 * 1000; // relay waits timeout_s + this
@@ -119,6 +120,25 @@ export class Session {
   logRow(kind, detail = '', actor = null) {
     const d = actor ? `[${actor}] ${detail}`.trimEnd() : detail;
     this.sql.exec(`INSERT INTO log(ts,kind,detail) VALUES(?,?,?)`, Date.now(), kind, d);
+  }
+
+  // A screenshot for the session log. The app takes one every few seconds while a tab
+  // is open, so a screenshot that is the same person's, of the same size and display, and
+  // follows the log's last row (itself such a screenshot) within a minute is added to
+  // that row's count instead of a new row: "screenshot 1280x800 (x3)". The row's time
+  // moves to the latest one. Nothing else is ever merged.
+  logScreenshot(text, actor) {
+    const base = `${actor ? `[${actor}] ` : ''}${text}`;
+    const now = Date.now();
+    const [last] = this.sql.exec(`SELECT ts,kind,detail FROM log ORDER BY rowid DESC LIMIT ?`, 1).toArray();
+    const rest = last && last.kind === 'screen' && now - last.ts <= SCREENSHOT_FOLD_MS && last.detail.startsWith(base) ? last.detail.slice(base.length) : null;
+    const folded = rest === '' ? 1 : rest === null ? null : /^ \(x(\d+)\)$/.exec(rest);
+    if (folded === null || folded === undefined) {
+      this.logRow('screen', text, actor);
+      return;
+    }
+    const count = (folded === 1 ? 1 : Number(folded[1])) + 1;
+    this.sql.exec(`UPDATE log SET ts = ?, detail = ? WHERE rowid = (SELECT MAX(rowid) FROM log)`, now, `${base} (x${count})`);
   }
 
   async pushRegistry() {
@@ -548,7 +568,8 @@ export class Session {
   async finishScreen(result, action, actor) {
     if (action?.name === 'screenshot') {
       const display = action.display ? ` display ${action.display}` : '';
-      this.logRow('screen', result.ok ? `screenshot ${result.width}x${result.height}${display}` : `screenshot failed${display}`, actor);
+      if (result.ok) this.logScreenshot(`screenshot ${result.width}x${result.height}${display}`, actor);
+      else this.logRow('screen', `screenshot failed${display}`, actor);
     }
     if (result.ok) {
       if (result.control === undefined) result.control = (await this.get('control', null));
@@ -940,13 +961,13 @@ export class Session {
   // pointer (devices.session), in one change. If the database is unreachable the
   // alarm tries again until it works, so a PC is never left looking busy.
   async runCleanup() {
-    const s = await this.ctx.storage.get(['device_id', 'device_name', 'sid', 'workspace', 'cleanup_reason', 'cleanup_actor']);
+    const s = await this.ctx.storage.get(['device_id', 'device_name', 'sid', 'workspace', 'cleanup_reason', 'cleanup_actor', 'driver', 'opened_by_task']);
     try {
       const deviceId = s.get('device_id');
       const reason = s.get('cleanup_reason');
       const actor = s.get('cleanup_actor') ?? (['owner', ...DECLINE_REASONS].includes(reason) ? `pc ${deviceId}` : 'relay');
       await devicesFromEnv(this.env).sessionEnded(s.get('workspace') ?? DEFAULT_WORKSPACE, {
-        deviceId, sid: s.get('sid'), name: s.get('device_name') ?? '', reason, actor,
+        deviceId, sid: s.get('sid'), name: s.get('device_name') ?? '', reason, actor, driver: s.get('driver') ?? null, openedByTask: s.get('opened_by_task') ?? null,
       });
       await this.setMany({ cleanup_pending: false });
     } catch (_) {

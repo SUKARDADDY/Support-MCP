@@ -12,7 +12,10 @@
 //
 // The conversation lives in memory only, in the provider's own shape and only ever
 // appended to. Screenshots are never stored. What is stored is redacted: the verb and a
-// short detail of each step, and the notes. A fresh conversation starts every 12 tool
+// short detail of each step, and the notes. The one picture kept is the last full
+// screenshot (never a zoom), in a field of this object, for the technician's app to show
+// while the task works: it is read through /frame, dropped when the task ends, and lost
+// if the object is evicted. A fresh conversation starts every 12 tool
 // calls, or after the object restarts, from the last note and a new screenshot.
 //
 // This file never logs, stores or returns a key, and shows a provider's answer only as
@@ -22,7 +25,8 @@ import { AccessDenied, checkAgentStarter, runAgentTool } from './app.js';
 import { agentStoreFromEnv } from './agent-store.js';
 import { devicesFromEnv } from './devices.js';
 import { deviceHooks, sessionWatch } from './device-sessions.js';
-import { normalizeIdentity } from './workspace.js';
+import { normalizeIdentity, teamFromEnv } from './workspace.js';
+import { notifyStore } from './notify.js';
 import { INPUT_SOFT_MAX, costMicro, fitOutput, reserveMicro } from './agent-models.js';
 import { MESSAGES, ProviderError, adapterFor, classify, estimateTokens } from './agent-providers.js';
 import { runModelCheck } from './agent-check.js';
@@ -113,6 +117,7 @@ export class AgentTask {
     this.cfg = undefined; // fixed at start
     this.st = undefined; // the task's own state, stored after every step
     this.conv = null; // the conversation, in memory only
+    this.frame = null; // the last full screenshot { rev, at, mime, data }, in memory only: never in storage, D1 or KV
     this.owed = []; // tool results the conversation still owes the model
     this.waiters = new Set();
     this.watchers = 0;
@@ -153,6 +158,7 @@ export class AgentTask {
       if (request.method === 'POST' && url.pathname === '/start') return await this.doStart(request);
       if (!this.cfg) return json({ error: 'no such task' }, 404);
       if (request.method === 'GET' && url.pathname === '/status') return await this.doStatus(url);
+      if (request.method === 'GET' && url.pathname === '/frame') return this.doFrame();
       if (request.method === 'POST' && url.pathname === '/wake') return await this.doWake();
     } catch (e) {
       return json({ error: 'internal error' }, 500);
@@ -222,6 +228,25 @@ export class AgentTask {
     return json(this.view());
   }
 
+  // The last full screenshot, or 404 when there is none (the task has not taken one since this
+  // object started, or it has ended). Who may ask is checked by the relay before it gets here.
+  doFrame() {
+    if (!this.frame || this.st.ending || this.st.done) return json({ error: 'no_frame' }, 404);
+    return json(this.frame);
+  }
+
+  // Keep the picture a tool returned if it is a full screenshot: a zoom is a piece of the
+  // screen and never replaces it. Anything that is not a plain JPEG or PNG is not kept. Nothing
+  // is kept once the task is ending or done: a tool call that was in flight when cleanup
+  // cleared the frame must not bring it back.
+  holdFrame(name, result) {
+    if (name === 'zoom' || result?.isError || this.st.ending || this.st.done) return;
+    const image = (result?.content ?? []).find((c) => c.type === 'image' && typeof c.data === 'string' && (c.mimeType === 'image/jpeg' || c.mimeType === 'image/png'));
+    if (!image) return;
+    this.frame = { rev: this.st.rev + 1, at: Date.now(), mime: image.mimeType, data: image.data };
+    this.bump();
+  }
+
   untilChange(ms) {
     return new Promise((resolve) => {
       const finish = () => {
@@ -271,6 +296,7 @@ export class AgentTask {
   // One cleanup at a time, whoever asks: a stop, an alarm and a step that finds the row ended
   // all wait for the same run.
   cleanup() {
+    this.frame = null;
     this.cleaning ??= this.runCleanup().finally(() => { this.cleaning = null; });
     return this.cleaning;
   }
@@ -291,6 +317,7 @@ export class AgentTask {
     if (st.cleanup_tries >= CLEANUP_TRIES_MAX) {
       // A reservation left uncharged stays counted against the caps.
       this.giveUp();
+      await this.tellGiveUp();
       await this.ctx.storage.deleteAlarm();
       await this.save().catch(() => {});
       return;
@@ -317,6 +344,7 @@ export class AgentTask {
         return;
       }
       this.giveUp();
+      await this.tellGiveUp();
     }
     st.done = true;
     await this.ctx.storage.deleteAlarm();
@@ -333,6 +361,19 @@ export class AgentTask {
     st.phase = 'ended';
     st.notes.push({ ts: Date.now(), text: note });
     this.addStep('cleanup', note, false);
+  }
+
+  // The task's end was already recorded, so this is a notification of its own: the starter
+  // is told the PC's session may still be open. Best effort; the task's notes say it too.
+  async tellGiveUp() {
+    const { workspace, task_id: id, starter, device_id: deviceId } = this.cfg;
+    try {
+      const notify = notifyStore(this.env.DB, teamFromEnv(this.env));
+      await notify.write(workspace, await notify.rows(workspace, 'task_problem', { to: [starter] }, {
+        device_id: deviceId, task_id: id, session_id: this.st.sid,
+        title: 'Task needs attention', body: 'Could not confirm that the PC\'s session ended. End it by hand.', dedupe: `task:${id}:cleanup`,
+      }));
+    } catch (_) { /* the notes carry the same words */ }
   }
 
   // End the saved-PC session the task made. True when none of it is left to end: it is
@@ -631,6 +672,7 @@ export class AgentTask {
     const { cfg, st } = this;
     const { workspace } = cfg;
     const shot = await this.tool('screenshot', { session_id: st.sid });
+    this.holdFrame('screenshot', shot);
     st.calls += 1;
     this.addStep('screenshot', 'new conversation', !shot.isError);
     let deviceId = cfg.device_id;
@@ -827,6 +869,7 @@ export class AgentTask {
       st.pending = { id: call.id, name: call.name, state: 'sending', extra: extra.map((c) => c.id) };
       await this.save();
       const res = await this.tool(call.name, { ...args, session_id: st.sid });
+      this.holdFrame(call.name, res);
       this.fail('afterSend');
       st.pending = null;
       st.calls += 1;

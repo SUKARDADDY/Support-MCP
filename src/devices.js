@@ -15,6 +15,11 @@
 // codes and waiting PCs. A log detail holds names and ids, never a code, a key
 // or a field value.
 //
+// Three of these changes also raise a notification for the people who should hear of
+// it (src/notify.js): a PC asking to join, a PC leaving, and a saved-PC session that
+// ended early. Their rows go into the same batch as the change, ahead of the
+// statement that changes what the guard reads, so they exist exactly when it does.
+//
 // A device's key is smd1.<workspace>.<device id>.<secret>. Only the SHA-256 of
 // the secret is stored. A pairing code and a waiting PC's six-digit number are
 // stored as keyed hashes under AUTH_SECRET, and never appear in clear in a row
@@ -24,6 +29,7 @@ import { TeamError, normalizeIdentity, teamFromEnv } from './workspace.js';
 import { UNATTENDED_PERMISSION } from './permissions.js';
 import { compareVersions, validVersion } from './release.js';
 import { deviceHooks } from './device-sessions.js';
+import { notifyStore } from './notify.js';
 
 export const ID_RE = /^[a-z2-7]{20}$/;
 // smd1.<workspace>.<device id>.<secret>. A mismatch is 401 device_unknown.
@@ -178,6 +184,13 @@ export function livePointer(row, now = Date.now()) {
   if (!p || typeof p !== 'object' || typeof p.id !== 'string' || typeof p.by !== 'string' || !Number.isFinite(p.expires_at) || p.expires_at <= now) return null;
   return p;
 }
+// The ways a saved-PC session ends from the PC's side, and how a notification puts each.
+const EARLY_ENDS = Object.freeze({
+  declined: 'the person at the PC declined',
+  nobody: 'nobody was signed in at the PC',
+  busy: 'the PC was busy',
+  owner: 'the PC\'s owner ended the session',
+});
 const STOPPED_MESSAGE = 'this workspace is stopped; someone who can manage members must resume it';
 // A customer or site, without its workspace column.
 const recordOut = ({ workspace, ...r }) => ({ ...r, fields: JSON.parse(r.fields) });
@@ -191,6 +204,7 @@ const recordOut = ({ workspace, ...r }) => ({ ...r, fields: JSON.parse(r.fields)
 export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
   const { mutate, actorContext, actorHas, actorUnchanged, and, lit } = team;
   const q = (sql, ...params) => db.prepare(sql).bind(...params);
+  const notify = notifyStore(db, team);
   const secretOk = typeof authSecret === 'string' && authSecret.length >= MIN_SECRET_LENGTH;
   const needSecret = () => {
     if (!secretOk) throw new TeamError(503, 'unavailable', `pairing is not configured: the server operator must set AUTH_SECRET (at least ${MIN_SECRET_LENGTH} characters)`);
@@ -761,6 +775,10 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
       if ((await count('devices', slug, notExpired, now)) >= LIMITS.devices) throw new TeamError(409, 'device_limit', `a team holds at most ${LIMITS.devices} PCs`);
       const expires = now + PENDING_TTL_MS;
       const device = newDevice(slug, id, fields, { status: 'pending', key_hash: keyHash, confirm_hash: confirmHash, expires_at: expires, paired_by: `pc ${id}` });
+      // Everyone who can approve it hears that it is waiting.
+      const heard = await notify.rows(slug, 'device_waiting', { holding: 'devices.manage' }, {
+        device_id: id, title: 'A PC is waiting for approval', body: device.name, dedupe: `waiting:${id}`,
+      });
       return {
         entries: [{ kind: 'device_requested', detail: `${id} ${JSON.stringify(device.name)}` }],
         guard: and(
@@ -768,8 +786,10 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
           countBelow('devices', slug, LIMITS.devices, notExpired, now),
           recentRequests,
         ),
+        // The notifications come before the new device: its row counts toward the limits in the guard.
         change: ([cond, params]) => [
           q(`DELETE FROM devices WHERE workspace = ? AND status = 'pending' AND expires_at <= ? AND ${cond}`, slug, now, ...params),
+          ...notify.statements(slug, heard, [cond, params]),
           insertDevice(device, null, [cond, params]),
         ],
         result: { status: 'pending', workspace: slug, device_id: id, key: `smd1.${slug}.${id}.${secret}`, confirm, expires_at: expires },
@@ -863,10 +883,18 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
         ended.add(live.id);
         await hooks?.endSession(key.workspace, live.id, 'removed', `pc ${key.id}`);
       }
+      // A PC that watchers follow, or that the team manages, is missing for good. A waiting PC is not.
+      const heard = dev.status === 'active' ? await notify.rows(key.workspace, 'device_missing', { watching: key.id, holding: 'devices.manage' }, {
+        device_id: key.id, title: 'A PC left the team', body: dev.name, dedupe: `left:${key.id}`,
+      }) : [];
       return {
         entries: [{ kind: 'device_left', detail: `${key.id} ${JSON.stringify(dev.name)}` }],
         guard: ['EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND key_hash = ?)', [key.workspace, key.id, dev.key_hash]],
-        change: ([cond, params]) => [q(`DELETE FROM devices WHERE workspace = ? AND id = ? AND key_hash = ? AND ${cond}`, key.workspace, key.id, dev.key_hash, ...params)],
+        // The notifications come first: the delete removes the row the guard reads.
+        change: (cond) => [
+          ...notify.statements(key.workspace, heard, cond),
+          q(`DELETE FROM devices WHERE workspace = ? AND id = ? AND key_hash = ? AND ${cond[0]}`, key.workspace, key.id, dev.key_hash, ...cond[1]),
+        ],
         result: { removed: true },
       };
     });
@@ -992,17 +1020,29 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
   // The Session object calls this when a saved-PC session ends. It writes
   // device_session_ended and clears the PC's pointer, guarded on the session id
   // so it never clears a newer session. One change, so a retry after a failure
-  // either does both or neither. actor is who ended it, or "relay".
-  async function sessionEnded(slug, { deviceId, sid, name, reason, actor }) {
-    return mutate(slug, actor, async () => ({
-      entries: [{ kind: 'device_session_ended', detail: `${deviceId} ${JSON.stringify(name)} ${sid.slice(0, 8)} ${reason}` }],
-      guard: lit(true),
-      change: ([cond, params]) => [q(
-        `UPDATE devices SET session = NULL WHERE workspace = ? AND id = ? AND json_extract(session, '$.id') = ? AND ${cond}`,
-        slug, deviceId, sid, ...params,
-      )],
-      result: { ended: true },
-    }));
+  // either does both or neither. actor is who ended it, or "relay". driver is who
+  // drove the session: when the PC's person said no, or ended it early, they hear of
+  // it, unless a task holds the session (then the task raises its own event). A task
+  // holds it when the session carries the task's id (openedByTask, which stays true
+  // before the task has recorded the sid and after it has ended), or when a running task
+  // is attached to it by sid.
+  async function sessionEnded(slug, { deviceId, sid, name, reason, actor, driver = null, openedByTask = null }) {
+    return mutate(slug, actor, async () => {
+      const text = Object.hasOwn(EARLY_ENDS, reason) ? EARLY_ENDS[reason] : null;
+      const held = text && driver && !openedByTask ? await q('SELECT 1 AS held FROM agent_tasks WHERE workspace = ? AND sid = ? AND ended_at IS NULL LIMIT 1', slug, sid).first('held') : null;
+      const heard = text && driver && !openedByTask && !held ? await notify.rows(slug, 'session_declined', { to: [driver] }, {
+        device_id: deviceId, session_id: sid, title: 'Session ended early', body: `${name}: ${text}`, dedupe: `declined:${sid}`,
+      }) : [];
+      return {
+        entries: [{ kind: 'device_session_ended', detail: `${deviceId} ${JSON.stringify(name)} ${sid.slice(0, 8)} ${reason}` }],
+        guard: lit(true),
+        change: (cond) => [
+          ...notify.statements(slug, heard, cond),
+          q(`UPDATE devices SET session = NULL WHERE workspace = ? AND id = ? AND json_extract(session, '$.id') = ? AND ${cond[0]}`, slug, deviceId, sid, ...cond[1]),
+        ],
+        result: { ended: true },
+      };
+    });
   }
 
   // The session's first hello fixes its end at 24 hours from then. The pointer

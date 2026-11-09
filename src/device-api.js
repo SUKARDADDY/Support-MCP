@@ -77,7 +77,7 @@ const ROUTES = Object.freeze({
 // The doorbell. Same refusals as the other /device addresses, then the Worker
 // checks the key and hands the upgrade to the workspace's Registry object, which
 // holds the socket. Active and waiting PCs may connect. The key is stripped from
-// what the Registry sees.
+// what the Registry sees, and the workspace is added (the Registry names no team itself).
 async function handleRing(request, env, url) {
   if (request.method !== 'GET') return fail(405, 'method_not_allowed', 'use GET', { allow: 'GET' });
   if (request.headers.has('origin')) return fail(403, 'forbidden', 'cross-site requests are refused');
@@ -93,7 +93,7 @@ async function handleRing(request, env, url) {
     const row = await devicesFromEnv(env).authenticate(key);
     if (!row) throw new TeamError(401, 'device_unknown', 'this key is not valid');
     if (!env.REGISTRY) return fail(503, 'unavailable', 'the doorbell is not configured', { 'retry-after': '60' });
-    const forward = new Request(`https://do/doorbell?device=${row.id}`, request);
+    const forward = new Request(`https://do/doorbell?device=${row.id}&workspace=${row.workspace}`, request);
     forward.headers.delete('authorization');
     return await env.REGISTRY.get(env.REGISTRY.idFromName(registryName(row.workspace))).fetch(forward);
   } catch (e) {

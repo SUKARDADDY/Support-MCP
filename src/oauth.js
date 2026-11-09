@@ -19,9 +19,12 @@
 // the /oauth/authorize page (src/auth.js) and the 401 challenge.
 //
 // A resource address is the MCP address: PUBLIC_ORIGIN/mcp for the default
-// workspace and PUBLIC_ORIGIN/w/<slug>/mcp for every other. A token is bound to
-// exactly one of them.
+// workspace and PUBLIC_ORIGIN/w/<slug>/mcp for every other. The technician app has
+// its own address per workspace, PUBLIC_ORIGIN/app/w/<slug> (default included), so
+// its sign-in is a different grant from an MCP client's. A token is bound to
+// exactly one address: an MCP token is refused on /app and an app token on /mcp.
 import { ownOrigin } from './auth.js';
+import { sha256Hex } from './crypto.js';
 import { DEFAULT_WORKSPACE, teamFromEnv } from './workspace.js';
 import { accountStore } from './accounts.js';
 import { needsSecondFactor } from './permissions.js';
@@ -41,6 +44,13 @@ const LIST_TTL_MS = 10_000;
 const MISS_GAP_MS = 2_000;
 
 const WORKSPACE_PATH = /^\/w\/([a-z0-9-]{1,40})\/mcp$/;
+const APP_WORKSPACE_PATH = /^\/app\/w\/([a-z0-9-]{1,40})$/;
+
+// A checked app token is kept this long in this isolate, so an app that calls
+// every few seconds does not read KV (100,000 reads a day on the free plan) and
+// D1 on every call. The cache is bounded; the oldest entry goes first.
+const APP_CHECK_TTL_MS = 60_000;
+const APP_CHECK_MAX = 500;
 
 // The MCP path of a workspace, and its full resource address.
 export const mcpPath = (slug) => (slug === DEFAULT_WORKSPACE ? '/mcp' : `/w/${slug}/mcp`);
@@ -53,6 +63,26 @@ export function workspaceForResource(origin, resource) {
   if (path === '/mcp') return DEFAULT_WORKSPACE;
   const m = WORKSPACE_PATH.exec(path);
   return m && m[1] !== DEFAULT_WORKSPACE ? m[1] : null;
+}
+
+// The app's address for a workspace. Unlike the MCP address, default has one too.
+export const appPath = (slug) => `/app/w/${slug}`;
+export const appResourceUrl = (origin, slug) => `${origin}${appPath(slug)}`;
+
+// The workspace an app resource address names, or null if it is none of ours.
+export function workspaceForAppResource(origin, resource) {
+  if (typeof resource !== 'string' || !resource.startsWith(origin)) return null;
+  const m = APP_WORKSPACE_PATH.exec(resource.slice(origin.length));
+  return m ? m[1] : null;
+}
+
+// What a resource address is for: { workspace, app } where app is true for the
+// technician app's address, or null if it is none of ours.
+export function resourceTarget(origin, resource) {
+  const appWorkspace = workspaceForAppResource(origin, resource);
+  if (appWorkspace !== null) return { workspace: appWorkspace, app: true };
+  const workspace = workspaceForResource(origin, resource);
+  return workspace === null ? null : { workspace, app: false };
 }
 
 // A token this server issues is `<user id>:<grant id>:<secret>`. The user id is a
@@ -72,11 +102,11 @@ export function bearerToken(request) {
   return m ? (m[1] || '').trim() : null;
 }
 
-// WWW-Authenticate for a 401 on an MCP address. It points a client at the
-// resource's metadata, which names our authorization server.
-export function challengeHeader(origin, workspace, { invalid = false } = {}) {
+// WWW-Authenticate for a 401 on an MCP address, or on the app's with `app`. It
+// points a client at the resource's metadata, which names our authorization server.
+export function challengeHeader(origin, workspace, { invalid = false, app = false } = {}) {
   if (!origin) return 'Bearer';
-  const doc = `${origin}${PROTECTED_RESOURCE_PREFIX}${mcpPath(workspace)}`;
+  const doc = `${origin}${PROTECTED_RESOURCE_PREFIX}${app ? appPath(workspace) : mcpPath(workspace)}`;
   return `Bearer resource_metadata="${doc}"${invalid ? ', error="invalid_token"' : ''}`;
 }
 
@@ -96,6 +126,8 @@ export function createOAuth(lib, tuning = {}) {
   const missGapMs = tuning.missGapMs ?? MISS_GAP_MS;
   // Per isolate, per database: the workspace addresses and the server built from them.
   const lists = new WeakMap();
+  // Checked app tokens: key -> { until, caller }. See APP_CHECK_TTL_MS.
+  const appChecked = new Map();
 
   // Is OAuth set up for this request? It needs the KV namespace and an address
   // to be the issuer: PUBLIC_ORIGIN, or the loopback address in development.
@@ -105,8 +137,15 @@ export function createOAuth(lib, tuning = {}) {
     return where.error ? null : { origin: where.origin };
   }
 
-  function buildServer(origin, slugs, { cimd }) {
-    const resources = [resourceUrl(origin, DEFAULT_WORKSPACE), ...slugs.map((slug) => resourceUrl(origin, slug))];
+  // `app` is a workspace slug: the server then declares that workspace's app
+  // address and nothing else. Building a server costs time that grows with the
+  // square of its address count (about 220 ms for 500 workspaces), so the app's
+  // addresses are never added to the list of every workspace: a request that names
+  // an app address gets its own small server.
+  function buildServer(origin, slugs, { cimd, app = null }) {
+    const resources = app !== null
+      ? [appResourceUrl(origin, app)]
+      : [resourceUrl(origin, DEFAULT_WORKSPACE), ...slugs.map((slug) => resourceUrl(origin, slug))];
     return new lib.OAuthAuthorizationServer({
       issuer: origin,
       resources,
@@ -172,8 +211,9 @@ export function createOAuth(lib, tuning = {}) {
   // The library's helpers for the consent page. `resource` is the request's
   // resource parameter, so a workspace made a moment ago is in the list.
   async function api(env, origin, resource) {
-    const slug = workspaceForResource(origin, resource);
-    return (await serverFor(env, origin, slug)).getOAuthApi(env);
+    const target = resourceTarget(origin, resource);
+    if (target && target.app) return buildServer(origin, [], { cimd: true, app: target.workspace }).getOAuthApi(env);
+    return (await serverFor(env, origin, target && target.workspace)).getOAuthApi(env);
   }
 
   // Is this /oauth/token answer a refusal that an unknown workspace address causes?
@@ -200,6 +240,27 @@ export function createOAuth(lib, tuning = {}) {
     return new Response(JSON.stringify(doc), { status: response.status, headers });
   }
 
+  // The fields of a token request, or {} when its body is not a form.
+  async function tokenForm(request) {
+    try {
+      return Object.fromEntries(await request.clone().formData());
+    } catch (_) {
+      return {};
+    }
+  }
+
+  // The app workspace a token request is for, read from the grant its code or
+  // refresh token names, or null. Used when the request does not name a resource
+  // (a refresh need not). A grant is the KV record `grant:<user id>:<grant id>`,
+  // and both ids are in the front of the token.
+  async function appWorkspaceOfGrant(env, origin, form) {
+    const token = typeof form.code === 'string' ? form.code : form.refresh_token;
+    const parts = typeof token === 'string' ? token.split(':') : [];
+    if (parts.length !== 3 || !UUID.test(parts[0]) || !/^[A-Za-z0-9_-]{16}$/.test(parts[1])) return null;
+    const grant = await env.OAUTH_KV.get(`grant:${parts[0]}:${parts[1]}`, { type: 'json' });
+    return grant ? workspaceForAppResource(origin, grant.resource) : null;
+  }
+
   // /.well-known/oauth-authorization-server, /oauth/token and /oauth/register.
   async function serveServer(request, env, ctx, url) {
     const where = available(env, url);
@@ -209,19 +270,30 @@ export function createOAuth(lib, tuning = {}) {
     // so a refusal is the miss signal: if re-reading the list finds a workspace
     // the server did not have, the request runs once more on the new server.
     // A refusal never uses up a code, so the second run is safe.
+    // A request for the app's address (named in its resource, or bound to its
+    // grant) runs on a server that declares only that address.
     const isToken = url.pathname === TOKEN_PATH && request.method === 'POST';
     const again = isToken ? request.clone() : null;
-    let server = await serverFor(env, where.origin, null);
+    const form = isToken ? await tokenForm(request) : null;
+    const named = form ? workspaceForAppResource(where.origin, form.resource) : null;
+    const appServer = (slug) => buildServer(where.origin, [], { cimd: true, app: slug });
+    let server = named !== null ? appServer(named) : await serverFor(env, where.origin, null);
     let response = await server.fetch(request, env, context);
-    if (isToken && response.status === 400 && (await refusedForResource(response)) && (await listChangedOnMiss(env, where.origin))) {
-      server = await serverFor(env, where.origin, null);
-      response = await server.fetch(again, env, context);
+    if (isToken && named === null && response.status === 400 && (await refusedForResource(response))) {
+      const bound = await appWorkspaceOfGrant(env, where.origin, form);
+      if (bound !== null) {
+        response = await appServer(bound).fetch(again, env, context);
+      } else if (await listChangedOnMiss(env, where.origin)) {
+        server = await serverFor(env, where.origin, null);
+        response = await server.fetch(again, env, context);
+      }
     }
     return url.pathname === AS_METADATA_PATH ? withoutResourceList(response) : response;
   }
 
   // RFC 9728 documents. The bare path and /mcp name the default workspace;
   // /w/<slug>/mcp names that workspace, and 404 if it was never created.
+  // /app/w/<slug> is the same for the technician app's address.
   async function serveResourceMetadata(request, env, url) {
     const where = available(env, url);
     if (!where) return new Response('not found', { status: 404 });
@@ -231,14 +303,17 @@ export function createOAuth(lib, tuning = {}) {
     }
     const rest = url.pathname.slice(PROTECTED_RESOURCE_PREFIX.length);
     let slug = null;
+    let app = false;
     if (rest === '' || rest === '/mcp') slug = DEFAULT_WORKSPACE;
     else {
       const m = WORKSPACE_PATH.exec(rest);
+      const a = APP_WORKSPACE_PATH.exec(rest);
       if (m && m[1] !== DEFAULT_WORKSPACE && (await workspaceKnown(env, where.origin, m[1]))) slug = m[1];
+      else if (a && (await workspaceKnown(env, where.origin, a[1]))) { slug = a[1]; app = true; }
     }
     if (slug === null) return jsonResponse({ error: 'not_found' }, 404, CORS);
     const body = {
-      resource: resourceUrl(where.origin, slug),
+      resource: app ? appResourceUrl(where.origin, slug) : resourceUrl(where.origin, slug),
       authorization_servers: [where.origin],
       bearer_methods_supported: ['header'],
       resource_name: 'Support-MCP',
@@ -248,27 +323,39 @@ export function createOAuth(lib, tuning = {}) {
       : jsonResponse(body, 200, CORS);
   }
 
-  // Checks a bearer token for exactly this workspace's MCP address. A server
-  // that declares only this one address is enough: a token for another address
-  // is not found under it, and a workspace that does not exist has no tokens.
-  // Before KV is read, the token must have the shape this server issues and name
-  // a person who exists and is enabled (one D1 read; D1's free read limit is far
-  // above KV's). Anything else is refused with no KV read, so junk bearer tokens
-  // cannot use up the day's KV reads. Returns the caller, or why not.
-  async function checkBearer(env, origin, workspace, token) {
+  // Checks a bearer token for exactly this workspace's MCP address, or with
+  // `app` its app address. A server that declares only this one address is enough:
+  // a token for another address is not found under it, and a workspace that does
+  // not exist has no tokens. Before KV is read, the token must have the shape this
+  // server issues and name a person who exists and is enabled (one D1 read; D1's
+  // free read limit is far above KV's). Anything else is refused with no KV read,
+  // so junk bearer tokens cannot use up the day's KV reads. Returns the caller,
+  // or why not.
+  // A passing app token is remembered for APP_CHECK_TTL_MS, keyed by the SHA-256
+  // of the token. So an app token that was revoked or whose person was disabled
+  // can work on the app's address for up to a minute here; every app call still
+  // checks the person and their role live. MCP tokens are never remembered.
+  async function checkBearer(env, origin, workspace, token, { app = false } = {}) {
     if (!token || token.length > 2000) return { ok: false };
     const wanted = tokenUserId(token);
     if (!wanted) return { ok: false };
+    const cacheKey = app ? `${origin} ${workspace} ${await sha256Hex(token)}` : null;
+    if (cacheKey) {
+      const hit = appChecked.get(cacheKey);
+      if (hit && hit.until > Date.now()) return hit.caller;
+      appChecked.delete(cacheKey);
+    }
     try {
       const user = await accountStore(env.DB, { secret: env.AUTH_SECRET }).userById(wanted);
       if (!user || user.disabled_at) return { ok: false };
     } catch (_) {
       return { ok: false, unavailable: true };
     }
-    const resource = resourceUrl(origin, workspace);
+    const resource = app ? appResourceUrl(origin, workspace) : resourceUrl(origin, workspace);
     let found;
     try {
-      found = await buildServer(origin, workspace === DEFAULT_WORKSPACE ? [] : [workspace], { cimd: false }).validateToken(resource, token, env);
+      const server = buildServer(origin, app || workspace === DEFAULT_WORKSPACE ? [] : [workspace], { cimd: false, app: app ? workspace : null });
+      found = await server.validateToken(resource, token, env);
     } catch (_) {
       // KV failed (its daily limit, say). The token may be fine, so this is
       // not a 401: the client must not throw its sign-in away.
@@ -278,11 +365,17 @@ export function createOAuth(lib, tuning = {}) {
     if (!props || typeof props.email !== 'string' || typeof props.user_id !== 'string' || props.workspace !== workspace || props.user_id !== found.userId) {
       return { ok: false };
     }
-    return { ok: true, email: props.email, userId: props.user_id, factor: typeof props.factor === 'number' ? props.factor : null };
+    const caller = { ok: true, email: props.email, userId: props.user_id, factor: typeof props.factor === 'number' ? props.factor : null };
+    if (cacheKey) {
+      if (appChecked.size >= APP_CHECK_MAX) appChecked.delete(appChecked.keys().next().value);
+      appChecked.set(cacheKey, { until: Date.now() + APP_CHECK_TTL_MS, caller });
+    }
+    return caller;
   }
 
   // Ends every grant the person has, which ends their tokens.
   async function revokeGrants(env, origin, userId) {
+    appChecked.clear();
     const helpers = buildServer(origin, [], { cimd: false }).getOAuthApi(env);
     let cursor;
     do {
@@ -293,7 +386,7 @@ export function createOAuth(lib, tuning = {}) {
   }
 
   return {
-    lib, available, api, serveServer, serveResourceMetadata, checkBearer, revokeGrants, workspaceKnown, workspaceForResource,
+    lib, available, api, serveServer, serveResourceMetadata, checkBearer, revokeGrants, workspaceKnown, workspaceForResource, resourceTarget,
     AuthorizationError: lib.AuthorizationError,
     CimdFetchError: lib.CimdFetchError,
   };

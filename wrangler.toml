@@ -97,6 +97,13 @@ class_name = "Registry"
 name = "AGENT_TASK"
 class_name = "AgentTask"
 
+# One hourly run (src/sweep.js): it raises "missing" for saved PCs not seen for 7 days
+# and deletes notifications older than 30 days. A free account allows a few Cron
+# Triggers in all, so check how many it already uses. If you deploy with a copy
+# of this file, give the copy the same trigger, or the run never happens.
+[triggers]
+crons = ["17 * * * *"]
+
 # Free plan requires SQLite-backed Durable Objects.
 [[migrations]]
 tag = "v1"

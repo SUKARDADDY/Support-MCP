@@ -141,7 +141,7 @@ The consent page lets the browser follow the last redirect by listing the
 return address in its `form-action` policy. Chrome applies `form-action` to the
 redirect that answers a form post, so `'self'` alone would block it. The address
 comes from the client's registered redirect, which the library has already
-matched exactly. A return address the relay cannot write into that policy
+matched (exactly, except that a loopback address matches on any port). A return address the relay cannot write into that policy
 safely is refused on the authorize page.
 
 ## Saved PCs: device_list and device_connect
@@ -226,7 +226,10 @@ discovery document:
 Registration is not limited to public clients. A client that names no
 authentication method is registered with a client secret. So the relay requires
 PKCE with S256 on every authorization request, whatever the client type, and
-refuses a request without it. Redirect addresses match exactly. They may be
+refuses a request without it. Redirect addresses match the registration exactly,
+except that a loopback address (`127.0.0.1`, `[::1]` or `localhost`) matches on any
+port, as RFC 8252 says: the scheme, host, path and query must be the registered ones, and
+a client may register `http://127.0.0.1/callback` and use a free port at each sign-in. Redirect addresses may be
 `https`, `http` on the loopback address, or an app link such as `cursor://`
 (RFC 8252). Dangerous schemes (`javascript:`, `data:`, `file:` and similar) are
 refused at registration, and the authorize page refuses any scheme it cannot
@@ -253,9 +256,15 @@ including deletes and lists.
 - Past a limit KV refuses the call, and OAuth calls fail until 00:00 UTC. The
   relay answers 503 (not 401), so the client keeps its sign-in and retries. An
   Access login or service token keeps working. Workers Paid lifts the limits.
+- The technician app's token (for `/app/w/<slug>`, not an MCP address) also reads KV
+  once per call, but the relay remembers a token it has just checked for 60 seconds, so
+  a busy app costs about one read a minute. The app's feed and its open session tabs
+  cost Worker requests instead: about 3,500 feed calls a day for one person, and about
+  1,800 requests an hour for each open session tab, against 100,000 requests a day on
+  the free plan.
 - The checks above stop junk tokens before KV, but each still costs a request
-  and a database read. Add a Cloudflare rate-limiting rule on `/mcp` and
-  `/w/*` as well as `/oauth/`.
+  and a database read. Add a Cloudflare rate-limiting rule on `/mcp`, `/w/*`
+  and `/app/*` as well as `/oauth/`.
 
 KV is eventually consistent. A write reaches other locations within about a
 minute. Two things follow:
@@ -269,6 +278,9 @@ minute. Two things follow:
   delay, because that check reads D1 on every call.
 
 ## Many workspaces
+
+The technician app's addresses (`/app/w/<slug>`) are not in this list. A request for one
+builds a server that declares only that address, so they add nothing to the build time below.
 
 The relay builds the list of MCP addresses from the database every ten seconds,
 so a new workspace works without a deploy. It also reads the list again at once

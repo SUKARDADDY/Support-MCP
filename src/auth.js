@@ -507,7 +507,8 @@ async function signOut(c, everywhere) {
 // needs a second factor, have passed one in this sign-in.
 
 // What each permission lets an MCP client do. Team and log permissions are not
-// reachable through the MCP tools, so they are not listed.
+// reachable through the MCP tools, so they are not listed. A grant for the
+// technician app's address is described by its own text instead (src/pages.js).
 const ABILITIES = {
   'sessions.create': 'start support sessions',
   'sessions.view': 'list sessions and read their status',
@@ -610,7 +611,8 @@ async function authorizeGet(c) {
   // The consent form can return only to an address its form-action can name.
   const source = redirectSource(req.redirectUri);
   if (!source) return askAgain('This app’s return address is not one this server can send you back to.');
-  const workspace = c.oauth.workspaceForResource(c.origin, req.resource);
+  const target = c.oauth.resourceTarget(c.origin, req.resource);
+  const workspace = target ? target.workspace : null;
   const role = workspace ? await roleIn(c, session, workspace) : null;
   if (!role) return page('You can’t connect to this workspace', 'The workspace this app asked for does not exist, or you are not a member of it. Ask a team admin to add your address, then try again.', 403);
 
@@ -635,7 +637,7 @@ async function authorizeGet(c) {
     email: session.email,
     clientName: details.clientName, clientDomain: details.clientDomain,
     redirectHost: returnAddress(req.redirectUri), redirectIsLoopback: details.redirectIsLoopback, redirectIsApp: isAppLink(req.redirectUri),
-    workspaceName: role.name, workspaceSlug: workspace, roleName: role.role_name || role.role_id,
+    workspaceName: role.name, workspaceSlug: workspace, roleName: role.role_name || role.role_id, technicianApp: target.app,
     abilities: role.permissions.filter((k) => Object.hasOwn(ABILITIES, k)).map((k) => ABILITIES[k]),
     csrf: await csrfFor(c, 'session', session.idHash), handle: consent.handle,
   });
@@ -673,7 +675,8 @@ async function authorizePost(c) {
     if (problem) return askAgain(problem);
     // The handle is used up. Membership and the second factor are read again
     // now, so a change made while the page was open is honoured.
-    const workspace = c.oauth.workspaceForResource(c.origin, approved.request.resource);
+    const target = c.oauth.resourceTarget(c.origin, approved.request.resource);
+    const workspace = target ? target.workspace : null;
     const role = workspace ? await roleIn(c, session, workspace) : null;
     const gate = role && role.permissions.find(needsSecondFactor);
     const factorOk = !gate || (await authorizeSignIn(c.team, session, workspace, gate)).ok;
