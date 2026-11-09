@@ -5,6 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { agentWorld, BOSS, TECH, VIEW, LEAD, OTHER } from './agent-world.js';
+import { appWorld, skip } from './app-world.js';
 import { socket } from './device-sessions-world.js';
 import { oai } from './agent-fakes.js';
 import { EVENTS, KEEP_MS, notifyStore, readNotify } from '../src/notify.js';
@@ -409,4 +410,119 @@ test('a retried write adds nothing: the dedupe key is unique per person, and the
   assert.ok(rowsOf(w).every((r) => r.workspace === 'default'));
   assert.equal(w.sql("SELECT COUNT(*) AS n FROM audit WHERE kind LIKE '%notif%'")[0].n, 0);
   await assert.rejects(() => notify.recipients('default', 'nope', { to: [TECH] }), /unknown notification event/);
+});
+
+// ---- the feed and the settings, through /app ----------------------------------------------------------
+const appTest = (name, fn) => test(name, { skip }, fn);
+const feedWorld = (t) => appWorld(t, { handlerOptions: { notify: { pollMs: 20 } } });
+
+appTest('GET /notifications returns the person\'s own rows, oldest first, with a next id to ask after', async (t) => {
+  const w = await feedWorld(t);
+  await acme(w);
+  const tech = await w.connect(TECH, { app: true });
+  const boss = await w.connect(BOSS, { app: true });
+  assert.deepEqual((await w.appCall(tech.access, 'GET', '/notifications')).body, { items: [], next: 0 });
+  const first = await w.addPc({ status: 'pending', name: 'First' });
+  const second = await w.addPc({ status: 'pending', name: 'Second' });
+  await w.devs.requestJoin({ protocol: 1, workspace: 'acme', name: 'In another team' });
+
+  const feed = await w.appCall(tech.access, 'GET', '/notifications');
+  assert.equal(feed.status, 200);
+  assert.equal(feed.headers.get('cache-control'), 'no-store');
+  assert.equal(feed.body.items.length, 2);
+  const [a, b] = feed.body.items;
+  assert.deepEqual(Object.keys(a), ['id', 'event', 'at', 'title', 'body', 'device_id', 'task_id', 'session_id']);
+  assert.deepEqual([a.event, a.title, a.body, a.device_id, a.task_id, a.session_id, a.at], ['device_waiting', 'A PC is waiting for approval', 'First', first.id, null, null, w.now()]);
+  assert.deepEqual([b.body, b.device_id], ['Second', second.id]);
+  assert.ok(a.id < b.id);
+  assert.equal(feed.body.next, b.id);
+  // After the last id: nothing. After the first: the second.
+  assert.deepEqual((await w.appCall(tech.access, 'GET', `/notifications?after=${feed.body.next}`)).body, { items: [], next: b.id });
+  assert.deepEqual((await w.appCall(tech.access, 'GET', `/notifications?after=${a.id}`)).body.items.map((i) => i.id), [b.id]);
+  // BOSS has the same two (an admin), in this team only, and a feed of their own.
+  assert.equal((await w.appCall(boss.access, 'GET', '/notifications')).body.items.length, 2);
+  // Another team's feed is another list: the token is for one team.
+  const other = await w.connect(OTHER, { app: true, workspace: 'acme' });
+  assert.deepEqual((await w.appCall(other.access, 'GET', '/notifications', undefined, { slug: 'acme' })).body.items.map((i) => i.body), ['In another team']);
+  assert.equal((await w.appCall(other.access, 'GET', '/notifications')).status, 401, 'and not readable at the default team');
+});
+
+appTest('the feed refuses bad parameters, other methods, and a person who is not a member', async (t) => {
+  const w = await feedWorld(t);
+  const tech = await w.connect(TECH, { app: true });
+  for (const q of ['after=-1', 'after=x', 'after=1.5', 'wait_s=26', 'wait_s=-1', 'wait_s=abc']) {
+    const r = await w.appCall(tech.access, 'GET', `/notifications?${q}`);
+    assert.equal(r.status, 400, q);
+    assert.equal(r.body.error.code, 'bad_request');
+  }
+  assert.equal((await w.appCall(tech.access, 'POST', '/notifications', {})).status, 405);
+  assert.equal((await w.appCall(tech.access, 'DELETE', '/notifications', {})).status, 405);
+  assert.equal((await w.appCall(tech.access, 'POST', '/notifications/settings', {})).status, 405);
+  w.db.sqlite.prepare("DELETE FROM members WHERE identity = ?").run(TECH);
+  assert.equal((await w.appCall(tech.access, 'GET', '/notifications')).status, 403);
+  assert.equal((await w.appCall(tech.access, 'GET', '/notifications/settings')).status, 403);
+});
+
+appTest('a waiting feed request returns within 3 seconds of a new row, and comes back empty when its wait runs out', async (t) => {
+  const w = await feedWorld(t);
+  const tech = await w.connect(TECH, { app: true });
+  const started = performance.now();
+  const waiting = w.appCall(tech.access, 'GET', '/notifications?wait_s=2');
+  await new Promise((r) => setTimeout(r, 300));
+  await w.addPc({ status: 'pending', name: 'Late' });
+  const got = await waiting;
+  const took = performance.now() - started;
+  assert.equal(got.body.items.length, 1);
+  assert.equal(got.body.items[0].body, 'Late');
+  assert.ok(took < 3000, `returned in ${took.toFixed(0)} ms`);
+  assert.ok(took >= 280, 'it waited for the row');
+
+  const idle = performance.now();
+  const empty = await w.appCall(tech.access, 'GET', `/notifications?after=${got.body.next}&wait_s=2`);
+  const idleMs = performance.now() - idle;
+  assert.deepEqual(empty.body, { items: [], next: got.body.next });
+  assert.ok(idleMs >= 1800 && idleMs < 4000, `waited ${idleMs.toFixed(0)} ms`);
+  // A request that already has rows does not wait.
+  const instant = performance.now();
+  assert.equal((await w.appCall(tech.access, 'GET', '/notifications?wait_s=25')).body.items.length, 1);
+  assert.ok(performance.now() - instant < 1000);
+});
+
+appTest('GET and PATCH /notifications/settings: the person\'s switches and watched PCs, validated', async (t) => {
+  const w = await feedWorld(t);
+  await acme(w);
+  const tech = await w.connect(TECH, { app: true });
+  const view = await w.connect(VIEW, { app: true, factor: false });
+  const pc = await w.addPc({ name: 'Till' });
+  const theirs = await w.devs.requestJoin({ protocol: 1, workspace: 'acme', name: 'Theirs' });
+  const all = Object.fromEntries(EVENTS.map((e) => [e, true]));
+  const get = (token = tech.access) => w.appCall(token, 'GET', '/notifications/settings');
+  const patch = (body, token = tech.access) => w.appCall(token, 'PATCH', '/notifications/settings', body);
+
+  assert.deepEqual((await get()).body, { events: all, watch: [] });
+  assert.deepEqual((await patch({ events: { task_finished: false } })).body, { events: { ...all, task_finished: false }, watch: [] });
+  assert.deepEqual((await patch({ watch: [pc.id] })).body, { events: { ...all, task_finished: false }, watch: [pc.id] }, 'part of it');
+  assert.deepEqual((await get()).body.watch, [pc.id]);
+  assert.deepEqual((await get(view.access)).body, { events: all, watch: [] }, 'settings are the person\'s own');
+  // A Viewer may set their own too: the settings need membership, not a role.
+  assert.equal((await patch({ watch: [pc.id] }, view.access)).status, 200);
+
+  for (const [body, match] of [
+    [{}, /send events, watch or both/], [{ events: { nope: true } }, /unknown event/], [{ events: { task_finished: 1 } }, /true or false/],
+    [{ watch: ['x'] }, /PC ids/], [{ watch: [theirs.device_id] }, /PC ids from this team/], [{ extra: 1 }, /unknown setting/], [{ watch: Array(501).fill(pc.id) }, /at most 500/],
+  ]) {
+    const r = await patch(body);
+    assert.equal(r.status, 400, JSON.stringify(body).slice(0, 60));
+    assert.match(r.body.error.message, match);
+  }
+  assert.deepEqual((await get()).body.watch, [pc.id], 'a refused patch changes nothing');
+  assert.equal((await w.appCall(tech.access, 'PATCH', '/notifications/settings', undefined, { headers: { 'content-type': 'text/plain' } })).status, 415);
+  const text = await w.send('/app/w/default/notifications/settings', { method: 'PATCH', headers: { 'content-type': 'application/json', authorization: `Bearer ${tech.access}` }, body: 'not json' });
+  assert.equal(text.status, 400);
+  // The switch is honoured by the writer: no "waiting" row for someone who switched it off.
+  await patch({ events: { device_waiting: false } });
+  await w.addPc({ status: 'pending', name: 'Next' });
+  assert.deepEqual((await w.appCall(tech.access, 'GET', '/notifications')).body.items, []);
+  const boss = await w.connect(BOSS, { app: true });
+  assert.equal((await w.appCall(boss.access, 'GET', '/notifications')).body.items.length, 1);
 });

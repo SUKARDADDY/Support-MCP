@@ -34,7 +34,7 @@ const json = (obj, status = 200, extra = {}) =>
 export const fail = (status, code, message, extra) => json({ error: { code, message } }, status, extra);
 const notAllowed = (allow) => fail(405, 'method_not_allowed', `use ${allow}`, { allow });
 
-async function readBody(request, max = BODY_MAX) {
+export async function readBody(request, max = BODY_MAX) {
   const declared = request.headers.get('content-length');
   if (declared !== null && Number(declared) > max) throw new TeamError(400, 'bad_request', 'the request body is too large');
   const text = await request.text();
@@ -49,7 +49,7 @@ function decodeSegment(s) {
   try { return decodeURIComponent(s); } catch (_) { throw new TeamError(400, 'bad_request', 'bad path'); }
 }
 
-function intParam(url, name, def, min, max) {
+export function intParam(url, name, def, min, max) {
   const v = url.searchParams.get(name);
   if (v === null || v === '') return def;
   if (!/^\d+$/.test(v) || Number(v) < min || Number(v) > max) throw new TeamError(400, 'bad_request', `${name} must be a whole number from ${min} to ${max}`);

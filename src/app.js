@@ -10,13 +10,14 @@ import { VERSION } from './version.js';
 import { permissionForTool } from './permissions.js';
 import { DEFAULT_WORKSPACE, TeamError, teamFromEnv } from './workspace.js';
 import { registryName } from './registry.js';
-import { fail, handleApi } from './api.js';
+import { fail, handleApi, intParam, readBody } from './api.js';
 import { handleDevice } from './device-api.js';
 import { ID_RE, devicesFromEnv, linkCode, livePointer, parseDeviceKey } from './devices.js';
 import { deviceHooks, newCode } from './device-sessions.js';
 import { agentService } from './agent.js';
 import { agentStoreFromEnv } from './agent-store.js';
 import { sweep } from './sweep.js';
+import { WAIT_MAX_S, notifyStore, waitForFeed } from './notify.js';
 import { handleAuth } from './auth.js';
 import {
   AS_METADATA_PATH, PROTECTED_RESOURCE_PREFIX, REGISTER_PATH, TOKEN_PATH, assertPersonActive, assertSecondFactor, bearerToken,
@@ -689,6 +690,8 @@ async function runMcp(request, env, url, origin, devTtlMs, workspace, actor, oau
 //   /mcp     the same tools as /mcp, with the same checks for an OAuth caller
 //   /api/... the team API, limited to the routes the app uses (src/api.js)
 //   /teams   the teams the person belongs to
+//   /notifications            the person's feed, held open for up to 25 seconds
+//   /notifications/settings   which events they hear of, and which PCs they watch
 // and every route but /mcp first checks that the person is still a member.
 
 // The person behind an app token is still enabled and invited somewhere, and a
@@ -703,7 +706,7 @@ async function assertAppMember(env, team, workspace, caller) {
   if (!(await team.getMember(workspace, caller.email))) throw new TeamError(403, 'not_member', 'you are not a member of this team');
 }
 
-async function handleApp(request, env, url, origin, devTtlMs, workspace, rest, oauth) {
+async function handleApp(request, env, url, origin, devTtlMs, workspace, rest, oauth, notifyTuning) {
   if (request.headers.has('origin')) return fail(403, 'forbidden', 'cross-site requests are refused');
   const oauthOn = oauth ? oauth.available(env, url) : null;
   if (!oauthOn) return new Response('not found', { status: 404 });
@@ -734,6 +737,21 @@ async function handleApp(request, env, url, origin, devTtlMs, workspace, rest, o
       await assertAppMember(env, team, workspace, caller);
       return json({ teams: (await team.memberships(caller.email)).map(({ slug, name }) => ({ slug, name })) }, 200, noStore);
     }
+    if (rest === '/notifications') {
+      if (request.method !== 'GET') return fail(405, 'method_not_allowed', 'use GET', { allow: 'GET' });
+      await assertAppMember(env, team, workspace, caller);
+      const after = intParam(url, 'after', 0, 0, Number.MAX_SAFE_INTEGER);
+      const waitS = intParam(url, 'wait_s', 0, 0, notifyTuning?.maxWaitS ?? WAIT_MAX_S);
+      return json(await waitForFeed(notifyStore(env.DB, team), workspace, caller.email, { after, waitS }, notifyTuning), 200, noStore);
+    }
+    if (rest === '/notifications/settings') {
+      if (request.method !== 'GET' && request.method !== 'PATCH') return fail(405, 'method_not_allowed', 'use GET or PATCH', { allow: 'GET, PATCH' });
+      await assertAppMember(env, team, workspace, caller);
+      const store = notifyStore(env.DB, team);
+      return json(request.method === 'GET'
+        ? await store.settings(workspace, caller.email)
+        : await store.patchSettings(workspace, caller.email, await readBody(request)), 200, noStore);
+    }
     throw new TeamError(404, 'not_found', 'not found');
   } catch (e) {
     if (e instanceof TeamError) return fail(e.status, e.code, e.message, e.status === 503 ? { 'retry-after': '1' } : undefined);
@@ -757,7 +775,9 @@ async function oauthRoute(serve) {
 // addresses admit only Access logins, service tokens and the local bypass.
 // For tests: fetch replaces the network for the sign-in providers and the mail
 // provider; mailer replaces the one chosen by MAIL_PROVIDER (null = none);
-// oauthTuning sets how long OAuth keeps its list of workspace addresses.
+// oauthTuning sets how long OAuth keeps its list of workspace addresses; notify
+// ({ pollMs, sleep, maxWaitS }) sets how often a waiting notification feed looks
+// again and the longest wait it accepts.
 export function createHandler(agentText, appBundle = null, options = {}) {
   const oauth = options.oauth ? createOAuth(options.oauth, options.oauthTuning) : null;
   return {
@@ -790,7 +810,7 @@ export function createHandler(agentText, appBundle = null, options = {}) {
       if (wm && wm[1] !== DEFAULT_WORKSPACE) return handleMcp(request, env, url, origin, devTtlMs, wm[1], oauth);
       // The technician app's own address: a bearer token for it, never an Access login.
       const am = APP_ROUTE.exec(p);
-      if (am) return handleApp(request, env, url, origin, devTtlMs, am[1], am[2] ?? '', oauth);
+      if (am) return handleApp(request, env, url, origin, devTtlMs, am[1], am[2] ?? '', oauth, options.notify);
       // OAuth: the authorization server's own addresses and the protected
       // resource documents. They answer 404 when OAuth is not set up.
       if (p === AS_METADATA_PATH || p === TOKEN_PATH || p === REGISTER_PATH) {

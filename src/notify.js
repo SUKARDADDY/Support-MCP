@@ -21,6 +21,9 @@ export const EVENTS = Object.freeze(['task_finished', 'task_problem', 'session_d
 export const WATCH_MAX = 500;
 export const FEED_LIMIT = 50;
 export const KEEP_MS = 30 * 24 * 60 * 60 * 1000;
+// A feed request may wait this long for a new row, checking the database every POLL_MS.
+export const WAIT_MAX_S = 25;
+export const POLL_MS = 2000;
 // A saved PC's id (src/devices.js ID_RE, repeated here so the two files do not import each other).
 const ID_RE = /^[a-z2-7]{20}$/;
 const TITLE_MAX = 120;
@@ -143,4 +146,17 @@ export function notifyStore(db, team) {
   }
 
   return { recipients, rows, statements, write, feed, settings, patchSettings, prune };
+}
+
+// The feed, held open: the rows after `after` if there are any, otherwise a check every
+// pollMs until there are or waitS seconds have passed (then an empty page). The waits are
+// counted, not timed, so a test with a frozen clock still ends. tuning is for tests:
+// { pollMs, sleep } (the handler's notify option also takes maxWaitS).
+export async function waitForFeed(store, slug, identity, { after, waitS }, { pollMs = POLL_MS, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
+  let page = await store.feed(slug, identity, { after });
+  for (let left = Math.floor((waitS * 1000) / pollMs); !page.items.length && left > 0; left--) {
+    await sleep(pollMs);
+    page = await store.feed(slug, identity, { after });
+  }
+  return page;
 }
