@@ -91,6 +91,8 @@ work in the request path; use the WebSocket Hibernation API
 | `GET /.well-known/oauth-protected-resource[/mcp\|/w/<slug>/mcp]` | none | RFC 9728 documents; 404 for a workspace that does not exist |
 | `GET`, `POST /oauth/authorize` | browser sign-in | the consent page; see [OAuth](#oauth-for-mcp-clients) |
 | `/api/v1/w/<slug>/...` | Access JWT | the team API (below) |
+| `POST /app/w/<slug>/mcp`, `/app/w/<slug>/api/...`, `GET /app/w/<slug>/teams`, `GET /app/w/<slug>/notifications`, `GET`, `PATCH /app/w/<slug>/notifications/settings` | a bearer token made for the technician app | the technician app's routes ([below](#the-technician-apps-routes-appwslug)). `<slug>` may be `default`. Bearer only, no `Origin`, JSON on writes, members only |
+| `GET /.well-known/oauth-protected-resource/app/w/<slug>` | none | RFC 9728 document for the app's address; 404 for a workspace that does not exist |
 | `POST /device/pair`, `/device/hello`, `/device/update`, `/device/leave` | none (pair) or a device key in `Authorization: Bearer` | the PC wire for saved PCs ([below](#the-pc-wire-device)). Public: not under any Access app. 403 over plain `http:` except loopback, 405 other methods, 403 on any `Origin` header, 400 on `?key=` or `?code=`, 415 non-JSON, 413 over 8 KB |
 | `GET /device/ring?protocol=1` | a device key in `Authorization: Bearer` | the doorbell, a WebSocket upgrade ([below](#the-doorbell)). Public, with the refusals of the PC wire |
 | `GET`, `POST`, `DELETE /api/v1/w/<slug>/stop` | Access JWT | read, set and clear a workspace's stop ([below](#stop-and-resume)) |
@@ -256,7 +258,9 @@ The same gate as `/mcp`, before any database access: an `Origin` header → 403
 405; then the Access JWT, failure → 403 `forbidden`. The slug `default`
 always exists. Any other slug exists once it has a row in `workspaces`. A slug
 that does not, or is malformed, is 404 `not_found` before any permission is
-looked at, and so is any other unknown path. Bodies are JSON objects of at most
+looked at, and so is any other unknown path. (The technician app reaches a part of this
+API through its own address, `/app/w/<slug>/api`, [below](#the-technician-apps-routes-appwslug);
+the Access gate here is unchanged and a bearer token is still 403.) Bodies are JSON objects of at most
 16,384 characters (32,768 on the customer, site and device routes, which carry
 custom fields). Every answer is JSON with `Cache-Control: no-store`, and every
 error is `{"error":{"code","message"}}`.
@@ -872,6 +876,11 @@ own refusals.
   relay checks the token's shape and that its user id (the first segment) is an
   enabled person in D1; anything else is 401 `invalid_token` with no KV read, and
   a D1 failure is 503.
+- **The technician app's address.** `<origin>/app/w/<slug>` is a second kind of
+  resource, one per workspace and `default` too, for the technician app
+  ([below](#the-technician-apps-routes-appwslug)). It is never added to the list
+  above: a request that names one gets a server that declares only it, so the build time
+  stays that of the list alone. A token for one kind is refused on the other.
 - **Endpoints** the library serves: `/.well-known/oauth-authorization-server`
   (without `protected_resources`), `/oauth/token` (code, refresh, revocation) and
   `/oauth/register`. Requests for them on another host are 404.
@@ -913,6 +922,90 @@ own refusals.
   the MCP addresses only, an Access JWT for it is accepted next to `ACCESS_AUD`.
   An OAuth caller is checked with `authorize(..., { membersOnly: true })`, so an
   empty `default` neither admits nor records it.
+
+## The technician app's routes (`/app/w/<slug>`)
+
+Code: `src/app.js` (`handleApp`), `src/oauth.js`, `src/api.js`, `src/agent-api.js`,
+`src/notify.js`. The technician app (a Windows program for the team's technicians) is
+an OAuth client of the relay, like an MCP client, with an address of its own.
+
+**The grant.** The app's resource is `<origin>/app/w/<slug>` for every workspace,
+`default` included. It registers as a public client (`token_endpoint_auth_method: none`)
+with a loopback redirect (`http://127.0.0.1/callback`), and any port on a loopback host
+matches (the library's rule). An authorization request names exactly one resource, an
+MCP address or an app address. The OAuth server is built with only the resource a
+request names: a request for an app address (in the authorize query, the token request's
+`resource`, or, when a refresh names none, the resource of the grant its token names) gets a
+server that declares that one address, and the MCP list of every workspace is never
+extended with the app's addresses. The library checks its list pairwise, so a server for
+500 workspaces takes about 220 ms to build and 1,000 addresses about 900 ms. The consent page
+for an app address reads: "Support technician app: works as you in `<team>`, including seeing PCs
+and their screens, pairing and approving PCs, changing how they can be reached, and starting
+agent tasks. It can't change members, roles or agent keys. Only approve this if you just
+started signing in from the app." The membership and second-factor rules of the MCP consent
+page apply unchanged. Grant props are the same, `{ user_id, email, workspace, factor }`.
+
+**The gate**, in this order. An `Origin` header → 403 `forbidden`. Other methods than `GET`,
+`POST`, `PATCH` and `DELETE` → 405. A write without `Content-Type: application/json` → 415.
+No `Authorization: Bearer` → 401 with `WWW-Authenticate: Bearer
+resource_metadata="<origin>/.well-known/oauth-protected-resource/app/w/<slug>"`. A token
+that fails (expired, revoked, for another address or workspace, malformed, or an MCP
+token) → 401 with `error="invalid_token"` added; KV or D1 failing → 503. There is no Access
+or cookie path. `checkBearer(env, origin, workspace, token, { app })` checks the token for the
+app address or the MCP address and for nothing else, and the grant's `workspace` must equal
+the path's. A passing app token is remembered in memory for 60 seconds (keyed by the SHA-256 of the token,
+at most 500 entries), so a token that was revoked can work on `/app` for up to a minute
+after the isolate last checked it; sign out everywhere clears the isolate's memory. MCP tokens
+are never remembered.
+
+**Routes** (all answers JSON, `Cache-Control: no-store`):
+
+| Route | What |
+|---|---|
+| `POST /app/w/<slug>/mcp` | the MCP handler of `/mcp`, with the same tools, role, second-factor, mode and stop checks for an OAuth caller (`?ui=` works as there) |
+| `/app/w/<slug>/api[/...]` | the team API router, as `/api/v1/w/<slug>[/...]`, limited to what the app uses: the root (who you are), `customers`, `sites`, `devices`, `fields` (`GET` of the list only), `pairing` and `agent/tasks[/...]`. Members, roles, `audit`, `stop`, `agent` settings and `agent/models` answer 404 `not_found`, as does anything else |
+| `GET /app/w/<slug>/teams` | `{"teams":[{"slug","name"}]}`: the caller's memberships, `default` included when they are a member |
+| `GET /app/w/<slug>/notifications?after=<id>&wait_s=0..25` | `{"items":[{"id","event","at","title","body","device_id","task_id","session_id"}],"next":<id>}`, the caller's own, oldest first, at most 50 after `after`. With `wait_s` and no item, the relay looks again every 2 seconds until there is one or the wait ends, then answers `{"items":[],"next":<after>}` |
+| `GET`, `PATCH /app/w/<slug>/notifications/settings` | `{"events":{"<event>":bool},"watch":["<device id>"]}`. Every event is on until switched off. A `PATCH` may send part: events not named keep their value, and `watch` replaces the list (at most 500 ids, all PCs of this team). Unknown events or fields, and a non-boolean, are 400 |
+| `GET /app/w/<slug>/api/agent/tasks/<id>/frame` | `{"rev","at","mime":"image/jpeg"\|"image/png","data":"<base64>"}`, the last full screenshot the task took (never a zoom). 404 `no_frame` when there is none yet or the task has ended; 403 for anyone but the task's starter or the current driver of its session, and for a role without `sessions.control`; 409 `stopped` and 503 `relay_stopped` as for a screenshot |
+
+**Every call checks the caller live**, as an OAuth tool call does: the account exists and is
+enabled, the person is invited somewhere, and is a real member of this workspace (open mode
+never admits the app, and an empty `default` neither admits it nor records it). On the team
+API a permission is checked with `authorize(..., { membersOnly: true })`, and one that needs
+a second factor (`FACTOR_PERMISSIONS`) needs the authenticator the grant was made with,
+else 403 `second_factor`. The agent routes pass the caller's account as the task's person:
+a task started from the app checks that person (active, a member holding `sessions.control`)
+before each model call, as for a task started with `agent_start` over OAuth.
+
+**The frame** is a field of the `AgentTask` object: memory only, never its storage, D1 or KV.
+It holds the last full screenshot a tool returned (a `zoom` never replaces it), is dropped
+when the task ends, and is lost if the object is evicted (then 404 `no_frame` until the task
+takes another). Taking a picture bumps the task's status `rev`, which a waiting status
+read sees. The relay does not store the picture in the Session or Registry either.
+
+**Notifications.** One row per person per event in `notifications` (migration
+`0007_notify.sql`), for members who are people, never service tokens. The events and who gets them:
+
+| Event | When | To |
+|---|---|---|
+| `task_finished` | a task ends `done` | the starter |
+| `task_problem` | a task ends `stuck` or `failed`, or the relay stops it (2 minutes unwatched, key or caps removed, someone else took over, and so on), or its cleanup gave up on ending the PC's session | the starter |
+| `session_declined` | a saved PC's person declined, nobody was there, the PC was busy, or the owner ended it, and no running task holds the session | the session's driver |
+| `device_online` | a watched PC's doorbell returns after 10 minutes or more away | its watchers |
+| `device_missing` | a PC removes itself; or it has no doorbell and its `last_seen` is over 7 days old | its watchers, and for a PC that left also holders of `devices.manage` |
+| `device_waiting` | a PC asks to join | holders of `devices.manage` |
+
+A person's own settings can switch an event off, and `device_online` and `device_missing` for a
+watched PC go only to people who watch it. Each row is written in the same batch as the change that
+caused it (the end of a task, a PC joining or leaving, a session's end), so it exists exactly when
+the change does. The ones with no change of their own are written alone: a PC coming online (from the
+Registry, which learns its workspace from the Worker's hand-off and records when a PC's last
+doorbell closed), a task whose cleanup gave up, and the hourly run (`scheduled` in `src/app.js`,
+`src/sweep.js`, a Cron Trigger in `wrangler.toml`), which also deletes rows older than 30 days. A
+`dedupe` key per occurrence, unique per person, makes a retry add nothing; for a missing PC it is
+the PC plus its `last_seen`, so it is told of once. The team log is not written. Title and body are
+plain text and may repeat text from a customer's PC.
 
 ## Session state machine (Session DO)
 
@@ -1311,7 +1404,12 @@ chars` (a length, never the text), `key ctrl+s`, `wait 2s`, `zoom 1,2,3,4`,
 `ui_tree`, `ui_act invoke 12` (the verb and ref, never the value),
 `block_input on 10m` or `block_input off`, `send_sas`, and `type_secret` with
 no length and no text. A non-zero display adds ` display <n>` (not for
-`type_secret`). A `control` row is `request_full_control`. Screenshots and
+`type_secret`). A screenshot that is the same person's, of the same size and
+display, and comes within 60 seconds of the log's last row (itself such a
+screenshot) is not a new row: it makes that row `screenshot 1280x800 (x3)` and
+moves its time to the latest. The app takes a picture every few seconds while a
+tab is open. Nothing else is merged: not a click between them, not another
+person, not `via agent` with the person's own, not a failed screenshot. A `control` row is `request_full_control`. Screenshots and
 every other image are never stored: not in SQLite, not in the registry, not in
 a log. The relay does not write to the Worker log at all, so tool arguments and
 results can not reach it. A `hello` row holds the stored, truncated machine
@@ -1988,6 +2086,13 @@ never update themselves.
     agent's actions as the starter's, marked `via agent`. `test/agent-*.test.js`
     drive this against fake providers; the live checks are in the PR 7 plan.
 
+13. Technician app's routes: `test/app-access.test.js` signs in with the real OAuth library
+    as the app does (a public client, `http://127.0.0.1/callback`, port 53122, resource
+    `/app/w/default`), uses the token on `/app/w/default/api/devices` and
+    `/app/w/default/mcp`, and finds it a 401 on `/mcp` and an MCP token a 401 on `/app`.
+    `test/notify.test.js` covers the six events, the feed and the settings, and
+    `test/agent-frame.test.js` the picture, including that no storage holds image bytes.
+
 ## Must keep
 
 - `/healthz` stays public and 200.
@@ -2035,4 +2140,14 @@ never update themselves.
 - The relay never stores a screenshot or typed text for the agent either: the
   conversation lives in the task object's memory, and the stored step records
   hold only the verb and a short detail.
+- The technician app's routes take a bearer token made for the app's address and nothing
+  else, refuse an `Origin` header, need JSON on a write, and serve members only. An MCP
+  client's token is a 401 on `/app`, and the app's is a 401 on `/mcp`. `/api/v1` stays
+  Access-only. The app reaches only the allowlisted part of the team API, holds the second
+  factor a permission needs, and starts agent tasks as a person the task checks at every step.
+- The agent's last picture is held in the task object's memory only, read by the task's
+  starter or its session's driver with `sessions.control` and the second factor, and dropped
+  when the task ends.
+- Notifications are written with the event that causes them, go only to members who are
+  people, are never part of the team log, and are deleted after 30 days.
 - No secrets in the repo: `.dev.vars` gitignored; attach keys stored hashed.

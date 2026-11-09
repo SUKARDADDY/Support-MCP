@@ -866,7 +866,8 @@ apply to only one client say which.
     request, from every client, and refuses the request on the authorize page
     when it is missing, is `plain`, or has no method. It checks again when the
     person presses Allow, where the code is made. Redirect addresses must match
-    the registration exactly, and may be `https`, `http` on loopback, or an
+    the registration exactly (a loopback address matches on any port, as RFC 8252
+    allows), and may be `https`, `http` on loopback, or an
     RFC 8252 app link such as `cursor://` (`allowPrivateUseRedirectUris`; safe
     only because PKCE is mandatory). Access tokens last one hour. Refresh tokens
     last 30 days from approval, as one fixed limit. The library accepts the
@@ -943,6 +944,35 @@ apply to only one client say which.
     keys each time its access token is refreshed, once an hour, about 48 writes
     a day if it is active around the clock. About 20 such clients use the 1,000
     free writes a day.
+  - **The technician app has its own address and grant.** The app (a Windows program the
+    team's technicians run) signs in through the same consent page, for the resource
+    `<origin>/app/w/<slug>` instead of an MCP address, so its token is a different
+    grant: a 401 on `/mcp` and `/w/<slug>/mcp`, while an MCP client's token is a 401 on
+    `/app`. The consent page says what the app can do (see PCs and their screens, pair
+    and approve PCs, change how they can be reached, start agent tasks) and that it
+    cannot change members, roles or agent keys, and asks the person to approve only if
+    they just started signing in from the app. The app is a public client that registers
+    itself, so any program on the PC can claim to be it; what protects the person is
+    that they approve on that page, and an AI client cannot widen its own token to the
+    app's address, so a prompt-injected AI client cannot approve a PC. Every `/app` route
+    takes a bearer token only (no Access login, no cookie), refuses an `Origin` header,
+    needs JSON on a write, and serves members only. `/api/v1` stays Access-only, and a
+    bearer token there is still 403. The app reaches only an allowlisted part of the team
+    API: who you are, customers, sites, PCs, custom fields (read only), pairing codes and
+    the agent's tasks. Members, roles, the team log, stop and resume, and the agent's
+    settings, models and keys answer 404 there, even for an admin. On the routes it does
+    reach, the app is held to what an OAuth caller on MCP is: a real member (never open
+    mode), the person still active on every call, and for a permission that needs a second
+    factor, the authenticator the grant was made with (else 403 `second_factor`). A task
+    started from the app is the person's: every step checks that they are still an active
+    member holding `sessions.control`.
+  - **The app's token is remembered for a minute.** To save the free plan's KV reads, a
+    token the relay has just checked for the app's address is kept in memory for 60
+    seconds, keyed by the SHA-256 of the token (at most 500 entries). So a grant that was
+    revoked can work on `/app` for up to a minute in an isolate that checked it just
+    before; signing out everywhere clears the isolate that handles it. The person, their
+    membership and their role are read from D1 on every call, so removing someone, or
+    disabling their account, takes effect at once. MCP tokens are never remembered.
   - **The workspace list is capped and refreshed on a miss.** The OAuth server
     lists every workspace address, and the library checks that list pairwise, so
     creating a workspace past 500 is refused with `409 workspace_limit`. The list
@@ -966,6 +996,35 @@ apply to only one client say which.
     second app whose policies are Service Auth for the service token, then
     Bypass for everyone. Service tokens keep working on the MCP addresses in
     both modes.
+- **The agent's last picture is held in memory, and read on the terms of a screenshot.**
+  While a built-in agent task works, the technician's app shows the last full screenshot the
+  agent took (`GET .../agent/tasks/<id>/frame`). It is a field of the task's Durable Object:
+  never its storage, D1 or KV, never a Session or Registry, and it is dropped when the task
+  ends or the object is evicted. A zoom never replaces it. Only the task's starter or the
+  current driver of its session can read it, and only as a real member holding
+  `sessions.control` who passes the second factor, so nobody sees a PC's screen through the
+  app who could not take a screenshot. It is not served while the workspace or the relay is
+  stopped. A test asserts that no D1 row, KV value, Durable Object storage entry or statement
+  holds image bytes. The picture goes to the app's window and nowhere else; the AI provider
+  already sees the same screenshots (see the built-in agent section).
+- **Notifications hold names and short texts, and are kept 30 days.** The `notifications`
+  table has one row per person per event: the workspace, the recipient's identity (a member
+  who is a person; service tokens get none), the event, a time, the ids of the PC, task or
+  session, a title and a body of a few words. The body can repeat a PC's name or a task's
+  first line, which come from people and from the PC, so the app shows them as text. A row
+  is written in the same batch as the change that causes it, is never part of the team log,
+  and is deleted after 30 days by an hourly Cron Trigger. Another team's members never see it:
+  every read filters by workspace and recipient. A member's switches and watched PCs are in
+  `members.notify`.
+- **The free plan's allowances, for the app.** The feed holds each call open up to 25 seconds,
+  so one person with the app open around the clock makes about 3,500 feed calls a day, and
+  each open session tab asks for a picture every 3 seconds, about 1,200 requests an hour. The
+  free plan allows 100,000 Worker requests a day, so a handful of busy tabs and people can use
+  it up, and Cloudflare then refuses requests until the next day. Each call with the
+  app's token reads KV once, against 100,000 reads a day, unless the token was checked in the
+  last 60 seconds (above); with that, a feed alone costs about 1 KV read a minute. A team that
+  uses the app all day should be on the paid plan. Each waiting feed call also makes about 12 D1
+  reads over its 25 seconds, and a few more for its checks, against a D1 allowance far above KV's.
 - **What sign-in stores.** `users` (email), `user_identities` (provider, the
   provider's id, the email seen at link time), `login_sessions` (hash of the
   cookie, times, when the second factor passed), `email_links` (hashes, address,

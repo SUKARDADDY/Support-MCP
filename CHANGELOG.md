@@ -5,6 +5,43 @@ All notable changes to Support-MCP are listed here. The format follows
 [Semantic Versioning](https://semver.org). It stays at 0.x until Stage 1 is safe
 to run on unattended customer PCs.
 
+## [Unreleased]
+
+The relay side of the technician app (the Windows app itself comes in the next release).
+The version stays 0.7.0.
+
+### Added
+
+- The technician app's own sign-in. It uses the same consent page and OAuth server as an MCP
+  client, for the resource `<origin>/app/w/<slug>` (every workspace, `default` too), so its
+  token is a different grant: a 401 on `/mcp` and `/w/<slug>/mcp`, while an MCP client's token
+  is a 401 on `/app`. The consent page says what the app can do and what it cannot. A request
+  that names an app address gets an OAuth server that declares only that address, and a token
+  the relay has just checked is remembered in memory for 60 seconds, to save free-plan KV reads.
+- Routes under `/app/w/<slug>`: `POST .../mcp` (the same tools as `/mcp`), `.../api/...` (the
+  team API, limited to who you are, customers, sites, PCs, custom fields to read, pairing
+  codes and the agent's tasks), `GET .../teams`, `GET .../notifications` (held open for up to
+  25 seconds) and `GET` and `PATCH .../notifications/settings`. Every route takes a bearer token
+  only, refuses an `Origin` header, needs JSON on writes, serves members only (never open mode),
+  and holds the caller to the second factor a permission needs. `/api/v1` stays Access-only.
+- The agent's last picture: `GET /app/w/<slug>/api/agent/tasks/<id>/frame` returns the last full
+  screenshot a task took, for the task's starter or its session's driver. It is held in the task's
+  memory only, never stored, and gone when the task ends.
+- Notifications for six events: task finished, task needs attention, session ended early, PC
+  online, PC missing and PC waiting for approval. Rows go to members who are people, in the same
+  batch as the change that causes them. Migration `0007_notify.sql` adds the `notifications` table
+  and `members.notify`. Apply it before you deploy this version. An hourly Cron Trigger
+  (`[triggers]` in `wrangler.toml`) finds PCs not seen for 7 days and deletes notifications older
+  than 30 days. If you deploy with a copy of `wrangler.toml`, add the trigger to the copy.
+- A Registry notes when a PC's doorbell goes away, and the Worker tells it the workspace.
+
+### Changed
+
+- The session log folds a run of identical screenshots by one person, within a minute of each
+  other, into one row: `screenshot 1280x800 (x3)`. Nothing else is merged.
+- `docs/mcp-clients.md` now says that a loopback redirect address matches on any port, which the
+  library has always done.
+
 ## [0.7.0] - 2026-11-09
 
 ### Added

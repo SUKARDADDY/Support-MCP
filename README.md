@@ -656,6 +656,21 @@ credential, or a failed token, gets 401 with a `WWW-Authenticate` header that
 leads the client to sign in. Setup, the other clients, the free-plan KV limits
 and local testing are in [docs/mcp-clients.md](docs/mcp-clients.md).
 
+### The technician app's address
+
+The technician app signs in the same way, but for its own address,
+`/app/w/<slug>` (`default` has one too), so its sign-in is a different grant from an AI
+client's. The consent page says the app works as you, including seeing PCs and their screens,
+pairing and approving PCs, changing how they can be reached and starting agent tasks, and
+that it cannot change members, roles or agent keys. A token for the app is a 401 on `/mcp`,
+and an MCP client's token is a 401 on `/app`. Every `/app` route takes a bearer token only
+(no Access login, no cookie), refuses an `Origin` header, needs a JSON content type on a
+write, and serves members only, never open mode. A permission that needs a second factor
+needs the authenticator the app's sign-in was made with, and the built-in agent's tasks
+started from the app check the person at every step, exactly as they do for an MCP client.
+A new `scheduled` handler runs hourly (a Cron Trigger in `wrangler.toml`); see
+[Deploy your own](#deploy-your-own).
+
 ## Architecture
 
 ```mermaid
@@ -681,6 +696,9 @@ flowchart LR
 | `POST /mcp` | Cloudflare Access, then the caller's role | MCP JSON-RPC 2.0, stateless HTTP, for the `default` workspace |
 | `POST /w/<slug>/mcp` | Cloudflare Access, then the caller's role | the same endpoint for another workspace |
 | `/api/v1/w/<slug>/...` | Cloudflare Access, then the caller's role | the team API: members, roles, the team log, stop and resume, customers, sites, saved PCs, custom fields, pairing codes, and the built-in agent's settings, models and tasks |
+| `POST /app/w/<slug>/mcp` | a bearer token made for the technician app, then the caller's role | the same tools as `/mcp`, for the technician app. Any workspace, `default` included. An MCP client's token is a 401 here |
+| `/app/w/<slug>/api/...` | the app's bearer token, then the caller's role and second factor | the part of the team API the app uses: who you are, customers, sites, saved PCs, custom fields (read only), pairing codes, and the built-in agent's tasks. Members, roles, the team log, stop and the agent's settings and models answer 404 here. `GET .../api/agent/tasks/<id>/frame` returns the last full screenshot the agent took |
+| `GET /app/w/<slug>/teams`, `GET /app/w/<slug>/notifications`, `GET` and `PATCH /app/w/<slug>/notifications/settings` | the app's bearer token, a member | the person's teams, their notification feed (held open up to 25 seconds for a new item), and which of the six events they hear of and which PCs they watch |
 | `POST /device/pair`, `hello`, `update`, `leave` | public, https only; a saved PC's key in a header (pair: a pairing code or a workspace in the body) | the PC's side of saved devices. Not behind Access |
 | `GET /device/ring?protocol=1` | public, https only; a saved PC's key in a header | the doorbell: a WebSocket the relay rings when the PC should check in. Not behind Access |
 | `POST /api/v1/w`, `GET /api/v1/w` | Cloudflare Access, a deployment admin to create | create a workspace, list yours |
@@ -707,11 +725,12 @@ keyed by workspace. So do the built-in agent's settings and tasks.
 | `src/agent.js`, `src/agent-api.js`, `src/agent-store.js` | the built-in agent: starting, following and controlling tasks, its settings and models, its team API routes and its D1 queries |
 | `src/agent-task.js`, `src/agent-providers.js`, `src/agent-check.js` | the `AgentTask` Durable Object (one step per alarm), the OpenAI and Claude adapters, and the check a new model passes |
 | `src/agent-models.js`, `src/agent-tools.js` | the model table with its prices and the cost arithmetic, and the tools the agent's model sees |
-| `migrations/` | the D1 tables, applied in name order: `0001_team.sql` (members, roles, callers, the team log, each keyed by workspace), `0002_workspaces.sql` (the workspaces table and an index on members by identity), `0003_signin.sql` (people, sign-ins, links and authenticators) `0004_devices.sql` (customers, sites, devices, custom field definitions and pairing codes), `0005_device_sessions.sql` (the live session pointer on a device) and `0006_agent.sql` (the built-in agent's settings and tasks) |
+| `migrations/` | the D1 tables, applied in name order: `0001_team.sql` (members, roles, callers, the team log, each keyed by workspace), `0002_workspaces.sql` (the workspaces table and an index on members by identity), `0003_signin.sql` (people, sign-ins, links and authenticators) `0004_devices.sql` (customers, sites, devices, custom field definitions and pairing codes), `0005_device_sessions.sql` (the live session pointer on a device) `0006_agent.sql` (the built-in agent's settings and tasks) and `0007_notify.sql` (notifications, and each member's notification settings) |
 | `src/mcp.js` | JSON-RPC dispatch, the tool schemas, and the mapping of each screen tool to one normalized action |
 | `src/screen.js` | the screen actions, their audit text, and the strict check of every field an app result may carry |
 | `src/jwt.js` | RS256 verification of the Access JWT with WebCrypto |
 | `src/template.js` | builds the served script and the downloaded executable, validates every value placed in them, and maps the mode aliases |
+| `src/notify.js`, `src/sweep.js` | notifications for the technician app: who hears of each of the six events, the rows, the feed and each member's settings; and the hourly run that finds PCs missing for 7 days and deletes notifications older than 30 days |
 | `src/agent-app.cs` | the Windows app: C# source for .NET Framework 4.5.2 or later. One exe with several roles: the customer's app (WPF window, dialogs, HTTPS polling client with two lanes, normal-mode screen control), `--elevate-install`, the full-control `--service`, the SYSTEM `--helper` that runs screen operations on the console session, and the `--window` corner window. For a saved PC it also has the setup wizard (no arguments, with a device footer), `--device-install`, the `--device-service` (which also hosts a session), the `--device-ask` question, the `--tray` and `--uninstall` with `--device-remove` |
 | `src/agent-app.manifest` | the app's `asInvoker` manifest. The app asks for elevation only through `--elevate-install`, after the customer started it |
 | `src/app-bundle.json` | the compiled x86 app with the SHA-256 of its source and manifest. Tests fail when the source changed without a rebuild |
@@ -791,7 +810,11 @@ deploy without Windows. You need Windows only to change the app: see
    see [Sign and deploy a release](docs/development.md#sign-and-deploy-a-release).
    With the bundle of a tagged release unchanged, you can use the signature and
    the `released` time from that GitHub release. If you build your own app, it
-   needs your own release key.
+   needs your own release key. The file also has one Cron Trigger, hourly. It
+   finds saved PCs that have not been seen for 7 days and deletes notifications
+   older than 30 days. If you deploy with a copy of the file, give the copy the
+   same `[triggers]` block. A free account allows a few Cron Triggers in all, so
+   check how many it already uses.
 4. **Harden the zone.** Turn on **Always Use HTTPS** for the zone (SSL/TLS,
    Edge Certificates), so a link pasted without `https://` is redirected. The
    relay refuses `/j`, `/ws` and `/device/` over plain http either way. The relay
@@ -929,6 +952,13 @@ check are in [docs/development.md](docs/development.md).
   command. On the free plan a Durable Object's 13,000 GB-s a day allow about 14 fully
   active two-hour tasks a day. Like saved PCs, it stays off real customers' unattended
   machines until the release that enforces the saved-PC rules.
+- The technician app uses the free plan's allowances (100,000 Worker requests and
+  100,000 KV reads a day). Its notification feed holds each call open for up to 25
+  seconds, so one person with the app open around the clock makes about 3,500 feed
+  calls a day. An open session tab asks for a new picture every 3 seconds, about
+  1,200 requests an hour. Each call with the app's token reads KV once, except that
+  a token the relay has just checked is remembered for 60 seconds. The security
+  model has the arithmetic.
 - Cloudflare Access, or the relay's OAuth for MCP clients, decides who can reach
   the relay, and each workspace's roles decide what its members can do.
   `session_list` lists the sessions of the workspace you called it on. A session
