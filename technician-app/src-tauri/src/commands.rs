@@ -5,6 +5,7 @@ use crate::error::CoreError;
 use crate::feed::AccountItem;
 use crate::relay::ToolOutput;
 use crate::store::Prefs;
+use crate::update::{UpdateStatus, Updater};
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
@@ -86,4 +87,16 @@ pub fn autostart_set(app: tauri::AppHandle, enabled: bool) -> Result<(), CoreErr
     let launch = app.autolaunch();
     let done = if enabled { launch.enable() } else { launch.disable() };
     done.map_err(|_| CoreError::other("Could not change the start setting."))
+}
+
+/// What the updater knows: the running version, a newer one found or kept, and the last check.
+#[tauri::command]
+pub fn update_status(updater: State<'_, Arc<Updater>>) -> UpdateStatus {
+    updater.status()
+}
+
+/// Checks for a newer signed release now. A found installer is kept and runs at the next start.
+#[tauri::command]
+pub async fn update_check(updater: State<'_, Arc<Updater>>) -> Result<UpdateStatus, CoreError> {
+    Ok(updater.inner().clone().check().await)
 }

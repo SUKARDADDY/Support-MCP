@@ -53,6 +53,10 @@ impl Resp {
         Resp { status, headers: vec![("content-type".into(), "application/json".into())], body: v.to_string(), delay_ms: 0 }
     }
 
+    pub fn text(status: u16, body: &str) -> Resp {
+        Resp { status, headers: vec![("content-type".into(), "application/octet-stream".into())], body: body.to_string(), delay_ms: 0 }
+    }
+
     pub fn header(mut self, k: &str, v: &str) -> Resp {
         self.headers.push((k.into(), v.into()));
         self

@@ -12,6 +12,7 @@ pub mod platform;
 pub mod relay;
 pub mod seal;
 pub mod store;
+pub mod update;
 #[cfg(test)]
 mod testkit;
 
@@ -50,11 +51,17 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec![platform::BACKGROUND_ARG])))
         .setup(|app| {
+            let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+            // A verified update kept from the last run is installed first: it replaces the
+            // app's files, so this copy exits as soon as the installer has started.
+            let updater = update::Updater::new(update::UpdateConfig::production(env!("CARGO_PKG_VERSION"), dir.clone())?, Arc::new(update::SilentInstaller));
+            if !cfg!(feature = "e2e") && updater.apply_staged() {
+                std::process::exit(0);
+            }
             let window = build_main_window(app, platform::started_in_background(std::env::args()))?;
             platform::keep_in_tray(&window);
             platform::build_tray(app.handle())?;
             let handle = app.handle().clone();
-            let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
             let store = Arc::new(store::Store::open(&dir, seal::default_sealer())?);
             let emitter = Arc::new(platform::TauriEmitter(handle.clone()));
             let notifier = Arc::new(platform::ToastNotifier::new(handle.clone()));
@@ -62,6 +69,12 @@ pub fn run() {
             let core = core::Core::new(store, emitter, notifier, browser(), core::CoreConfig::NORMAL);
             core.start();
             app.manage(core);
+            // Look for a newer signed release at start and every 6 hours. A development or
+            // end-to-end build never updates itself.
+            if !cfg!(debug_assertions) && !cfg!(feature = "e2e") {
+                tauri::async_runtime::spawn(update::run_update_loop(updater.clone()));
+            }
+            app.manage(updater);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -77,6 +90,8 @@ pub fn run() {
             commands::prefs_set,
             commands::autostart_get,
             commands::autostart_set,
+            commands::update_status,
+            commands::update_check,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Support app");

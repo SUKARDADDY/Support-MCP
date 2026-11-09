@@ -23,6 +23,10 @@ import { VERSION, VERSION_PATTERN } from './version.js';
 import { bytesToHex } from './crypto.js';
 
 export const NOTE_HEADER = 'support-mcp-release 1';
+// The technician app's note has the same four values under its own header, so a note for one
+// product never passes as a note for the other: each checks its own header, and the signature
+// covers it.
+export const TECHNICIAN_NOTE_HEADER = 'support-mcp-technician-release 1';
 const HEX64 = /^[0-9a-f]{64}$/;
 const DECIMAL = /^[1-9][0-9]{0,15}$/;
 const SIGNATURE = /^[A-Za-z0-9+/]{86}==$/; // 64 bytes in standard base64
@@ -31,26 +35,31 @@ const HOUR_MS = 3600_000;
 // A version this code compares: VERSION_PATTERN and at most 32 characters, as a hello's version is capped.
 export const validVersion = (v) => typeof v === 'string' && v.length <= 32 && VERSION_PATTERN.test(v);
 
-// The note's exact text. Throws on a value that would not round-trip.
-export function buildNote({ version, sha256, size, released }) {
+// The note's exact text. Throws on a value that would not round-trip. `header` is the PC
+// release's unless a caller names another (the technician app's).
+export function buildNote({ version, sha256, size, released }, header = NOTE_HEADER) {
   if (!validVersion(version)) throw new Error('bad version');
   if (typeof sha256 !== 'string' || !HEX64.test(sha256)) throw new Error('bad sha256');
   if (!Number.isSafeInteger(size) || size <= 0) throw new Error('bad size');
   if (!Number.isSafeInteger(released) || released <= 0) throw new Error('bad release date');
-  return `${NOTE_HEADER}\nversion ${version}\nsha256 ${sha256}\nsize ${size}\nreleased ${released}\n`;
+  return `${header}\nversion ${version}\nsha256 ${sha256}\nsize ${size}\nreleased ${released}\n`;
 }
 
-// The note's values, or null for anything but the exact five lines.
-export function parseNote(text) {
+// The note's values, or null for anything but the exact five lines under `header`.
+export function parseNote(text, header = NOTE_HEADER) {
   if (typeof text !== 'string' || !text.endsWith('\n') || /[^\x20-\x7e\n]/.test(text)) return null;
   const lines = text.slice(0, -1).split('\n');
-  if (lines.length !== 5 || lines[0] !== NOTE_HEADER) return null;
+  if (lines.length !== 5 || lines[0] !== header) return null;
   const value = (line, name) => (line.startsWith(`${name} `) ? line.slice(name.length + 1) : null);
   const version = value(lines[1], 'version'), sha256 = value(lines[2], 'sha256'), size = value(lines[3], 'size'), released = value(lines[4], 'released');
   if (!validVersion(version) || !HEX64.test(sha256 ?? '') || !DECIMAL.test(size ?? '') || !DECIMAL.test(released ?? '')) return null;
   const out = { version, sha256, size: Number(size), released: Number(released) };
   return Number.isSafeInteger(out.size) && Number.isSafeInteger(out.released) ? out : null;
 }
+
+// The technician app's note: the same five lines under TECHNICIAN_NOTE_HEADER.
+export const buildTechnicianNote = (values) => buildNote(values, TECHNICIAN_NOTE_HEADER);
+export const parseTechnicianNote = (text) => parseNote(text, TECHNICIAN_NOTE_HEADER);
 
 // SemVer precedence of two valid versions, build metadata ignored: -1, 0 or 1.
 // Throws on a version that is not valid.

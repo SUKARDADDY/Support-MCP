@@ -18,6 +18,8 @@
     "allow-prefs-set",
     "allow-autostart-get",
     "allow-autostart-set",
+    "allow-update-status",
+    "allow-update-check",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]
