@@ -301,7 +301,7 @@ test('after a restart the conversation is gone: a fresh one starts from the last
   const [, , third] = w.fake.sent('openai');
   assert.equal(third.body.input.length, 1, 'a new conversation, not a continuation');
   const text = third.body.input[0].content[0].text;
-  assert.match(text, /Your last progress note in this task: Found the spooler stopped\./);
+  assert.match(text, /<untrusted label="your last progress note in this task">\nFound the spooler stopped\.\n<\/untrusted>/);
   assert.match(text, /may or may not have reached the PC/);
   assert.equal(third.body.input[0].content[1].type, 'input_image', 'with a new screenshot');
   assert.equal(w.taskRow(a.id).state, 'done');
@@ -327,12 +327,12 @@ test('Stop pressed during a model call means the action is not sent; so does Pau
     await w.tool(BOSS, 'agent_control', { task_id: paused.id, action: 'pause' });
     return oai.call('click', { x: 1, y: 2, button: null, count: null, display: null, screenshot: null });
   }, oai.call('finish', { outcome: 'done', summary: 'ok' }));
-  await w.drive(paused.id);
+  await w.drive(paused.id, { stop: () => w.taskRow(paused.id).state === 'paused' });
   assert.equal(w.taskRow(paused.id).state, 'paused');
-  assert.equal(w.taskObject(paused.id).ctx.alarm(), null, 'a paused task sets no alarm');
   assert.equal(paused.joined.frames.filter((f) => f.action?.name === 'click').length, 0);
   const calls = w.fake.sent('openai').length;
   await w.alarm(paused.id); // a stray alarm does nothing while paused
+  assert.equal(w.taskObject(paused.id).ctx.alarm(), w.taskRow(paused.id).created_at + 2 * 3600_000, 'a paused task keeps one alarm: the time limit');
   assert.equal(w.fake.sent('openai').length, calls, 'no model call while paused');
   await w.tool(BOSS, 'agent_control', { task_id: paused.id, action: 'resume' });
   await w.drive(paused.id);

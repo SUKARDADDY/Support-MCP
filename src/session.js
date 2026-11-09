@@ -836,14 +836,20 @@ export class Session {
     let workspace;
     let reason = null;
     let discard = false;
+    let expectDriver = null;
     try {
-      ({ actor = null, workspace, reason = null, discard = false } = await request.json());
+      ({ actor = null, workspace, reason = null, discard = false, expect_driver: expectDriver = null } = await request.json());
     } catch (_) {}
     if (await this.otherWorkspace(workspace)) return Response.json({ ended: true });
     await this.expireIfDue();
     const state = await this.get('state');
     if (state === 'ended' || state === undefined) return Response.json({ ended: true });
     const deviceId = await this.get('device_id', null);
+    // The built-in agent ends only a session its starter still drives. Once someone else
+    // has taken it over, the session is theirs and this leaves it alone.
+    if (expectDriver !== null && deviceId && this.driver !== sameIdentity(expectDriver)) {
+      return Response.json({ ended: false, driver: this.driver });
+    }
     // The team ends a session for a reason of its own (a stop, a removal). A
     // saved-PC session ended by a technician says so; a link session keeps its old reason.
     const why = OPERATOR_END_REASONS.includes(reason) ? reason : deviceId ? 'technician' : 'ended_by_operator';

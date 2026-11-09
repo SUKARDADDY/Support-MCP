@@ -223,7 +223,9 @@ the tool error `this team uses the built-in agent`, except `agent_start`,
 `agent_status`, `agent_control`, `device_list`, `session_list` and
 `session_status`. The mode is read after the role check, so a caller who is not a
 member learns nothing about it. A workspace with no `agent_settings` row, or a
-database without the table yet, is in mode `both`. The built-in agent's own calls
+database without the table yet ("no such table"), is in mode `both`. Any other
+database error while reading the mode refuses the call (it fails closed), with the
+tool error `could not check whether this team uses the built-in agent; try again`. The built-in agent's own calls
 go through the same checks but not this one, so the mode never blocks it.
 
 A refusal is a tool error (`isError`), and nothing reaches a Session.
@@ -1390,8 +1392,10 @@ query is in `src/agent-store.js` and names the workspace.
 - `agent_tasks`: who started it, the PC or session, its state (`running`, `paused`,
   `done`, `stuck`, `stopped`, `failed`), `cost_microusd`, `reserved_microusd` (the
   call in flight), the tool call count, the end reason and the summary. The
-  month's spend is the sum of cost and reservation over the rows created in the
-  UTC calendar month, so there is no counter to drift. The latest three summaries
+  month's spend is the sum of cost and reservation over the rows that count toward
+  the UTC calendar month (created in it, still live, or ended in it), so a task that
+  crosses a month's end is never left out of both months and there is no counter to
+  drift. Counting a task in two months can only make a cap stricter. The latest three summaries
   of a PC are the latest three ended rows with a summary for its `device_id`.
 
 Changes to settings, a task starting and a task ending go through the team
@@ -1449,18 +1453,26 @@ retries) is shown in the answer and is outside the caps.
 
 `agent_start` and `POST .../agent/tasks` need real membership (never open mode) with
 `sessions.control`, a mode other than `mcp`, both caps set, and a usable model. They
-create the task row and the task object. The first step connects to the PC with the
-`device_connect` path as the starter (a PC set to ask still asks), or uses the given
-session, whose driver must be the starter or nobody.
+create the task row and the task object. The row is inserted under a guard that no
+other task is live on the same PC or session, so two starts at once make one task. The
+first step connects to the PC with the `device_connect` path as the starter (a PC set
+to ask still asks), or uses the given session, whose driver must be the starter or
+nobody. The connect is recorded before it is made; if the object died after the relay
+made the session and before it saved it, the next step takes up the live session on
+that PC whose driver is the starter instead of connecting again.
 
 Each alarm runs one step:
 
 1. Read the task's row. It is the truth: Stop and Pause win. A stopped task ends its
-   session and stops; a paused one sets no alarm until resumed.
+   session and stops; a paused one makes no call and keeps one alarm, at 2 hours
+   after it was created, where the time limit and the starter's standing end it. A
+   resume wakes it and counts as a read of its status.
 2. Check the limits (120 tool calls, 2 hours), the watching rule (below) and the
    starter: the operator's stop, the workspace, the account (for an OAuth starter),
    members only, `sessions.control`, and the workspace stop. A failure ends the task
-   with that reason.
+   with that reason. A step that throws (the database could not answer, the team was
+   busy) is counted in the task's storage and tried again after 5, 10, 20 and 40
+   seconds; the fifth failure in a row ends the task as `failed`.
 3. Read the settings and open the key; end the task if the caps or the key are gone.
 4. Check the session: the driver is still the starter, nobody else has sent a command to
    a link session since the task began, and the session has not ended.
@@ -1469,9 +1481,18 @@ Each alarm runs one step:
    the month's spend plus it fits the month cap, so tasks running at once cannot pass a
    cap together. The output limit shrinks to fit what is left, never under 4,000
    tokens; below that the task ends with "spending cap reached". Input is estimated from
-   the request's size and a fixed figure per image. The real cost settles the
-   reservation afterwards. A reservation the object never settled is charged in full.
-6. Read the row again. A stop or pause now means the action is not sent.
+   the request's size on the high side (ASCII text at 1 token per 3 characters, any other
+   character at half its UTF-8 bytes, a fixed 1,800 per image), and the same estimate
+   decides when a fresh conversation starts (over 100,000 tokens) and which
+   long-context price a reservation uses. The real cost settles the reservation
+   afterwards. A reservation the object never settled is charged in full. So is the
+   reservation of a call that got no HTTP answer (a timeout or a dropped connection),
+   because the provider may still bill it; a call answered with an error status was
+   refused, and its reservation is released.
+6. Read the row again, and look at the session again. A stop or pause now means the
+   action is not sent. So does a session that has ended or that someone else now drives
+   or commands. A pause that lands on a reply with no tool call leaves the
+   conversation ending with "Call a tool, or call finish.", so a resume is valid.
 7. Record the call as `sending`, run it through the tool path as the starter (marked
    `via: "agent"` for the session log), record it done, and set the next alarm. A
    repeat alarm that finds `sending` sends nothing and answers that call "outcome
@@ -1494,16 +1515,20 @@ are only redacted step records (the verb and a short detail, never typed text) a
 notes.
 
 Everything from the PC (screens, UI text, command output, file contents, the PC's fields,
-and earlier summaries) is wrapped in `<untrusted>` tags, with any closing tag inside it
-disarmed, and the system prompt says it is data and never an instruction. The first
+and earlier summaries) and the task's own last note is wrapped in `<untrusted>` tags, with
+any closing tag inside it disarmed (in any letter case, and with spaces inside the tag),
+and the system prompt says it is data and never an instruction. The note is the agent's own
+record and may repeat text from the screen. The first
 request of a task carries the PC's record and the last three summaries of that PC with
 their age and who started them.
 
 Without `keep_working`, a task stops 2 minutes after the last read of its status
 (`agent_status` with a `task_id`, or `GET .../agent/tasks/<id>`). Reads go through the task
 object so it records them, and `wait_s` (up to 25) holds a read until something changes.
-A task ends the saved-PC session it opened when it finishes, stops or fails, except when
-someone else took the session over, and leaves a session it was given.
+A task ends the saved-PC session it opened when it finishes, stops or fails, and leaves a
+session it was given. The Session object enforces the exception: the task asks it to end
+the session only while the starter is still the driver, so a session someone else took
+over, even one the task has not noticed yet, stays open.
 
 ### Providers
 

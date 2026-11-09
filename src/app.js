@@ -656,7 +656,14 @@ async function handleMcp(request, env, url, origin, devTtlMs, workspace = DEFAUL
   // It is read here and not in the shared tool path, so it never blocks the agent.
   const gate = async (name) => {
     if (ALLOWED_IN_AGENT_MODE.has(name)) return;
-    if ((await agentStoreFromEnv(env, teamFromEnv(env)).mode(workspace)) === 'agent') throw new Error('this team uses the built-in agent');
+    let mode;
+    try {
+      mode = await agentStoreFromEnv(env, teamFromEnv(env)).mode(workspace);
+    } catch (_) {
+      // The mode could not be read: refuse, so a team on "built-in agent only" is never let through.
+      throw new Error('could not check whether this team uses the built-in agent; try again');
+    }
+    if (mode === 'agent') throw new Error('this team uses the built-in agent');
   };
   const backend = authorizedBackend(makeBackend(env, origin, devTtlMs, actor, workspace), env, actor, toolName, workspace, oauthCaller, { gate });
   const { status, body } = await handleRpc(msg, backend, options);

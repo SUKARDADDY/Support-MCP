@@ -16,6 +16,7 @@ const KEY_RE = /^[\x21-\x7e]{16,400}$/;
 const CAP_MAX_USD = 100_000;
 const SETTING_FIELDS = ['mode', 'default_model', 'starters_pick_model', 'task_cap_usd', 'month_cap_usd', 'openai_key', 'anthropic_key'];
 
+export const BUSY = 'a task is already working on this PC or session';
 const bad = (message) => new TeamError(400, 'bad_request', message);
 const keyInfo = (provider) => `agent-key-${provider}`;
 const microOf = (dollars) => Math.round(dollars * 1e6);
@@ -63,6 +64,20 @@ export function agentStore(db, team, { authSecret = '' } = {}) {
     "COALESCE((SELECT MAX(seq) FROM audit WHERE workspace = ? AND kind = 'workspace_stopped'), 0) <= COALESCE((SELECT MAX(seq) FROM audit WHERE workspace = ? AND kind = 'workspace_resumed'), 0)",
     [slug, slug],
   ];
+  // No task is working on this PC or in this session.
+  const noLiveTaskOn = (slug, deviceId, sid) => [
+    `NOT EXISTS (SELECT 1 FROM agent_tasks WHERE workspace = ? AND ended_at IS NULL
+       AND ((? IS NOT NULL AND device_id = ?) OR (? IS NOT NULL AND sid = ?)))`,
+    [slug, deviceId, deviceId, sid, sid],
+  ];
+  // The rows that count toward the month holding `now`: tasks that began in it, tasks still
+  // live, and tasks that ended in it. A task that crosses a month's end counts toward both
+  // months it touches, so its new spend is never counted against neither (a task that spans
+  // two months may be counted twice, which can only make a cap stricter).
+  const monthRows = (start, end) => [
+    '(created_at >= ? AND created_at < ?) OR ended_at IS NULL OR (ended_at >= ? AND ended_at < ?)',
+    [start, end, start, end],
+  ];
   const taskLive = (slug, id) => ['EXISTS (SELECT 1 FROM agent_tasks WHERE workspace = ? AND id = ? AND ended_at IS NULL)', [slug, id]];
 
   // ---- settings ----------------------------------------------------------------
@@ -70,13 +85,15 @@ export function agentStore(db, team, { authSecret = '' } = {}) {
     return parseSettings(await q('SELECT * FROM agent_settings WHERE workspace = ?', slug).first());
   }
 
-  // Who runs sessions here. A missing row, or a database without the table yet,
-  // is "both".
+  // Who runs sessions here. A missing row, or a database without the table yet (the
+  // migration has not run), is "both". Any other database error throws, so the /mcp gate
+  // refuses rather than let a team on "built-in agent only" through.
   async function mode(slug) {
     try {
       return (await q('SELECT mode FROM agent_settings WHERE workspace = ?', slug).first('mode')) ?? 'both';
-    } catch (_) {
-      return 'both';
+    } catch (e) {
+      if (/no such table/i.test(String(e?.message ?? e))) return 'both';
+      throw e;
     }
   }
 
@@ -241,13 +258,13 @@ export function agentStore(db, team, { authSecret = '' } = {}) {
     return results;
   }
 
-  // The month's spend: every task that began in this calendar month (UTC), cost and
-  // the reservation in flight.
+  // The month's spend (UTC): the cost and the reservation in flight of every task that
+  // counts toward the calendar month (see monthRows).
   async function monthSpend(slug, now = Date.now()) {
-    const [start, end] = monthBounds(now);
+    const [rows, params] = monthRows(...monthBounds(now));
     return (await q(
-      'SELECT COALESCE(SUM(cost_microusd + reserved_microusd), 0) AS spent FROM agent_tasks WHERE workspace = ? AND created_at >= ? AND created_at < ?',
-      slug, start, end).first('spent')) ?? 0;
+      `SELECT COALESCE(SUM(cost_microusd + reserved_microusd), 0) AS spent FROM agent_tasks WHERE workspace = ? AND (${rows})`,
+      slug, ...params).first('spent')) ?? 0;
   }
 
   // Start a task: its row and the agent_task_started log row commit together, and
@@ -257,10 +274,12 @@ export function agentStore(db, team, { authSecret = '' } = {}) {
     const actor = normalizeIdentity(actorIdentity);
     return mutate(slug, actor, async () => {
       const ctx = await actorContext(slug, actor, 'sessions.control');
+      // Read again on every attempt: a task that began since the last one makes this a refusal.
+      if (await liveTaskOn(slug, { deviceId: t.device_id ?? null, sid: t.sid ?? null })) throw new TeamError(409, 'busy', BUSY);
       const now = Date.now();
       return {
         entries: [{ kind: 'agent_task_started', detail: `${t.id} ${t.provider}/${t.model}${t.device_id ? ` pc ${t.device_id}` : ''}` }],
-        guard: and(actorHas(slug, actor, 'sessions.control'), actorUnchanged(slug, ctx), notStopped(slug)),
+        guard: and(actorHas(slug, actor, 'sessions.control'), actorUnchanged(slug, ctx), notStopped(slug), noLiveTaskOn(slug, t.device_id ?? null, t.sid ?? null)),
         change: ([cond, params]) => [q(
           `INSERT INTO agent_tasks(workspace, id, device_id, sid, opened_session, started_by, started_by_user, title, provider, model, state, keep_working, created_at)
            SELECT ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 'running', ?, ? WHERE ${cond}`,
@@ -307,12 +326,12 @@ export function agentStore(db, team, { authSecret = '' } = {}) {
   // tasks running at once cannot pass a cap together. false when it does not fit
   // or the task has ended or already holds a reservation.
   async function reserve(slug, id, amount, { taskCap, monthCap, now = Date.now() }) {
-    const [start, end] = monthBounds(now);
+    const [rows, params] = monthRows(...monthBounds(now));
     const r = await q(
       `UPDATE agent_tasks SET reserved_microusd = ?
        WHERE workspace = ? AND id = ? AND ended_at IS NULL AND reserved_microusd = 0 AND cost_microusd + ? <= ?
-         AND (SELECT COALESCE(SUM(cost_microusd + reserved_microusd), 0) FROM agent_tasks WHERE workspace = ? AND created_at >= ? AND created_at < ?) + ? <= ?`,
-      amount, slug, id, amount, taskCap, slug, start, end, amount, monthCap).run();
+         AND (SELECT COALESCE(SUM(cost_microusd + reserved_microusd), 0) FROM agent_tasks WHERE workspace = ? AND (${rows})) + ? <= ?`,
+      amount, slug, id, amount, taskCap, slug, ...params, amount, monthCap).run();
     return r.meta.changes === 1;
   }
 

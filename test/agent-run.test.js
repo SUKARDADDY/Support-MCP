@@ -128,15 +128,29 @@ test('an OpenAI 429 with a billing code stops the task at once; a plain 429 and 
   assert.equal(status.task.notice, null);
 });
 
-test('a network failure is retried like a 503, and charges nothing', async (t) => {
+test('a network failure is retried like a 503, but the call may have been billed, so its reservation is charged in full', async (t) => {
   const w = await agentWorld(t);
   await w.ready();
-  w.fake.queue('openai', () => { throw new TypeError('fetch failed'); }, finish());
+  let held = 0;
+  w.fake.queue('openai', () => { held = w.taskRow(a.id).reserved_microusd; throw new TypeError('fetch failed'); }, finish());
   const a = await w.startOnPc(BOSS);
   await w.drive(a.id);
+  assert.ok(held > 100000, 'a worst case was reserved');
   assert.equal(w.taskRow(a.id).state, 'done');
   assert.equal(w.fake.sent('openai').length, 2);
-  assert.equal(w.taskRow(a.id).cost_microusd, 1100);
+  assert.deepEqual([w.taskRow(a.id).cost_microusd, w.taskRow(a.id).reserved_microusd], [held + 1100, 0], 'the call with no answer in full, then the call that finished');
+  assert.ok(w.step(a.id).steps.some((x) => x.verb === 'charged'));
+});
+
+test('a clean error status releases the reservation; a timeout is charged in full; an answer that said "failed" with status 200 is charged too', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  let held = 0;
+  const timeout = () => { held = w.taskRow(a.id).reserved_microusd; const e = new Error('timed out'); e.name = 'APIConnectionTimeoutError'; throw e; };
+  w.fake.queue('openai', { status: 503, json: { error: { message: 'overloaded' } } }, timeout, finish());
+  const a = await w.startOnPc(BOSS);
+  await w.drive(a.id);
+  assert.equal(w.taskRow(a.id).cost_microusd, held + 1100, 'only the timeout and the finished call are charged');
 });
 
 test('a provider that keeps failing for two minutes pauses the task with the reason; resume tries again', async (t) => {
@@ -145,9 +159,9 @@ test('a provider that keeps failing for two minutes pauses the task with the rea
   const down = { status: 503, json: { error: { message: 'overloaded' } } };
   w.fake.queue('openai', ...Array.from({ length: 30 }, () => down));
   const a = await w.startOnPc(BOSS);
-  await w.drive(a.id);
+  await w.drive(a.id, { stop: () => w.taskRow(a.id).state === 'paused' });
   assert.equal(w.taskRow(a.id).state, 'paused');
-  assert.equal(w.taskObject(a.id).ctx.alarm(), null);
+  assert.equal(w.taskObject(a.id).ctx.alarm(), w.taskRow(a.id).created_at + 2 * 3600_000, 'a paused task keeps one alarm: the time limit');
   const status = await w.tool(BOSS, 'agent_status', { task_id: a.id });
   assert.equal(status.task.state, 'paused');
   assert.match(status.task.notice, /^paused: the provider is busy or cannot be reached\. Resume to try again\.$/);
@@ -166,7 +180,7 @@ test('a bad key, a model the key cannot use and a refused request stop the task 
   const outcome = async (reply) => {
     w.fake.queue('openai', reply);
     const a = await w.startOnPc(BOSS);
-    await w.drive(a.id);
+    await w.drive(a.id, { stop: () => w.taskRow(a.id).state !== 'running' });
     const status = await w.tool(BOSS, 'agent_status', { task_id: a.id });
     return [w.taskRow(a.id).state, w.taskRow(a.id).end_reason, JSON.stringify([status, w.step(a.id)])];
   };
@@ -393,7 +407,7 @@ test('a fresh conversation starts every 12 tool calls from the last note and a n
   assert.ok(lengths.slice(0, 13).every((n, i) => i === 0 || n > lengths[i - 1]), 'growing: append-only');
   const fresh = sent[13];
   assert.equal(fresh.body.input.length, 1, 'a new conversation');
-  assert.match(fresh.body.input[0].content[0].text, /Your last progress note in this task: Checked the spooler; it runs\./);
+  assert.match(fresh.body.input[0].content[0].text, /<untrusted label="your last progress note in this task">\nChecked the spooler; it runs\.\n<\/untrusted>/);
   assert.equal(fresh.body.input[0].content[1].type, 'input_image');
   assert.equal(a.joined.frames.filter((f) => f.action?.name === 'screenshot').length, 2 + 1, 'a screenshot to start, one to start again, and the model\'s own');
   // Reasoning from before the restart is not carried over.

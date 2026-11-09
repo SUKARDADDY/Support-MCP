@@ -76,13 +76,24 @@ const text = (t) => ({ type: 'text', text: t });
 // All the text parts of a list, joined, for a provider call that takes a string.
 const joined = (parts) => parts.filter((p) => p.type === 'text').map((p) => p.text).join('\n');
 
-// Tokens of a conversation item, estimated from its size: its characters over 3,
-// and a fixed figure for each image (the base64 is not counted as text).
+// Tokens of a conversation item, estimated from its size, on the high side. ASCII text is
+// its characters over 3. Any other character is counted at half its UTF-8 bytes (a Hebrew
+// letter is 1 token, a Chinese character 1.5, an emoji 2), because such text splits into
+// many more tokens than Latin text does. Each image is a fixed figure (its base64 is not
+// counted as text).
 export function estimateTokens(value) {
-  let chars = 0;
+  let ascii = 0;
+  let wide = 0; // UTF-8 bytes of the characters that are not ASCII
   let images = 0;
   const walk = (v) => {
-    if (typeof v === 'string') { chars += v.length; return; }
+    if (typeof v === 'string') {
+      for (const ch of v) {
+        const code = ch.codePointAt(0);
+        if (code < 0x80) ascii += 1;
+        else wide += code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+      }
+      return;
+    }
     if (Array.isArray(v)) { for (const x of v) walk(x); return; }
     if (v && typeof v === 'object') {
       if (v.type === 'input_image' || v.type === 'image') { images += 1; return; }
@@ -90,7 +101,7 @@ export function estimateTokens(value) {
     }
   };
   walk(value);
-  return Math.ceil(chars / 3) + images * IMAGE_TOKENS;
+  return Math.ceil(ascii / 3) + Math.ceil(wide / 2) + images * IMAGE_TOKENS;
 }
 
 // The base URLs are set here, so a stray OPENAI_BASE_URL or ANTHROPIC_BASE_URL in the
@@ -133,9 +144,9 @@ function openaiAdapter(OpenAI, { apiKey, fetch, timeoutMs }) {
       }
       if (user) conv.push({ role: 'user', content: content(user) });
     },
-    // What goes into the conversation from a reply. A reply that ran out of room and called
-    // nothing leaves no lone reasoning item behind.
-    keep: (reply) => (reply.stop === 'cut' && !reply.calls.length ? withoutTrailingReasoning(reply.items) : reply.items),
+    // What goes into the conversation from a reply. A reply that called nothing leaves no
+    // lone reasoning item behind: one with nothing after it is refused when replayed.
+    keep: (reply) => (reply.calls.length ? reply.items : withoutTrailingReasoning(reply.items)),
     async call(spec, { system, tools, conv, maxOutput, cacheKey, signal }) {
       const body = {
         model: spec.id, store: false, service_tier: 'default', parallel_tool_calls: false, truncation: 'disabled',
@@ -193,9 +204,9 @@ function claudeAdapter(Anthropic, { apiKey, fetch, timeoutMs }) {
       if (user) blocks.push(...content(user));
       conv.push({ role: 'user', content: blocks });
     },
-    // A reply that ran out of room and called nothing is dropped: an assistant turn of
-    // thinking alone is not a valid turn to replay.
-    keep: (reply) => (reply.stop === 'cut' && !reply.calls.length ? [] : reply.items),
+    // A reply that called nothing is dropped when it ran out of room or holds no text: an
+    // assistant turn of thinking alone, or an empty one, is not a valid turn to replay.
+    keep: (reply) => (!reply.calls.length && (reply.stop === 'cut' || !reply.text) ? [] : reply.items),
     async call(spec, { system, tools, conv, maxOutput, signal }) {
       const thinking = spec.settings.thinking === 'adaptive';
       // Prompt caching on the system prompt, the last tool and the last block of the last message,

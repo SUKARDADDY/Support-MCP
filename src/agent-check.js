@@ -23,8 +23,9 @@ const NOT_ABLE = 'this model can\'t read screenshots or call tools';
 const NO_ROOM = 'the check ran out of room; try again';
 const TOO_SMALL = 'output limit too small';
 
-// spec: { provider, id, prices, long } (what the model costs). adminLimit: the
-// output limit the admin asked for, or undefined. Returns
+// spec: { provider, id, prices, long, output_limit } (what the model costs, and for a model
+// in the table its output limit, where the check starts). adminLimit: the output limit the
+// admin asked for, or undefined. Returns
 //   { ok: true, settings, output_limit, cost_micro }
 //   { ok: false, message, cost_micro }
 // message is a fixed sentence. cost_micro is what the check's calls cost.
@@ -45,11 +46,11 @@ export async function runModelCheck({ spec, adminLimit, apiKey, fetch }) {
       const thinking = caps === null ? true : caps.thinking?.types?.adaptive?.supported === true;
       const effort = caps === null ? true : caps.effort?.medium?.supported === true;
       const modelMax = Number.isInteger(info.max_tokens) ? info.max_tokens : null;
-      const wanted = adminLimit ?? (modelMax === null ? 8000 : CLAUDE_OUTPUT_MAX);
+      const wanted = adminLimit ?? spec.output_limit ?? (modelMax === null ? 8000 : CLAUDE_OUTPUT_MAX);
       saved = Math.min(wanted, CLAUDE_OUTPUT_MAX, modelMax ?? Infinity);
       settings = { thinking: thinking ? 'adaptive' : null, effort: effort ? 'medium' : null };
     } else {
-      saved = adminLimit ?? 8000;
+      saved = adminLimit ?? spec.output_limit ?? 8000;
       settings = { reasoning_effort: 'medium' };
     }
     if (saved < OUTPUT_FLOOR) return fail(TOO_SMALL);

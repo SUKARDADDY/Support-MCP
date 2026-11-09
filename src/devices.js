@@ -450,6 +450,11 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
     return { devices: page.map(deviceOut), next: results.length > limit ? page.at(-1).id : null };
   }
 
+  // The live session pointer on a PC ({ id, by, ... }), or null.
+  async function liveSession(slug, id) {
+    return livePointer(await q('SELECT session FROM devices WHERE workspace = ? AND id = ?', slug, id).first());
+  }
+
   async function getDevice(slug, id) {
     await purgePending(slug);
     const row = await q('SELECT * FROM devices WHERE workspace = ? AND id = ?', slug, id).first();
@@ -1011,7 +1016,7 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
     connect, sessionEnded, pinSessionEnd,
     listRecords, getRecord, addRecord, updateRecord, removeRecord,
     listFields, addField, updateField, removeField,
-    listDevices, getDevice, updateDevice, removeDevice,
+    listDevices, getDevice, liveSession, updateDevice, removeDevice,
     createPairingCode, listPairingCodes, revokePairingCode,
     redeemCode, requestJoin, authenticate, checkIn, checkInFull, updateOwn, leave,
   };

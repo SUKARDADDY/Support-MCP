@@ -1082,8 +1082,9 @@ apply to only one client say which.
   one of a few fixed sentences instead. A test fails if a canary key appears anywhere.
 - **What the agent reads from the PC is wrapped as untrusted.** Screen text, UI trees,
   command output, file contents, the PC's name and custom fields, and the summaries of
-  earlier tasks on the same PC reach the model inside `<untrusted>` tags (a closing tag
-  inside the text is disarmed), and the system prompt says they are data. Summaries have a
+  earlier tasks on the same PC, and the agent's own last note after a fresh conversation,
+  reach the model inside `<untrusted>` tags (a closing tag inside the text is disarmed in
+  any case and with spaces in it), and the system prompt says they are data. Summaries have a
   fixed shape and at most 600 characters, and show their age and who started the task.
   This lowers the risk of a customer's screen steering the agent. It does not remove it.
 - **Session output is untrusted input.** Everything that comes back from a

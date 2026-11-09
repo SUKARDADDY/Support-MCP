@@ -39,7 +39,9 @@ CREATE TABLE agent_settings (
 -- every model call under a guarded update that checks both caps, and cleared
 -- when the real cost is added, so tasks running at once cannot pass the month's
 -- cap together. A reservation that was never cleared is charged in full. The
--- month's spend is the sum of cost and reservation over the month's rows.
+-- month's spend is the sum of cost and reservation over the rows that count
+-- toward the month: tasks created in it, tasks still live, and tasks that ended
+-- in it, so a task that crosses a month's end is never left out of both.
 -- summary is the finish tool's text (at most 600 characters); the next task on
 -- the same PC reads the latest three as untrusted text. Steps, notes and
 -- the conversation live in the task's own object, redacted or in memory only.
@@ -67,3 +69,4 @@ CREATE TABLE agent_tasks (
 );
 CREATE INDEX agent_tasks_by_created ON agent_tasks (workspace, created_at);
 CREATE INDEX agent_tasks_by_device ON agent_tasks (workspace, device_id, ended_at);
+CREATE INDEX agent_tasks_by_ended ON agent_tasks (workspace, ended_at);

@@ -8,7 +8,7 @@
 import { randomToken } from './crypto.js';
 import { TeamError, normalizeIdentity, teamFromEnv } from './workspace.js';
 import { ID_RE, devicesFromEnv, newId } from './devices.js';
-import { agentStoreFromEnv, taskOut } from './agent-store.js';
+import { BUSY, agentStoreFromEnv, taskOut } from './agent-store.js';
 import {
   MAX_ADDED_MODELS, MODEL_ID_RE, PROVIDERS, TABLE_MODELS, defaultModelId, normalizeOutputLimit, normalizePrices, pickSpec,
   specOf, specOut, usableSpecs, usd,
@@ -116,7 +116,7 @@ export function agentService(env, { origin = '', devTtlMs = 0 } = {}) {
     const checker = object(`check:${randomToken(16)}`);
     const reply = await checker.fetch('https://do/check', {
       method: 'POST',
-      body: JSON.stringify({ workspace: slug, spec: { provider, id, prices: prices ?? table.prices, long: table?.long ?? null }, output_limit: limit ?? null }),
+      body: JSON.stringify({ workspace: slug, spec: { provider, id, prices: prices ?? table.prices, long: table?.long ?? null, output_limit: table?.output_limit ?? null }, output_limit: limit ?? null }),
     });
     const out = await reply.json().catch(() => ({ ok: false, message: 'the check failed' }));
     if (!out.ok) throw new TeamError(422, 'model_refused', out.message);
@@ -184,7 +184,7 @@ export function agentService(env, { origin = '', devTtlMs = 0 } = {}) {
       if (watch.driver && normalizeIdentity(watch.driver) !== actor) throw new TeamError(409, 'driven', `${watch.driver} is driving that session`);
       deviceId = watch.device_id ?? null;
     }
-    if (await store.liveTaskOn(slug, { deviceId, sid })) throw new TeamError(409, 'busy', 'a task is already working on this PC or session');
+    if (await store.liveTaskOn(slug, { deviceId, sid })) throw new TeamError(409, 'busy', BUSY);
 
     const id = newId();
     const title = instructions.split('\n')[0].slice(0, 100);
