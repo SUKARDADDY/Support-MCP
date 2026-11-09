@@ -57,6 +57,7 @@ function context({ sql } = {}) {
         exec(query, ...args) {
           if (query.startsWith('INSERT INTO log')) logs.push({ ts: args[0], kind: args[1], detail: args[2] });
           else if (query.startsWith('SELECT ts,kind,detail')) return { toArray: () => logs.slice(-args[0]).reverse() };
+          else if (query.startsWith('UPDATE log SET')) Object.assign(logs.at(-1), { ts: args[0], detail: args[1] });
           else if (!query.startsWith('CREATE TABLE')) throw new Error(`Unexpected SQL: ${query}`);
           return { toArray: () => [] };
         },
