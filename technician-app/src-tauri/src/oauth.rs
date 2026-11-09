@@ -177,6 +177,11 @@ pub struct Loopback {
     pub port: u16,
 }
 
+/// How long one connection to the listener may take to send its request.
+const CONNECTION_LIMIT: Duration = Duration::from_secs(5);
+/// How many connections to the listener are read at the same time.
+const MAX_OPEN: usize = 256;
+
 enum Callback {
     Code(String),
     Denied,
@@ -197,18 +202,35 @@ impl Loopback {
     /// Waits for the browser's return with this `state`. A request that is not it (another
     /// path, another host name, a wrong state) is answered and ignored: only the right
     /// return ends the wait.
+    ///
+    /// Each connection is read on its own task with its own 5 second limit, so a process on
+    /// this PC that connects and says nothing (or sends a byte at a time) cannot hold up the
+    /// browser's return. At most MAX_OPEN connections are read at once; more are closed.
     pub async fn wait_for_code(&self, state: &str) -> CoreResult<String> {
+        let mut open = tokio::task::JoinSet::new();
         loop {
-            let (mut sock, _) = self.listener.accept().await.map_err(|_| CoreError::other("The listener for the browser stopped."))?;
-            match tokio::time::timeout(Duration::from_secs(5), self.handle(&mut sock, state)).await {
-                Ok(Callback::Code(code)) => return Ok(code),
-                Ok(Callback::Denied) => return Err(CoreError::invalid("Sign-in was not approved.")),
-                _ => {}
+            tokio::select! {
+                accepted = self.listener.accept() => {
+                    let (sock, _) = accepted.map_err(|_| CoreError::other("The listener for the browser stopped."))?;
+                    if open.len() >= MAX_OPEN {
+                        continue; // dropped: closed without a word
+                    }
+                    let (port, state) = (self.port, state.to_string());
+                    open.spawn(async move {
+                        let mut sock = sock;
+                        tokio::time::timeout(CONNECTION_LIMIT, Self::handle(port, &mut sock, &state)).await.unwrap_or(Callback::Ignore)
+                    });
+                }
+                Some(done) = open.join_next(), if !open.is_empty() => match done {
+                    Ok(Callback::Code(code)) => return Ok(code),
+                    Ok(Callback::Denied) => return Err(CoreError::invalid("Sign-in was not approved.")),
+                    _ => {}
+                },
             }
         }
     }
 
-    async fn handle(&self, sock: &mut TcpStream, state: &str) -> Callback {
+    async fn handle(port: u16, sock: &mut TcpStream, state: &str) -> Callback {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 2048];
         while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -227,7 +249,7 @@ impl Loopback {
         let (method, target) = (first.next().unwrap_or(""), first.next().unwrap_or(""));
         let host = lines.find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("host")).map(|(_, v)| v.trim().to_string()));
         // Only the address the person's own browser was sent to.
-        if host.as_deref() != Some(&format!("127.0.0.1:{}", self.port)) {
+        if host.as_deref() != Some(&format!("127.0.0.1:{port}")) {
             reply(sock, "400 Bad Request", FAIL_PAGE).await;
             return Callback::Ignore;
         }
@@ -545,6 +567,24 @@ mod tests {
         let page = ok.text().await.unwrap();
         assert!(page.contains("signed in") || page.contains("You are signed in"));
         assert_eq!(wait.await.unwrap().unwrap(), "GOOD");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connections_that_say_nothing_cannot_hold_up_the_browsers_return() {
+        let lb = Loopback::bind().await.unwrap();
+        let port = lb.port;
+        let wait = tokio::spawn(async move { lb.wait_for_code("S").await });
+        // Far more silent connections than a listener that reads one at a time could wait out
+        // inside the test's limit (each would take its 5 seconds).
+        let mut idle = Vec::new();
+        for _ in 0..40 {
+            idle.push(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+        }
+        let http = http_client();
+        let ok = tokio::time::timeout(Duration::from_secs(2), http.get(format!("http://127.0.0.1:{port}/callback?code=GOOD&state=S")).send()).await.expect("answered while others sit silent").unwrap();
+        assert_eq!(ok.status(), 200);
+        assert_eq!(tokio::time::timeout(Duration::from_secs(2), wait).await.unwrap().unwrap().unwrap(), "GOOD");
+        drop(idle);
     }
 
     #[tokio::test(flavor = "multi_thread")]

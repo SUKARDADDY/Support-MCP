@@ -12,12 +12,19 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Tokens {
     pub access: String,
     pub refresh: String,
     /// When the access token ends, in milliseconds since 1970.
     pub expires_at_ms: u64,
+}
+
+// Written by hand so a token never reaches a log line, a panic message or a failed assert.
+impl std::fmt::Debug for Tokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tokens").field("access", &"[redacted]").field("refresh", &"[redacted]").field("expires_at_ms", &self.expires_at_ms).finish()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -235,6 +242,16 @@ pub fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::seal::DevSealer;
+
+    #[test]
+    fn tokens_print_without_their_secrets() {
+        let t = Tokens { access: "access-secret-123".into(), refresh: "refresh-secret-456".into(), expires_at_ms: 1_794_000_000_000 };
+        let shown = format!("{t:?} {t:#?}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(shown.contains("[redacted]") && shown.contains("1794000000000"), "{shown}");
+        let account = StoredAccount { id: "a".into(), relay: "r".into(), team: "t".into(), team_name: None, email: None, client_id: "c".into(), token_endpoint: "e".into(), sealed: None };
+        assert!(!format!("{account:?}").contains("secret"));
+    }
 
     fn tmp(name: &str) -> PathBuf {
         crate::testkit::temp_dir(name)
