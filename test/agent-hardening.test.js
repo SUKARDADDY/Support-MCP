@@ -521,7 +521,7 @@ test('an end that never gets through is tried a bounded number of times, then th
   const o = w.taskObject(a.id);
   assert.equal(o.ctx.values.get('st').done, true);
   assert.equal(o.ctx.alarm(), null);
-  assert.match(o.ctx.values.get('st').notes.at(-1).text, /could not confirm/);
+  assert.match(o.ctx.values.get('st').notes.at(-1).text, /could not confirm.*end it by hand, with session_end or the PC's End session/);
   assert.equal(ends(), 0, 'every try failed before it reached the session');
   assert.equal(o.ctx.values.get('st').cleanup_tries, 20);
   w.hooks.endFails = 0;
@@ -609,4 +609,100 @@ test('with EMERGENCY_STOP set, the team API and agent_start both refuse to start
   assert.equal(w.sql('SELECT COUNT(*) AS n FROM agent_tasks')[0].n, 0);
   w.env.EMERGENCY_STOP = '';
   assert.equal((await w.api(BOSS, 'POST', '/agent/tasks', { device_id: pc.id, instructions: 'Fix it.' })).status, 201);
+});
+
+// ---- 17: a retrying cleanup touches only the session this task's connect made ------------------------------------------------------------------------
+const crashedConnect = async (w) => {
+  const pc = await w.addPc({ access: 'any', name: 'Till' });
+  const out = await w.tool(BOSS, 'agent_start', { device_id: pc.id, instructions: 'Fix it.', keep_working: true });
+  w.hooks.fail = (point) => { if (point === 'afterConnect') throw new Error('crash'); };
+  await assert.rejects(w.alarm(out.task_id), /crash/);
+  w.hooks.fail = null;
+  w.restart(out.task_id);
+  return { pc, id: out.task_id, s1: w.pointer(pc.id).id };
+};
+
+test('a cleanup retry ends the session it found at first, not a newer one the starter opened by hand', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const { pc, id, s1 } = await crashedConnect(w);
+  w.hooks.endFails = 1;
+  await w.tool(BOSS, 'agent_control', { task_id: id, action: 'stop' });
+  const st = () => w.taskObject(id).ctx.values.get('st');
+  assert.equal(st().done, false);
+  assert.equal(st().sid, s1, 'the found session is kept');
+  assert.equal(w.stateOf(s1), 'waiting');
+  await w.tool(BOSS, 'session_end', { session_id: s1 });
+  const s2 = (await w.tool(BOSS, 'device_connect', { device_id: pc.id })).session_id;
+  assert.notEqual(s2, s1);
+  await w.drive(id);
+  assert.equal(st().done, true);
+  assert.equal(w.stateOf(s2), 'waiting', 'the starter\'s own new session is untouched');
+});
+
+test('when the first lookup fails, a session the starter opens by hand later is not taken for the task\'s', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const { pc, id, s1 } = await crashedConnect(w);
+  const realPrepare = w.db.prepare;
+  w.db.prepare = (sql) => {
+    if (/SELECT session FROM devices/.test(sql)) throw new Error('D1_ERROR: database is busy');
+    return realPrepare(sql);
+  };
+  await w.tool(BOSS, 'agent_control', { task_id: id, action: 'stop' });
+  w.db.prepare = realPrepare;
+  const st = () => w.taskObject(id).ctx.values.get('st');
+  assert.equal(st().done, false);
+  w.advance(5 * 60_000);
+  await w.tool(BOSS, 'session_end', { session_id: s1 });
+  const s2 = (await w.tool(BOSS, 'device_connect', { device_id: pc.id })).session_id;
+  await w.drive(id);
+  assert.equal(st().done, true);
+  assert.equal(w.stateOf(s2), 'waiting', 'the later session is not the task\'s to end');
+});
+
+// ---- 18: a cleanup that throws is retried by the object itself ------------------------------------------------------------------------
+test('a cleanup retry that hits a database error does not throw out of the alarm: it counts a try and sets the next alarm', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const a = await w.startOnPc(BOSS);
+  w.fake.queue('openai', shotCall(), shotCall());
+  await w.alarm(a.id);
+  const sid = w.taskRow(a.id).sid;
+  w.hooks.endFails = 1;
+  await w.tool(BOSS, 'agent_control', { task_id: a.id, action: 'stop' });
+  const o = w.taskObject(a.id);
+  assert.equal(o.ctx.values.get('st').cleanup_tries, 1);
+  const realPrepare = w.db.prepare;
+  w.db.prepare = (sql) => {
+    if (/SELECT reserved_microusd AS held/.test(sql)) throw new Error('D1_ERROR: database is busy');
+    return realPrepare(sql);
+  };
+  o.ctx.fire();
+  await assert.doesNotReject(o.task.alarm());
+  assert.equal(o.ctx.values.get('st').cleanup_tries, 2);
+  assert.equal(o.ctx.alarm(), w.now() + 10_000, 'the object set its own next alarm');
+  w.db.prepare = realPrepare;
+  await w.drive(a.id);
+  assert.equal(o.ctx.values.get('st').done, true);
+  assert.equal(w.stateOf(sid), 'ended');
+});
+
+// ---- 19: one cleanup at a time ------------------------------------------------------------------------
+test('a stop that arrives while a cleanup retry runs does not start a second cleanup', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const a = await w.startOnPc(BOSS);
+  w.fake.queue('openai', shotCall(), shotCall());
+  await w.alarm(a.id);
+  w.hooks.endFails = Infinity;
+  await w.tool(BOSS, 'agent_control', { task_id: a.id, action: 'stop' });
+  const o = w.taskObject(a.id);
+  assert.equal(o.ctx.values.get('st').cleanup_tries, 1);
+  o.ctx.fire();
+  const running = o.task.alarm();
+  const wake = o.task.fetch(new Request('https://do/wake', { method: 'POST' }));
+  await Promise.all([running, wake]);
+  assert.equal(o.ctx.values.get('st').cleanup_tries, 2, 'one try, not two');
+  w.hooks.endFails = 0;
 });

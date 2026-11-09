@@ -57,6 +57,9 @@ const STEP_ERRORS_MAX = 5;
 // session ends by its own time limit.
 const CLEANUP_BACKOFF_MS = [5000, 10000, 20000, 40000, 80000, 160000, 300000];
 const CLEANUP_TRIES_MAX = 20;
+// A session found after an unfinished connect must have been made by that connect: no
+// earlier than it began and no later than this long after.
+const CONNECT_WINDOW_MS = 60_000;
 const SESSION_FAILS_MAX = 3;
 const NUDGE_TEXT = 'Call a tool, or call finish.';
 const EXTRA_CALL = 'Only one tool call per reply. This one was not run.';
@@ -244,11 +247,12 @@ export class AgentTask {
     }
     const row = await this.store.getTask(this.cfg.workspace, this.cfg.task_id);
     if (!row || row.ended_at !== null) {
+      // A failed cleanup sets its own retry alarm.
+      this.busy = true;
       try {
         await this.cleanup();
-      } catch (_) {
-        // The database could not answer: the next alarm finishes the job.
-        await this.rearm(STEP_ERROR_BACKOFF_MS[0]);
+      } finally {
+        this.busy = false;
       }
     } else {
       await this.rearm(0);
@@ -265,6 +269,30 @@ export class AgentTask {
   // once the session is confirmed ended or is someone else's. Until then an alarm tries
   // again with a growing wait, and gives up after CLEANUP_TRIES_MAX tries.
   async cleanup() {
+    try {
+      await this.finishCleanup();
+    } catch (_) {
+      // The database or the Session could not answer: count a try, and the alarm comes back.
+      await this.cleanupFailed();
+    }
+  }
+
+  async cleanupFailed() {
+    const st = this.st;
+    st.ending = true;
+    st.cleanup_tries = (st.cleanup_tries ?? 0) + 1;
+    if (st.cleanup_tries >= CLEANUP_TRIES_MAX) {
+      // Nothing more can be done from here. A reservation left uncharged stays counted against the caps.
+      st.done = true;
+      await this.ctx.storage.deleteAlarm();
+      await this.save().catch(() => {});
+      return;
+    }
+    await this.save().catch(() => {});
+    await this.rearm(CLEANUP_BACKOFF_MS[Math.min(st.cleanup_tries - 1, CLEANUP_BACKOFF_MS.length - 1)]);
+  }
+
+  async finishCleanup() {
     const { workspace, task_id: id } = this.cfg;
     const st = this.st;
     st.ending = true;
@@ -281,7 +309,7 @@ export class AgentTask {
         this.bump();
         return;
       }
-      const note = 'could not confirm that the PC\'s session was ended; it ends by itself when its time runs out';
+      const note = 'could not confirm that the PC\'s session was ended; the starter should end it by hand, with session_end or the PC\'s End session';
       st.closed = true;
       st.notes.push({ ts: Date.now(), text: note });
       this.addStep('cleanup', note, false);
@@ -308,6 +336,13 @@ export class AgentTask {
       } catch (_) {
         return false;
       }
+      if (sid) {
+        // Keep it: a retry must end this session and no other the starter opens later.
+        st.sid = sid;
+        st.opened = true;
+        st.connecting = false;
+        await this.save();
+      }
     }
     if (!sid) return true;
     const ended = await deviceHooks(this.env).endSession(workspace, sid, undefined, starter, { expectDriver: starter });
@@ -329,7 +364,15 @@ export class AgentTask {
     await this.load();
     if (!this.cfg || this.st.done) return;
     // The task is over and only its session is left to end: the row is the truth, so no step.
-    if (this.st.ending) return this.cleanup();
+    if (this.st.ending) {
+      this.busy = true;
+      try {
+        await this.cleanup();
+      } finally {
+        this.busy = false;
+      }
+      return;
+    }
     this.busy = true;
     try {
       await this.step();
@@ -473,6 +516,7 @@ export class AgentTask {
         if (found) return this.attach(found);
       }
       st.connecting = true;
+      st.connect_at = Date.now();
       await this.save();
       const res = await this.tool('device_connect', { device_id: cfg.device_id });
       let out = null;
@@ -520,6 +564,9 @@ export class AgentTask {
     const pointer = await devicesFromEnv(this.env).liveSession(cfg.workspace, cfg.device_id);
     if (!pointer || normalizeIdentity(pointer.by) !== cfg.starter) return null;
     const watch = await this.readWatch(pointer.id);
+    // Only the session this task's own connect made, not one the starter opened by hand since.
+    const at = this.st.connect_at;
+    if (typeof at !== 'number' || typeof watch.created_at !== 'number' || watch.created_at < at || watch.created_at > at + CONNECT_WINDOW_MS) return null;
     return ['waiting', 'attached'].includes(watch.state) && watch.device_id === cfg.device_id && normalizeIdentity(watch.driver) === cfg.starter ? pointer.id : null;
   }
 

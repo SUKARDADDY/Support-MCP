@@ -1460,7 +1460,9 @@ to ask still asks), or uses the given session, whose driver must be the starter 
 nobody. The connect is recorded before it is made; if the object died after the relay
 made the session and before it saved it, the next step takes up the live session on
 that PC whose driver is the starter instead of connecting again, and an end of the task
-before that step ends it. A refused connect made no session, so nothing is adopted or
+before that step ends it. Only a session created by that connect counts (the Session's
+`/watch` answer carries its `created_at`: no earlier than the connect began, no more than
+60 seconds after), and a session found is saved at once, so a retry never ends a later one. A refused connect made no session, so nothing is adopted or
 ended after one. While `EMERGENCY_STOP` is set, `POST .../agent/tasks` answers 503
 `relay_stopped` and makes no task, as `agent_start` refuses.
 
@@ -1536,7 +1538,9 @@ only when the Session confirms the end, says it is already over, or says another
 drives it. If the Session or the database cannot be reached, the task row keeps its
 stopped, done or failed state and the object keeps an alarm that tries again after 5, 10,
 20, 40, 80, 160 and then 300 seconds. After 20 tries (about 75 minutes) it gives up, adds
-a note to the task, and leaves the session to end at its own time limit.
+a note to the task telling the starter to end the session by hand (`session_end` or the
+PC's End session). An error inside a retry counts as a try and sets the next alarm; one
+cleanup runs at a time.
 
 ### Providers
 

@@ -879,9 +879,10 @@ export class Session {
   async doWatch(url) {
     if (await this.otherWorkspace(url.searchParams.get('workspace'))) return Response.json({ state: 'unknown', actors: [] });
     await this.expireIfDue();
-    const s = await this.ctx.storage.get(['state', 'device_id', 'driver', 'ended_reason', 'actors']);
+    const s = await this.ctx.storage.get(['state', 'device_id', 'driver', 'ended_reason', 'actors', 'created_at']);
     return Response.json({
       state: s.get('state') ?? 'unknown',
+      created_at: s.get('created_at') ?? null,
       ended_reason: s.get('ended_reason') ?? null,
       device_id: s.get('device_id') ?? null,
       driver: s.get('device_id') ? s.get('driver') ?? null : null,
