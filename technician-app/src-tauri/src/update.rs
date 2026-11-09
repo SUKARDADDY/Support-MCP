@@ -9,7 +9,7 @@
 //   * needs a newer version, downloads the installer, and checks its size and SHA-256
 //     against the signed note before it keeps the file
 //   * at the next start checks the signature and the file again, runs the installer silently
-//     (/S /R) and exits so the installer can replace the app's files
+//     (/S /R /UPDATE) and exits so the installer can replace the app's files
 //
 // The note is five lines, as the PC app's is, under its own header (src/release.js):
 //   support-mcp-technician-release 1 / version / sha256 / size / released
@@ -223,7 +223,13 @@ struct Staged {
     attempts: u32,
 }
 
-/// Runs the installer. On Windows it starts the file with /S /R, detached; the app then exits.
+/// What the installer is started with: silent (/S), start the app again when done (/R), and
+/// /UPDATE, which is the one flag that puts Tauri's NSIS installer in update mode: it installs
+/// over the old files without running the old uninstaller, and any uninstaller it does start
+/// is told it is an update too. /S and /R alone do not set it. docs/technician-app.md.
+pub const INSTALLER_ARGS: [&str; 3] = ["/S", "/R", "/UPDATE"];
+
+/// Runs the installer. On Windows it starts the file with INSTALLER_ARGS, detached; the app then exits.
 pub trait Installer: Send + Sync {
     fn run(&self, installer: &Path) -> CoreResult<()>;
 }
@@ -242,7 +248,7 @@ fn run_silent(installer: &Path) -> CoreResult<()> {
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     std::process::Command::new(installer)
-        .args(["/S", "/R"])
+        .args(INSTALLER_ARGS)
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .spawn()
         .map(|_| ())
@@ -968,6 +974,14 @@ mod tests {
         let ran = installer.0.lock().unwrap().clone();
         assert_eq!(ran.len(), 1);
         assert!(ran[0].ends_with("support-technician-0.8.0-setup.exe"));
+    }
+
+    #[test]
+    fn the_installer_is_started_in_update_mode() {
+        // Tauri's installer enters update mode only on /UPDATE. In that mode it never runs the old
+        // uninstaller, and the uninstall hook (windows/hooks.nsh) never clears the sign-in.
+        assert_eq!(INSTALLER_ARGS, ["/S", "/R", "/UPDATE"]);
+        assert!(include_str!("update.rs").contains(".args(INSTALLER_ARGS)"), "the Windows start uses the list");
     }
 
     #[tokio::test(flavor = "multi_thread")]

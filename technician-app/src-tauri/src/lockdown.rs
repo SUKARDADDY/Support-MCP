@@ -119,6 +119,28 @@ mod tests {
     }
 
     #[test]
+    fn a_silent_uninstall_removes_the_app_data_and_an_update_never_does() {
+        let conf = json("tauri.conf.json");
+        let hooks = conf["bundle"]["windows"]["nsis"]["installerHooks"].as_str().expect("the installer hooks file is set");
+        let nsh = read(hooks.trim_start_matches("./"));
+        // The data is removed in the post-uninstall hook only: nothing at install time.
+        assert!(nsh.contains("!macro NSIS_HOOK_POSTUNINSTALL"));
+        for other in ["NSIS_HOOK_PREINSTALL", "NSIS_HOOK_POSTINSTALL", "NSIS_HOOK_PREUNINSTALL"] {
+            assert!(!nsh.contains(other), "{other}");
+        }
+        let code: String = nsh.lines().filter(|l| !l.trim_start().starts_with(';')).collect::<Vec<_>>().join("\n");
+        // Both folders, only for a silent uninstall that is not an update.
+        assert!(code.contains("${If} ${Silent}") && code.contains("${AndIf} $UpdateMode <> 1"));
+        assert!(code.contains("RmDir /r \"$APPDATA\\${BUNDLEID}\"") && code.contains("RmDir /r \"$LOCALAPPDATA\\${BUNDLEID}\""));
+        assert_eq!(code.matches("RmDir").count(), 2, "nothing else is removed");
+        assert!(code.find("${If} ${Silent}").unwrap() < code.find("RmDir").unwrap(), "the removal sits inside the guard");
+        // The bundle id the template expands is the folder name the app's data lives in.
+        assert_eq!(conf["identifier"], "dev.support-mcp.technician");
+        // The updater starts the installer in update mode.
+        assert!(crate::update::INSTALLER_ARGS.contains(&"/UPDATE"));
+    }
+
+    #[test]
     fn tauri_is_built_without_dev_tools_asset_protocol_or_shell() {
         let cargo = read("Cargo.toml");
         let line = cargo.lines().find(|l| l.starts_with("tauri = ")).unwrap();
