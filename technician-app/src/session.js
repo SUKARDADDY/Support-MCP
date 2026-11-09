@@ -69,7 +69,7 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
   const [stopped, setStopped] = useState(null); // null, 'driving', 'busy' or 'failed'
   const [stoppedMessage, setStoppedMessage] = useState(null);
   const [held, setHeld] = useState(false); // a task is being started: no screenshot may begin
-  const heldRef = useRef(false);
+  const holds = useRef(0); // how many task starts hold the screenshots; each releases its own
   const inFlight = useRef(null); // the screenshot request on its way, if any
   const alive = useRef(true);
   const fails = useRef(0);
@@ -109,9 +109,11 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
     try {
       const f = await taskFrame(core, account, id);
       if (alive.current) { setFrame(f); setFrameWaiting(false); }
+      return true;
     } catch (e) {
       // A task that has not taken a picture yet (or whose object was evicted) has none: wait for the next.
       if (alive.current && e?.code === 'no_frame') setFrameWaiting(true);
+      return false;
     }
   }, [core, account]);
   const visibleRef = useRef(onScreen);
@@ -142,7 +144,8 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
           }
           if (t.rev !== lastRev.current) {
             lastRev.current = t.rev;
-            if (visibleRef.current) await fetchFrame(taskId);
+            // A fetch that fails (or finds no picture yet) is tried again at the next poll.
+            if (visibleRef.current) { if (!(await fetchFrame(taskId))) lastRev.current = null; }
             else lastRev.current = null; // fetch it when the tab comes back
           }
           // The relay holds the call until something changes. One that comes back at once
@@ -166,7 +169,8 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
   useEffect(() => {
     if (onScreen && taskLive) {
       lastRev.current = task.rev;
-      fetchFrame(taskId);
+      // A fetch that fails must not stay marked as done: the next status poll tries again.
+      fetchFrame(taskId).then((ok) => { if (!ok && lastRev.current === task.rev) lastRev.current = null; });
     }
   }, [onScreen]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -174,7 +178,7 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
   // Not while a task is followed (taskId), even before its first status has come back.
   const watching = attached && isDriver && !taskId && !taskLive && !stopped && canControl && onScreen && !held;
   useInterval(async () => {
-    if (heldRef.current) return;
+    if (holds.current > 0) return;
     try {
       const call = screenshot(core, account, sessionId);
       inFlight.current = call;
@@ -195,13 +199,17 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
 
   // Before a task is started on this session: stop the loop and let a request in flight finish
   // (whatever it answers), so the PC is free for the agent's first step.
+  // Each start holds once and releases once, so one start failing does not free another's hold.
   const holdScreenshots = useCallback(async () => {
-    heldRef.current = true;
+    holds.current += 1;
     setHeld(true);
     const pending = inFlight.current;
     if (pending) await pending.catch(() => {});
   }, []);
-  const releaseScreenshots = useCallback(() => { heldRef.current = false; setHeld(false); }, []);
+  const releaseScreenshots = useCallback(() => {
+    holds.current = Math.max(0, holds.current - 1);
+    setHeld(holds.current > 0);
+  }, []);
 
   const resumeShots = useCallback(() => { fails.current = 0; setStopped(null); setStoppedMessage(null); }, []);
 

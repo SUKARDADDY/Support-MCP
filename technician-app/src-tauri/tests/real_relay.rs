@@ -104,7 +104,20 @@ async fn the_core_signs_in_calls_the_relay_refreshes_and_hears_the_feed() {
     assert_ne!(after.access, before.access, "a new access token");
     assert_ne!(after.refresh, before.refresh, "the refresh token rotated");
 
-    // Signing out removes the account.
+    // Signing out revokes the sign-in at the relay and removes the account here.
+    let last = store.tokens(&id).unwrap();
+    let saved = store.account(&id).unwrap();
     core.sign_out(&id).await.unwrap();
     assert!(core.accounts().is_empty());
+    // The refresh token the app held no longer works: the relay answers invalid_grant. (The
+    // library answers 200 to any revocation request, so only this shows the grant is gone.)
+    let refused = http
+        .post(&saved.token_endpoint)
+        .form(&[("grant_type", "refresh_token"), ("refresh_token", last.refresh.as_str()), ("client_id", saved.client_id.as_str()), ("resource", &format!("{relay}/app/w/default"))])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status().as_u16(), 400, "the old refresh token is refused");
+    let refused: Value = refused.json().await.unwrap();
+    assert_eq!(refused["error"], "invalid_grant", "{refused}");
 }

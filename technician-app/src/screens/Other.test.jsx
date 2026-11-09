@@ -59,6 +59,21 @@ describe('Add a device', () => {
     expect(await screen.findByText('Code used by Bar till 2.')).toBeInTheDocument();
   });
 
+  test('a pairing list that comes back malformed does not make the code look used', async () => {
+    const user = userEvent.setup();
+    const fake = fakeCore();
+    fake.state.pairingList = () => ({});
+    renderApp(fake);
+    await screen.findByRole('button', { name: /Front counter/ });
+    await user.click(nav('Add a device'));
+    await user.click(screen.getByRole('button', { name: 'Get a pairing code' }));
+    await screen.findByTestId('pairing-code');
+    await waitFor(() => expect(fake.calls.filter((c) => c.kind === 'request' && c.args[0] === 'GET' && c.args[1] === '/api/pairing').length).toBeGreaterThanOrEqual(2));
+    expect(screen.queryByTestId('pairing-done')).not.toBeInTheDocument();
+    expect(screen.getByTestId('pairing-code')).toBeInTheDocument();
+    expect(screen.getByText(/Works once\. \d+:\d\d left\./)).toBeInTheDocument();
+  });
+
   test('an expired code is replaced by a button for a new one', async () => {
     const user = userEvent.setup();
     const fake = fakeCore();

@@ -66,7 +66,9 @@ export async function createPairing(core, account) {
 // The pairing codes that can still be used (the relay never shows the code again): [{ id, expires_at, ... }].
 export async function listPairings(core, account) {
   const v = await core.request(account, 'GET', '/api/pairing');
-  return Array.isArray(v?.pairings) ? v.pairings : [];
+  // A reply without the list is a failed read, not an empty list: an empty one would read as "every code is used".
+  if (!Array.isArray(v?.pairings)) throw new Error('the pairing list is missing from the relay\'s answer');
+  return v.pairings;
 }
 
 // Approves a waiting PC with the six digits its owner reads out.

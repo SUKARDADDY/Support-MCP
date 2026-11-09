@@ -1,9 +1,10 @@
-import { act, screen, waitFor, within } from '@testing-library/react';
+import { act, renderHook, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
-import { ID, ToolFail, fakeCore, renderApp } from '../test-utils.jsx';
+import { useSession } from '../session.js';
+import { FAST, ID, ToolFail, fakeCore, renderApp } from '../test-utils.jsx';
 
 const SID = 's'.repeat(64);
 const TASK = ID('t');
@@ -348,9 +349,52 @@ describe('Session tab: handing the session to the agent', () => {
 
   test('every task start goes through the app\'s one guarded function', () => {
     const dir = join(import.meta.dirname, '..');
-    const files = [...readdirSync(dir), ...readdirSync(join(dir, 'screens')).map((f) => `screens/${f}`)].filter((f) => /\.jsx?$/.test(f) && !/\.test\./.test(f));
+    const files = readdirSync(dir, { recursive: true }).map(String).filter((f) => /\.jsx?$/.test(f) && !/\.test\./.test(f) && f !== 'test-utils.jsx');
+    expect(files).toContain(join('screens', 'SessionTab.jsx'));
     const callers = files.filter((f) => /\bstartTask\(/.test(readFileSync(join(dir, f), 'utf8')) && f !== 'api.js');
     expect(callers).toEqual(['App.jsx']);
+  });
+
+  test('two starts hold the screenshots separately: one releasing does not free the other', async () => {
+    const fake = fakeCore();
+    fake.state.sessions[SID] = { state: 'attached', driver: 'tech@example.com', machine: 'FRONT', log: [] };
+    const props = { core: fake.core, account: 'acc1', tab: { key: SID, sessionId: SID, taskId: null }, active: true, me: { identity: 'tech@example.com' }, canControl: true, tuning: FAST, visible: true, onSessionKnown: () => {} };
+    const { result } = renderHook(() => useSession(props));
+    await waitFor(() => expect(toolCalls(fake, 'screenshot').length).toBeGreaterThanOrEqual(2));
+    await act(async () => { await result.current.holdScreenshots(); await result.current.holdScreenshots(); });
+    await sleep(60);
+    const held = toolCalls(fake, 'screenshot').length;
+    act(() => result.current.releaseScreenshots()); // the first start failed
+    await sleep(150);
+    expect(toolCalls(fake, 'screenshot').length).toBe(held); // the second start still holds
+    act(() => result.current.releaseScreenshots());
+    await waitFor(() => expect(toolCalls(fake, 'screenshot').length).toBeGreaterThan(held));
+    // A release with nothing held does not push the count below zero.
+    act(() => result.current.releaseScreenshots());
+    act(() => { result.current.holdScreenshots(); });
+    const again = toolCalls(fake, 'screenshot').length;
+    await sleep(120);
+    expect(toolCalls(fake, 'screenshot').length).toBe(again);
+  });
+
+  test('a picture that fails to load when the tab comes back is fetched again at the next poll', async () => {
+    const fake = fakeCore();
+    fake.state.tasks = [{ id: TASK, state: 'running', title: 'Fix', session_id: SID, device_id: ID('a'), created_at: Date.now() - 1000, ended_at: null, phase: 'working', rev: 1, steps: [], notes: [] }];
+    let mode = 'first';
+    let failed = 0;
+    fake.state.frame = () => {
+      if (mode === 'fail') { failed += 1; throw Object.assign(new Error('the relay is busy'), { code: 'unavailable', status: 503 }); }
+      return { rev: 1, at: Date.now(), mime: 'image/png', data: mode === 'first' ? 'QUJD' : 'REVG' };
+    };
+    const { user } = await openTab(fake);
+    await waitFor(() => expect(screen.getByRole('img', { name: 'Screen of Front counter' }).getAttribute('src')).toBe('data:image/png;base64,QUJD'));
+    // Away from the tab and back, while the frame cannot be read. Its rev has not moved.
+    await user.click(screen.getByRole('tab', { name: 'Devices' }));
+    mode = 'fail';
+    await user.click(screen.getByRole('tab', { name: /Front counter/ }));
+    await waitFor(() => expect(failed).toBeGreaterThanOrEqual(1));
+    mode = 'good';
+    await waitFor(() => expect(screen.getByRole('img', { name: 'Screen of Front counter' }).getAttribute('src')).toBe('data:image/png;base64,REVG'));
   });
 
   test('a task the relay refuses to start lets the screenshots go on', async () => {

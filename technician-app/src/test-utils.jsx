@@ -80,7 +80,7 @@ export function fakeCore(initial = {}) {
       if (p === '/api/customers') return { customers: state.customers, next: null };
       if (p === '/api/devices' && method === 'GET') return { devices: state.devices.map(({ online, ...d }) => d), next: null };
       if (p === '/api/pairing' && method === 'POST') return { pairing: state.pairing };
-      if (p === '/api/pairing' && method === 'GET') return { pairings: state.pairingUsed ? [] : [{ id: state.pairing.id, expires_at: state.pairing.expires_at }], next: null };
+      if (p === '/api/pairing' && method === 'GET') return state.pairingList ? state.pairingList() : { pairings: state.pairingUsed ? [] : [{ id: state.pairing.id, expires_at: state.pairing.expires_at }], next: null };
       const approve = /^\/api\/devices\/(\w+)$/.exec(p);
       if (approve && method === 'PATCH') {
         if (state.approveError) throw state.approveError;

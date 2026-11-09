@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from 'vitest';
-import { fetchDevices, fetchPlaces, isLiveTask, messageOf, taskOnSession } from './api.js';
+import { fetchDevices, fetchPlaces, isLiveTask, listPairings, messageOf, taskOnSession } from './api.js';
 import { device } from './test-utils.jsx';
 
 describe('api', () => {
@@ -16,6 +16,12 @@ describe('api', () => {
     const request = vi.fn(async (_a, _m, path) => (path.startsWith('/api/sites') ? { sites: [{ id: 's', customer_id: 'k', name: 'Bakery' }], next: null } : { customers: [{ id: 'k', name: 'Hadar Ltd' }], next: null }));
     const places = await fetchPlaces({ request }, 'acc');
     expect(places.get('s')).toEqual({ name: 'Bakery', customer: 'Hadar Ltd' });
+  });
+
+  test('the pairing list is the relay\'s list, and an answer without one is an error, not an empty list', async () => {
+    expect(await listPairings({ request: async () => ({ pairings: [{ id: 'p1' }] }) }, 'acc')).toEqual([{ id: 'p1' }]);
+    expect(await listPairings({ request: async () => ({ pairings: [] }) }, 'acc')).toEqual([]);
+    for (const odd of [{}, null, { pairings: null }, { pairings: 'x' }]) await expect(listPairings({ request: async () => odd }, 'acc')).rejects.toThrow(/pairing list/);
   });
 
   test('a task is live while it runs or waits to be resumed', () => {

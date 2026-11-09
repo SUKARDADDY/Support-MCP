@@ -323,8 +323,11 @@ impl AccountClient {
 
     /// Asks the relay to revoke this sign-in (RFC 7009, at the token endpoint the relay serves
     /// for refreshing too). Revoking the refresh token ends the whole grant on the relay, the
-    /// access token with it. Best effort and short: true when the relay confirmed, false when
-    /// it was unreachable or refused, so signing out on this PC never waits on the relay.
+    /// access token with it. Best effort and short: true when the relay answered with a success
+    /// status, false when it was unreachable or refused, so signing out on this PC never waits
+    /// on the relay. The true is not proof: the OAuth library answers 200 to any revocation
+    /// request, even for a token it does not know. tests/real_relay.rs shows against a real relay
+    /// that the old refresh token is refused afterwards.
     pub async fn revoke(&self) -> bool {
         let Some(tokens) = self.store.tokens(&self.id) else { return false };
         let sent = self

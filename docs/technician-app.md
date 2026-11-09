@@ -45,6 +45,11 @@ app's data. What happens to them depends on how the app is removed:
   new installer runs for an interactive reinstall is started without `/S`, so it never matches.
   A test (`lockdown.rs`) holds the hook, its two guards and the installer's arguments.
 
+Upgrading by running `uninstall.exe /S` and then the new installer (as winget and some Intune setups
+do) is a silent uninstall, so it wipes the sign-in by design; only the app's own updater and an
+installer run over the old one keep it. During a silent uninstall WebView2 may still hold files in
+`EBWebView` for a moment, so a few may remain in the local folder.
+
 The hook is plain NSIS and is not built on Linux. Check it on Windows: sign in, run
 `uninstall.exe /S` and confirm both folders are gone; then sign in again and let the app update
 itself, and confirm `app.json` is still there.
