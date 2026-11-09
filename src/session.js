@@ -961,13 +961,13 @@ export class Session {
   // pointer (devices.session), in one change. If the database is unreachable the
   // alarm tries again until it works, so a PC is never left looking busy.
   async runCleanup() {
-    const s = await this.ctx.storage.get(['device_id', 'device_name', 'sid', 'workspace', 'cleanup_reason', 'cleanup_actor', 'driver']);
+    const s = await this.ctx.storage.get(['device_id', 'device_name', 'sid', 'workspace', 'cleanup_reason', 'cleanup_actor', 'driver', 'opened_by_task']);
     try {
       const deviceId = s.get('device_id');
       const reason = s.get('cleanup_reason');
       const actor = s.get('cleanup_actor') ?? (['owner', ...DECLINE_REASONS].includes(reason) ? `pc ${deviceId}` : 'relay');
       await devicesFromEnv(this.env).sessionEnded(s.get('workspace') ?? DEFAULT_WORKSPACE, {
-        deviceId, sid: s.get('sid'), name: s.get('device_name') ?? '', reason, actor, driver: s.get('driver') ?? null,
+        deviceId, sid: s.get('sid'), name: s.get('device_name') ?? '', reason, actor, driver: s.get('driver') ?? null, openedByTask: s.get('opened_by_task') ?? null,
       });
       await this.setMany({ cleanup_pending: false });
     } catch (_) {

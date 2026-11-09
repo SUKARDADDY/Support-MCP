@@ -260,11 +260,11 @@ including deletes and lists.
   once per call, but the relay remembers a token it has just checked for 60 seconds, so
   a busy app costs about one read a minute. The app's feed and its open session tabs
   cost Worker requests instead: about 3,500 feed calls a day for one person, and about
-  1,200 requests an hour for each open session tab, against 100,000 requests a day on
+  1,800 requests an hour for each open session tab, against 100,000 requests a day on
   the free plan.
 - The checks above stop junk tokens before KV, but each still costs a request
-  and a database read. Add a Cloudflare rate-limiting rule on `/mcp` and
-  `/w/*` as well as `/oauth/`.
+  and a database read. Add a Cloudflare rate-limiting rule on `/mcp`, `/w/*`
+  and `/app/*` as well as `/oauth/`.
 
 KV is eventually consistent. A write reaches other locations within about a
 minute. Two things follow:

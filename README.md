@@ -819,8 +819,8 @@ deploy without Windows. You need Windows only to change the app: see
    Edge Certificates), so a link pasted without `https://` is redirected. The
    relay refuses `/j`, `/ws` and `/device/` over plain http either way. The relay
    does no rate limiting of its own, so add a Cloudflare rate-limiting rule on
-   `/j`, `/ws` and `/device/` (and on `/oauth/`, `/mcp` and `/w/` if you turn on
-   OAuth). A pairing code is 50 random bits, checked across every workspace, so
+   `/j`, `/ws` and `/device/` (and on `/oauth/`, `/mcp`, `/w/` and `/app/` if you turn
+   on OAuth). A pairing code is 50 random bits, checked across every workspace, so
    the rule on `/device/` is what keeps guessing out of reach.
 5. **Connect your MCP client.** Every request to `/mcp` needs the headers
    `CF-Access-Client-Id` and `CF-Access-Client-Secret`. `cf/mcp-headers.sh`
@@ -863,8 +863,8 @@ deploy without Windows. You need Windows only to change the app: see
    connect with just the address, and service tokens keep working on the MCP
    addresses. Access session revocation does not apply on the paths the second
    app bypasses; there the relay's own checks are the gate. See
-   [docs/mcp-clients.md](docs/mcp-clients.md). Add a rate-limiting rule on `/mcp`
-   and `/w/` too: a flood of junk tokens there is stopped before KV, but each one
+   [docs/mcp-clients.md](docs/mcp-clients.md). Add a rate-limiting rule on `/mcp`,
+   `/w/` and `/app/` too: a flood of junk tokens there is stopped before KV, but each one
    still costs a database read.
 7. **Turn on roles.** Add yourself as the first member, as admin, and in the
    same sitting add your MCP client's service token by its client ID
@@ -955,8 +955,8 @@ check are in [docs/development.md](docs/development.md).
 - The technician app uses the free plan's allowances (100,000 Worker requests and
   100,000 KV reads a day). Its notification feed holds each call open for up to 25
   seconds, so one person with the app open around the clock makes about 3,500 feed
-  calls a day. An open session tab asks for a new picture every 3 seconds, about
-  1,200 requests an hour. Each call with the app's token reads KV once, except that
+  calls a day. An open session tab you drive makes about 1,800 requests an hour (a
+  picture every 3 seconds, plus the task check and the feed). Each call with the app's token reads KV once, except that
   a token the relay has just checked is remembered for 60 seconds. The security
   model has the arithmetic.
 - Cloudflare Access, or the relay's OAuth for MCP clients, decides who can reach

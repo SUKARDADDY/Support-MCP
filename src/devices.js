@@ -1022,12 +1022,15 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
   // so it never clears a newer session. One change, so a retry after a failure
   // either does both or neither. actor is who ended it, or "relay". driver is who
   // drove the session: when the PC's person said no, or ended it early, they hear of
-  // it, unless a running task holds the session (then the task raises its own event).
-  async function sessionEnded(slug, { deviceId, sid, name, reason, actor, driver = null }) {
+  // it, unless a task holds the session (then the task raises its own event). A task
+  // holds it when the session carries the task's id (openedByTask, which stays true
+  // before the task has recorded the sid and after it has ended), or when a running task
+  // is attached to it by sid.
+  async function sessionEnded(slug, { deviceId, sid, name, reason, actor, driver = null, openedByTask = null }) {
     return mutate(slug, actor, async () => {
       const text = Object.hasOwn(EARLY_ENDS, reason) ? EARLY_ENDS[reason] : null;
-      const held = text && driver ? await q('SELECT 1 AS held FROM agent_tasks WHERE workspace = ? AND sid = ? AND ended_at IS NULL LIMIT 1', slug, sid).first('held') : null;
-      const heard = text && driver && !held ? await notify.rows(slug, 'session_declined', { to: [driver] }, {
+      const held = text && driver && !openedByTask ? await q('SELECT 1 AS held FROM agent_tasks WHERE workspace = ? AND sid = ? AND ended_at IS NULL LIMIT 1', slug, sid).first('held') : null;
+      const heard = text && driver && !openedByTask && !held ? await notify.rows(slug, 'session_declined', { to: [driver] }, {
         device_id: deviceId, session_id: sid, title: 'Session ended early', body: `${name}: ${text}`, dedupe: `declined:${sid}`,
       }) : [];
       return {

@@ -13,7 +13,8 @@
 // does not bill, and only a ring wakes the object.
 //
 // It also notes when a PC's doorbell went away (the `doorbells` table, written only
-// when no other socket of that PC is still open). A PC that connects again after 10
+// when no other socket of that PC is still open), and moves the PC's last_seen up to
+// then, which is what the hourly "missing for 7 days" run counts from. A PC that connects again after 10
 // minutes or more raises "came online" for the people who watch it (src/notify.js).
 // The Worker tells this object which workspace it serves when it hands over a doorbell.
 import { teamFromEnv } from './workspace.js';
@@ -26,6 +27,7 @@ export const registryName = (workspace) => (workspace && workspace !== 'default'
 const DEVICE_ID = /^[a-z2-7]{20}$/;
 const WORKSPACE = /^[a-z0-9-]{1,40}$/;
 const DOORBELL_TAG = 'dev:';
+const WORKSPACE_TAG = 'ws:';
 // A PC that was away at least this long raises "came online" when its doorbell returns.
 export const ONLINE_AFTER_MS = 10 * 60 * 1000;
 export const DOORBELL_FRAME_MAX = 1024; // bytes; a larger frame closes the doorbell
@@ -96,14 +98,19 @@ export class Registry {
     for (const old of this.ctx.getWebSockets(tag)) {
       try { old.close(1000, 'replaced'); } catch (_) { /* already closed */ }
     }
+    const workspace = url.searchParams.get('workspace') || '';
     const pair = new WebSocketPair();
-    this.ctx.acceptWebSocket(pair[1], [tag]);
+    // The workspace rides on the socket (a tag lasts through hibernation), so a doorbell that
+    // closes can still say whose PC it was.
+    this.ctx.acceptWebSocket(pair[1], WORKSPACE.test(workspace) ? [tag, WORKSPACE_TAG + workspace] : [tag]);
     // A doorbell is back: if the PC was away long enough, tell its watchers.
     const gone = this.sql.exec('SELECT gone_at FROM doorbells WHERE device_id = ?', id).toArray()[0];
     if (gone) {
       this.sql.exec('DELETE FROM doorbells WHERE device_id = ?', id);
-      const workspace = url.searchParams.get('workspace') || '';
-      if (WORKSPACE.test(workspace) && Date.now() - gone.gone_at >= ONLINE_AFTER_MS) await this.announceOnline(workspace, id, gone.gone_at);
+      if (WORKSPACE.test(workspace) && Date.now() - gone.gone_at >= ONLINE_AFTER_MS) {
+        // Off the connect path: a slow or failing database never delays the doorbell.
+        this.later(this.announceOnline(workspace, id, gone.gone_at));
+      }
     }
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
@@ -131,9 +138,28 @@ export class Registry {
       if (!tag.startsWith(DOORBELL_TAG)) continue;
       const stillOpen = this.ctx.getWebSockets(tag).some((other) => other !== ws && (other.readyState === undefined || other.readyState === 1));
       if (!stillOpen) {
-        this.sql.exec('INSERT INTO doorbells(device_id, gone_at) VALUES (?, ?) ON CONFLICT(device_id) DO UPDATE SET gone_at = excluded.gone_at', tag.slice(DOORBELL_TAG.length), Date.now());
+        const id = tag.slice(DOORBELL_TAG.length);
+        const now = Date.now();
+        this.sql.exec('INSERT INTO doorbells(device_id, gone_at) VALUES (?, ?) ON CONFLICT(device_id) DO UPDATE SET gone_at = excluded.gone_at', id, now);
+        const workspace = tags.find((t) => t.startsWith(WORKSPACE_TAG))?.slice(WORKSPACE_TAG.length);
+        if (workspace) this.later(this.touchSeen(workspace, id, now));
       }
     }
+  }
+
+  // The PC was in contact until its doorbell closed: move its last_seen up to then, so the
+  // hourly run counts its 7 days from the drop and not from its last check-in, which can be
+  // months back on a PC whose doorbell stayed connected. Best effort.
+  async touchSeen(workspace, id, at) {
+    try {
+      await this.env.DB.prepare("UPDATE devices SET last_seen = ? WHERE workspace = ? AND id = ? AND status = 'active' AND last_seen < ?").bind(at, workspace, id, at).run();
+    } catch (_) { /* the PC looks as quiet as it was */ }
+  }
+
+  // Work that is not on the connection's path. Its failures are its own.
+  later(promise) {
+    const quiet = promise.catch(() => {});
+    if (typeof this.ctx.waitUntil === 'function') this.ctx.waitUntil(quiet);
   }
 
   // The ids of the PCs whose doorbell is connected.

@@ -7,7 +7,7 @@
 // bare, `node --test` skips this file with a message instead of failing.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { appWorld, skip, BOSS, TECH, VIEW, HOST, JSON_HEADERS, unesc } from './app-world.js';
+import { appWorld, skip, field, BOSS, TECH, VIEW, HOST, JSON_HEADERS, unesc } from './app-world.js';
 import { oai } from './agent-fakes.js';
 import { appResourceUrl, challengeHeader, resourceTarget, resourceUrl, workspaceForAppResource } from '../src/oauth.js';
 
@@ -176,6 +176,20 @@ it('a checked app token is remembered for 60 seconds and then checked again', as
   assert.ok(w.kv.reads >= before + 2, 'MCP tokens are not remembered');
   // A token stays bound to its address through the cache.
   assert.equal((await w.appTool(app.access, 'session_list', {}, { base: '/app/w/acme/mcp' })).status, 401);
+});
+
+it('sign out everywhere ends a remembered app token at the next call, not a minute later', async (t) => {
+  const w = await appWorld(t);
+  const app = await w.connect(TECH, { app: true });
+  assert.equal((await w.appCall(app.access, 'GET', '/teams')).status, 200, 'the token works');
+  const reads = w.kv.reads;
+  assert.equal((await w.appCall(app.access, 'GET', '/teams')).status, 200);
+  assert.equal(w.kv.reads, reads, 'the check is remembered');
+  const page = await (await app.browser.fetch('/account')).text();
+  const out = await app.browser.fetch('/account/signout-everywhere', { method: 'POST', form: { csrf: field(page, 'csrf') } });
+  assert.equal(out.status, 303);
+  assert.match(out.headers.get('location'), /m=signed_out/);
+  assert.equal((await w.appCall(app.access, 'GET', '/teams')).status, 401, 'the next call is refused with no time passed');
 });
 
 it('an app token stops working at the next call once its person is removed from every team', async (t) => {

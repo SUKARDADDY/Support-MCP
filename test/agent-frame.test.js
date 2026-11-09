@@ -216,3 +216,28 @@ it('no storage write holds image bytes: not the task\'s storage, not D1, not KV,
   assert.deepEqual(everywhere(), [], 'after it ends');
   assert.equal(w.taskObject(a.id).task.frame, null);
 });
+
+it('a tool call still in flight when the task ends does not put the picture back in memory', async (t) => {
+  const w = await appWorld(t);
+  await w.ready();
+  const a = await startThroughApp(w, TECH, { handler: screens(FULL_ONE) });
+  w.fake.queue('openai', shotCall());
+  await w.alarm(a.id);
+  const task = w.taskObject(a.id).task;
+  assert.equal(task.frame?.data, FULL_ONE, 'the task holds a picture while it works');
+  const late = { content: [{ type: 'image', data: FULL_TWO, mimeType: 'image/jpeg' }] };
+  // Ending: cleanup has cleared the frame and the result of the call in flight comes in.
+  task.st.ending = true;
+  task.frame = null;
+  task.holdFrame('screenshot', late);
+  assert.equal(task.frame, null, 'ending');
+  // Done: the same.
+  task.st.ending = false;
+  task.st.done = true;
+  task.holdFrame('screenshot', late);
+  assert.equal(task.frame, null, 'done');
+  // Working again would hold it, so the guard is what keeps it out.
+  task.st.done = false;
+  task.holdFrame('screenshot', late);
+  assert.equal(task.frame.data, FULL_TWO);
+});

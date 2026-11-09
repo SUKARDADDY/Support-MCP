@@ -44,9 +44,11 @@ function context({ sql } = {}) {
   const values = new Map();
   const logs = [];
   const sockets = [];
+  const waited = []; // promises handed to waitUntil
   let alarm = null;
   const ctx = {
-    values, logs, sockets,
+    values, logs, sockets, waited,
+    waitUntil: (promise) => { waited.push(promise); },
     alarm: () => alarm,
     storage: {
       get: async (key) => (Array.isArray(key) ? new Map(key.map((k) => [k, values.get(k)])) : values.get(key)),

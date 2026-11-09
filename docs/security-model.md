@@ -919,7 +919,7 @@ apply to only one client say which.
     person who exists and is not disabled in D1, whose free read limit is far
     higher. Anything else is a 401 `invalid_token` with no KV read. If D1 cannot
     answer, the answer is 503. A flood still costs a request and a D1 read each,
-    so add a rate-limiting rule on `/mcp` and `/w/*`, as on `/oauth/`.
+    so add a rate-limiting rule on `/mcp`, `/w/*` and `/app/*`, as on `/oauth/`.
   - **Sign out everywhere ends the person's grants.** It lists and revokes every
     grant for the person. If KV cannot be reached it says so instead of
     claiming success. A plain sign out leaves the clients connected.
@@ -1018,7 +1018,7 @@ apply to only one client say which.
   `members.notify`.
 - **The free plan's allowances, for the app.** The feed holds each call open up to 25 seconds,
   so one person with the app open around the clock makes about 3,500 feed calls a day, and
-  each open session tab asks for a picture every 3 seconds, about 1,200 requests an hour. The
+  each open session tab you drive makes about 1,800 requests an hour (a picture every 3 seconds, plus the task check and the feed). The
   free plan allows 100,000 Worker requests a day, so a handful of busy tabs and people can use
   it up, and Cloudflare then refuses requests until the next day. Each call with the
   app's token reads KV once, against 100,000 reads a day, unless the token was checked in the

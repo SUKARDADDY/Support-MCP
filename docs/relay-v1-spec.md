@@ -993,7 +993,7 @@ read sees. The relay does not store the picture in the Session or Registry eithe
 | `task_problem` | a task ends `stuck` or `failed`, or the relay stops it (2 minutes unwatched, key or caps removed, someone else took over, and so on), or its cleanup gave up on ending the PC's session | the starter |
 | `session_declined` | a saved PC's person declined, nobody was there, the PC was busy, or the owner ended it, and no running task holds the session | the session's driver |
 | `device_online` | a watched PC's doorbell returns after 10 minutes or more away | its watchers |
-| `device_missing` | a PC removes itself; or it has no doorbell and its `last_seen` is over 7 days old | its watchers, and for a PC that left also holders of `devices.manage` |
+| `device_missing` | a PC removes itself; or it has no doorbell and its last contact is over 7 days old (`last_seen`, which a closing doorbell also moves up to the drop, or `paired_at` when `last_seen` is empty) | its watchers, and for a PC that left also holders of `devices.manage` |
 | `device_waiting` | a PC asks to join | holders of `devices.manage` |
 
 A person's own settings can switch an event off, and `device_online` and `device_missing` for a
@@ -1004,7 +1004,7 @@ Registry, which learns its workspace from the Worker's hand-off and records when
 doorbell closed), a task whose cleanup gave up, and the hourly run (`scheduled` in `src/app.js`,
 `src/sweep.js`, a Cron Trigger in `wrangler.toml`), which also deletes rows older than 30 days. A
 `dedupe` key per occurrence, unique per person, makes a retry add nothing; for a missing PC it is
-the PC plus its `last_seen`, so it is told of once. The team log is not written. Title and body are
+the PC plus that last contact, so it is told of once. The run stays under 50 subrequests and takes teams and PCs in turn, starting from a different place each hour, so a big team cannot crowd out the others. The team log is not written. Title and body are
 plain text and may repeat text from a customer's PC.
 
 ## Session state machine (Session DO)

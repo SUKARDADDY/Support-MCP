@@ -180,6 +180,22 @@ test('a declined PC with a live task raises only the task\'s problem', async (t)
   assert.deepEqual(rows.map((r) => [r.recipient, r.event, r.body]), [[TECH, 'task_problem', 'The printer stopped printing.: the person at the PC declined']]);
 });
 
+test('a session a task opened raises no "declined" before the task records its sid, nor on a cleanup retried after the task ended', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  for (const [label, hold] of [['before the task records the sid', 'sid = NULL'], ['after the task ended', "ended_at = 1, state = 'failed'"]]) {
+    const pc = await w.addPc({ access: 'any', name: label });
+    const a = await w.startOnPc(TECH, { keep_working: true }, { pc, join: false });
+    const sid = w.taskRow(a.id).sid;
+    assert.ok(sid, 'the task opened a session');
+    // The agent_tasks row no longer shows a running task on this sid: only the Session knows.
+    w.db.sqlite.prepare(`UPDATE agent_tasks SET ${hold} WHERE id = ?`).run(a.id);
+    assert.equal((await w.agent(sid, pc.key, { type: 'decline', reason: 'declined' })).status, 200, label);
+    assert.equal(w.reasonOf(sid), 'declined', label);
+    assert.equal(rowsOf(w, 'WHERE session_id = ?', sid).length, 0, `${label}: no "declined"`);
+  }
+});
+
 // ---- a PC waiting, and a PC that left ---------------------------------------------------------------------
 test('a PC that asks to join tells the people who can approve it, and no one else', async (t) => {
   const w = await agentWorld(t);
@@ -253,10 +269,37 @@ test('a doorbell that returns after 10 minutes away tells the PC\'s watchers; a 
   const wentAt = w.now();
   w.advance(ONLINE_AFTER_MS);
   assert.equal((await WORKSPACE_DOOR(w, pc.id)).status, 101);
+  await Promise.all(ctx.waited);
   assert.deepEqual(rowsOf(w).map((r) => [r.recipient, r.event, r.device_id, r.body, r.dedupe]), [[TECH, 'device_online', pc.id, 'Till', `online:${pc.id}:${wentAt}`]]);
   // It is told of once.
   assert.equal((await WORKSPACE_DOOR(w, pc.id)).status, 101);
   assert.equal(rowsOf(w).length, 1);
+});
+
+test('the doorbell connects without waiting for the "came online" write, and a write that fails does not break it', async (t) => {
+  const w = await agentWorld(t);
+  upgradeResponses(t);
+  const pc = await w.addPc({ name: 'Till' });
+  const { registry, ctx } = w.registryFor('registry');
+  assert.equal((await WORKSPACE_DOOR(w, pc.id)).status, 101);
+  const goneAndBack = async () => {
+    await registry.webSocketClose(ctx.sockets.filter((s) => !s.closed).at(-1), 1006, '');
+    w.advance(ONLINE_AFTER_MS);
+  };
+  // A write that never finishes.
+  let started = 0;
+  registry.announceOnline = () => { started++; return new Promise(() => {}); };
+  await goneAndBack();
+  const waitedBefore = ctx.waited.length;
+  const door = await Promise.race([WORKSPACE_DOOR(w, pc.id), new Promise((resolve) => setTimeout(() => resolve('waited'), 200))]);
+  assert.equal(door.status, 101, 'the 101 did not wait for the write');
+  assert.equal(started, 1);
+  assert.equal(ctx.waited.length, waitedBefore + 1, 'the write was handed to waitUntil');
+  // A write that throws.
+  registry.announceOnline = async () => { throw new Error('D1 is down'); };
+  await goneAndBack();
+  assert.equal((await WORKSPACE_DOOR(w, pc.id)).status, 101);
+  await Promise.all(ctx.waited.slice(waitedBefore + 1));
 });
 
 test('the Worker hands the doorbell its workspace, and a Registry that is told nothing raises nothing', async (t) => {
@@ -301,6 +344,82 @@ test('a PC with no check-in and no doorbell for 7 days is reported missing once,
   w.advance(7 * DAY + 3600_000);
   await sweep(w.env);
   assert.deepEqual(rowsOf(w, 'WHERE id > ?', 2).map((r) => [r.recipient, r.device_id]).sort(), [[LEAD, gone.id], [TECH, fresh.id], [TECH, gone.id]].sort());
+});
+
+test('a PC with no last_seen counts from when it was paired', async (t) => {
+  const w = await agentWorld(t);
+  const pc = await w.addPc({ name: 'Never seen' });
+  await notifyStore(w.db, w.team).patchSettings('default', TECH, { watch: [pc.id] });
+  // The column is NOT NULL in the shipped schema: let it be empty for this test.
+  w.db.sqlite.exec('CREATE TABLE devices_open AS SELECT * FROM devices; DROP TABLE devices; ALTER TABLE devices_open RENAME TO devices');
+  const pairedAt = w.sql('SELECT paired_at FROM devices WHERE id = ?', pc.id)[0].paired_at;
+  w.db.sqlite.prepare('UPDATE devices SET last_seen = NULL WHERE id = ?').run(pc.id);
+  w.advance(7 * DAY + 3600_000);
+  await sweep(w.env);
+  assert.deepEqual(rowsOf(w).map((r) => [r.recipient, r.dedupe]), [[TECH, `missing:${pc.id}:${pairedAt}`]]);
+  await sweep(w.env);
+  assert.equal(rowsOf(w).length, 1, 'once');
+});
+
+test('a PC whose doorbell stayed connected for weeks is reported 7 days after the doorbell drops, once', async (t) => {
+  const w = await agentWorld(t);
+  upgradeResponses(t);
+  const pc = await w.addPc({ name: 'Till' });
+  await notifyStore(w.db, w.team).patchSettings('default', TECH, { watch: [pc.id] });
+  const { registry, ctx } = w.registryFor('registry');
+  assert.equal((await WORKSPACE_DOOR(w, pc.id)).status, 101);
+  // It checked in once, then only the doorbell stayed up: last_seen is 30 days old.
+  w.advance(30 * DAY);
+  await sweep(w.env);
+  assert.equal(rowsOf(w).length, 0, 'the doorbell is connected');
+  // The doorbell drops now.
+  await registry.webSocketClose(ctx.sockets.find((s) => !s.closed), 1006, '');
+  await Promise.all(ctx.waited);
+  const droppedAt = w.now();
+  assert.equal(w.sql('SELECT last_seen FROM devices WHERE id = ?', pc.id)[0].last_seen, droppedAt, 'the drop is the last contact');
+  w.advance(DAY);
+  await sweep(w.env);
+  assert.equal(rowsOf(w).length, 0, 'one day is not 7');
+  w.advance(6 * DAY + 3600_000);
+  await sweep(w.env);
+  assert.deepEqual(rowsOf(w).map((r) => [r.recipient, r.dedupe]), [[TECH, `missing:${pc.id}:${droppedAt}`]]);
+  await sweep(w.env);
+  assert.equal(rowsOf(w).length, 1, 'once');
+  // A doorbell that is replaced by a newer socket, or that closes because the PC was removed, is not a drop.
+  const other = await w.addPc({ name: 'Replaced' });
+  assert.equal((await WORKSPACE_DOOR(w, other.id)).status, 101);
+  assert.equal((await WORKSPACE_DOOR(w, other.id)).status, 101);
+  const seen = w.sql('SELECT last_seen FROM devices WHERE id = ?', other.id)[0].last_seen;
+  w.advance(1000);
+  await registry.webSocketClose(ctx.sockets.filter((s) => s.tags.includes(`dev:${other.id}`))[0], 1000, 'replaced');
+  assert.equal(w.sql('SELECT last_seen FROM devices WHERE id = ?', other.id)[0].last_seen, seen);
+});
+
+test('a big team does not crowd the others out of the hourly run, and a run stays under the free plan\'s subrequests', async (t) => {
+  const w = await agentWorld(t);
+  await acme(w);
+  // 600 PCs in acme (which sorts first) that crossed 7 days earlier than default's one PC.
+  const insert = w.db.sqlite.prepare("INSERT INTO devices(workspace, id, status, name, access, control, key_hash, paired_at, paired_by, last_seen) VALUES (?, ?, 'active', ?, 'ask', 'full', 'k', 1, 'test', ?)");
+  const base = w.now();
+  for (let i = 0; i < 600; i++) insert.run('acme', `${String(i).padStart(4, '0')}`.replace(/\d/g, (d) => 'abcdefghij'[d]).padEnd(20, 'a'), `Big ${i}`, base - 1000 - i);
+  const small = 'z'.repeat(20);
+  insert.run('default', small, 'Small', base + 5000);
+  const watch = (slug, ids) => w.db.sqlite.prepare('UPDATE members SET notify = ? WHERE workspace = ? AND identity = ?').run(JSON.stringify({ watch: ids }), slug, TECH);
+  watch('default', [small]);
+  watch('acme', w.sql("SELECT id FROM devices WHERE workspace = 'acme'").map((r) => r.id).slice(0, 500));
+  w.advance(7 * DAY + 1000);
+  // Count what the free plan counts: each statement run on its own, each batch once.
+  let calls = 0;
+  const real = w.env.DB;
+  const counted = (st) => ({ ...st, bind: (...a) => counted(st.bind(...a)), run: (...a) => (calls++, st.run(...a)), all: (...a) => (calls++, st.all(...a)), first: (...a) => (calls++, st.first(...a)) });
+  w.env.DB = { ...real, prepare: (sql) => counted(real.prepare(sql)), batch: (list) => (calls++, real.batch(list)) };
+  const registryCalls = w.registryCalls.length;
+  await sweep(w.env);
+  w.env.DB = real;
+  assert.ok(calls + (w.registryCalls.length - registryCalls) <= 50, `${calls} D1 calls and ${w.registryCalls.length - registryCalls} Registry calls`);
+  // Over the hours, the small team is reached although the big one had the earlier PCs.
+  for (let h = 0; h < 3; h++) { w.advance(3600_000); await sweep(w.env); }
+  assert.ok(rowsOf(w, "WHERE workspace = 'default'").length > 0, 'the small team was reached');
 });
 
 test('the hourly run skips a team whose doorbells it cannot read, and the Worker has a scheduled handler that runs it', async (t) => {

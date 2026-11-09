@@ -236,9 +236,11 @@ export class AgentTask {
   }
 
   // Keep the picture a tool returned if it is a full screenshot: a zoom is a piece of the
-  // screen and never replaces it. Anything that is not a plain JPEG or PNG is not kept.
+  // screen and never replaces it. Anything that is not a plain JPEG or PNG is not kept. Nothing
+  // is kept once the task is ending or done: a tool call that was in flight when cleanup
+  // cleared the frame must not bring it back.
   holdFrame(name, result) {
-    if (name === 'zoom' || result?.isError) return;
+    if (name === 'zoom' || result?.isError || this.st.ending || this.st.done) return;
     const image = (result?.content ?? []).find((c) => c.type === 'image' && typeof c.data === 'string' && (c.mimeType === 'image/jpeg' || c.mimeType === 'image/png'));
     if (!image) return;
     this.frame = { rev: this.st.rev + 1, at: Date.now(), mime: image.mimeType, data: image.data };
