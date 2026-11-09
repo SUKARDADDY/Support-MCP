@@ -34,6 +34,19 @@ export const OPERATOR_END_REASONS = Object.freeze(['stopped', 'removed', 'replac
 // attach, or when its alarm fires, which is every 30 seconds while attached.
 export const STOP_FANOUT_MAX = 40;
 
+const WATCH_STATES = new Set(['pending', 'consumed', 'waiting', 'attached', 'ended', 'unknown']);
+
+// What a Session's internal /watch says: { state, driver, device_id, actors, ... }. Throws unless
+// the Session gave a well-formed answer. An error status or a body without a state is not "no
+// such session": a Session that is gone or was never made answers state "unknown".
+export async function sessionWatch(env, slug, sid) {
+  const r = await env.SESSION.get(env.SESSION.idFromString(sid)).fetch(`https://do/watch?workspace=${encodeURIComponent(slug)}`);
+  if (!r.ok) throw new Error(`the session answered ${r.status}`);
+  const watch = await r.json();
+  if (!watch || typeof watch !== 'object' || !WATCH_STATES.has(watch.state)) throw new Error('the session gave no usable answer');
+  return watch;
+}
+
 // env: the Worker env. devTtlMs: the dev session-length override (0 in production).
 export function deviceHooks(env, { devTtlMs = 0 } = {}) {
   const registry = (slug) => {
@@ -67,7 +80,8 @@ export function deviceHooks(env, { devTtlMs = 0 } = {}) {
       try {
         const r = await registry(slug).fetch('https://do/online');
         const { online } = await r.json();
-        return new Set(Array.isArray(online) ? online : []);
+        // An error answer is not "nobody is online".
+        return r.ok && Array.isArray(online) ? new Set(online) : null;
       } catch (_) {
         return null;
       }
@@ -75,13 +89,14 @@ export function deviceHooks(env, { devTtlMs = 0 } = {}) {
 
     // A new Session object for a saved PC, waiting for the PC to pick it up.
     // Throws when it cannot be made: nothing was claimed yet.
-    async createSession({ slug, actor, device }) {
+    // openedByTask: the built-in agent task that asked, written on the Session.
+    async createSession({ slug, actor, device, openedByTask = null }) {
       const code = newCode();
       const id = env.SESSION.idFromName(code);
       const sid = id.toString();
       const r = await post(env.SESSION.get(id), '/create', {
         code, sid, label: `PC ${device.name} (${device.id})`, windows_mode: 'app', ttl_ms: devTtlMs, actor, workspace: slug,
-        device_id: device.id, device_name: device.name, driver: actor,
+        device_id: device.id, device_name: device.name, driver: actor, ...(openedByTask ? { opened_by_task: openedByTask } : {}),
       });
       const out = await r.json();
       if (!out.ok) throw new Error(out.error || 'could not make the session');
@@ -95,17 +110,23 @@ export function deviceHooks(env, { devTtlMs = 0 } = {}) {
       try {
         const r = await session(sid).fetch(`https://do/status?workspace=${encodeURIComponent(slug)}&log_tail=0`);
         const { state } = await r.json();
-        return typeof state === 'string' ? state : null;
+        return r.ok && typeof state === 'string' ? state : null;
       } catch (_) {
         return null;
       }
     },
 
-    // End a session by the team's hand. Best effort.
-    async endSession(slug, sid, reason, actor) {
+    // End a session by the team's hand. Best effort. expectDriver: end it only while that
+    // person still drives it (the built-in agent's own session). Returns true when the
+    // session was ended or already over, false when another driver holds it, null when
+    // the Session could not be reached or did not say.
+    async endSession(slug, sid, reason, actor, { expectDriver = null } = {}) {
       try {
-        await post(session(sid), '/end', { actor, workspace: slug, reason });
+        const r = await post(session(sid), '/end', { actor, workspace: slug, reason, ...(expectDriver ? { expect_driver: expectDriver } : {}) });
+        const { ended } = await r.json();
+        if (r.ok && typeof ended === 'boolean') return ended;
       } catch (_) { /* the Session object clears its own pointer when it ends */ }
+      return null;
     },
 
     // Throw away a session that was made but never claimed (a lost race, a
@@ -135,8 +156,8 @@ export function deviceHooks(env, { devTtlMs = 0 } = {}) {
         const live = (Array.isArray(sessions) ? sessions : []).filter((s) => s && s.state !== 'ended' && /^[0-9a-f]{64}$/.test(String(s.sid)));
         for (const s of live.slice(0, STOP_FANOUT_MAX)) {
           try {
-            await post(session(s.sid), '/end', { actor, workspace: slug, reason: 'stopped' });
-            ended++;
+            const r = await post(session(s.sid), '/end', { actor, workspace: slug, reason: 'stopped' });
+            if (r.ok && (await r.json()).ended === true) ended++;
           } catch (_) { /* its own check ends it */ }
         }
       } catch (_) { /* best effort */ }

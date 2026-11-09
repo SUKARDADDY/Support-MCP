@@ -83,7 +83,8 @@ migrations_dir = "migrations"
 binding = "OAUTH_KV"
 id = "REPLACE_ME"
 
-# Durable Objects: one Session per pairing code, one Registry per workspace.
+# Durable Objects: one Session per pairing code, one Registry per workspace, and one
+# AgentTask per built-in agent task (plus a fresh one for each model check).
 [[durable_objects.bindings]]
 name = "SESSION"
 class_name = "Session"
@@ -92,10 +93,18 @@ class_name = "Session"
 name = "REGISTRY"
 class_name = "Registry"
 
+[[durable_objects.bindings]]
+name = "AGENT_TASK"
+class_name = "AgentTask"
+
 # Free plan requires SQLite-backed Durable Objects.
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Session", "Registry"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["AgentTask"]
 
 # Import the PowerShell agent template as text.
 [[rules]]

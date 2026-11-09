@@ -49,6 +49,9 @@ refuses the other mode's transport (`/ws` for an `app` session, `/agent` for a
 | `src/permissions.js` | the permission keys, the built-in roles, and the permission each MCP tool needs (pure data) |
 | `src/workspace.js` | team data in D1: members, roles, recent callers, the chained team log and `authorize`. All team SQL is here, and every query filters by workspace |
 | `src/api.js` | the team API under `/api/v1/w/<slug>/`, plus `POST` and `GET /api/v1/w` |
+| `src/agent.js`, `src/agent-api.js`, `src/agent-store.js`, `src/agent-models.js` | the built-in agent: its service (settings, models, tasks), its team API routes, its D1 queries, and its model table and cost arithmetic. See [The built-in agent](#the-built-in-agent) |
+| `src/agent-task.js`, `src/agent-providers.js`, `src/agent-check.js`, `src/agent-tools.js` | the `AgentTask` Durable Object (one per task, and one per model check), the OpenAI and Claude adapters, the two-turn model check, and the tool list the model sees |
+| `migrations/0006_agent.sql` | the D1 tables `agent_settings` and `agent_tasks` |
 | `migrations/0001_team.sql`, `migrations/0002_workspaces.sql` | the D1 tables `members`, `roles`, `callers` and `audit`, each keyed by workspace first; then `workspaces` (one row per workspace other than `default`) and the index `members_by_identity`. `wrangler d1 migrations apply` runs them in name order, and so does `test/d1-fake.js` |
 | `src/agent.ps1` | PowerShell agent template (imported as text, placeholders substituted) |
 | `src/agent-app.cs`, `src/agent-app.manifest` | the Windows app: .NET Framework 4 source (WPF window) and an `asInvoker` manifest |
@@ -57,7 +60,9 @@ refuses the other mode's transport (`/ws` for an `app` session, `/agent` for a
 | `test/` | `npm test` (`node --test` with the `cloudflare:workers` stub in `test/stubs/`) unit tests for pure logic (JWT checks, MCP dispatch, template fill, screen validation) and for the Durable Object (lanes, screen and control frames, audit rules) |
 
 `wrangler.toml`: add DO bindings `SESSION` → `Session`, `REGISTRY` → `Registry`,
-`[[migrations]] tag="v1" new_sqlite_classes=["Session","Registry"]` (free plan
+`AGENT_TASK` → `AgentTask`,
+`[[migrations]] tag="v1" new_sqlite_classes=["Session","Registry"]` and
+`tag="v2" new_sqlite_classes=["AgentTask"]` (free plan
 needs SQLite-backed DOs), `[[rules]] type="Text" globs=["**/*.ps1"]`, and
 `[vars] ACCESS_TEAM_DOMAIN="<team>.cloudflareaccess.com"`,
 `ACCESS_AUD="<Access app AUD tag>"`, `ACCESS_MCP_AUD=""` (the optional second Access app that covers the MCP addresses when OAuth is on), `DEPLOYMENT_ADMINS=""` (comma-separated
@@ -171,7 +176,7 @@ The session's own log keeps it as sent, in the `[identity] detail` form.
 ### Role check (`tools/call`)
 
 `initialize`, `ping`, `tools/list` and every refusal above never read team
-data, so `tools/list` answers the same 24 tools on any well-formed
+data, so `tools/list` answers the same 27 tools on any well-formed
 `/w/<slug>/mcp`, created or not, without touching D1 or a Durable Object. On
 `tools/call` for a listed tool, after the `session_id` check, the relay checks
 that the workspace exists (`default` always does; any other slug needs a row in
@@ -189,6 +194,8 @@ tool's arguments.
 | `session_end` | `sessions.end` |
 | `device_list` | `devices.view` |
 | `device_connect` | `sessions.control`, and `sessions.unattended` inside the tool when the session will not ask or the call is a take-over |
+| `agent_status` | `sessions.view`, members only |
+| `agent_start`, `agent_control` | `sessions.control`, members only |
 | every other tool | `sessions.control` |
 
 - No members in `default` (open): allowed, and the caller is recorded in
@@ -206,6 +213,20 @@ someone who can manage members must resume it`. A caller who is not a member
 never learns this. `EMERGENCY_STOP` is checked first of all, before any database
 read, and refuses every call whoever asks: `this relay is stopped by its
 operator`. `tools/list` is static and still answers.
+
+The three agent tools are for real members only, by a flag on the tool: open
+mode never admits a caller to them, and they never record a caller of the open
+workspace. After the stop checks, `/mcp` reads the workspace's agent mode (one
+`agent_settings` read, only for a tool that is not one of the allowed ones
+below). In mode `agent` (built-in agent only) every session tool is refused with
+the tool error `this team uses the built-in agent`, except `agent_start`,
+`agent_status`, `agent_control`, `device_list`, `session_list` and
+`session_status`. The mode is read after the role check, so a caller who is not a
+member learns nothing about it. A workspace with no `agent_settings` row, or a
+database without the table yet ("no such table"), is in mode `both`. Any other
+database error while reading the mode refuses the call (it fails closed), with the
+tool error `could not check whether this team uses the built-in agent; try again`. The built-in agent's own calls
+go through the same checks but not this one, so the mode never blocks it.
 
 A refusal is a tool error (`isError`), and nothing reaches a Session.
 `session_create` sends `workspace: "<slug>"` to `/create`, and the operator
@@ -254,6 +275,11 @@ error is `{"error":{"code","message"}}`.
 | `PATCH .../roles/<id>` | `roles.manage` | `{name?, permissions?}` | `{role}` |
 | `DELETE .../roles/<id>` | `roles.manage` | | `{removed:{id}}` |
 | `GET .../audit?after=&limit=&verify=` | `audit.view` | | `{rows:[{seq,ts,actor,kind,detail,prev_hash,hash}], head:{seq,hash}, verified, verified_scope}`; rows with `seq > after` (default 0), at most `limit` (1 to 500, default 100). `verify` is left out or empty (check the returned rows only, `verified_scope: "page"`) or `full` (check the whole chain, `"full"`); any other value is 400, and a repeated parameter uses its first value |
+
+| `GET .../agent`, `PATCH .../agent` | `members.manage` | `{mode?, default_model?, starters_pick_model?, task_cap_usd?, month_cap_usd?, openai_key?, anthropic_key?}` | `{agent:{...}}`: the settings, with each key shown only as `{set, hint}` (its last four characters). See [The built-in agent](#the-built-in-agent) |
+| `POST .../agent/models`, `DELETE .../agent/models/<provider>/<id>` | `members.manage` | `{provider, id, prices?, output_limit?}` | 201 `{model, checked, check_cost_usd?}`; `{removed:true}` |
+| `GET .../agent/tasks`, `POST .../agent/tasks` | `sessions.view`, `sessions.control`; members only | `{device_id \| session_id, instructions, keep_working?, model?}` | `{tasks:[...]}`; 201 `{task_id, state, ...}` |
+| `GET .../agent/tasks/<id>?wait_s=`, `POST .../agent/tasks/<id>/pause\|resume\|stop` | `sessions.view`, `sessions.control`; members only | | `{task, caps, untrusted_text}`; `{task_id, state}` |
 
 `<identity>` is URL-encoded and compared trimmed and lowercased. A member's
 `kind` is `service` when the identity has no `@`, else `person`. Identities are
@@ -1078,6 +1104,14 @@ poll with the new driver, rings the PC and writes `device_session_taken_over`. I
 is not an end. Without the permission the error says to ask the driver to end the
 session and connect again, so the person at the PC is asked.
 
+**The built-in agent's marks.** A command the built-in agent sends carries `via: "agent"`.
+The Session writes its log row as `[<actor> via agent] <detail>`, and the actor stays the
+person who started the task for the driver check. The Session also keeps the last 10 people
+who sent it a command (past the driver check) with the time, and `GET /watch?workspace=`
+(internal, for the agent task) answers `{state, opened_by_task, ended_reason, device_id, driver, actors}`, or
+`{state: "unknown", actors: []}` for another workspace's call. A task ends when a person other
+than its starter appears there on a session with no driver.
+
 **End reasons** (`ended_reason` in `session_status`, and the last word of the
 `device_session_ended` detail): `declined`, `nobody` and `busy` (the PC's decline),
 `timed_out` (the waiting deadline), `max_time` (the 24 hours), `owner` (the PC
@@ -1334,6 +1368,230 @@ otherwise); `get_file` `length` is clamped to 524288 bytes. Chunk larger files:
 write the first chunk with `append:false` and each further chunk with
 `append:true`; read by advancing `offset` until `eof` (`size` is the total).
 
+## The built-in agent
+
+A technician can hand a task to an agent that runs on the relay: `agent_start`
+or `POST .../agent/tasks` names a saved PC (or a session the caller drives) and
+what is wrong, and a Durable Object works through it one step per alarm, with
+nobody connected. It acts as the person who started the task, through the same
+tools an MCP client has, on the team's own OpenAI or Claude key, within caps an
+admin set. A team picks who runs sessions: MCP clients, the built-in agent, or
+both, on the same sessions. One driver at a time still applies.
+
+### Data
+
+Migration `0006_agent.sql` adds two tables, each keyed by workspace first. Every
+query is in `src/agent-store.js` and names the workspace.
+
+- `agent_settings` (one row per workspace that set anything): `mode` (`mcp`,
+  `agent` or `both`), `openai_key_enc` and `anthropic_key_enc` (sealed) with their
+  `_hint` (last four characters), `default_model`, `models` (JSON, at most 10 added
+  models), `starters_pick_model`, `task_cap_microusd`, `month_cap_microusd`. No
+  row means mode `both`, the built-in default model, no keys, no caps, so no task
+  can start. Money is whole micro-dollars; the API speaks dollars.
+- `agent_tasks`: who started it, the PC or session, its state (`running`, `paused`,
+  `done`, `stuck`, `stopped`, `failed`), `cost_microusd`, `reserved_microusd` (the
+  call in flight), the tool call count, the end reason and the summary. The
+  month's spend is the sum of cost and reservation over the rows that count toward
+  the UTC calendar month (created in it, still live, or ended in it), so a task that
+  crosses a month's end is never left out of both months and there is no counter to
+  drift. Counting a task in two months can only make a cap stricter. The latest three summaries
+  of a PC are the latest three ended rows with a summary for its `device_id`.
+
+Changes to settings, a task starting and a task ending go through the team
+store's guarded change, so their team log rows (`agent_settings_changed`, with
+field names and model ids only, `agent_task_started`, `agent_task_ended`) commit
+with them.
+
+### Keys
+
+`PATCH .../agent` saves `openai_key` and `anthropic_key` (`null` removes one). A
+key is sealed with `seal(AUTH_SECRET, "agent-key-openai" or "agent-key-anthropic",
+key, workspace)`, so it opens only for its workspace and use; saving one needs an
+`AUTH_SECRET` of at least 32 characters. Only the last four characters are ever
+shown. The key is opened only inside an `AgentTask` object: for each step of a task
+and for a model check. A key that no longer opens (a rotated secret) stops a task
+with "enter the key again", and removing a key stops the tasks that use it at
+their next step. There is no deployment-wide key.
+
+### Models
+
+Five models are in the code, with their prices per million tokens (input, cached
+input, cache write, output): `gpt-6.1-terra` ($1, $0.05, $1.25, $5) and
+`gpt-6.1-sol` ($2, $0.10, $2.50, $10), both at 2x input and 1.5x output above
+272,000 input tokens; `claude-opus-5-5` ($4, $0.20, $5, $20); `claude-sonnet-5-5`
+($2, $0.10, $2.50, $10); and `claude-haiku-5-5` ($0.10, $0.01, $0.125, $0.50), all
+5x above 100,000 input tokens. Neither provider's models API returns prices.
+
+A model is usable when its provider has a key and it is the team's default or was
+added. The default is `default_model`, else `gpt-6.1-terra` when there is an OpenAI
+key and `claude-sonnet-5-5` otherwise. `POST .../agent/models` adds a model (at most
+10): a table model without prices (it uses the table's), any other model with
+`prices` (`input` and `output`, and optionally `cached_input`, defaulting to input,
+and `cache_write`, defaulting to 1.25 times input). `DELETE
+.../agent/models/<provider>/<id>` removes one. A task keeps the model, settings and
+prices it started with. While `starters_pick_model` is on, whoever starts a task may
+name a usable model; with it off every task uses the default.
+
+Adding a model runs a two-turn check inside a fresh `AgentTask` object, with the
+team's key: turn 1 must call a `look` tool, and turn 2 answers it with a 1.5 KB PNG
+of a word, which the model must read back through an `answer` tool. Each call is
+limited to 2,048 output tokens and 60 seconds. It records the settings the model
+accepts. On Claude they come only from `GET /v1/models/<id>`: a retired model or
+one without image input is refused, adaptive thinking is used when supported,
+effort `medium` when supported, and the output limit is the lower of 16,000 and the
+model's `max_tokens` (8,000 when unknown); Anthropic's 400 answers name no
+parameter, so there are no retries. On OpenAI the first try sends reasoning effort
+`medium`; a 400 naming `reasoning` is retried once without it, and one naming
+`max_output_tokens` once with 4,000. A model whose output limit is under 4,000 is
+refused. The list is written once, guarded on the list read before the check, so a
+clash is a 409 and a retry never repeats a paid call. New prices for a model already
+added are written with no check. The check's cost (at most two calls and three
+retries) is shown in the answer and is outside the caps.
+
+### Runner
+
+`agent_start` and `POST .../agent/tasks` need real membership (never open mode) with
+`sessions.control`, a mode other than `mcp`, both caps set, and a usable model. They
+create the task row and the task object. The row is inserted under a guard that no
+other task is live on the same PC or session, so two starts at once make one task. The
+first step connects to the PC with the `device_connect` path as the starter (a PC set
+to ask still asks), or uses the given session, whose driver must be the starter or
+nobody. The connect is recorded before it is made. The relay writes the task's id on the
+Session that connect makes (`opened_by_task`; the agent's tool path sets it, no tool
+argument can, and the Session's internal `/watch` answer returns it). If the object died
+after the relay made the session and before it saved it, the next step takes up the live
+session on that PC that carries this task's id and that the starter drives, instead of
+connecting again, and an end of the task before that step ends that session. A session
+without the tag is never taken up, however close in time: not one the starter opened by
+hand, not another task's. While the lookup fails the step waits (3 failures in a row end
+the task) and never connects again. A session found is saved at once, so a retry never
+ends another. A refused connect made no session, so nothing is adopted or
+ended after one. While `EMERGENCY_STOP` is set, `POST .../agent/tasks` answers 503
+`relay_stopped` and makes no task, as `agent_start` refuses.
+
+Each alarm runs one step:
+
+1. Read the task's row. It is the truth: Stop and Pause win. A stopped task ends its
+   session and stops; a paused one makes no call and keeps one alarm, at 2 hours
+   after it was created, where the time limit and the starter's standing end it. A
+   resume wakes it and counts as a read of its status.
+2. Check the limits (120 tool calls, 2 hours), the watching rule (below) and the
+   starter: the operator's stop, the workspace, the account (for an OAuth starter),
+   members only, `sessions.control`, and the workspace stop. A failure ends the task
+   with that reason. A step that throws (the database could not answer, the team was
+   busy) is counted in the task's storage and tried again after 5, 10, 20 and 40
+   seconds; the fifth failure in a row ends the task as `failed`.
+3. Read the settings and open the key; end the task if the caps or the key are gone.
+4. Check the session: the driver is still the starter, nobody else has sent a command to
+   a link session since the task began, and the session has not ended. Only a
+   well-formed answer from the Session counts: an error status, a body that is not
+   JSON or one without a `state` is a failed read (counted, tried again after 10
+   seconds, the third in a row ends the task), never "the session is gone". A Session
+   that is gone or was never made answers `state: "unknown"`.
+5. Ask the model. The worst case of the call is reserved in D1 first, in one guarded
+   update that holds only if the task's cost plus the reservation fits the task cap and
+   the month's spend plus it fits the month cap, so tasks running at once cannot pass a
+   cap together. The output limit shrinks to fit what is left, never under 4,000
+   tokens; below that the task ends with "spending cap reached". Input is estimated from
+   the request's size on the high side (ASCII text at 1 token per 3 characters, any other
+   character at half its UTF-8 bytes, a fixed 1,800 per image), and the same estimate
+   decides when a fresh conversation starts (over 100,000 tokens) and which
+   long-context price a reservation uses. The real cost settles the reservation
+   afterwards. A reservation the object never settled is charged in full. So is the
+   reservation of a call that got no HTTP answer (a timeout or a dropped connection),
+   because the provider may still bill it; a call answered with an error status was
+   refused, and its reservation is released.
+6. Read the row again, and look at the session again. A stop or pause now means the
+   action is not sent. So does a session that has ended or that someone else now drives
+   or commands. A pause that lands on a reply with no tool call leaves the
+   conversation ending with "Call a tool, or call finish.", so a resume is valid.
+7. Record the call as `sending`, run it through the tool path as the starter (marked
+   `via: "agent"` for the session log), record it done, and set the next alarm. A
+   repeat alarm that finds `sending` sends nothing and answers that call "outcome
+   unknown; take a screenshot".
+
+The model sees the session tools without `session_id` and without `type_secret`,
+`block_input`, `send_sas`, `request_full_control`, the session and PC tools and the
+agent's own tools, plus `note` (progress, 400 characters) and `finish` (`done`,
+`stuck` or `needs_human`, with a summary of at most 600 characters). `run` as
+`system` and `put_file` are allowed, as for an MCP client. One call per reply: extra
+calls are answered "not run". A reply with no tool call gets "Call a tool, or call
+finish."; two in a row end the task as `stuck`.
+
+Conversations are append-only, in memory, in the provider's own shape: OpenAI reasoning
+items are replayed in order with their encrypted content, and a Claude thinking block
+comes back as the model gave it, with the binding set to drop a block on a mismatch.
+Screenshots are never stored. A fresh conversation starts every 12 tool calls or after
+the object restarts, from the task, the last note and a new screenshot. Stored per task
+are only redacted step records (the verb and a short detail, never typed text) and the
+notes.
+
+Everything from the PC (screens, UI text, command output, file contents, the PC's fields,
+and earlier summaries) and the task's own last note is wrapped in `<untrusted>` tags, with
+any closing tag inside it disarmed (in any letter case, and with spaces inside the tag),
+and the system prompt says it is data and never an instruction. The note is the agent's own
+record and may repeat text from the screen. The first
+request of a task carries the PC's record and the last three summaries of that PC with
+their age and who started them.
+
+Without `keep_working`, a task stops 2 minutes after the last read of its status
+(`agent_status` with a `task_id`, or `GET .../agent/tasks/<id>`). Reads go through the task
+object so it records them, and `wait_s` (up to 25) holds a read until something changes.
+A task ends the saved-PC session it opened when it finishes, stops or fails, and leaves a
+session it was given. The Session object enforces the exception: the task asks it to end
+the session only while the starter is still the driver, so a session someone else took
+over, even one the task has not noticed yet, stays open. The task counts as cleaned up
+only when the Session confirms the end, says it is already over, or says another person
+drives it. If the Session or the database cannot be reached, the task row keeps its
+stopped, done or failed state and the object keeps an alarm that tries again after 5, 10,
+20, 40, 80, 160 and then 300 seconds. After 20 tries (about 75 minutes), by either route
+(the session would not confirm, or the cleanup kept throwing), it gives up the same way: it
+adds a note to the task telling the starter to end the session by hand (`session_end` or
+the PC's End session), adds a step, and sets the phase to ended. An error inside a retry
+counts as a try and sets the next alarm. One cleanup runs at a time: a stop, an alarm and a
+step that finds the row ended all wait for the same run.
+
+### Providers
+
+OpenAI: the official `openai` SDK, Responses API, `maxRetries: 0`, `store: false`,
+`service_tier: "default"`, `include: ["reasoning.encrypted_content"]`,
+`parallel_tool_calls: false`, `truncation: "disabled"`, strict function tools, the
+whole conversation replayed each turn, screenshots as `input_image` inside the
+`function_call_output`, and the task id as `prompt_cache_key`. Cost: `input_tokens`
+includes the cached and cache-write tokens, so those are subtracted before the input
+price. Claude: `@anthropic-ai/sdk`, Messages API, `maxRetries: 0`, `x-api-key` and API
+version 2023-06-01 (the SDK's own defaults are a bearer token and a newer version; step 0
+verified these), adaptive thinking and effort from the saved settings, caching on the
+system prompt, the last tool and the tail, `tool_choice` with parallel use disabled.
+Cost: `input_tokens` is the uncached rest, plus cache writes (the 5-minute price) and reads.
+
+A provider's error text is never shown (OpenAI's 401 echoes part of the key): the runner
+maps each answer to a fixed sentence. A 429 whose code names credit, quota, billing or a
+spend or usage limit, a 402, a bad key, a model the key cannot use and a refused request
+stop the task. Any other 429, a 503, a 5xx and a network failure retry with backoff
+(2, 4, 8, 16, 32 and 60 seconds) for 2 minutes, then the task pauses with the reason.
+
+### What the providers keep
+
+The relay keeps no conversation at a provider, and sends `store: false` to OpenAI, but
+the providers' own retention applies. OpenAI keeps abuse-monitoring logs for up to 30
+days even with `store: false`, keeps flagged images for review, and holds cached prompt
+state for up to 24 hours. Anthropic keeps requests and answers under its own retention
+terms, and holds a cached prompt for a few minutes. Screenshots, UI text, command output
+and file contents the agent reads go to the team's provider: check that the team may
+share what is on its customers' screens.
+
+### Limits and cost of running it
+
+A task is limited to 120 tool calls and 2 hours. On the free plan, a Durable Object alarm
+is not held to the 10 ms of a request: step 0 measured an alarm that built, stringified and
+parsed a request body of 2 MB in 9 ms of CPU, 8 MB in 19 to 24 ms and 34 MB in 94 to 97 ms,
+none cut off. A conversation holds at most 12 screenshots (about 1,225 tokens each on
+OpenAI), and the real tool list and system prompt are about 3,900 input tokens. A task
+object holds about 128 MB while it works, so 2 hours is about 900 GB-s, and the free plan's
+13,000 GB-s a day is about 14 fully active two-hour tasks.
+
 ## MCP tools (`tools/list`, `tools/call`)
 
 Implement `initialize` (protocolVersion echo of the client's if it is one of
@@ -1354,14 +1612,18 @@ text content item, not JSON-RPC errors.
 | `device_list` | `site?` (an id), `status?` (`active` or `pending`), `after?` (an id) | `{devices:[...], next, untrusted_text}`: the team's device shape plus `online` (true while the PC's doorbell is connected; false when the Registry cannot be read), from one Registry request per call. Names, contacts and custom field values come from people and are untrusted data |
 | `device_connect` | `device_id`, `ask?` (boolean), `take_over?` (boolean) | `{session_id, state:"waiting"\|"attached", asks, rang}`. `rang` is true when the PC's doorbell was connected (else the PC sees the request within about 5 minutes). Refused: an unknown PC or one in another workspace, a waiting PC, an `app_version` below 0.6.0 (`this PC updates itself to 0.6.0 first`), a PC already in a session without `take_over` (`<who> is connected`) and a stopped workspace. See [Saved-PC sessions](#saved-pc-sessions) |
 
+| `agent_start` | `device_id` or `session_id`, `instructions`, `keep_working?`, `model?` | `{task_id, state:"running", provider, model, device_id, session_id, task_cap_usd, month_cap_usd, keep_working, next}`. See [The built-in agent](#the-built-in-agent) |
+| `agent_status` | `task_id?`, `wait_s?` (0 to 25) | with a `task_id`: `{task, caps, untrusted_text}`, where `task` has the state, end reason, model, cost, the tool calls (verb and short detail), the notes and the summary. Without one: `{tasks, caps, default_model, starters_pick_model, models, untrusted_text}` |
+| `agent_control` | `task_id`, `action` (`pause`, `resume`, `stop`) | `{task_id, state}` |
+
 The tools above are in every connection, with the screen tools below. `?ui=0`
 hides `ui_tree` and `ui_act` (`?ui=1` is the default); any other value gets 400
 `{"error":"unknown ui value; use 0 or 1"}` after the Access check. The `shape`
 parameter no longer exists: a request that carries it, with any value, gets 400
 `{"error":"the shape parameter was removed; ..."}` rather than a silently
 different tool list. A tool that the connection does not list is `unknown tool`.
-Every tool except `session_create`, `session_list`, `device_list` and
-`device_connect` requires `session_id`. When
+Every tool except `session_create`, `session_list`, `device_list`,
+`device_connect` and the three agent tools requires `session_id`. When
 it is missing, empty or not a string, `tools/call` returns a tool error
 `session_id is required; call session_list to find it` and nothing reaches the
 backend. There is no default session.
@@ -1678,8 +1940,8 @@ never update themselves.
 2. Local stack (`wrangler dev`, `.dev.vars` with `DEV_SKIP_ACCESS=1`): MCP
    `initialize` → `tools/list` returns the 7 session tools and the two device
    tools (`device_list`, `device_connect`) plus the nine screen tools, `ui_tree`,
-   `ui_act`, `block_input`, `send_sas`, `type_secret` and `request_full_control`
-   (24), `?ui=0` drops `ui_tree` and `ui_act`, and `?shape=...` is a 400 (curl).
+   `ui_act`, `block_input`, `send_sas`, `type_secret` and `request_full_control`,
+   and the three agent tools (27), `?ui=0` drops `ui_tree` and `ui_act`, and `?shape=...` is a 400 (curl).
 3. `/mcp` without the JWT on a non-localhost host → 403 (unit test with a fake
    host + a test for bad aud / expired / wrong sig using a locally generated
    RSA key).
@@ -1719,6 +1981,13 @@ never update themselves.
     `HKLM\SOFTWARE\SupportMCP` as it was (the recipe is in
     [development.md](development.md#installing-a-saved-pc-on-a-test-machine)).
 
+12. Built-in agent: with both caps and a key saved, `agent_start` on a saved PC
+    connects as the caller, works through the session tools one step at a time,
+    and finishes with a summary under both caps. `agent_status` follows it,
+    `agent_control` pauses, resumes and stops it, and the session's log names the
+    agent's actions as the starter's, marked `via agent`. `test/agent-*.test.js`
+    drive this against fake providers; the live checks are in the PR 7 plan.
+
 ## Must keep
 
 - `/healthz` stays public and 200.
@@ -1755,4 +2024,15 @@ never update themselves.
   only as a hash, compared in constant time, and refused on a request with an
   `Origin` header. `/device/` and `/install` stay public and outside every Access
   app.
+- The built-in agent acts only as the person who started its task, through the same
+  tool path, role checks and stops as an MCP call, and the starter is checked
+  again before every model call: an active account, a real member (never open
+  mode) holding `sessions.control`. Team settings, keys, caps and mode are never an
+  agent tool.
+- A team's AI provider key is sealed at rest, opened only inside an `AgentTask`
+  object, and never appears in an API answer, a tool result, a log row, a team log
+  row, a step record or an error. A provider's own error text is never shown.
+- The relay never stores a screenshot or typed text for the agent either: the
+  conversation lives in the task object's memory, and the stored step records
+  hold only the verb and a short detail.
 - No secrets in the repo: `.dev.vars` gitignored; attach keys stored hashed.

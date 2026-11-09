@@ -5,6 +5,59 @@ All notable changes to Support-MCP are listed here. The format follows
 [Semantic Versioning](https://semver.org). It stays at 0.x until Stage 1 is safe
 to run on unattended customer PCs.
 
+## [0.7.0] - 2026-11-09
+
+### Added
+
+- The built-in agent. A technician hands a task to an agent that runs on the relay: it
+  works on a saved PC (or a session the technician drives) one step per alarm, as the
+  technician, through the same tools, role checks and stops an MCP client has, and keeps
+  going after the technician disconnects. It runs on any OpenAI or Claude model the team
+  chooses (GPT-6.1 Terra by default), with the team's own key. A new Durable Object,
+  `AgentTask` (binding `AGENT_TASK`, migration tag `v2`), runs each task and each model
+  check.
+- Three MCP tools, `agent_start`, `agent_status` and `agent_control`. The tool count goes
+  from 24 to 27. They are for members only (never open mode); starting and controlling
+  need `sessions.control`, reading needs `sessions.view`. `tools/list` is the same in
+  every mode.
+- Team API routes under `/api/v1/w/<slug>/agent`: `GET` and `PATCH` for the settings (mode,
+  default model, who may pick a model, the two caps, the two keys; `members.manage`),
+  `POST .../models` and `DELETE .../models/<provider>/<id>`, and `GET` and `POST
+  .../tasks`, `GET .../tasks/<id>` and `POST .../tasks/<id>/pause|resume|stop`. A key is
+  sealed under `AUTH_SECRET`, shown only as its last four characters, and opened only
+  inside an `AgentTask` object.
+- A team picks who runs sessions: MCP clients, the built-in agent, or both (the default).
+  In "agent" mode `/mcp` refuses the session tools with "this team uses the built-in
+  agent" but still allows the agent tools, `device_list`, `session_list` and
+  `session_status`.
+- Spending caps. Nothing runs until an admin sets a per-task cap and a per-month cap. The
+  worst case of every model call is reserved in D1 against both before the call, sized to
+  the room left (never under 4,000 output tokens), so tasks running at once cannot pass a
+  cap together. A task also stops at 120 tool calls or 2 hours, when anyone else takes
+  over its session, when its starter is removed or loses `sessions.control`, when the
+  workspace or the relay is stopped, and, unless started with `keep_working`, 2 minutes
+  after the last time anyone read its status.
+- Models: five in the code with their prices (`gpt-6.1-terra`, `gpt-6.1-sol`,
+  `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`), and any other OpenAI or
+  Anthropic model an admin adds with its prices. A model must pass a two-turn check (call a
+  tool, then read a word off a small screenshot) before it is usable.
+- The Session log marks the agent's actions: `[boss@example.com via agent] click 640,412`.
+  The actor is still the person who started the task. A new internal `/watch` route lets a
+  task see its session's state, driver and who has commanded it.
+- Migration `0006_agent.sql` adds `agent_settings` and `agent_tasks`. Apply it before you
+  deploy this version.
+
+### Changed
+
+- The relay now sends screenshots to the team's AI provider when a task runs on the
+  built-in agent. It stores none and sends `store: false` to OpenAI, but the providers'
+  own retention applies (OpenAI keeps abuse-monitoring logs for up to 30 days). The
+  security model and the README say so. The relay's own size grows by the two provider
+  SDKs, which load only when a task or a model check first runs.
+- The package depends on `openai` and `@anthropic-ai/sdk` (both with retries off, and the
+  Claude client pinned to the `x-api-key` header and API version 2023-06-01 that were
+  checked against the real API).
+
 ## [0.6.0] - 2026-11-08
 
 ### Added

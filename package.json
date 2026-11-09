@@ -1,6 +1,6 @@
 {
   "name": "support-mcp",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
   "description": "Consent-based, self-expiring Windows remote support sessions, operated by an AI agent over MCP. Cloudflare Worker + Durable Objects + a downloadable Windows app and a PowerShell agent.",
@@ -15,6 +15,8 @@
     "dry-run": "wrangler deploy --dry-run --outdir /tmp/support-mcp-dry"
   },
   "dependencies": {
-    "@cloudflare/workers-oauth-provider": "1.2.4"
+    "@anthropic-ai/sdk": "1.6.0",
+    "@cloudflare/workers-oauth-provider": "1.2.4",
+    "openai": "7.53.0"
   }
 }

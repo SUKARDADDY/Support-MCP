@@ -15,9 +15,10 @@ import AGENT_PS1 from './agent.ps1';
 import APP_BUNDLE from './app-bundle.json';
 import { Session } from './session.js';
 import { Registry } from './registry.js';
+import { AgentTask } from './agent-task.js';
 import { createHandler } from './app.js';
 
-export { Session, Registry };
+export { Session, Registry, AgentTask };
 
 export default createHandler(AGENT_PS1, APP_BUNDLE, {
   oauth: { OAuthAuthorizationServer, AuthorizationError, CimdFetchError },

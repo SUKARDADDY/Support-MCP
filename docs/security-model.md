@@ -1046,6 +1046,47 @@ apply to only one client say which.
   share that with it before you open a session. Tell the model not to guess
   passwords: `type_secret` types only a secret the operator supplied, and the
   relay neither logs it nor returns it.
+- **The built-in agent sends screenshots to the team's own AI provider, from the
+  relay.** When a team runs a task on the built-in agent, the relay (not the
+  operator's own agent) sends what is on the PC's screen, UI text, command output
+  and file contents to the OpenAI or Claude account whose key the team saved. The
+  relay sends `store: false` to OpenAI and keeps no conversation at either
+  provider, but their own retention applies: OpenAI keeps abuse-monitoring logs for
+  up to 30 days even with `store: false`, keeps flagged images for review, and holds
+  cached prompt state for up to 24 hours; Anthropic keeps requests and answers under
+  its own terms. Check that you may share a customer's screen with that provider
+  before you start a task. The relay itself stores no screenshot and no typed text for
+  a task: the conversation lives in the task object's memory, and the stored step
+  records hold the verb and a short detail only, as the session log does.
+- **The built-in agent acts as its starter and is bounded.** A task is the person who
+  started it, using the same tools, role checks, workspace stop and operator stop as an
+  MCP call, and the person is checked again before every model call: an active
+  account, a real member (open mode never counts) holding `sessions.control`, so
+  removing someone ends their task at the next step. It has no tool that changes the
+  team, its keys, caps or mode, no `type_secret` (a background task has no operator who
+  supplied a secret), no `request_full_control`, `block_input` or `send_sas`, and it
+  cannot connect to a PC without asking unless the starter may. It can run system-level
+  commands and write files, like an MCP client, so the limits bound spend and time, not
+  the harm of one bad command: 120 tool calls, 2 hours, a cap per task and a cap per
+  month reserved in the database before each model call, and it ends at once when
+  someone else takes over its session, when the person at the PC ends it, when the
+  starter, the workspace or the operator stops it, or when the starter stops watching
+  (unless the task was started with `keep_working`). There are no approvals by default.
+  This stays Stage 1: not on real customers' unattended PCs until the release that
+  enforces the saved-PC rules.
+- **A team's AI provider key stays inside the task object.** It is sealed with AES-GCM
+  under `AUTH_SECRET` with the workspace as associated data, shown only as its last four
+  characters, and opened only inside `AgentTask` objects (a task's steps and a model
+  check). It is never in an API answer, a tool result, a session or team log row, a step
+  record or an error: a provider's error text can echo part of a key, so the relay shows
+  one of a few fixed sentences instead. A test fails if a canary key appears anywhere.
+- **What the agent reads from the PC is wrapped as untrusted.** Screen text, UI trees,
+  command output, file contents, the PC's name and custom fields, and the summaries of
+  earlier tasks on the same PC, and the agent's own last note after a fresh conversation,
+  reach the model inside `<untrusted>` tags (a closing tag inside the text is disarmed in
+  any case and with spaces in it), and the system prompt says they are data. Summaries have a
+  fixed shape and at most 600 characters, and show their age and who started the task.
+  This lowers the risk of a customer's screen steering the agent. It does not remove it.
 - **Session output is untrusted input.** Everything that comes back from a
   session is written by the customer's PC: stdout, stderr, file contents,
   screenshots, window text, and the machine and user names. So is what a saved
