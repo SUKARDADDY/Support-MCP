@@ -1484,7 +1484,11 @@ Each alarm runs one step:
    seconds; the fifth failure in a row ends the task as `failed`.
 3. Read the settings and open the key; end the task if the caps or the key are gone.
 4. Check the session: the driver is still the starter, nobody else has sent a command to
-   a link session since the task began, and the session has not ended.
+   a link session since the task began, and the session has not ended. Only a
+   well-formed answer from the Session counts: an error status, a body that is not
+   JSON or one without a `state` is a failed read (counted, tried again after 10
+   seconds, the third in a row ends the task), never "the session is gone". A Session
+   that is gone or was never made answers `state: "unknown"`.
 5. Ask the model. The worst case of the call is reserved in D1 first, in one guarded
    update that holds only if the task's cost plus the reservation fits the task cap and
    the month's spend plus it fits the month cap, so tasks running at once cannot pass a

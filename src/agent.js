@@ -6,6 +6,7 @@
 //
 // Errors are TeamError, whose message is safe to show to the caller.
 import { randomToken } from './crypto.js';
+import { sessionWatch } from './device-sessions.js';
 import { TeamError, normalizeIdentity, teamFromEnv } from './workspace.js';
 import { ID_RE, devicesFromEnv, newId } from './devices.js';
 import { BUSY, agentStoreFromEnv, taskOut } from './agent-store.js';
@@ -180,7 +181,7 @@ export function agentService(env, { origin = '', devTtlMs = 0 } = {}) {
       sid = args.session_id;
       let watch;
       try {
-        watch = await (await env.SESSION.get(env.SESSION.idFromString(sid)).fetch(`https://do/watch?workspace=${encodeURIComponent(slug)}`)).json();
+        watch = await sessionWatch(env, slug, sid);
       } catch (_) {
         throw new TeamError(503, 'unavailable', 'could not reach that session; try again');
       }

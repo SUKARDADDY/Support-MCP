@@ -21,7 +21,7 @@ import { open } from './crypto.js';
 import { AccessDenied, checkAgentStarter, runAgentTool } from './app.js';
 import { agentStoreFromEnv } from './agent-store.js';
 import { devicesFromEnv } from './devices.js';
-import { deviceHooks } from './device-sessions.js';
+import { deviceHooks, sessionWatch } from './device-sessions.js';
 import { normalizeIdentity } from './workspace.js';
 import { INPUT_SOFT_MAX, costMicro, fitOutput, reserveMicro } from './agent-models.js';
 import { MESSAGES, ProviderError, adapterFor, classify, estimateTokens } from './agent-providers.js';
@@ -242,7 +242,14 @@ export class AgentTask {
       this.bump();
       return json({ ok: true });
     }
-    const row = await this.store.getTask(this.cfg.workspace, this.cfg.task_id);
+    let row;
+    try {
+      row = await this.store.getTask(this.cfg.workspace, this.cfg.task_id);
+    } catch (_) {
+      // The row could not be read: the next alarm reads it and carries out what it says.
+      await this.rearm(STEP_ERROR_BACKOFF_MS[0]);
+      throw new Error('could not read the task');
+    }
     if (!row || row.ended_at !== null) {
       // A failed cleanup sets its own retry alarm, and an alarm may have started one while the
       // row was read: wait for that one rather than run another.
@@ -579,9 +586,10 @@ export class AgentTask {
     return ['waiting', 'attached'].includes(watch.state) && watch.device_id === cfg.device_id && normalizeIdentity(watch.driver) === cfg.starter ? pointer.id : null;
   }
 
-  async readWatch(sid) {
-    const r = await this.env.SESSION.get(this.env.SESSION.idFromString(sid)).fetch(`https://do/watch?workspace=${encodeURIComponent(this.cfg.workspace)}`);
-    return r.json();
+  // Throws unless the Session gave a well-formed answer, so a failed read is never taken for
+  // a session that is gone.
+  readWatch(sid) {
+    return sessionWatch(this.env, this.cfg.workspace, sid);
   }
 
   // Who is on the session now. Answers { watch } to go on, { end } when the session is over
@@ -593,7 +601,9 @@ export class AgentTask {
       watch = await this.readWatch(st.sid);
     } catch (_) {
       st.session_fails += 1;
-      return st.session_fails >= SESSION_FAILS_MAX ? { end: ['failed', 'could not reach the session'] } : { later: 10_000 };
+      if (st.session_fails >= SESSION_FAILS_MAX) return { end: ['failed', 'could not reach the session'] };
+      await this.save();
+      return { later: 10_000 };
     }
     st.session_fails = 0;
     if (watch.state === 'ended' || watch.state === 'unknown') {

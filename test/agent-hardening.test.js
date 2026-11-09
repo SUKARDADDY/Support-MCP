@@ -823,3 +823,95 @@ test('a cleanup that fails on the database every time gives up the same way: a n
   assert.match(st.notes.at(-1).text, /end it by hand, with session_end or the PC's End session/);
   assert.equal(st.steps.at(-1).verb, 'cleanup');
 });
+
+// ---- 22: a failed read is not an answer ------------------------------------------------------------------------
+const BAD_WATCH = [
+  ['an error status with a JSON body', () => Response.json({ error: 'boom' }, { status: 500 })],
+  ['a 200 whose body has no state', () => Response.json({})],
+  ['a body that is not JSON', () => new Response('<html>', { status: 200 })],
+];
+
+test('a /watch that fails or is malformed during cleanup recovery is not taken for "no session": the cleanup stays pending and the session is ended later', async (t) => {
+  for (const [label, answer] of BAD_WATCH) {
+    const w = await agentWorld(t);
+    await w.ready();
+    const { id, s1 } = await crashedConnect(w);
+    w.hooks.watchAnswer = answer;
+    w.hooks.watchFails = 1;
+    await w.tool(BOSS, 'agent_control', { task_id: id, action: 'stop' });
+    const o = w.taskObject(id);
+    assert.equal(o.ctx.values.get('st').done, false, label);
+    assert.equal(o.ctx.values.get('st').cleanup_tries, 1, label);
+    assert.equal(o.ctx.alarm(), w.now() + 5000, label);
+    assert.equal(w.stateOf(s1), 'waiting', label);
+    await w.drive(id);
+    assert.equal(o.ctx.values.get('st').done, true, label);
+    assert.equal(w.stateOf(s1), 'ended', label);
+  }
+});
+
+test('a /watch that fails when a running task checks its session counts as a failed read, not as a session to go on with', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const a = await w.startOnPc(BOSS);
+  w.fake.queue('openai', shotCall(), finish());
+  await w.alarm(a.id);
+  const st = () => w.taskObject(a.id).ctx.values.get('st');
+  assert.equal(st().session_fails, 0);
+  w.hooks.watchFails = 1;
+  await w.alarm(a.id);
+  assert.equal(st().session_fails, 1);
+  assert.equal(w.taskObject(a.id).ctx.alarm(), w.now() + 10_000);
+  await w.drive(a.id);
+  assert.equal(w.taskRow(a.id).state, 'done');
+});
+
+test('starting a task on a session whose /watch fails answers "try again" (503), not "that session is not live"', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const link = await w.tool(BOSS, 'session_create', {});
+  w.hooks.watchFails = 1;
+  const r = await w.api(BOSS, 'POST', '/agent/tasks', { session_id: link.session_id, instructions: 'Look.' });
+  assert.equal(r.status, 503);
+  assert.equal(r.body.error.code, 'unavailable');
+  assert.equal(w.sql('SELECT COUNT(*) AS n FROM agent_tasks')[0].n, 0);
+});
+
+test('a stop whose wake finds the database down leaves the object an alarm to read the row soon, even when the task was paused', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const a = await w.startOnPc(BOSS);
+  w.fake.queue('openai', shotCall(), shotCall());
+  await w.alarm(a.id);
+  await w.tool(BOSS, 'agent_control', { task_id: a.id, action: 'pause' });
+  await w.alarm(a.id);
+  const o = w.taskObject(a.id);
+  assert.ok(o.ctx.alarm() > w.now() + 60_000, 'a paused task sleeps until its time limit');
+  await agentStoreFromEnv(w.env).endTask('default', a.id, { state: 'stopped', reason: 'stopped', summary: null, actor: 'relay', steps: 1 });
+  const realPrepare = w.db.prepare;
+  w.db.prepare = (sql) => {
+    if (/SELECT \* FROM agent_tasks/.test(sql)) throw new Error('D1_ERROR: database is busy');
+    return realPrepare(sql);
+  };
+  const reply = await o.task.fetch(new Request('https://do/wake', { method: 'POST' }));
+  assert.equal(reply.status, 500);
+  assert.equal(o.ctx.alarm(), w.now() + 5000);
+  w.db.prepare = realPrepare;
+  await w.drive(a.id);
+  assert.equal(w.stateOf(w.taskRow(a.id).sid), 'ended');
+});
+
+test('the relay\'s own calls to the Session list and Registry take an error answer for "unknown", never for "nobody online", "ended" or "gone"', async () => {
+  const { deviceHooks } = await import('../src/device-sessions.js');
+  const sid = 'a'.repeat(64);
+  const answer = (body, status = 500) => ({ fetch: async () => Response.json(body, { status }) });
+  const env = {
+    REGISTRY: { idFromName: (n) => n, get: () => ({ fetch: async (u) => (String(u).endsWith('/list') ? Response.json({ sessions: [{ sid, state: 'attached' }] }) : Response.json({ online: [] }, { status: 500 })) }) },
+    SESSION: { idFromString: (s) => s, get: () => answer({ ended: true, state: 'ended' }) },
+  };
+  const hooks = deviceHooks(env);
+  assert.equal(await hooks.online('default'), null, 'a failed Registry read is not an empty set');
+  assert.equal(await hooks.sessionState('default', sid), null);
+  assert.equal(await hooks.endSession('default', sid, 'stopped', 'x'), null);
+  assert.equal(await hooks.stopAll('default', 'x'), 0, 'an end that errored is not counted as ended');
+});

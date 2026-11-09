@@ -51,7 +51,8 @@ export async function agentWorld(t, opts = {}) {
   const fake = fakeProviders();
   const objects = new Map(); // object name -> { ctx, task }
   // endFails: how many of the next /end calls to a Session fail as if it were out of reach.
-  const hooks = { fail: null, tool: null, endFails: 0 };
+  // watchFails: how many of the next /watch calls answer watchAnswer() instead of the Session (an error status by default).
+  const hooks = { fail: null, tool: null, endFails: 0, watchFails: 0, watchAnswer: () => Response.json({ error: 'boom' }, { status: 500 }) };
   const realGet = w.env.SESSION.get;
   w.env.SESSION.get = (id) => {
     const stub = realGet(id);
@@ -60,6 +61,10 @@ export async function agentWorld(t, opts = {}) {
         if (hooks.endFails > 0 && new URL(typeof u === 'string' ? u : u.url).pathname === '/end') {
           hooks.endFails -= 1;
           throw new Error('the session is out of reach');
+        }
+        if (hooks.watchFails > 0 && new URL(typeof u === 'string' ? u : u.url).pathname === '/watch') {
+          hooks.watchFails -= 1;
+          return hooks.watchAnswer();
         }
         return stub.fetch(u, init);
       },

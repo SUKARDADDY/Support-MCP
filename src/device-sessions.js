@@ -34,6 +34,19 @@ export const OPERATOR_END_REASONS = Object.freeze(['stopped', 'removed', 'replac
 // attach, or when its alarm fires, which is every 30 seconds while attached.
 export const STOP_FANOUT_MAX = 40;
 
+const WATCH_STATES = new Set(['pending', 'consumed', 'waiting', 'attached', 'ended', 'unknown']);
+
+// What a Session's internal /watch says: { state, driver, device_id, actors, ... }. Throws unless
+// the Session gave a well-formed answer. An error status or a body without a state is not "no
+// such session": a Session that is gone or was never made answers state "unknown".
+export async function sessionWatch(env, slug, sid) {
+  const r = await env.SESSION.get(env.SESSION.idFromString(sid)).fetch(`https://do/watch?workspace=${encodeURIComponent(slug)}`);
+  if (!r.ok) throw new Error(`the session answered ${r.status}`);
+  const watch = await r.json();
+  if (!watch || typeof watch !== 'object' || !WATCH_STATES.has(watch.state)) throw new Error('the session gave no usable answer');
+  return watch;
+}
+
 // env: the Worker env. devTtlMs: the dev session-length override (0 in production).
 export function deviceHooks(env, { devTtlMs = 0 } = {}) {
   const registry = (slug) => {
@@ -67,7 +80,8 @@ export function deviceHooks(env, { devTtlMs = 0 } = {}) {
       try {
         const r = await registry(slug).fetch('https://do/online');
         const { online } = await r.json();
-        return new Set(Array.isArray(online) ? online : []);
+        // An error answer is not "nobody is online".
+        return r.ok && Array.isArray(online) ? new Set(online) : null;
       } catch (_) {
         return null;
       }
@@ -96,7 +110,7 @@ export function deviceHooks(env, { devTtlMs = 0 } = {}) {
       try {
         const r = await session(sid).fetch(`https://do/status?workspace=${encodeURIComponent(slug)}&log_tail=0`);
         const { state } = await r.json();
-        return typeof state === 'string' ? state : null;
+        return r.ok && typeof state === 'string' ? state : null;
       } catch (_) {
         return null;
       }
@@ -110,7 +124,7 @@ export function deviceHooks(env, { devTtlMs = 0 } = {}) {
       try {
         const r = await post(session(sid), '/end', { actor, workspace: slug, reason, ...(expectDriver ? { expect_driver: expectDriver } : {}) });
         const { ended } = await r.json();
-        if (typeof ended === 'boolean') return ended;
+        if (r.ok && typeof ended === 'boolean') return ended;
       } catch (_) { /* the Session object clears its own pointer when it ends */ }
       return null;
     },
@@ -142,8 +156,8 @@ export function deviceHooks(env, { devTtlMs = 0 } = {}) {
         const live = (Array.isArray(sessions) ? sessions : []).filter((s) => s && s.state !== 'ended' && /^[0-9a-f]{64}$/.test(String(s.sid)));
         for (const s of live.slice(0, STOP_FANOUT_MAX)) {
           try {
-            await post(session(s.sid), '/end', { actor, workspace: slug, reason: 'stopped' });
-            ended++;
+            const r = await post(session(s.sid), '/end', { actor, workspace: slug, reason: 'stopped' });
+            if (r.ok && (await r.json()).ended === true) ended++;
           } catch (_) { /* its own check ends it */ }
         }
       } catch (_) { /* best effort */ }
