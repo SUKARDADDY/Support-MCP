@@ -1,0 +1,355 @@
+// The built-in agent's rows in the shared D1 database: a workspace's agent settings
+// and its tasks. Every query the relay runs on them is in this file, and every
+// query filters by workspace. Settings and task start and end go through the team
+// store's guarded change (mutate), so their team log rows commit with them and the
+// actor's role is checked again at commit.
+//
+// A key is sealed here and never opened here. Only an AgentTask object opens it.
+// Nothing this file returns carries a key, sealed or not: the hint is the last four
+// characters. A team log detail holds field names and ids, never a key or a price.
+import { MIN_SECRET_LENGTH, seal } from './crypto.js';
+import { TeamError, normalizeIdentity, teamFromEnv } from './workspace.js';
+import { MAX_ADDED_MODELS, PROVIDERS, findSpec, monthBounds, usd } from './agent-models.js';
+
+export const MODES = Object.freeze(['mcp', 'agent', 'both']);
+const KEY_RE = /^[\x21-\x7e]{16,400}$/;
+const CAP_MAX_USD = 100_000;
+const SETTING_FIELDS = ['mode', 'default_model', 'starters_pick_model', 'task_cap_usd', 'month_cap_usd', 'openai_key', 'anthropic_key'];
+
+const bad = (message) => new TeamError(400, 'bad_request', message);
+const keyInfo = (provider) => `agent-key-${provider}`;
+const microOf = (dollars) => Math.round(dollars * 1e6);
+
+// The settings of a workspace with no row.
+const DEFAULTS = Object.freeze({
+  mode: 'both', default_model: null, models: [], models_raw: '[]', starters_pick_model: true,
+  task_cap_microusd: null, month_cap_microusd: null, has_key: { openai: false, anthropic: false }, key_hint: { openai: null, anthropic: null },
+  updated_at: null, updated_by: null,
+});
+
+function parseSettings(row) {
+  if (!row) return { ...DEFAULTS, has_key: { ...DEFAULTS.has_key }, key_hint: { ...DEFAULTS.key_hint } };
+  let models = [];
+  try { models = JSON.parse(row.models); } catch (_) { /* a damaged list is an empty one */ }
+  return {
+    mode: row.mode,
+    default_model: row.default_model,
+    models: Array.isArray(models) ? models : [],
+    models_raw: row.models,
+    starters_pick_model: row.starters_pick_model !== 0,
+    task_cap_microusd: row.task_cap_microusd,
+    month_cap_microusd: row.month_cap_microusd,
+    has_key: { openai: !!row.openai_key_enc, anthropic: !!row.anthropic_key_enc },
+    key_hint: { openai: row.openai_key_hint, anthropic: row.anthropic_key_hint },
+    updated_at: row.updated_at,
+    updated_by: row.updated_by,
+  };
+}
+
+// A task row as the API shows it.
+export const taskOut = (r) => ({
+  id: r.id, state: r.state, end_reason: r.end_reason, title: r.title, provider: r.provider, model: r.model,
+  device_id: r.device_id, session_id: r.sid, started_by: r.started_by, keep_working: r.keep_working !== 0,
+  cost_usd: usd(r.cost_microusd), reserved_usd: usd(r.reserved_microusd), tool_calls: r.steps,
+  created_at: r.created_at, ended_at: r.ended_at, summary: r.summary,
+});
+
+// deps: the team store (src/workspace.js), whose guarded change this builds on.
+// opts.authSecret is AUTH_SECRET: saving a key needs MIN_SECRET_LENGTH characters.
+export function agentStore(db, team, { authSecret = '' } = {}) {
+  const { mutate, actorContext, actorHas, actorUnchanged, and } = team;
+  const q = (sql, ...params) => db.prepare(sql).bind(...params);
+  const notStopped = (slug) => [
+    "COALESCE((SELECT MAX(seq) FROM audit WHERE workspace = ? AND kind = 'workspace_stopped'), 0) <= COALESCE((SELECT MAX(seq) FROM audit WHERE workspace = ? AND kind = 'workspace_resumed'), 0)",
+    [slug, slug],
+  ];
+  const taskLive = (slug, id) => ['EXISTS (SELECT 1 FROM agent_tasks WHERE workspace = ? AND id = ? AND ended_at IS NULL)', [slug, id]];
+
+  // ---- settings ----------------------------------------------------------------
+  async function readSettings(slug) {
+    return parseSettings(await q('SELECT * FROM agent_settings WHERE workspace = ?', slug).first());
+  }
+
+  // Who runs sessions here. A missing row, or a database without the table yet,
+  // is "both".
+  async function mode(slug) {
+    try {
+      return (await q('SELECT mode FROM agent_settings WHERE workspace = ?', slug).first('mode')) ?? 'both';
+    } catch (_) {
+      return 'both';
+    }
+  }
+
+  // The sealed key of one provider, or null. Only an AgentTask object opens it.
+  async function sealedKey(slug, provider) {
+    if (!PROVIDERS.includes(provider)) throw new TypeError('unknown provider');
+    return (await q(`SELECT ${provider}_key_enc AS enc FROM agent_settings WHERE workspace = ?`, slug).first('enc')) ?? null;
+  }
+
+  // What the team API shows. A key is never in it.
+  function settingsOut(s) {
+    return {
+      mode: s.mode,
+      default_model: s.default_model,
+      starters_pick_model: s.starters_pick_model,
+      task_cap_usd: usd(s.task_cap_microusd),
+      month_cap_usd: usd(s.month_cap_microusd),
+      keys: {
+        openai: { set: s.has_key.openai, hint: s.key_hint.openai },
+        anthropic: { set: s.has_key.anthropic, hint: s.key_hint.anthropic },
+      },
+      models: s.models.map((m) => ({ ...m })),
+      updated_at: s.updated_at,
+      updated_by: s.updated_by,
+    };
+  }
+
+  // Change settings. body holds any of SETTING_FIELDS. Only the columns sent are
+  // written, so two admins changing different fields at once both stay. Needs
+  // members.manage. Returns the settings as the API shows them.
+  async function patchSettings(slug, actorIdentity, body) {
+    const actor = normalizeIdentity(actorIdentity);
+    const sent = SETTING_FIELDS.filter((f) => Object.hasOwn(body, f));
+    for (const k of Object.keys(body)) if (!SETTING_FIELDS.includes(k)) throw bad(`unknown setting: ${k.slice(0, 40)}`);
+    if (!sent.length) throw bad(`send ${SETTING_FIELDS.join(', ')}`);
+    const cols = {};
+    if (sent.includes('mode')) {
+      if (!MODES.includes(body.mode)) throw bad('mode must be mcp, agent or both');
+      cols.mode = body.mode;
+    }
+    if (sent.includes('starters_pick_model')) {
+      if (typeof body.starters_pick_model !== 'boolean') throw bad('starters_pick_model must be true or false');
+      cols.starters_pick_model = body.starters_pick_model ? 1 : 0;
+    }
+    for (const [field, col] of [['task_cap_usd', 'task_cap_microusd'], ['month_cap_usd', 'month_cap_microusd']]) {
+      if (!sent.includes(field)) continue;
+      const v = body[field];
+      if (v === null) cols[col] = null;
+      else if (typeof v === 'number' && Number.isFinite(v) && v > 0 && v <= CAP_MAX_USD && microOf(v) >= 1) cols[col] = microOf(v);
+      else throw bad(`${field} must be a number of dollars above 0 and at most ${CAP_MAX_USD}, or null to clear it`);
+    }
+    if (sent.includes('default_model') && body.default_model !== null && (typeof body.default_model !== 'string' || !body.default_model)) {
+      throw bad('default_model must be a model id, or null for the built-in choice');
+    }
+    const keyFields = PROVIDERS.filter((p) => sent.includes(`${p}_key`));
+    for (const p of keyFields) {
+      const v = body[`${p}_key`];
+      if (v !== null && (typeof v !== 'string' || !KEY_RE.test(v))) throw bad(`${p}_key must be the key as text, or null to remove it`);
+    }
+    if (keyFields.some((p) => body[`${p}_key`] !== null) && !(typeof authSecret === 'string' && authSecret.length >= MIN_SECRET_LENGTH)) {
+      throw new TeamError(503, 'unavailable', `keys cannot be saved: the server operator must set AUTH_SECRET (at least ${MIN_SECRET_LENGTH} characters)`);
+    }
+    return mutate(slug, actor, async () => {
+      const ctx = await actorContext(slug, actor, 'members.manage');
+      const cur = await readSettings(slug);
+      const set = { ...cols };
+      const has = { ...cur.has_key };
+      for (const p of keyFields) {
+        const v = body[`${p}_key`];
+        set[`${p}_key_enc`] = v === null ? null : await seal(authSecret, keyInfo(p), v, slug);
+        set[`${p}_key_hint`] = v === null ? null : v.slice(-4);
+        has[p] = v !== null;
+      }
+      let listGuard = null;
+      if (sent.includes('default_model')) {
+        set.default_model = body.default_model;
+        if (body.default_model !== null) {
+          // An explicit default must be a model the team could use: in the table or added, with its key saved.
+          const spec = findSpec(cur, body.default_model);
+          if (!spec) throw new TeamError(400, 'unknown_model', 'that model is not in the table and was not added; add it first');
+          if (!has[spec.provider]) throw new TeamError(409, 'no_key', `save the team's ${spec.provider === 'openai' ? 'OpenAI' : 'Claude'} key first`);
+          listGuard = ['(SELECT COALESCE((SELECT models FROM agent_settings WHERE workspace = ?), \'[]\')) = ?', [slug, cur.models_raw]];
+        }
+      }
+      // Only what differs from the stored settings is a change (a key always is).
+      const same = (col, v) => v === ({ mode: cur.mode, default_model: cur.default_model, starters_pick_model: cur.starters_pick_model ? 1 : 0,
+        task_cap_microusd: cur.task_cap_microusd, month_cap_microusd: cur.month_cap_microusd })[col];
+      for (const col of Object.keys(set)) if (!col.includes('_key_') && same(col, set[col]) && cur.updated_at !== null) delete set[col];
+      const fields = [
+        ...Object.keys(set).filter((c) => !c.includes('_key_')).map((c) => ({ task_cap_microusd: 'task_cap_usd', month_cap_microusd: 'month_cap_usd' })[c] ?? c),
+        ...keyFields.map((p) => `${p}_key`),
+      ];
+      if (!fields.length) return { noop: true, result: settingsOut(cur) };
+      const now = Date.now();
+      const names = Object.keys(set);
+      return {
+        entries: [{ kind: 'agent_settings_changed', detail: fields.join(', ') }],
+        guard: and(actorHas(slug, actor, 'members.manage'), actorUnchanged(slug, ctx), ...(listGuard ? [listGuard] : [])),
+        change: ([cond, params]) => [q(
+          `INSERT INTO agent_settings(workspace, ${names.join(', ')}, updated_at, updated_by) SELECT ?, ${names.map(() => '?').join(', ')}, ?, ? WHERE ${cond}
+           ON CONFLICT(workspace) DO UPDATE SET ${names.map((c) => `${c} = excluded.${c}`).join(', ')}, updated_at = excluded.updated_at, updated_by = excluded.updated_by`,
+          slug, ...names.map((c) => set[c]), now, actor, ...params,
+        )],
+        result: null,
+      };
+    }).then(async (out) => out ?? settingsOut(await readSettings(slug)));
+  }
+
+  // Replace the added-models list. `before` is the stored list text the caller read
+  // (settings.models_raw) before any paid check: a list that has changed since is a
+  // 409, so a clash never repeats a provider call. `next` is the new list.
+  // `detail` is the team log text. clearDefault: also clear default_model.
+  async function writeModels(slug, actorIdentity, { before, next, detail, clearDefault = null }) {
+    const actor = normalizeIdentity(actorIdentity);
+    if (next.length > MAX_ADDED_MODELS) throw new TeamError(409, 'model_limit', `a team adds at most ${MAX_ADDED_MODELS} models`);
+    return mutate(slug, actor, async () => {
+      const ctx = await actorContext(slug, actor, 'members.manage');
+      const cur = await readSettings(slug);
+      if (cur.models_raw !== before) throw new TeamError(409, 'try_again', 'the model list changed while this was checked; try again');
+      const now = Date.now();
+      const text = JSON.stringify(next);
+      const clears = clearDefault !== null && cur.default_model === clearDefault;
+      return {
+        entries: [{ kind: 'agent_settings_changed', detail }],
+        guard: and(actorHas(slug, actor, 'members.manage'), actorUnchanged(slug, ctx),
+          ['(SELECT COALESCE((SELECT models FROM agent_settings WHERE workspace = ?), \'[]\')) = ?', [slug, before]]),
+        change: ([cond, params]) => [q(
+          `INSERT INTO agent_settings(workspace, models, ${clears ? 'default_model, ' : ''}updated_at, updated_by) SELECT ?, ?, ${clears ? 'NULL, ' : ''}?, ? WHERE ${cond}
+           ON CONFLICT(workspace) DO UPDATE SET models = excluded.models, ${clears ? 'default_model = NULL, ' : ''}updated_at = excluded.updated_at, updated_by = excluded.updated_by`,
+          slug, text, now, actor, ...params,
+        )],
+        result: { models: next },
+      };
+    });
+  }
+
+  // ---- tasks -------------------------------------------------------------------
+  async function getTask(slug, id) {
+    return (await q('SELECT * FROM agent_tasks WHERE workspace = ? AND id = ?', slug, id).first()) ?? null;
+  }
+
+  async function listTasks(slug, { limit = 50 } = {}) {
+    const { results } = await q('SELECT * FROM agent_tasks WHERE workspace = ? ORDER BY created_at DESC, id DESC LIMIT ?', slug, limit).all();
+    return results;
+  }
+
+  // A task still working on this PC or in this session, or null. One task at a time.
+  async function liveTaskOn(slug, { deviceId = null, sid = null }) {
+    return (await q(
+      `SELECT id FROM agent_tasks WHERE workspace = ? AND ended_at IS NULL
+         AND ((? IS NOT NULL AND device_id = ?) OR (? IS NOT NULL AND sid = ?)) LIMIT 1`,
+      slug, deviceId, deviceId, sid, sid).first('id')) ?? null;
+  }
+
+  // The newest summaries of tasks that ended on this PC.
+  async function lastSummaries(slug, deviceId, limit = 3) {
+    if (!deviceId) return [];
+    const { results } = await q(
+      `SELECT started_by, state, end_reason, ended_at, summary FROM agent_tasks
+       WHERE workspace = ? AND device_id = ? AND ended_at IS NOT NULL AND summary IS NOT NULL ORDER BY ended_at DESC LIMIT ?`,
+      slug, deviceId, limit).all();
+    return results;
+  }
+
+  // The month's spend: every task that began in this calendar month (UTC), cost and
+  // the reservation in flight.
+  async function monthSpend(slug, now = Date.now()) {
+    const [start, end] = monthBounds(now);
+    return (await q(
+      'SELECT COALESCE(SUM(cost_microusd + reserved_microusd), 0) AS spent FROM agent_tasks WHERE workspace = ? AND created_at >= ? AND created_at < ?',
+      slug, start, end).first('spent')) ?? 0;
+  }
+
+  // Start a task: its row and the agent_task_started log row commit together, and
+  // only while the starter still holds sessions.control and the workspace is not
+  // stopped. t is the row's fields.
+  async function createTask(slug, actorIdentity, t) {
+    const actor = normalizeIdentity(actorIdentity);
+    return mutate(slug, actor, async () => {
+      const ctx = await actorContext(slug, actor, 'sessions.control');
+      const now = Date.now();
+      return {
+        entries: [{ kind: 'agent_task_started', detail: `${t.id} ${t.provider}/${t.model}${t.device_id ? ` pc ${t.device_id}` : ''}` }],
+        guard: and(actorHas(slug, actor, 'sessions.control'), actorUnchanged(slug, ctx), notStopped(slug)),
+        change: ([cond, params]) => [q(
+          `INSERT INTO agent_tasks(workspace, id, device_id, sid, opened_session, started_by, started_by_user, title, provider, model, state, keep_working, created_at)
+           SELECT ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 'running', ?, ? WHERE ${cond}`,
+          slug, t.id, t.device_id ?? null, t.sid ?? null, actor, t.started_by_user ?? null, t.title, t.provider, t.model, t.keep_working ? 1 : 0, now, ...params,
+        )],
+        result: { id: t.id, created_at: now },
+      };
+    });
+  }
+
+  // End a task, once. state is done, stuck, stopped or failed. actor is a person
+  // or "relay". A task that has already ended is left as it is.
+  async function endTask(slug, id, { state, reason, summary = null, actor = 'relay', steps = null }) {
+    return mutate(slug, actor, async () => {
+      const cur = await getTask(slug, id);
+      if (!cur || cur.ended_at !== null) return { noop: true, result: { ended: false } };
+      const now = Date.now();
+      return {
+        entries: [{ kind: 'agent_task_ended', detail: `${id} ${state} ${reason}` }],
+        guard: taskLive(slug, id),
+        change: ([cond, params]) => [q(
+          `UPDATE agent_tasks SET state = ?, ended_at = ?, end_reason = ?, summary = COALESCE(?, summary), steps = COALESCE(?, steps)
+           WHERE workspace = ? AND id = ? AND ended_at IS NULL AND ${cond}`,
+          state, now, reason, summary, steps, slug, id, ...params,
+        )],
+        result: { ended: true },
+      };
+    });
+  }
+
+  // running -> paused or paused -> running. false when the task was not in `from`.
+  async function setState(slug, id, from, to) {
+    const r = await q('UPDATE agent_tasks SET state = ? WHERE workspace = ? AND id = ? AND ended_at IS NULL AND state = ?', to, slug, id, from).run();
+    return r.meta.changes === 1;
+  }
+
+  async function setSession(slug, id, sid, opened) {
+    await q('UPDATE agent_tasks SET sid = ?, opened_session = ? WHERE workspace = ? AND id = ?', sid, opened ? 1 : 0, slug, id).run();
+  }
+
+  // Reserve the worst case of the next call: one guarded update that holds only if
+  // the task's cost plus this reservation fits the task cap and the month's spend
+  // plus it fits the month cap. Statements run one at a time in the database, so
+  // tasks running at once cannot pass a cap together. false when it does not fit
+  // or the task has ended or already holds a reservation.
+  async function reserve(slug, id, amount, { taskCap, monthCap, now = Date.now() }) {
+    const [start, end] = monthBounds(now);
+    const r = await q(
+      `UPDATE agent_tasks SET reserved_microusd = ?
+       WHERE workspace = ? AND id = ? AND ended_at IS NULL AND reserved_microusd = 0 AND cost_microusd + ? <= ?
+         AND (SELECT COALESCE(SUM(cost_microusd + reserved_microusd), 0) FROM agent_tasks WHERE workspace = ? AND created_at >= ? AND created_at < ?) + ? <= ?`,
+      amount, slug, id, amount, taskCap, slug, start, end, amount, monthCap).run();
+    return r.meta.changes === 1;
+  }
+
+  // The call finished: add its real cost and clear the reservation. Only while a
+  // reservation is held, so a reservation already charged in full is not charged twice.
+  async function settle(slug, id, cost, steps) {
+    const r = await q(
+      'UPDATE agent_tasks SET cost_microusd = cost_microusd + ?, reserved_microusd = 0, steps = ? WHERE workspace = ? AND id = ? AND reserved_microusd > 0',
+      cost, steps, slug, id).run();
+    return r.meta.changes === 1;
+  }
+
+  // The call failed before it cost anything: clear the reservation.
+  async function release(slug, id) {
+    await q('UPDATE agent_tasks SET reserved_microusd = 0 WHERE workspace = ? AND id = ?', slug, id).run();
+  }
+
+  // A reservation nobody settled (the object died mid-call) is charged in full.
+  // Returns what it charged.
+  async function chargeUnsettled(slug, id) {
+    const held = await q('SELECT reserved_microusd AS held FROM agent_tasks WHERE workspace = ? AND id = ?', slug, id).first('held');
+    if (!held) return 0;
+    const r = await q(
+      'UPDATE agent_tasks SET cost_microusd = cost_microusd + reserved_microusd, reserved_microusd = 0 WHERE workspace = ? AND id = ? AND reserved_microusd > 0',
+      slug, id).run();
+    return r.meta.changes === 1 ? held : 0;
+  }
+
+  async function setSteps(slug, id, steps) {
+    await q('UPDATE agent_tasks SET steps = ? WHERE workspace = ? AND id = ?', steps, slug, id).run();
+  }
+
+  return {
+    readSettings, settingsOut, mode, sealedKey, patchSettings, writeModels,
+    getTask, listTasks, liveTaskOn, lastSummaries, monthSpend, createTask, endTask, setState, setSession,
+    reserve, settle, release, chargeUnsettled, setSteps,
+  };
+}
+
+export const agentStoreFromEnv = (env, team = teamFromEnv(env)) => agentStore(env.DB, team, { authSecret: env.AUTH_SECRET });

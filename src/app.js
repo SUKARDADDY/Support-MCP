@@ -14,6 +14,8 @@ import { handleApi } from './api.js';
 import { handleDevice } from './device-api.js';
 import { ID_RE, devicesFromEnv, linkCode, livePointer, parseDeviceKey } from './devices.js';
 import { deviceHooks, newCode } from './device-sessions.js';
+import { agentService } from './agent.js';
+import { agentStoreFromEnv } from './agent-store.js';
 import { handleAuth } from './auth.js';
 import {
   AS_METADATA_PATH, PROTECTED_RESOURCE_PREFIX, REGISTER_PATH, TOKEN_PATH, assertPersonActive, assertSecondFactor, bearerToken,
@@ -124,7 +126,9 @@ function installPage(query, hasCode) {
 // request arrived on (/mcp is default, /w/<slug>/mcp is that workspace). The
 // Session answers a call from another workspace as it answers for a session
 // that does not exist.
-function makeBackend(env, origin, devTtlMs, actor, workspace) {
+// via is "agent" when the built-in agent makes the call as its starter: the Session's
+// log row says so, and the actor stays the starter for every check.
+function makeBackend(env, origin, devTtlMs, actor, workspace, via = null) {
   const sessionStub = (sid) => {
     if (sid === undefined || sid === null || sid === '') throw new Error('session_id is required; call session_list to find it');
     if (!/^[0-9a-f]{64}$/.test(String(sid))) throw new Error('session_id must be the 64 hex characters from session_create or session_list');
@@ -133,10 +137,11 @@ function makeBackend(env, origin, devTtlMs, actor, workspace) {
   async function cmd(sid, body) {
     const r = await sessionStub(sid).fetch('https://do/command', {
       method: 'POST',
-      body: JSON.stringify({ ...body, actor, workspace }),
+      body: JSON.stringify({ ...body, actor, workspace, ...(via ? { via } : {}) }),
     });
     return r.json();
   }
+  const agent = () => agentService(env, { origin, devTtlMs });
   return {
     async session_create(args) {
       const windowsMode = normalizeWindowsMode(args.windows_mode ?? 'app');
@@ -240,7 +245,61 @@ function makeBackend(env, origin, devTtlMs, actor, workspace) {
       });
       return r.json();
     },
+    // The built-in agent. caps.user is the OAuth caller's { userId, email }, or null.
+    async agent_start(args, caps) {
+      return agent().start(workspace, actor, args, caps.user ?? null);
+    },
+    async agent_status(args) {
+      return agent().status(workspace, args);
+    },
+    async agent_control(args) {
+      return agent().control(workspace, actor, args);
+    },
   };
+}
+
+// The relay and the workspace are open to this caller, or this says why not. The
+// reason is text safe to show.
+export class AccessDenied extends Error {}
+
+// The three agent tools are for real members only: they never run in open mode.
+const MEMBERS_ONLY_TOOLS = new Set(['agent_start', 'agent_status', 'agent_control']);
+// What a team on "built-in agent only" can still call from /mcp: the three agent
+// tools, and the three that only read.
+const ALLOWED_IN_AGENT_MODE = new Set([...MEMBERS_ONLY_TOOLS, 'device_list', 'session_list', 'session_status']);
+
+// The checks in front of a call, in order: the operator's stop, the workspace, the
+// person (an OAuth caller, or the starter of an agent task), their role, the second
+// factor, and the workspace's own stop. A refused call never reaches a Session.
+//   oauthCaller   an OAuth token's caller: checked on every call, members only, with the second factor
+//   person        { userId, email } of an agent task's OAuth starter: active, members only; no second factor,
+//                 which the starter passed when starting the task
+//   membersOnly   open mode never admits the caller
+//   gate(tool)    one more check, made after the role and stop checks
+async function checkCaller(env, actor, workspace, permission, { oauthCaller = null, person = null, membersOnly = false, gate = null, tool = null } = {}) {
+  // The operator's stop for the whole relay: nothing runs, whoever asks.
+  if (String(env.EMERGENCY_STOP ?? '') !== '') throw new AccessDenied('this relay is stopped by its operator');
+  const team = teamFromEnv(env);
+  // A workspace that was never created answers every tool call the same way,
+  // whoever asks. tools/list never gets here.
+  if (!(await team.workspaceExists(workspace))) throw new AccessDenied('workspace not found');
+  if (oauthCaller) await assertPersonActive(env, team, oauthCaller);
+  if (person) {
+    try {
+      await assertPersonActive(env, team, person);
+    } catch (e) {
+      throw e.message === 'you are not a member of this team' ? new AccessDenied(e.message) : e;
+    }
+  }
+  // An OAuth caller is a member or nothing: authorize does not apply open
+  // mode to them, and does not record them as a recent caller of default.
+  const a = await team.authorize(workspace, actor, permission, { membersOnly: oauthCaller !== null || person !== null || membersOnly });
+  if (!a.ok) throw new AccessDenied(a.reason === 'not_member' ? 'you are not a member of this team' : `your role does not allow ${permission}`);
+  if (oauthCaller) await assertSecondFactor(env, oauthCaller, permission);
+  // A stopped workspace answers no tool call. Read after the role check, so
+  // someone who is not a member learns nothing about the workspace.
+  if ((await team.stopState(workspace)).stopped) throw new AccessDenied('this workspace is stopped; someone who can manage members must resume it');
+  if (gate) await gate(tool);
 }
 
 // The role check in front of every tool. A tool call runs exactly one backend
@@ -252,33 +311,45 @@ function makeBackend(env, origin, devTtlMs, actor, workspace) {
 // on every call: the person must still exist, be enabled and be invited; open
 // mode never admits them; and a permission that needs a second factor needs the
 // authenticator their grant was made with. Removal takes effect on the next call.
-function authorizedBackend(backend, env, actor, toolName, workspace, oauthCaller = null) {
+// The agent tools are members only for everyone. `extra` is { person, membersOnly,
+// gate }, see checkCaller: /mcp passes a gate that reads the team's mode, and the
+// built-in agent passes its starter as `person`, so its calls skip the mode.
+function authorizedBackend(backend, env, actor, toolName, workspace, oauthCaller = null, extra = {}) {
   const check = async () => {
     const permission = permissionForTool(toolName);
     if (!permission) throw new Error(`unknown tool: ${toolName}`);
-    // The operator's stop for the whole relay: nothing runs, whoever asks.
-    if (String(env.EMERGENCY_STOP ?? '') !== '') throw new Error('this relay is stopped by its operator');
-    const team = teamFromEnv(env);
-    // A workspace that was never created answers every tool call the same way,
-    // whoever asks. tools/list never gets here.
-    if (!(await team.workspaceExists(workspace))) throw new Error('workspace not found');
-    if (oauthCaller) await assertPersonActive(env, team, oauthCaller);
-    // An OAuth caller is a member or nothing: authorize does not apply open
-    // mode to them, and does not record them as a recent caller of default.
-    const a = await team.authorize(workspace, actor, permission, { membersOnly: oauthCaller !== null });
-    if (!a.ok) throw new Error(a.reason === 'not_member' ? 'you are not a member of this team' : `your role does not allow ${permission}`);
-    if (oauthCaller) await assertSecondFactor(env, oauthCaller, permission);
-    // A stopped workspace answers no tool call. Read after the role check, so
-    // someone who is not a member learns nothing about the workspace.
-    if ((await team.stopState(workspace)).stopped) throw new Error('this workspace is stopped; someone who can manage members must resume it');
+    await checkCaller(env, actor, workspace, permission, {
+      ...extra, oauthCaller, tool: toolName, membersOnly: extra.membersOnly || MEMBERS_ONLY_TOOLS.has(toolName),
+    });
   };
   // caps.factor(permission) is for a tool that checks a second permission inside
   // itself: it throws when an OAuth caller's sign-in lacks that permission's factor.
-  const caps = { factor: async (permission) => { if (oauthCaller) await assertSecondFactor(env, oauthCaller, permission); } };
+  // caps.user is the OAuth caller's { userId, email }, for a tool that starts work
+  // that outlives the call.
+  const caps = {
+    factor: async (permission) => { if (oauthCaller) await assertSecondFactor(env, oauthCaller, permission); },
+    user: oauthCaller ? { userId: oauthCaller.userId, email: oauthCaller.email } : null,
+  };
   return Object.fromEntries(Object.entries(backend).map(([name, fn]) => [name, async (args) => {
     await check();
     return fn(args, caps);
   }]));
+}
+
+// The built-in agent's way into the same tool path an MCP client uses, as its
+// starter: the same role, workspace stop and operator stop checks, members only,
+// and the starter's account checked when they signed in with OAuth. The Session's
+// log row is marked "agent". Returns the tool's MCP result, { content, isError }.
+export async function runAgentTool(env, { origin, devTtlMs = 0, starter, person = null, workspace }, name, args) {
+  const backend = authorizedBackend(makeBackend(env, origin, devTtlMs, starter, workspace, 'agent'), env, starter, name, workspace, null, { person, membersOnly: true });
+  const { body } = await handleRpc({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }, backend, { ui: true });
+  return body.result;
+}
+
+// Is the starter of a task still allowed to act? Throws AccessDenied when not.
+// Run before every model call, so a removed member's task stops before it spends.
+export async function checkAgentStarter(env, { starter, person = null, workspace }) {
+  await checkCaller(env, starter, workspace, 'sessions.control', { person, membersOnly: true });
 }
 
 // ---- Access gate -----------------------------------------------------------
@@ -580,7 +651,14 @@ async function handleMcp(request, env, url, origin, devTtlMs, workspace = DEFAUL
   // Roles are checked on tools/call only. tools/list, initialize and ping never
   // touch the team database.
   const toolName = msg && msg.method === 'tools/call' && msg.params ? msg.params.name : undefined;
-  const backend = authorizedBackend(makeBackend(env, origin, devTtlMs, actor, workspace), env, actor, toolName, workspace, oauthCaller);
+  // A team on "built-in agent only" refuses the session tools here. The mode is read
+  // after the role check, so someone who is not a member learns nothing about it.
+  // It is read here and not in the shared tool path, so it never blocks the agent.
+  const gate = async (name) => {
+    if (ALLOWED_IN_AGENT_MODE.has(name)) return;
+    if ((await agentStoreFromEnv(env, teamFromEnv(env)).mode(workspace)) === 'agent') throw new Error('this team uses the built-in agent');
+  };
+  const backend = authorizedBackend(makeBackend(env, origin, devTtlMs, actor, workspace), env, actor, toolName, workspace, oauthCaller, { gate });
   const { status, body } = await handleRpc(msg, backend, options);
   if (body === null) return new Response(null, { status });
   return json(body, status);

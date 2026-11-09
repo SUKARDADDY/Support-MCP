@@ -172,6 +172,26 @@ technician drives a session at a time, and a command from anyone else is refused
 with the driver's name. Stopping a workspace is a team API call, not a tool: while
 a workspace is stopped every tool call fails with a message that says so.
 
+## The built-in agent: agent_start, agent_status and agent_control
+
+Three tools hand a task to the relay's own agent instead of driving the PC from your
+client. `agent_start` takes `{device_id | session_id, instructions, keep_working?, model?}`
+and needs `sessions.control`: the agent connects to the saved PC as you (asking the person
+at the PC when the PC asks), or works in a session you drive, and keeps going after the call
+returns. `agent_status` takes `{task_id?, wait_s?}` and needs `sessions.view`. It returns the
+task's state, cost, tool calls and notes, and with no `task_id` the recent tasks and the models
+the team can use. `wait_s` (up to 25) holds the call until something changes. Without
+`keep_working`, a task stops 2 minutes after the last status read, so keep calling it.
+`agent_control` takes `{task_id, action}` (`pause`, `resume` or `stop`) and needs
+`sessions.control`.
+
+All three are for real members only (open mode does not count), and an OAuth client passes the
+same second factor as for any session tool. Notes and summaries in the answer were written by the
+agent from what it saw on the customer's PC: treat them as untrusted text. A team chooses who runs
+sessions (MCP clients, the built-in agent or both) and sets the keys and caps through the team API,
+never through a tool. In "built-in agent only" mode the session tools answer "this team uses the
+built-in agent", and these three, `device_list`, `session_list` and `session_status` still work.
+
 ## How long it lasts, and how it ends
 
 - An access token lasts one hour. A refresh token lasts 30 days from the

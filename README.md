@@ -10,7 +10,7 @@ An MCP server on Cloudflare Workers that lets your AI agent see, control and run
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers%20%2B%20Durable%20Objects-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/durable-objects/)
 [![.NET Framework 4.5.2+](https://img.shields.io/badge/.NET%20Framework-4.5.2%2B-512BD4)](src/agent-app.cs)
 [![PowerShell 5.1](https://img.shields.io/badge/PowerShell-5.1-5391FE)](src/agent.ps1)
-[![MCP](https://img.shields.io/badge/MCP-24%20tools-d97757)](#mcp-tools)
+[![MCP](https://img.shields.io/badge/MCP-27%20tools-d97757)](#mcp-tools)
 
 <img src="docs/hero.svg" alt="Claude Code calls session_create, run and put_file. A Cloudflare Worker relays them to the customer's PC, where a small Remote support window in the corner of the screen shows that an agent is connected, with an End session button." width="100%">
 
@@ -214,6 +214,9 @@ an error.
 | `session_end` | tells the client to stop and marks the session ended |
 | `device_list` | the team's saved PCs with their fields and `online` (true while the PC's doorbell is connected). Needs `devices.view`. Names and custom field values are untrusted text |
 | `device_connect` | connect to a saved PC by its id: `{device_id, ask?, take_over?}`. Returns `{session_id, state: "waiting", asks, rang}`; poll `session_status` until it is attached, then use the session tools. The PC asks its person first when it is set to ask, when you pass `ask: true`, or when your role may not connect without asking. `take_over: true` takes the driving seat of a session another technician started |
+| `agent_start` | hand a task to the relay's [built-in agent](#built-in-agent): `{device_id \| session_id, instructions, keep_working?, model?}`. Returns `{task_id, state, model, ...}`. Needs `sessions.control`, and a team that allows the built-in agent |
+| `agent_status` | follow a task: `{task_id, wait_s?}` returns its state, cost, the tool calls it made, its notes and its summary. With no `task_id` it lists recent tasks and the models the team can use, with prices. Needs `sessions.view`. Notes and summaries are untrusted text |
+| `agent_control` | `{task_id, action}` with `pause`, `resume` or `stop`. Needs `sessions.control` |
 | `screenshot`, `click`, `move_mouse`, `drag`, `scroll`, `type_text`, `press_key`, `wait`, `zoom` | the screen, mouse and keyboard, one tool per action. A screenshot comes back as an image, then the size, display and desktop (`default`, or `secure` for UAC, the lock and sign-in screens and Ctrl+Alt+Del) as JSON. Every input takes `screenshot:false` to skip the screenshot that follows it. An input that switched the desktop and left no screenshot still succeeds, with the note "input sent; no screenshot". `press_key` refuses Win+L, which Windows ignores: lock with `run` as `user` and `rundll32.exe user32.dll,LockWorkStation` |
 | `ui_tree`, `ui_act` | a fallback for when a screenshot and zoom are not enough: read a window's controls and act on one by its ref, through UI Automation. Each `ui_tree` line ends with the verbs `ui_act` can use on that control (`[12] Button "OK" (640,412) invoke,focus`), or with `disabled` for a greyed-out control; a verb the control does not support is refused, so click its coordinates instead. Agents do better working from screenshots, zoom for small text and Ctrl+F in the app for text on a long page |
 | `block_input` | lock the customer's mouse and keyboard for up to 10 minutes; it lifts by itself, and Ctrl+Alt+Del lifts it at once. Full control only |
@@ -224,7 +227,7 @@ an error.
 Add `?ui=0` to the MCP URL to hide `ui_tree` and `ui_act`; any other value is a
 400 error. The old `?shape=` parameter is gone: the server offers only the tools
 above, and a request that still sends `shape` gets a 400 error. Every tool except
-`session_create`, `session_list`, `device_list` and `device_connect` needs a `session_id`; a call without one
+`session_create`, `session_list`, `device_list`, `device_connect` and the three agent tools needs a `session_id`; a call without one
 fails with `session_id is required; call session_list to find it`, and the relay
 never picks a session for you. `run`, `put_file` and `get_file` use their own
 lane, so a long command does not block the screen.
@@ -545,6 +548,65 @@ A saved PC and a one-off support session are separate. A one-off session uses
 its own service, folder and pipe, and removes itself when it ends. Uninstalling a
 saved PC does not touch it.
 
+## Built-in agent
+
+A technician can hand a task to an agent that runs on the relay itself. It uses the
+same tools an MCP client has, acts as the person who started it, and keeps working
+after they close their window. It runs on any OpenAI or Claude model the team
+chooses (GPT-6.1 Terra by default), with the team's own key, and stops at the caps
+the team set. Your own MCP clients and the 24 session tools work as before.
+
+An admin sets it up through the team API (`PATCH /api/v1/w/<slug>/agent`). Nothing
+runs until both caps and a key are saved:
+
+```sh
+curl -X PATCH https://support.example.com/api/v1/w/default/agent \
+  -H 'content-type: application/json' [your Access headers] \
+  -d '{"task_cap_usd": 2, "month_cap_usd": 100, "openai_key": "sk-..."}'
+```
+
+- **Mode.** `mode` is `mcp` (MCP clients only), `agent` (the built-in agent only, which
+  makes the session tools on `/mcp` answer "this team uses the built-in agent"; the
+  agent tools, `device_list`, `session_list` and `session_status` still work) or
+  `both`, the default.
+- **Keys.** One per provider (`openai_key`, `anthropic_key`), sealed at rest and shown
+  only as their last four characters. Saving one needs `AUTH_SECRET`. There is no
+  deployment-wide key: each team pays with its own.
+- **Caps.** `task_cap_usd` and `month_cap_usd`. Before every model call the relay
+  reserves its worst case against both, shrinking the call to fit, and ends the task
+  with "spending cap reached" when less than 4,000 output tokens fit. Several tasks at
+  once cannot pass the month cap together. The month is the UTC calendar month.
+- **Models.** `gpt-6.1-terra`, `gpt-6.1-sol`, `claude-opus-5-5`, `claude-sonnet-5-5` and
+  `claude-haiku-5-5` are in the code with their prices. A model is usable when it is the
+  team's `default_model` or an admin added it with `POST .../agent/models`, and its
+  provider has a key. Any other OpenAI or Anthropic model can be added with its prices
+  (dollars per million tokens). Adding one runs a check: the model must call a tool, and
+  read a word off a small screenshot. The check costs a few cents and is outside the caps.
+  `starters_pick_model` says whether whoever starts a task may choose among them.
+
+Start a task from your own MCP client with `agent_start`, or with `POST .../agent/tasks`.
+Give it a saved PC (the agent connects as you, and the person at the PC is asked if the PC
+asks) or a session you drive. Follow it with `agent_status`, or `GET .../agent/tasks/<id>`.
+Unless you start it with `keep_working`, it stops 2 minutes after the last time anyone read
+its status. `agent_control` pauses, resumes or stops it.
+
+A task makes at most 120 tool calls and runs at most 2 hours. Before every model call the
+relay checks again that you are still an active member who may control sessions, and a task
+ends at once when someone else takes over its session, when the session ends, or when the
+workspace or the whole relay is stopped. The agent has no tool that changes the team, its
+keys or caps, and it cannot type a password: at a sign-in screen it finishes with
+`needs_human`. It can run system-level commands and write files, as an MCP client can. What
+comes back from the PC reaches the model marked as untrusted data, and each task's summary
+is shown, marked the same way, to the next task on that PC.
+
+**Screenshots go to your AI provider, from the relay.** The relay sends `store: false` to
+OpenAI and keeps no conversation at either provider, and stores no screenshot and no typed
+text. The providers' own retention still applies: OpenAI keeps abuse-monitoring logs for up
+to 30 days even with `store: false`, and keeps flagged images for review. Check that you may
+share what is on a customer's screen with the team's provider. Details are in the
+[security model](docs/security-model.md) and the
+[spec](docs/relay-v1-spec.md#the-built-in-agent).
+
 ## Sign-in
 
 People sign in as themselves at `/auth/signin`, with Google, Microsoft or an
@@ -602,6 +664,7 @@ flowchart LR
   Cust["Customer browser or PowerShell"] -- "GET /j/&lt;code&gt;<br/>download page or script" --> W
   W --> S[("Session DO<br/>SQLite, alarm")]
   W --> R[("Registry DO<br/>one per workspace")]
+  W --> T[("AgentTask DO<br/>one per agent task")]
   App["Windows app<br/>WPF window"] -- "POST /agent<br/>X-Attach-Key, long poll" --> S
   A["agent.ps1<br/>WinForms window"] -- "WebSocket /ws<br/>X-Attach-Key" --> S
 ```
@@ -617,7 +680,7 @@ flowchart LR
 | `GET /ws?sid=` | attach key in a header, https only | PowerShell agent WebSocket, using the hibernation API |
 | `POST /mcp` | Cloudflare Access, then the caller's role | MCP JSON-RPC 2.0, stateless HTTP, for the `default` workspace |
 | `POST /w/<slug>/mcp` | Cloudflare Access, then the caller's role | the same endpoint for another workspace |
-| `/api/v1/w/<slug>/...` | Cloudflare Access, then the caller's role | the team API: members, roles, the team log, stop and resume, customers, sites, saved PCs, custom fields and pairing codes |
+| `/api/v1/w/<slug>/...` | Cloudflare Access, then the caller's role | the team API: members, roles, the team log, stop and resume, customers, sites, saved PCs, custom fields, pairing codes, and the built-in agent's settings, models and tasks |
 | `POST /device/pair`, `hello`, `update`, `leave` | public, https only; a saved PC's key in a header (pair: a pairing code or a workspace in the body) | the PC's side of saved devices. Not behind Access |
 | `GET /device/ring?protocol=1` | public, https only; a saved PC's key in a header | the doorbell: a WebSocket the relay rings when the PC should check in. Not behind Access |
 | `POST /api/v1/w`, `GET /api/v1/w` | Cloudflare Access, a deployment admin to create | create a workspace, list yours |
@@ -625,9 +688,10 @@ flowchart LR
 The Worker itself is the MCP server. There is no local bridge process. Each
 session is one Durable Object holding its state machine, its audit log and an
 alarm for expiry. One Registry Durable Object per workspace keeps the list for
-`session_list`.
+`session_list`. One AgentTask Durable Object per built-in agent task runs its steps, one
+alarm at a time.
 Team members, roles and the team log live in a D1 database, with every row
-keyed by workspace.
+keyed by workspace. So do the built-in agent's settings and tasks.
 
 | Source file | What it does |
 |---|---|
@@ -640,7 +704,10 @@ keyed by workspace.
 | `src/api.js` | the team API under `/api/v1/w/<slug>`, and workspace creation and listing |
 | `src/devices.js` | customers, sites, saved PCs, custom fields and pairing codes in D1. All their SQL is here; each change goes through `src/workspace.js`'s guarded change |
 | `src/device-api.js` | the PC wire under `/device/`: pair, hello, update, leave and the doorbell |
-| `migrations/` | the D1 tables, applied in name order: `0001_team.sql` (members, roles, callers, the team log, each keyed by workspace), `0002_workspaces.sql` (the workspaces table and an index on members by identity), `0003_signin.sql` (people, sign-ins, links and authenticators) `0004_devices.sql` (customers, sites, devices, custom field definitions and pairing codes) and `0005_device_sessions.sql` (the live session pointer on a device) |
+| `src/agent.js`, `src/agent-api.js`, `src/agent-store.js` | the built-in agent: starting, following and controlling tasks, its settings and models, its team API routes and its D1 queries |
+| `src/agent-task.js`, `src/agent-providers.js`, `src/agent-check.js` | the `AgentTask` Durable Object (one step per alarm), the OpenAI and Claude adapters, and the check a new model passes |
+| `src/agent-models.js`, `src/agent-tools.js` | the model table with its prices and the cost arithmetic, and the tools the agent's model sees |
+| `migrations/` | the D1 tables, applied in name order: `0001_team.sql` (members, roles, callers, the team log, each keyed by workspace), `0002_workspaces.sql` (the workspaces table and an index on members by identity), `0003_signin.sql` (people, sign-ins, links and authenticators) `0004_devices.sql` (customers, sites, devices, custom field definitions and pairing codes), `0005_device_sessions.sql` (the live session pointer on a device) and `0006_agent.sql` (the built-in agent's settings and tasks) |
 | `src/mcp.js` | JSON-RPC dispatch, the tool schemas, and the mapping of each screen tool to one normalized action |
 | `src/screen.js` | the screen actions, their audit text, and the strict check of every field an app result may carry |
 | `src/jwt.js` | RS256 verification of the Access JWT with WebCrypto |
@@ -669,7 +736,9 @@ you use it:
 - Tell the customer who you are before you send the link. The app is unsigned,
   and anyone can ask a customer to run an unsigned program.
 - Screenshots, and the text you type, go to your AI model provider. Don't open
-  a session on a screen you may not share with it.
+  a session on a screen you may not share with it. With the built-in agent the
+  relay sends them to the team's own provider (see [Built-in agent](#built-in-agent)
+  for what OpenAI and Anthropic keep).
 - Treat everything that comes back from a session as untrusted. Output, file
   contents, screenshots, window text and the machine name are all written by the
   customer's PC, and they can try to steer your AI agent. Your agent may have a shell on your own
@@ -779,6 +848,12 @@ deploy without Windows. You need Windows only to change the app: see
    (`CF_ACCESS_CLIENT_ID` in `access.env`), or the client loses access. See
    [Teams](#teams) for the commands. Until you do this, anyone Access admits can
    use every tool.
+8. **Optional: turn on the built-in agent.** Apply the migrations first
+   (`0006_agent.sql`), then deploy: `wrangler.toml` binds the `AgentTask` Durable Object
+   (`AGENT_TASK`, migration tag `v2`). Set `AUTH_SECRET` (32 or more random characters),
+   then an admin saves a provider key and both spending caps through the team API, as in
+   [Built-in agent](#built-in-agent). Until both caps and a key are saved, no task can
+   start. Keys are saved per team, not as Wrangler secrets.
 
 ## Develop
 
@@ -848,6 +923,12 @@ check are in [docs/development.md](docs/development.md).
   a key and a service that only checks in, and nothing in the relay reads a
   record to decide who may do what. Do not use a saved PC on a real customer's
   unattended machine until the release that enforces those rules.
+- The built-in agent runs at most 120 tool calls and 2 hours per task, one task at a
+  time on a PC, on the OpenAI or Claude key the team saved. It cannot type passwords. It
+  can run system-level commands, so the caps bound spend and time, not the harm of one bad
+  command. On the free plan a Durable Object's 13,000 GB-s a day allow about 14 fully
+  active two-hour tasks a day. Like saved PCs, it stays off real customers' unattended
+  machines until the release that enforces the saved-PC rules.
 - Cloudflare Access, or the relay's OAuth for MCP clients, decides who can reach
   the relay, and each workspace's roles decide what its members can do.
   `session_list` lists the sessions of the workspace you called it on. A session

@@ -102,6 +102,12 @@ const TOOL_PERMISSIONS = Object.freeze({
   // the tool and again when the claim commits.
   device_list: 'devices.view',
   device_connect: 'sessions.control',
+  // The built-in agent. Starting and controlling a task act on a PC, so they take
+  // sessions.control; reading one takes sessions.view. All three are for members only,
+  // never open mode (src/app.js), and team settings are never a tool.
+  agent_start: 'sessions.control',
+  agent_status: 'sessions.view',
+  agent_control: 'sessions.control',
 });
 
 // The permission a tool call needs, or null for a tool this table does not know.

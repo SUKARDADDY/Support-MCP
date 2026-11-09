@@ -614,5 +614,30 @@ development when `DEV_SHOW_EMAIL_LINKS=1`.
 id_tokens, a fake token and key endpoint, a fake mailer and a cookie jar, so
 nothing touches the network. It reads and writes the same D1 stand-in.
 
+### The built-in agent locally
+
+`test/agent-*.test.js` run the agent with no network. `test/agent-fakes.js` is a fake
+OpenAI and Claude behind one `fetch`: its reply bodies have the shapes step 0 recorded from
+the real providers (usage fields, reasoning items with encrypted content, thinking blocks),
+and its error bodies are the real ones. `test/agent-world.js` adds `AgentTask` objects behind
+a small Durable Object stand-in to the saved-PC world of `test/device-sessions-world.js`, and
+a stand-in for the PC that answers the agent's commands. A test drives a task the way
+Cloudflare's alarms would, with `drive(taskId)`, which moves the clock to each alarm. The
+object takes an optional third constructor argument for tests: `fetch` (replaces the network),
+`fail(point)` (may throw at `afterReserve`, `beforeSettle` or `afterSend`, to test a crash) and
+`tool` (replaces the tool path). Workerd passes only two arguments, so none of it exists in
+production.
+
+To run a task for real under `wrangler dev`, apply the migrations, add yourself as an admin,
+and save a provider key and both caps with `PATCH /api/v1/w/default/agent`. Set `AUTH_SECRET`
+in `.dev.vars` first: a key cannot be saved without one. Then connect a saved PC and call
+`agent_start`. Real provider calls cost money, so set small caps (for example a task cap of
+`0.10`).
+
+Step 0 of the PR measured the free plan's CPU with a throwaway Worker: a Durable Object alarm
+that built, stringified and parsed a 2 MB body used 9 ms of CPU, 8 MB used 19 to 24 ms, and
+34 MB used 94 to 97 ms. An agent step passes screenshots through without decoding them, and a
+conversation starts fresh every 12 tool calls, so a step stays far below that.
+
 The wire protocol, the state machine and the acceptance checks are in
 [`docs/relay-v1-spec.md`](relay-v1-spec.md).

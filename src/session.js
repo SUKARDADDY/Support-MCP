@@ -247,6 +247,7 @@ export class Session {
       if (p === '/command') return await this.doCommand(request);
       if (p === '/end') return await this.doEnd(request);
       if (p === '/takeover') return await this.doTakeover(request);
+      if (p === '/watch') return await this.doWatch(url);
     } catch (e) {
       return Response.json({ ok: false, error: String(e && e.message ? e.message : e) }, { status: 500 });
     }
@@ -450,6 +451,10 @@ export class Session {
     if (this.driver && sameIdentity(b.actor) !== this.driver) {
       return Response.json({ ok: false, error: `${this.driver} is driving this session; use device_connect with take_over` });
     }
+    await this.noteActor(b.actor);
+    // The built-in agent acts as the person who started its task. The log says so,
+    // and the actor stays that person for every check.
+    const who = b.actor && b.via === 'agent' ? `${b.actor} via agent` : b.actor;
     const lane = Object.hasOwn(LANE_OF, b.op) ? LANE_OF[b.op] : null;
     if (lane === 'screen' && (await this.get('windows_mode', 'powershell')) !== 'app') {
       return Response.json({ ok: false, error: NO_SCREEN_PS });
@@ -488,7 +493,7 @@ export class Session {
       // Only a client that reports lanes knows the field; the app enforces it.
       if (lanesClient) frame.as = as;
       waitMs = t * 1000 + RESULT_SLACK_MS;
-      this.logRow('run', (as === 'system' ? '(system) ' : '') + truncate(String(b.command ?? ''), 512), b.actor);
+      this.logRow('run', (as === 'system' ? '(system) ' : '') + truncate(String(b.command ?? ''), 512), who);
     } else if (b.op === 'put_file') {
       const data = String(b.data_b64 ?? '');
       if (data.length > PUT_B64_MAX) {
@@ -500,7 +505,7 @@ export class Session {
       frame = { type: 'put_file', id, lane, path: String(b.path ?? ''), data_b64: data, append: !!b.append };
       waitMs = 60 * 1000 + RESULT_SLACK_MS;
       const bytes = Math.floor((data.length * 3) / 4);
-      this.logRow('put_file', `${frame.path} (${bytes} bytes${frame.append ? ', append' : ''})`, b.actor);
+      this.logRow('put_file', `${frame.path} (${bytes} bytes${frame.append ? ', append' : ''})`, who);
     } else if (b.op === 'get_file') {
       let len = Number(b.length);
       if (!Number.isFinite(len) || len <= 0 || len > GET_FILE_MAX) len = GET_FILE_MAX;
@@ -508,7 +513,7 @@ export class Session {
       const off = Number(b.offset) > 0 ? Math.floor(Number(b.offset)) : 0;
       frame = { type: 'get_file', id, lane, path: String(b.path ?? ''), offset: off, length: len };
       waitMs = 60 * 1000 + RESULT_SLACK_MS;
-      this.logRow('get_file', `${frame.path} (@${off}+${len})`, b.actor);
+      this.logRow('get_file', `${frame.path} (@${off}+${len})`, who);
     } else if (b.op === 'screen') {
       try { action = normalizeAction(b.action); } catch (e) { return Response.json({ ok: false, error: e.message }); }
       // These two work only through the SYSTEM service, so a normal-mode app never sees them.
@@ -518,12 +523,12 @@ export class Session {
         + (action.name === 'wait' ? action.seconds * 1000 : 0)
         + (action.text ? action.text.length * TYPE_MS_PER_CHAR : 0);
       // A screenshot is logged below, once its size is known. type_secret logs a bare name.
-      if (action.name !== 'screenshot') this.logRow('screen', auditText(action), b.actor);
+      if (action.name !== 'screenshot') this.logRow('screen', auditText(action), who);
     } else {
       if (b.action !== 'request_full_control') return Response.json({ ok: false, error: 'bad action' });
       frame = { type: 'control', id, lane, action: 'request_full_control' };
       waitMs = CONTROL_WAIT_MS + RESULT_SLACK_MS;
-      this.logRow('control', 'request_full_control', b.actor);
+      this.logRow('control', 'request_full_control', who);
     }
 
     let target = ws;
@@ -533,7 +538,7 @@ export class Session {
     }
     const result = await this.awaitResult(id, target, isHttp ? tag : this.socketTag(ws), frame, waitMs,
       b.op === 'control' ? { control_request: true } : {});
-    if (b.op === 'control' || b.op === 'screen') return Response.json(await this.finishScreen(result, action, b.actor));
+    if (b.op === 'control' || b.op === 'screen') return Response.json(await this.finishScreen(result, action, who));
     return Response.json(result);
   }
 
@@ -848,6 +853,34 @@ export class Session {
     this.failPending(() => true, 'session ended');
     await this.markEnded(why, actor, { quiet });
     return Response.json({ ended: true });
+  }
+
+  // Who has sent this session a command, and when (the last 10 people). The built-in
+  // agent reads it to end its task when someone other than its starter takes over a
+  // session that has no driver. Every command past the driver check counts.
+  async noteActor(actor) {
+    const who = sameIdentity(actor);
+    if (!who) return;
+    const seen = await this.get('actors', {});
+    const next = { ...seen, [who]: Date.now() };
+    const names = Object.keys(next).sort((a, b) => next[a] - next[b]);
+    for (const old of names.slice(0, Math.max(0, names.length - 10))) delete next[old];
+    await this.setMany({ actors: next });
+  }
+
+  // For the built-in agent: the session's state, its driver and who has commanded it.
+  // Another workspace sees what a session that does not exist shows.
+  async doWatch(url) {
+    if (await this.otherWorkspace(url.searchParams.get('workspace'))) return Response.json({ state: 'unknown', actors: [] });
+    await this.expireIfDue();
+    const s = await this.ctx.storage.get(['state', 'device_id', 'driver', 'ended_reason', 'actors']);
+    return Response.json({
+      state: s.get('state') ?? 'unknown',
+      ended_reason: s.get('ended_reason') ?? null,
+      device_id: s.get('device_id') ?? null,
+      driver: s.get('device_id') ? s.get('driver') ?? null : null,
+      actors: Object.entries(s.get('actors') ?? {}).map(([actor, ts]) => ({ actor, ts })),
+    });
   }
 
   // The team makes `actor` the driver of a live saved-PC session. The parked poll

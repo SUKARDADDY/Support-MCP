@@ -11,6 +11,7 @@
 import { TeamError, teamFromEnv } from './workspace.js';
 import { ID_RE, devicesFromEnv } from './devices.js';
 import { deviceHooks } from './device-sessions.js';
+import { handleAgentApi } from './agent-api.js';
 
 const ROOT = '/api/v1/w';
 const PREFIX = '/api/v1/w/';
@@ -103,6 +104,12 @@ export async function handleApi(request, env, url, { accessCaller, isJsonContent
     const team = teamFromEnv(env);
     // A slug that was never created, or is malformed, is 404 for everyone.
     if (!(await team.workspaceExists(slug))) throw new TeamError(404, 'not_found', 'no such workspace');
+    // The built-in agent has routes more than one segment deep (src/agent-api.js).
+    if (collection === 'agent') {
+      const segments = url.pathname.slice(PREFIX.length).split('/').slice(2);
+      return await handleAgentApi({ json, notAllowed, readBody, need, decodeSegment },
+        { env, team, slug, caller, method, request, url, origin, segments });
+    }
     if (extra.length || item === '') throw new TeamError(404, 'not_found', 'not found');
 
     if (collection === undefined) {
