@@ -484,12 +484,28 @@ test('100 PCs in each of two teams that all go quiet at once are each reported m
   done();
 });
 
+for (const [count, how] of [[500, 'in the query'], [3000, 'too many to send to the query, so dropped after it']]) test(`${count} watched PCs whose doorbells are connected cannot crowd a missing PC out of the hourly run (${how})`, async (t) => {
+  const w = await agentWorld(t);
+  const insert = w.db.sqlite.prepare("INSERT INTO devices(workspace, id, status, name, access, control, key_hash, paired_at, paired_by, last_seen) VALUES ('default', ?, 'active', ?, 'ask', 'full', 'k', 1, 'test', ?)");
+  const base = w.now();
+  const id = (n) => `${String(n).padStart(4, '0').replace(/\d/g, (d) => 'abcdefghij'[d])}`.padEnd(20, 'a');
+  // Many PCs with old last_seen but a connected doorbell, then one that is really missing (later last_seen, so it sorts after them).
+  const connected = [...Array(count).keys()].map(id);
+  connected.forEach((pcId, i) => { insert.run(pcId, `Up ${i}`, base - 100_000 + i); w.ringSocket(pcId); });
+  const gone = id(count);
+  insert.run(gone, 'Gone', base);
+  w.db.sqlite.prepare('UPDATE members SET notify = ? WHERE workspace = ? AND identity = ?').run(JSON.stringify({ watch: [...connected, gone] }), 'default', TECH);
+  w.advance(7 * DAY + 3600_000);
+  for (let h = 0; h < 48; h++) { await sweep(w.env); w.advance(3600_000); }
+  assert.deepEqual(rowsOf(w).map((r) => [r.recipient, r.device_id, r.dedupe]), [[TECH, gone, `missing:${gone}:${base}`]], 'the missing PC once, and none of the connected ones');
+});
+
 test('PCs nobody would be told of take none of the hourly budget, and the window ends before the rows are deleted', async (t) => {
   const w = await agentWorld(t);
   const insert = w.db.sqlite.prepare("INSERT INTO devices(workspace, id, status, name, access, control, key_hash, paired_at, paired_by, last_seen) VALUES ('default', ?, 'active', ?, 'ask', 'full', 'k', 1, 'test', ?)");
   const base = w.now();
   // 60 older PCs: 30 unwatched, 30 watched by someone who switched device_missing off. Then 5 that TECH watches.
-  const id = (n) => `${String(n).padStart(3, '0').replace(/\d/g, (d) => 'abcdefghij'[d])}`.padEnd(20, 'a');
+  const id = (n) => `${String(n).padStart(4, '0').replace(/\d/g, (d) => 'abcdefghij'[d])}`.padEnd(20, 'a');
   for (let i = 0; i < 65; i++) insert.run(id(i), `PC ${i}`, base - 10_000 + i);
   w.db.sqlite.prepare('UPDATE members SET notify = ? WHERE workspace = ? AND identity = ?').run(JSON.stringify({ watch: [...Array(65).keys()].slice(30, 60).map(id), events: { device_missing: false } }), 'default', LEAD);
   w.db.sqlite.prepare('UPDATE members SET notify = ? WHERE workspace = ? AND identity = ?').run(JSON.stringify({ watch: [...Array(65).keys()].slice(60).map(id) }), 'default', TECH);

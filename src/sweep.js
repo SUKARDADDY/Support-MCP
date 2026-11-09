@@ -17,8 +17,11 @@
 // the same absence look new.
 //
 // A run stays under the free plan's 50 subrequests (D1 queries and Registry calls). The
-// teams are taken in turn: the candidates are interleaved across teams, so one big team
-// cannot crowd out the rest, and the first team moves every hour.
+// teams with a candidate are taken in turn, and the first team moves every hour, so one big
+// team cannot crowd out the rest. For each team the run asks its Registry which doorbells are
+// connected, then picks that team's candidates with those PCs left out inside the query, and
+// no more than the budget can handle: a PC that is connected can never fill the list ahead
+// of a PC that is missing.
 //
 // It deletes notifications older than 30 days.
 //
@@ -31,12 +34,15 @@ import { notifyStore } from './notify.js';
 export const MISSING_MS = 7 * 24 * 60 * 60 * 1000;
 // MISSING_MS plus this must stay under KEEP_MS (src/notify.js) by more than a run's gap.
 export const MISSING_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
-const PCS_PER_RUN = 500;
 const HOUR_MS = 60 * 60 * 1000;
-// Of the 50: the candidate query and the prune take two, a team costs one (its doorbells),
-// and a PC costs two (who hears of it, and the write).
+// Of the 50: the query for the teams and the prune take two, a team costs two (its
+// doorbells, and its candidates), and a PC costs two (who hears of it, and the write).
 export const SUBREQUESTS = 46;
-const TEAM_COST = 1;
+const TEAM_COST = 2;
+// Connected ids go to the query as one JSON parameter. D1 allows 100 KB a statement, so a
+// longer list is not sent: the query then reads that many extra rows, which can hold every
+// connected PC, and the run drops them.
+const ONLINE_PARAM_MAX = 60_000;
 const PC_COST = 2;
 
 // The list started at `turn` places along, wrapping round.
@@ -55,25 +61,29 @@ const UNTOLD = `EXISTS (
 export async function sweep(env, now = Date.now()) {
   const notify = notifyStore(env.DB, teamFromEnv(env));
   const turn = Math.floor(now / HOUR_MS);
-  // The first PC of each team, then the second of each, and so on.
-  const { results } = await env.DB.prepare(
-    `SELECT workspace, id, name, seen FROM (
-       SELECT workspace, id, name, COALESCE(last_seen, paired_at) AS seen,
-         ROW_NUMBER() OVER (PARTITION BY workspace ORDER BY COALESCE(last_seen, paired_at), id) AS n
-       FROM devices d WHERE d.status = 'active' AND COALESCE(last_seen, paired_at) < ? AND COALESCE(last_seen, paired_at) >= ?
-         AND ${UNTOLD}
-     ) ORDER BY n, workspace LIMIT ?`,
-  ).bind(now - MISSING_MS, now - MISSING_MS - MISSING_WINDOW_MS, PCS_PER_RUN).all();
-  const byWorkspace = new Map();
-  for (const pc of results) byWorkspace.set(pc.workspace, [...(byWorkspace.get(pc.workspace) ?? []), pc]);
+  const hooks = deviceHooks(env);
+  const crossed = now - MISSING_MS;
+  const oldest = crossed - MISSING_WINDOW_MS;
+  const teams = (await env.DB.prepare(
+    `SELECT DISTINCT workspace FROM devices d WHERE d.status = 'active' AND COALESCE(d.last_seen, d.paired_at) < ? AND COALESCE(d.last_seen, d.paired_at) >= ? AND ${UNTOLD} ORDER BY workspace`,
+  ).bind(crossed, oldest).all()).results.map((r) => r.workspace);
   let left = SUBREQUESTS;
-  for (const [workspace, pcs] of rotated([...byWorkspace], turn)) {
+  for (const workspace of rotated(teams, turn)) {
     if (left < TEAM_COST + PC_COST) break;
-    left -= TEAM_COST;
+    left -= 1;
     try {
-      const online = await deviceHooks(env).online(workspace);
+      const online = await hooks.online(workspace);
       if (online === null) continue;
-      for (const pc of pcs.filter((p) => !online.has(p.id))) {
+      left -= 1;
+      const ids = JSON.stringify([...online]);
+      const inQuery = ids.length <= ONLINE_PARAM_MAX;
+      const { results } = await env.DB.prepare(
+        `SELECT id, name, COALESCE(d.last_seen, d.paired_at) AS seen FROM devices d
+         WHERE d.workspace = ? AND d.status = 'active' AND COALESCE(d.last_seen, d.paired_at) < ? AND COALESCE(d.last_seen, d.paired_at) >= ?
+           AND d.id NOT IN (SELECT value FROM json_each(?)) AND ${UNTOLD}
+         ORDER BY COALESCE(d.last_seen, d.paired_at), d.id LIMIT ?`,
+      ).bind(workspace, crossed, oldest, inQuery ? ids : '[]', Math.floor(left / PC_COST) + (inQuery ? 0 : online.size)).all();
+      for (const pc of results.filter((p) => !online.has(p.id))) {
         if (left < PC_COST) break;
         left -= PC_COST;
         await notify.write(workspace, await notify.rows(workspace, 'device_missing', { watching: pc.id }, {
