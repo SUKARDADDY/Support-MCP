@@ -1,6 +1,6 @@
 [package]
 name = "support-technician-app"
-version = "0.7.0"
+version = "0.8.0"
 description = "The Support-MCP technician app for Windows"
 authors = ["Support-MCP"]
 license = "MIT"

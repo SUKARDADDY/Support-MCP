@@ -1,6 +1,6 @@
 {
   "name": "support-mcp-technician-app",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
   "description": "The Support-MCP technician app for Windows: a Tauri 2 shell with a Rust core and React screens.",
