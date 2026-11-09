@@ -14,7 +14,7 @@ const KNOWN_KINDS = ['created', 'consumed', 'attached', 'hello', 'detached', 'de
 // or take it over. There are no click or type controls: this tab only watches. Everything
 // from the PC (the picture, step details, notes, log text) is untrusted and shown as text.
 export function SessionTab({ tab, active = true }) {
-  const { core, tuning, me, can, endTab, closeTab, toast, updateTab, devices, visible, titleOf } = useApp();
+  const { core, tuning, me, can, endTab, closeTab, toast, updateTab, devices, visible, titleOf, registerTab } = useApp();
   const [showActivity, setShowActivity] = useState(true);
   const [agentOpen, setAgentOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
@@ -23,6 +23,18 @@ export function SessionTab({ tab, active = true }) {
     core, account: tab.account, tab, active, me, canControl: can('sessions.control'), tuning, visible,
     onSessionKnown: (sid) => updateTab(tab.key, { sessionId: sid }),
   });
+  // Lets App quiet this tab before any task starts on its PC or session, and hand it the task.
+  const latest = useRef(null);
+  latest.current = { tab, s };
+  useEffect(() => registerTab(tab.key, {
+    account: tab.account,
+    deviceId: () => latest.current.tab.deviceId ?? null,
+    sessionId: () => latest.current.s.sessionId ?? null,
+    hold: () => latest.current.s.holdScreenshots(),
+    release: () => latest.current.s.releaseScreenshots(),
+    follow: (taskId) => { latest.current.s.watchTask(taskId); latest.current.s.releaseScreenshots(); },
+  }), [registerTab, tab.key, tab.account]);
+
   const device = devices.find((d) => d.id === tab.deviceId) ?? null;
   const name = tab.deviceName || device?.name || t('session.untitled');
 
@@ -165,7 +177,7 @@ export function SessionTab({ tab, active = true }) {
           </aside>
         ) : null}
       </div>
-      {agentOpen ? <AgentStartDialog sessionId={s.sessionId} onClose={() => setAgentOpen(false)} beforeStart={s.holdScreenshots} onStartFailed={s.releaseScreenshots} onStarted={(started) => { s.watchTask(started.task_id); s.releaseScreenshots(); }} /> : null}
+      {agentOpen ? <AgentStartDialog sessionId={s.sessionId} onClose={() => setAgentOpen(false)} /> : null}
     </div>
   );
 }

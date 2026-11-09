@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { endSession, fetchDevices, fetchMe, fetchPlaces, isLiveTask, listTasks, messageOf, sessionStatus } from './api.js';
+import { endSession, fetchDevices, fetchMe, fetchPlaces, isLiveTask, listTasks, messageOf, sessionStatus, startTask } from './api.js';
 import { Icon } from './components/Icon.jsx';
 import { useConnections } from './connections.js';
 import { AppContext } from './context.jsx';
@@ -160,6 +160,27 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     closeTab(key);
   }, [tabs, core, toast, closeTab]);
   const updateTab = useCallback((key, patch) => setTabs((cur) => persist(cur.map((x) => (x.key === key ? { ...x, ...patch } : x)))), [persist]);
+  // Every task start goes through here. The PC takes one command at a time, so the open session
+  // tab(s) on the same PC or session stop their screenshots and wait for one in flight first;
+  // otherwise the agent's first step meets "agent busy". A tab registers itself in `tabGuards`.
+  const tabGuards = useRef(new Map()); // tab key -> { account, deviceId(), sessionId(), hold(), release(), follow(taskId) }
+  const registerTab = useCallback((key, guard) => {
+    tabGuards.current.set(key, guard);
+    return () => { if (tabGuards.current.get(key) === guard) tabGuards.current.delete(key); };
+  }, []);
+  const startAgentTask = useCallback(async (body) => {
+    const guards = [...tabGuards.current.values()].filter((g) => g.account === accountId
+      && ((body.session_id && g.sessionId() === body.session_id) || (body.device_id && g.deviceId() === body.device_id)));
+    await Promise.all(guards.map((g) => g.hold()));
+    try {
+      const started = await startTask(core, accountId, body);
+      guards.forEach((g) => g.follow(started.task_id));
+      return started;
+    } catch (e) {
+      guards.forEach((g) => g.release());
+      throw e;
+    }
+  }, [core, accountId]);
   const sessionTabFor = useCallback((deviceId) => tabs.find((x) => x.deviceId === deviceId && x.account === accountId) ?? null, [tabs, accountId]);
 
   // Tabs from the last run: keep only the sessions that are still open.
@@ -268,8 +289,8 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     devices: deviceData.devices, places: deviceData.places, devicesState: deviceData, reloadDevices,
     selectedId, select, conns, connect, cancelConnect, dismissConnect,
     sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true),
-    toast, copyText, notifications, openTarget, now, theme, setTheme, tuning, visible, rememberTask, titleOf,
-  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf]); // eslint-disable-line react-hooks/exhaustive-deps
+    toast, copyText, notifications, openTarget, now, theme, setTheme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask,
+  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (accounts === null) return <div className="app" role="status"><p className="hint">{t('common.loading')}</p></div>;
 

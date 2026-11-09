@@ -1,5 +1,7 @@
 import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import { ID, ToolFail, fakeCore, renderApp } from '../test-utils.jsx';
 
@@ -305,6 +307,50 @@ describe('Session tab: handing the session to the agent', () => {
     await screen.findByText('Agent activity');
     await sleep(200);
     expect(order).toEqual(['shot-start', 'shot-end', 'task-start']);
+  });
+
+  test('starting from the device detail, with that PC\'s tab open, waits for the tab\'s screenshot too and follows the task in that tab', async () => {
+    const fake = fakeCore();
+    const order = [];
+    let finishShot = null;
+    fake.state.screenshot = () => {
+      order.push('shot-start');
+      return new Promise((resolve) => { finishShot = () => { order.push('shot-end'); resolve({ data: {}, image: { mime: 'image/jpeg', data: 'QUJD' } }); }; });
+    };
+    const request = fake.core.request.getMockImplementation();
+    fake.core.request.mockImplementation(async (account, method, path, body) => {
+      if (method === 'POST' && path === '/api/agent/tasks') order.push('task-start');
+      return request(account, method, path, body);
+    });
+    const { user } = await openTab(fake);
+    await waitFor(() => expect(order).toEqual(['shot-start']));
+    // Leave the tab (its screenshot is still on its way) and hand the same PC over from its detail.
+    await user.click(screen.getByRole('tab', { name: 'Devices' }));
+    await user.click(await screen.findByRole('button', { name: /^Front counter/ }));
+    const detail = screen.getByRole('region', { name: 'Device details' });
+    await user.click(within(detail).getByRole('button', { name: 'Hand to the agent' }));
+    const dialog = screen.getByRole('dialog', { hidden: true });
+    await user.click(within(dialog).getByLabelText('What should the agent do?'));
+    await user.paste('Fix the printer');
+    await user.click(within(dialog).getByRole('button', { name: 'Start the task' }));
+    await sleep(120);
+    expect(order).toEqual(['shot-start']);
+    expect(fake.state.started).toBeUndefined();
+    act(() => finishShot());
+    await waitFor(() => expect(fake.state.started).toEqual({ instructions: 'Fix the printer', keep_working: false, device_id: ID('a') }));
+    expect(order).toEqual(['shot-start', 'shot-end', 'task-start']);
+    // The PC's open tab is shown and follows the task; no second tab is made, and no screenshot follows.
+    expect(await screen.findByText('Agent activity')).toBeInTheDocument();
+    expect(screen.getAllByRole('tab')).toHaveLength(2);
+    await sleep(200);
+    expect(order).toEqual(['shot-start', 'shot-end', 'task-start']);
+  });
+
+  test('every task start goes through the app\'s one guarded function', () => {
+    const dir = join(import.meta.dirname, '..');
+    const files = [...readdirSync(dir), ...readdirSync(join(dir, 'screens')).map((f) => `screens/${f}`)].filter((f) => /\.jsx?$/.test(f) && !/\.test\./.test(f));
+    const callers = files.filter((f) => /\bstartTask\(/.test(readFileSync(join(dir, f), 'utf8')) && f !== 'api.js');
+    expect(callers).toEqual(['App.jsx']);
   });
 
   test('a task the relay refuses to start lets the screenshots go on', async () => {

@@ -103,6 +103,7 @@ export async function taskStatus(core, account, taskId, waitS = 0) {
 }
 export const taskFrame = (core, account, taskId) => core.request(account, 'GET', `/api/agent/tasks/${taskId}/frame`);
 export const controlTask = (core, account, taskId, action) => core.request(account, 'POST', `/api/agent/tasks/${taskId}/${action}`, {});
+// Only App's startAgentTask calls this: it stops the screenshots of the open tabs first (a test holds that).
 export const startTask = (core, account, body) => core.request(account, 'POST', '/api/agent/tasks', body);
 // The models a team offers and whether the starter may pick: the MCP tool with no task.
 export async function agentModels(core, account) {

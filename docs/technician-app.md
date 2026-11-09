@@ -113,9 +113,9 @@ the app's core has no tool for them.
   It stops at once when the relay answers that someone else is driving or the PC is busy with the
   agent, and starts again when you press **Try the screen again** or take over. It also stops
   while the window is minimised or in the tray.
-- **Hand to the agent** on a tab first stops that tab's screenshots and waits for one in flight to
-  finish, then starts the task, so the agent's first step does not meet a busy PC. The tab takes
-  no screenshot again until the task is over.
+- Every task start (from a tab or from a PC's detail) first stops the screenshots of any open tab on
+  that PC or session and waits for one in flight to finish, so the agent's first step does not meet
+  a busy PC. The tab then follows the task and takes no screenshot until it is over.
 - Every 15 seconds it looks for a task running on the session and switches to its picture.
 - The activity panel shows what the task has cost against the team's cap for one task ("Spent
   $0.42 of the $2.00 task cap."), and the same line in the summary when the task is over. The
