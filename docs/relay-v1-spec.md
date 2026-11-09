@@ -941,7 +941,7 @@ extended with the app's addresses. The library checks its list pairwise, so a se
 500 workspaces takes about 220 ms to build and 1,000 addresses about 900 ms. The consent page
 for an app address reads: "Support technician app: works as you in `<team>`, including seeing PCs
 and their screens, pairing and approving PCs, changing how they can be reached, and starting
-agent tasks. It can't change members, roles or agent keys. Only approve this if you just
+agent tasks, as far as your role allows. It can't change members, roles or agent keys. Only approve this if you just
 started signing in from the app." The membership and second-factor rules of the MCP consent
 page apply unchanged. Grant props are the same, `{ user_id, email, workspace, factor }`.
 

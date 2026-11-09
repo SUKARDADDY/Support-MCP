@@ -661,7 +661,8 @@ and local testing are in [docs/mcp-clients.md](docs/mcp-clients.md).
 The technician app signs in the same way, but for its own address,
 `/app/w/<slug>` (`default` has one too), so its sign-in is a different grant from an AI
 client's. The consent page says the app works as you, including seeing PCs and their screens,
-pairing and approving PCs, changing how they can be reached and starting agent tasks, and
+pairing and approving PCs, changing how they can be reached and starting agent tasks as far as
+your role allows, and
 that it cannot change members, roles or agent keys. A token for the app is a 401 on `/mcp`,
 and an MCP client's token is a 401 on `/app`. Every `/app` route takes a bearer token only
 (no Access login, no cookie), refuses an `Origin` header, needs a JSON content type on a

@@ -74,7 +74,7 @@ it('the consent page for the app says what it can do, in the plan\'s words', asy
   const w = await appWorld(t);
   const app = await w.connect(TECH, { app: true });
   const text = unesc(app.html);
-  assert.ok(text.includes("Support technician app: works as you in Default, including seeing PCs and their screens, pairing and approving PCs, changing how they can be reached, and starting agent tasks. It can't change members, roles or agent keys. Only approve this if you just started signing in from the app."), text);
+  assert.ok(text.includes("Support technician app: works as you in Default, including seeing PCs and their screens, pairing and approving PCs, changing how they can be reached, and starting agent tasks, as far as your role allows. It can't change members, roles or agent keys. Only approve this if you just started signing in from the app."), text);
   assert.ok(!text.includes('Run commands, move files'), 'not the MCP list of abilities');
   const mcp = await w.connect(TECH, { app: false });
   assert.ok(unesc(mcp.html).includes('Run commands, move files and control the screen'), 'an MCP client still sees its abilities');

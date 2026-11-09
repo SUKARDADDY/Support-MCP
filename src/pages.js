@@ -179,7 +179,7 @@ export function consentPage({ email, clientName, clientDomain, redirectHost, red
   // The technician app works as the person on its own routes, so its page says
   // so in full, and says what it cannot do.
   const can = technicianApp
-    ? `<p>Support technician app: works as you in ${esc(workspaceName)}, including seeing PCs and their screens, pairing and approving PCs, changing how they can be reached, and starting agent tasks. It can't change members, roles or agent keys. Only approve this if you just started signing in from the app.</p>`
+    ? `<p>Support technician app: works as you in ${esc(workspaceName)}, including seeing PCs and their screens, pairing and approving PCs, changing how they can be reached, and starting agent tasks, as far as your role allows. It can't change members, roles or agent keys. Only approve this if you just started signing in from the app.</p>`
     : abilities.length
       ? `<ul class="plain">${abilities.map((a) => `<li>${esc(a[0].toUpperCase() + a.slice(1))}</li>`).join('')}</ul>`
       : '<p class="muted">Nothing. Your role here holds no session permissions.</p>';
