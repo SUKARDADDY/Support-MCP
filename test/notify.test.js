@@ -9,7 +9,7 @@ import { appWorld, skip } from './app-world.js';
 import { socket } from './device-sessions-world.js';
 import { oai } from './agent-fakes.js';
 import { EVENTS, KEEP_MS, notifyStore, readNotify } from '../src/notify.js';
-import { sweep } from '../src/sweep.js';
+import { sweep, MISSING_MS, MISSING_WINDOW_MS } from '../src/sweep.js';
 import { ONLINE_AFTER_MS } from '../src/registry.js';
 
 const shotCall = () => oai.call('screenshot', { display: null });
@@ -420,6 +420,83 @@ test('a big team does not crowd the others out of the hourly run, and a run stay
   // Over the hours, the small team is reached although the big one had the earlier PCs.
   for (let h = 0; h < 3; h++) { w.advance(3600_000); await sweep(w.env); }
   assert.ok(rowsOf(w, "WHERE workspace = 'default'").length > 0, 'the small team was reached');
+});
+
+// Many watched PCs lose contact at the same moment, so they all cross 7 days in the same hour.
+// One run has the budget for about 22 of them. The ones already told of must not take the budget
+// again, and the rest must be reached before the window for a new absence closes.
+async function lostTogether(t, { teams }) {
+  const w = await agentWorld(t);
+  if (teams > 1) await acme(w);
+  const insert = w.db.sqlite.prepare("INSERT INTO devices(workspace, id, status, name, access, control, key_hash, paired_at, paired_by, last_seen) VALUES (?, ?, 'active', ?, 'ask', 'full', 'k', 1, 'test', ?)");
+  const lastSeen = w.now();
+  const slugs = ['default', 'acme'].slice(0, teams);
+  const ids = new Map(slugs.map((slug) => [slug, []]));
+  for (const slug of slugs) {
+    for (let i = 0; i < 100; i++) {
+      const id = `${slug === 'acme' ? 'b' : 'a'}${String(i).padStart(3, '0').replace(/\d/g, (d) => 'abcdefghij'[d])}`.padEnd(20, 'a');
+      ids.get(slug).push(id);
+      insert.run(slug, id, `PC ${slug} ${i}`, lastSeen);
+    }
+    w.db.sqlite.prepare('UPDATE members SET notify = ? WHERE workspace = ? AND identity = ?').run(JSON.stringify({ watch: ids.get(slug) }), slug, TECH);
+  }
+  w.advance(7 * DAY + 3600_000);
+  // Count what the free plan counts: each statement run on its own, each batch once, each Registry call.
+  let calls = 0;
+  const real = w.env.DB;
+  const counted = (st) => ({ ...st, bind: (...a) => counted(st.bind(...a)), run: (...a) => (calls++, st.run(...a)), all: (...a) => (calls++, st.all(...a)), first: (...a) => (calls++, st.first(...a)) });
+  w.env.DB = { ...real, prepare: (sql) => counted(real.prepare(sql)), batch: (list) => (calls++, real.batch(list)) };
+  let worst = 0;
+  const hour = async () => {
+    calls = 0;
+    const before = w.registryCalls.length;
+    await sweep(w.env);
+    worst = Math.max(worst, calls + (w.registryCalls.length - before));
+    w.advance(3600_000);
+  };
+  return { w, lastSeen, ids, hour, worst: () => worst, done: () => { w.env.DB = real; } };
+}
+
+test('100 PCs that all go quiet at once are each reported missing once, within the window, in one team', async (t) => {
+  const { w, lastSeen, ids, hour, worst, done } = await lostTogether(t, { teams: 1 });
+  for (let h = 0; h < 48; h++) await hour();
+  const rows = rowsOf(w, "WHERE event = 'device_missing'");
+  assert.equal(rows.length, 100, 'PCs told of after 48 hourly runs');
+  assert.deepEqual(rows.map((r) => r.dedupe).sort(), ids.get('default').map((id) => `missing:${id}:${lastSeen}`).sort(), 'every PC, once');
+  assert.ok(rows.every((r) => r.recipient === TECH));
+  // The window is over; later runs add nothing and spend nothing on PCs that were told of.
+  for (let h = 0; h < 72; h++) await hour();
+  assert.equal(rowsOf(w, "WHERE event = 'device_missing'").length, 100);
+  assert.ok(worst() <= 50, `${worst()} subrequests in the worst run`);
+  done();
+});
+
+test('100 PCs in each of two teams that all go quiet at once are each reported missing once, within the window', async (t) => {
+  const { w, lastSeen, ids, hour, worst, done } = await lostTogether(t, { teams: 2 });
+  for (let h = 0; h < 48; h++) await hour();
+  const rows = rowsOf(w, "WHERE event = 'device_missing'");
+  assert.equal(rows.length, 200, 'PCs told of after 48 hourly runs');
+  const want = [...ids].flatMap(([slug, list]) => list.map((id) => `${slug}:missing:${id}:${lastSeen}`)).sort();
+  assert.deepEqual(rows.map((r) => `${r.workspace}:${r.dedupe}`).sort(), want, 'every PC of both teams, once');
+  for (let h = 0; h < 72; h++) await hour();
+  assert.equal(rowsOf(w, "WHERE event = 'device_missing'").length, 200);
+  assert.ok(worst() <= 50, `${worst()} subrequests in the worst run`);
+  done();
+});
+
+test('PCs nobody would be told of take none of the hourly budget, and the window ends before the rows are deleted', async (t) => {
+  const w = await agentWorld(t);
+  const insert = w.db.sqlite.prepare("INSERT INTO devices(workspace, id, status, name, access, control, key_hash, paired_at, paired_by, last_seen) VALUES ('default', ?, 'active', ?, 'ask', 'full', 'k', 1, 'test', ?)");
+  const base = w.now();
+  // 60 older PCs: 30 unwatched, 30 watched by someone who switched device_missing off. Then 5 that TECH watches.
+  const id = (n) => `${String(n).padStart(3, '0').replace(/\d/g, (d) => 'abcdefghij'[d])}`.padEnd(20, 'a');
+  for (let i = 0; i < 65; i++) insert.run(id(i), `PC ${i}`, base - 10_000 + i);
+  w.db.sqlite.prepare('UPDATE members SET notify = ? WHERE workspace = ? AND identity = ?').run(JSON.stringify({ watch: [...Array(65).keys()].slice(30, 60).map(id), events: { device_missing: false } }), 'default', LEAD);
+  w.db.sqlite.prepare('UPDATE members SET notify = ? WHERE workspace = ? AND identity = ?').run(JSON.stringify({ watch: [...Array(65).keys()].slice(60).map(id) }), 'default', TECH);
+  w.advance(7 * DAY + 3600_000);
+  await sweep(w.env);
+  assert.deepEqual(rowsOf(w).map((r) => r.device_id).sort(), [...Array(65).keys()].slice(60).map(id), 'the 5 watched PCs, in the first run');
+  assert.ok(MISSING_MS + MISSING_WINDOW_MS + DAY < KEEP_MS, 'a row is not deleted while its absence is still a candidate');
 });
 
 test('the hourly run skips a team whose doorbells it cannot read, and the Worker has a scheduled handler that runs it', async (t) => {

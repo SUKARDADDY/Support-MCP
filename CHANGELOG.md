@@ -33,7 +33,7 @@ The version stays 0.7.0.
   and `members.notify`. Apply it before you deploy this version. An hourly Cron Trigger
   (`[triggers]` in `wrangler.toml`) finds PCs not seen for 7 days and deletes notifications older
   than 30 days. If you deploy with a copy of `wrangler.toml`, add the trigger to the copy.
-- A Registry notes when a PC's doorbell goes away, and the Worker tells it the workspace. When a doorbell closes it also moves the PC's `last_seen` up to the drop, so the "missing for 7 days" count starts there. The hourly run stays under the free plan's 50 subrequests and takes teams in turn.
+- A Registry notes when a PC's doorbell goes away, and the Worker tells it the workspace. When a doorbell closes it also moves the PC's `last_seen` up to the drop, so the "missing for 7 days" count starts there. The hourly run stays under the free plan's 50 subrequests and takes teams in turn. It picks only PCs that a watcher has no notification for yet, so PCs already told of cost nothing and many PCs that go quiet together are all reached; migration `0007_notify.sql` also adds an index on `devices` for it.
 
 ### Changed
 

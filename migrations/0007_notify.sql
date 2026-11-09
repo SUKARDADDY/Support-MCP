@@ -37,3 +37,8 @@ CREATE INDEX notifications_by_age ON notifications (created_at);
 --   {"events":{"<event>":true|false},"watch":["<device id>"]}
 -- "watch" lists the PCs they want "came online" and "missing" for.
 ALTER TABLE members ADD COLUMN notify TEXT;
+
+-- The hourly run looks for active PCs whose last contact (last_seen, or paired_at when
+-- last_seen is empty) falls in a range of days. The expression is the one src/sweep.js
+-- uses, so the range is read from this index and not by scanning every PC.
+CREATE INDEX devices_by_contact ON devices (status, COALESCE(last_seen, paired_at));
