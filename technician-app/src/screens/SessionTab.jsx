@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { connectDevice, messageOf } from '../api.js';
 import { Icon } from '../components/Icon.jsx';
 import { useApp } from '../context.jsx';
@@ -30,6 +30,24 @@ export function SessionTab({ tab, active = true }) {
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
+
+  // What a screen reader hears from the task: a new note from the agent, or that the task is
+  // over. Its steps are not read out one by one; the list below is there to be read on demand.
+  const [announcement, setAnnouncement] = useState('');
+  const seen = useRef({ notes: null, over: false });
+  useEffect(() => {
+    if (!s.task) return;
+    const notes = s.task.notes ?? [];
+    const over = !s.taskLive;
+    if (seen.current.notes === null) {
+      // The first look at a task is not news.
+      seen.current = { notes: notes.length, over };
+      return;
+    }
+    if (over && !seen.current.over) setAnnouncement(t('session.task_over', { state: t(`task.${s.task.state}`) }));
+    else if (notes.length > seen.current.notes) setAnnouncement(String(notes[notes.length - 1].text ?? ''));
+    seen.current = { notes: notes.length, over };
+  }, [s.task, s.taskLive]);
 
   const image = dataUrl(s.taskLive ? s.frame : s.shot ?? s.frame);
   const driver = s.status?.driver ?? null;
@@ -74,6 +92,7 @@ export function SessionTab({ tab, active = true }) {
 
   return (
     <div className="sess">
+      <p className="sr announce" role="status" aria-live="polite">{announcement}</p>
       <div className="sess-bar">
         <div className="sess-id">
           <h2 className="sess-name" tabIndex={-1}>{name}</h2>
@@ -121,7 +140,7 @@ export function SessionTab({ tab, active = true }) {
             {s.task?.notice ? <p className="paused">{s.task.notice}</p> : null}
             {s.task?.state === 'paused' ? <p className="paused">{t('session.task_paused_note')}</p> : null}
             {s.activity.length === 0 ? <p className="hint">{t('session.activity_empty')}</p> : (
-              <ol className="tl" aria-live="polite">
+              <ol className="tl">
                 {s.activity.map((a) => (
                   <li key={a.id} className={a.source === 'step' ? (a.ok ? 'step' : 'step fail') : a.source}>
                     <span className="mk">{a.source === 'step' ? <Icon name={a.ok ? 'check' : 'x'} /> : null}</span>

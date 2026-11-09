@@ -15,16 +15,22 @@ h1, h2, h3, p { margin: 0; }
 .app { height: 100%; display: flex; flex-direction: column; background: var(--surface); position: relative; }
 .tabbar { height: 40px; background: var(--chrome); color: var(--on-chrome); box-shadow: inset 0 -1px 0 var(--chrome-edge); display: flex; align-items: stretch; flex: none; font-size: 13px; }
 .tabbar .app-ico { display: grid; place-items: center; width: 44px; color: var(--live-ink); }
-.tabs { display: flex; align-items: flex-end; gap: 2px; min-width: 0; overflow-x: auto; scrollbar-width: none; padding-top: 6px; }
-.tab { display: flex; align-items: center; height: 34px; border-radius: 7px 7px 0 0; color: var(--on-chrome-2); min-width: 0; position: relative; }
-.tab[data-on="true"] { background: var(--surface); color: var(--on-chrome-strong); box-shadow: 0 0 0 1px var(--chrome-edge); }
-.tab[data-on="true"]::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; background: var(--surface); }
-.tab:not([data-on="true"]):hover { background: var(--chrome-2); }
-.tab-b { border: 0; background: transparent; height: 100%; padding: 0 12px; display: flex; align-items: center; gap: 8px; white-space: nowrap; font-size: 13px; font-weight: 500; color: inherit; }
-.tab-x { border: 0; background: transparent; width: 24px; height: 24px; margin-right: 6px; border-radius: 5px; display: grid; place-items: center; color: inherit; }
+.tabs { display: flex; align-items: flex-end; gap: 0; min-width: 0; overflow-x: auto; scrollbar-width: none; padding-top: 6px; }
+/* The tablist holds only the tabs and the closers sit beside them in their own group; both lay out as one row, in the order they set. */
+.tablist, .tab-closers { display: contents; }
+.tab-b { border: 0; background: transparent; height: 34px; padding: 0 12px; display: flex; align-items: center; gap: 8px; white-space: nowrap; font-size: 13px; font-weight: 500; color: var(--on-chrome-2); border-radius: 7px 7px 0 0; position: relative; margin-left: 2px; min-width: 0; }
+.tab-b:not([data-on="true"]):hover { background: var(--chrome-2); }
+.tab-b[data-on="true"], .tab-x[data-on="true"] { background: var(--surface); color: var(--on-chrome-strong); box-shadow: 0 -1px 0 var(--chrome-edge); }
+.tab-b[data-on="true"] { box-shadow: -1px 0 0 var(--chrome-edge), 0 -1px 0 var(--chrome-edge); }
+.tab-b[data-on="true"]::after, .tab-x[data-on="true"]::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; background: var(--surface); }
+.tab-b.has-x { border-radius: 7px 0 0 0; padding-right: 4px; }
+.tab-x { border: 0; background: transparent; width: 30px; height: 34px; border-radius: 0 7px 0 0; display: grid; place-items: center; color: var(--on-chrome-2); position: relative; }
+.tab-x[data-on="true"] { box-shadow: 1px 0 0 var(--chrome-edge), 0 -1px 0 var(--chrome-edge); }
 .tab-x:hover { background: var(--chrome-2); }
 .tab-x svg { width: 13px; height: 13px; }
-.tab .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--live); flex: none; }
+.panel-fill { flex: 1; min-width: 0; min-height: 0; display: flex; }
+.panel-fill[hidden] { display: none; }
+.tab-b .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--live); flex: none; }
 .body { flex: 1; min-height: 0; display: grid; grid-template-columns: 76px minmax(0, 1fr); }
 .rail { background: var(--chrome); box-shadow: inset -1px 0 0 var(--chrome-edge); padding: 10px 8px; display: flex; flex-direction: column; gap: 4px; }
 .rail .grow { flex: 1; }

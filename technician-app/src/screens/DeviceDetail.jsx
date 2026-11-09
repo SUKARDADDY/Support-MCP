@@ -12,7 +12,7 @@ import { AgentStartDialog } from './AgentStartDialog.jsx';
 // the owner's text come from people and from the PC, so they are shown as text only.
 export function DeviceDetail({ device }) {
   const app = useApp();
-  const { places, conns, can } = app;
+  const { places, conns, can, openSessionTab } = app;
   const conn = conns[device.id] ?? null;
   const st = deviceStatus(device, conn);
   const place = placeLabel(device, places);
@@ -55,7 +55,7 @@ export function DeviceDetail({ device }) {
         <dt>{t('facts.device_id')}</dt><dd className="mono">{device.id}</dd>
       </dl>
       <p className="fine">{t('device.owner_changes')}</p>
-      {agentOpen ? <AgentStartDialog device={device} onClose={() => setAgentOpen(false)} /> : null}
+      {agentOpen ? <AgentStartDialog device={device} onClose={() => setAgentOpen(false)} onStarted={(started) => openSessionTab({ device, taskId: started.task_id })} /> : null}
     </div>
   );
 }
@@ -158,6 +158,7 @@ function Approve({ device }) {
     <div className="approve">
       <h3>{t('approve.title', { name: device.name })}</h3>
       <p>{t('approve.text')}{device.expiresAt ? ` ${t('approve.expires', { when: formatDateTime(device.expiresAt) })}` : ''}</p>
+      <p className="fine">{t('approve.name_from_pc')}</p>
       {can('devices.manage') ? (
         <form onSubmit={submit}>
           <label className="sr" htmlFor="approve-code">{t('approve.label')}</label>

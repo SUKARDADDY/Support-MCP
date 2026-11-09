@@ -59,3 +59,19 @@ export function useLoad(load, deps) {
   }, [run]);
   return { ...state, reload: run };
 }
+
+// Arrow keys, Home and End move between the tabs of a tablist and open the one reached. Put it
+// on the element with role="tablist"; the tabs keep tabIndex 0 only for the selected one.
+export function tabKeyDown(e) {
+  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+  const tabs = [...e.currentTarget.querySelectorAll('[role="tab"]')];
+  const from = tabs.indexOf(e.target.closest('[role="tab"]'));
+  if (from < 0) return;
+  let to = from;
+  if (e.key === 'Home') to = 0;
+  else if (e.key === 'End') to = tabs.length - 1;
+  else to = (from + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+  e.preventDefault();
+  tabs[to].focus();
+  tabs[to].click();
+}

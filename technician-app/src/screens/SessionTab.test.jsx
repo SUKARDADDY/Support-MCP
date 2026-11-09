@@ -301,3 +301,165 @@ describe('Session tab: ending', () => {
     expect(screen.queryByRole('tab', { name: /Front counter/ })).not.toBeInTheDocument();
   });
 });
+
+const statusPolls = (fake) => fake.calls.filter((c) => c.kind === 'request' && /\/api\/agent\/tasks\/\w+\?wait_s=/.test(c.args[1])).length;
+const liveTask = (over = {}) => ({ id: TASK, state: 'running', title: 'Receipt printer stopped printing', session_id: SID, device_id: ID('a'), created_at: Date.now() - 60000, ended_at: null, model: 'claude-sonnet', phase: 'working', rev: 1, steps: [], notes: [], ...over });
+
+describe('Session tab: a task started from a PC', () => {
+  test('opens a tab keyed to the task, follows it, and adopts the session when the relay has made one', async () => {
+    const user = userEvent.setup();
+    const fake = fakeCore();
+    let connected = false;
+    // A task started on a PC has no session at first: the relay connects, and the status says which.
+    fake.state.taskStatus = (t) => ({ ...liveTask({ id: t.id, title: t.title }), session_id: connected ? SID : null });
+    fake.state.frame = () => ({ rev: 1, at: Date.now(), mime: 'image/png', data: 'QUJD' });
+    fake.state.sessions[SID] = { state: 'attached', driver: 'tech@example.com', log: [] };
+    renderApp(fake);
+    await user.click(await screen.findByRole('button', { name: /Front counter/ }));
+    await user.click(await screen.findByRole('button', { name: 'Hand to the agent' }));
+    const dialog = screen.getByRole('dialog', { hidden: true });
+    await user.type(within(dialog).getByLabelText('What should the agent do?'), 'Fix the printer');
+    await user.click(within(dialog).getByRole('button', { name: 'Start the task' }));
+    await waitFor(() => expect(fake.state.started).toEqual({ instructions: 'Fix the printer', keep_working: false, device_id: ID('a') }));
+
+    const tab = await screen.findByRole('tab', { name: /Front counter/ });
+    expect(tab).toHaveAttribute('aria-selected', 'true');
+    const taskId = fake.state.tasks[0].id;
+    expect(JSON.parse(localStorage.getItem('support.tabs'))[0]).toMatchObject({ key: `task:${taskId}`, taskId, sessionId: null, deviceId: ID('a') });
+    // It is followed from the first moment, with no session to look up.
+    expect(await screen.findByText('Agent activity')).toBeInTheDocument();
+    await waitFor(() => expect(statusPolls(fake)).toBeGreaterThanOrEqual(2));
+    expect(screen.getByRole('img', { name: 'Screen of Front counter' }).getAttribute('src')).toBe('data:image/png;base64,QUJD');
+
+    connected = true;
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('support.tabs'))[0].sessionId).toBe(SID));
+    expect(JSON.parse(localStorage.getItem('support.tabs'))).toHaveLength(1);
+  });
+});
+
+describe('Session tab: following every open task', () => {
+  test('a task keeps being followed while another screen or tab is shown, and only the tab on screen takes pictures', async () => {
+    const fake = fakeCore();
+    fake.state.tasks = [liveTask()];
+    fake.state.taskStatus = () => liveTask();
+    fake.state.frame = () => ({ rev: 1, at: Date.now(), mime: 'image/png', data: 'QUJD' });
+    const { user } = await openTab(fake);
+    await screen.findByText('Agent activity');
+    await user.click(screen.getByRole('tab', { name: 'Devices' }));
+    await user.click(screen.getByRole('button', { name: /Settings/ }));
+    expect(screen.getByText('Agent activity')).not.toBeVisible();
+    const before = statusPolls(fake);
+    await sleep(200);
+    expect(statusPolls(fake)).toBeGreaterThanOrEqual(before + 3);
+    // Back on the tab: it is there, with its picture.
+    await user.click(screen.getByRole('tab', { name: /Front counter/ }));
+    expect(await screen.findByRole('img', { name: 'Screen of Front counter' })).toBeInTheDocument();
+  });
+
+  test('a second tab is followed while the first one is shown', async () => {
+    const fake = fakeCore();
+    const SID2 = 'z'.repeat(64);
+    const TASK2 = ID('u');
+    localStorage.setItem('support.tabs', JSON.stringify([
+      { key: SID, account: 'acc1', deviceId: ID('a'), deviceName: 'Front counter', sessionId: SID, taskId: null },
+      { key: SID2, account: 'acc1', deviceId: ID('b'), deviceName: 'Back office', sessionId: SID2, taskId: TASK2 },
+    ]));
+    fake.state.sessions[SID] = { state: 'attached', driver: 'tech@example.com', log: [] };
+    fake.state.sessions[SID2] = { state: 'attached', driver: 'tech@example.com', log: [] };
+    fake.state.tasks = [liveTask({ id: TASK2, session_id: SID2, device_id: ID('b') })];
+    fake.state.taskStatus = (t) => ({ ...t });
+    renderApp(fake);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('tab', { name: /Front counter/ }));
+    const before = statusPolls(fake);
+    await waitFor(() => expect(statusPolls(fake)).toBeGreaterThanOrEqual(before + 3));
+    expect(fake.calls.filter((c) => c.kind === 'request' && c.args[1].includes(`/api/agent/tasks/${TASK2}?wait_s=`)).length).toBeGreaterThanOrEqual(3);
+  });
+
+  test('a tab that is not shown takes no pictures', async () => {
+    const { fake, user } = await openTab();
+    await waitFor(() => expect(toolCalls(fake, 'screenshot').length).toBeGreaterThanOrEqual(2));
+    await user.click(screen.getByRole('tab', { name: 'Devices' }));
+    await sleep(60);
+    const frozen = toolCalls(fake, 'screenshot').length;
+    await sleep(150);
+    expect(toolCalls(fake, 'screenshot').length).toBe(frozen);
+  });
+
+  test('a status that holds no task is a failed read: the loop waits and asks again, and nothing is left unhandled', async () => {
+    const fake = fakeCore();
+    fake.state.tasks = [liveTask()];
+    let asked = 0;
+    fake.state.taskStatus = () => (++asked <= 2 ? undefined : liveTask());
+    fake.state.frame = () => ({ rev: 1, at: Date.now(), mime: 'image/png', data: 'QUJD' });
+    await openTab(fake);
+    expect(await screen.findByText('Agent activity')).toBeInTheDocument();
+    expect(asked).toBeGreaterThanOrEqual(3);
+  });
+
+  test('a relay that answers with an error is waited out and asked again', async () => {
+    const fake = fakeCore();
+    fake.state.tasks = [liveTask()];
+    let asked = 0;
+    fake.state.taskStatus = () => { if (++asked <= 2) throw new ToolFail('The relay is busy. Try again in a moment.', 'unavailable'); return liveTask(); };
+    await openTab(fake);
+    expect(await screen.findByText('Agent activity')).toBeInTheDocument();
+  });
+});
+
+describe('Session tab: what a screen reader hears', () => {
+  test('a new note from the agent and the end of the task are announced; the steps are not', async () => {
+    const fake = fakeCore();
+    fake.state.tasks = [liveTask()];
+    let task = liveTask({ notes: [{ ts: Date.now() - 5000, text: 'Old note from before.' }] });
+    fake.state.taskStatus = () => task;
+    fake.state.frame = () => ({ rev: 1, at: Date.now(), mime: 'image/png', data: 'QUJD' });
+    const { container } = await openTab(fake);
+    await screen.findByText('Old note from before.');
+    const announce = () => container.querySelector('.announce').textContent;
+    expect(announce()).toBe('');
+    // The list is not a live region: ten steps would be ten announcements.
+    expect(container.querySelector('ol.tl').hasAttribute('aria-live')).toBe(false);
+    task = liveTask({ rev: 2, notes: task.notes, steps: [{ n: 1, ts: Date.now(), verb: 'screenshot', detail: '', ok: true }, { n: 2, ts: Date.now(), verb: 'click', detail: 'Start', ok: true }] });
+    await screen.findByText('Start');
+    await sleep(60);
+    expect(announce()).toBe('');
+    task = liveTask({ rev: 3, steps: task.steps, notes: [...task.notes, { ts: Date.now(), text: 'Found 14 stuck print jobs.' }] });
+    await waitFor(() => expect(announce()).toBe('Found 14 stuck print jobs.'));
+    task = liveTask({ state: 'done', rev: 4, ended_at: Date.now(), notes: task.notes, steps: task.steps });
+    await waitFor(() => expect(announce()).toBe('The task is over: finished.'));
+  });
+});
+
+describe('Tabs', () => {
+  test('the tablist holds only tabs, each wired to its panel, and ending a session is a labelled button beside it', async () => {
+    const { container, user } = await openTab();
+    const list = screen.getByRole('tablist', { name: 'Open views' });
+    expect([...list.children].map((c) => c.getAttribute('role'))).toEqual(['tab', 'tab']);
+    for (const tab of within(list).getAllByRole('tab', { hidden: true })) {
+      const panel = container.querySelector(`#${CSS.escape(tab.getAttribute('aria-controls'))}`);
+      expect(panel).toHaveAttribute('role', 'tabpanel');
+      expect(panel.getAttribute('aria-labelledby')).toBe(tab.id);
+    }
+    expect(screen.getByRole('tab', { name: /Front counter/ })).toHaveAttribute('tabindex', '0');
+    expect(screen.getByRole('tab', { name: 'Devices' })).toHaveAttribute('tabindex', '-1');
+    const close = screen.getByRole('button', { name: 'End session with Front counter' });
+    expect(list.contains(close)).toBe(false);
+    await user.click(close);
+    await waitFor(() => expect(screen.queryByRole('tab', { name: /Front counter/ })).not.toBeInTheDocument());
+  });
+
+  test('the arrow keys, Home and End move between the tabs and open the one reached', async () => {
+    const { user } = await openTab();
+    screen.getByRole('tab', { name: /Front counter/ }).focus();
+    await user.keyboard('{ArrowLeft}');
+    expect(screen.getByRole('tab', { name: 'Devices' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('tab', { name: 'Devices' })).toHaveFocus();
+    await user.keyboard('{ArrowLeft}');
+    expect(screen.getByRole('tab', { name: /Front counter/ })).toHaveAttribute('aria-selected', 'true');
+    await user.keyboard('{Home}');
+    expect(screen.getByRole('tab', { name: 'Devices' })).toHaveFocus();
+    await user.keyboard('{End}');
+    expect(screen.getByRole('tab', { name: /Front counter/ })).toHaveFocus();
+  });
+});

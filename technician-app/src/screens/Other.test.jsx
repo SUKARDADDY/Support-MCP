@@ -98,6 +98,53 @@ describe('Notifications', () => {
     expect(screen.queryByLabelText('1 new')).not.toBeInTheDocument();
   });
 
+  test('an item the feed repeats is listed once and counted once', async () => {
+    const user = userEvent.setup();
+    const fake = fakeCore({ recent: [item({ id: 3 })] });
+    renderApp(fake);
+    await screen.findByRole('button', { name: /Front counter/ });
+    await waitFor(() => expect(fake.core.on).toHaveBeenCalled());
+    const again = { id: 7, event: 'task_finished', at: Date.now(), title: 'Task finished', body: 'Printer fixed', device_id: ID('a'), task_id: null, session_id: null };
+    // An item the list already holds, then a new one sent twice in one batch and again later.
+    act(() => fake.emit('feed://items', { account: 'acc1', live: true, items: [{ ...again, id: 3 }, again, again] }));
+    act(() => fake.emit('feed://items', { account: 'acc1', live: true, items: [again] }));
+    expect(await screen.findByLabelText('1 new')).toBeInTheDocument();
+    await user.click(nav('Notifications'));
+    const list = await screen.findByRole('list', { name: 'Recent' });
+    expect(within(list).getAllByRole('listitem')).toHaveLength(2);
+  });
+
+  test('the body of a waiting-for-approval item is labelled as the PC\'s own text', async () => {
+    const user = userEvent.setup();
+    renderApp(fakeCore({ recent: [item(), item({ id: 2, event: 'task_finished', body: 'Printer fixed' })] }));
+    await screen.findByRole('button', { name: /Front counter/ });
+    await user.click(nav('Notifications'));
+    const list = await screen.findByRole('list', { name: 'Recent' });
+    const [waiting, finished] = within(list).getAllByRole('listitem');
+    const wait = [waiting, finished].find((li) => li.dataset.event === 'device_waiting');
+    const done = [waiting, finished].find((li) => li.dataset.event === 'task_finished');
+    expect(wait).toHaveTextContent('Text from the PC: Enter the six digits');
+    expect(done).not.toHaveTextContent('Text from the PC');
+  });
+
+  test('Recent and Settings are tabs with a panel, and the arrow keys move between them', async () => {
+    const user = userEvent.setup();
+    renderApp();
+    await screen.findByRole('button', { name: /Front counter/ });
+    await user.click(nav('Notifications'));
+    const recent = await screen.findByRole('tab', { name: 'Recent' });
+    const panel = document.getElementById(recent.getAttribute('aria-controls'));
+    expect(panel).toHaveAttribute('role', 'tabpanel');
+    expect(panel).toHaveAttribute('aria-labelledby', recent.id);
+    recent.focus();
+    await user.keyboard('{ArrowRight}');
+    const settings = screen.getByRole('tab', { name: 'Settings' });
+    expect(settings).toHaveAttribute('aria-selected', 'true');
+    expect(settings).toHaveFocus();
+    expect(panel).toHaveAttribute('aria-labelledby', settings.id);
+    expect(recent).toHaveAttribute('tabindex', '-1');
+  });
+
   test('says what the list is for when it is empty', async () => {
     const user = userEvent.setup();
     renderApp();

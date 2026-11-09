@@ -11,6 +11,13 @@
 //   * Every 15 seconds it looks for a running task on the session, and switches to its picture.
 //   * The session's own status (state, driver, log) is read every few seconds.
 //
+// The tab stays mounted (hidden) when another tab or screen is shown, so a task's status
+// keeps being held open for as long as the task runs: the relay stops a task that nobody
+// has watched for two minutes unless it was started with "keep working". Only the
+// screenshot loop, the picture fetch and the session status poll wait for the tab to be on
+// screen. No loop here ends in an unhandled rejection: a failed call is caught, waited out
+// and tried again.
+//
 // No click or type request exists here or in the core's tool list.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { controlTask, isLiveTask, listTasks, screenshot, sessionStatus, taskFrame, taskOnSession, taskStatus } from './api.js';
@@ -18,6 +25,7 @@ import { useInterval } from './hooks.js';
 
 const IMAGE_MIME = new Set(['image/jpeg', 'image/png']);
 const FAILS_BEFORE_STOP = 3;
+const MAX_RETRY_MS = 30000;
 
 export const dataUrl = (img) => (img && IMAGE_MIME.has(img.mime) && /^[A-Za-z0-9+/=]+$/.test(img.data ?? '') ? `data:${img.mime};base64,${img.data}` : null);
 const same = (a, b) => !!a && !!b && String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
@@ -76,7 +84,7 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
     } catch (e) {
       if (alive.current) setStatusError(e);
     }
-  }, tuning.statusMs, !!sessionId && !ended && onScreen);
+  }, tuning.statusMs, !!sessionId && !ended && visible);
 
   // ---- finding the task that works on this session ----------------------------------
   const lookForTask = useCallback(async () => {
@@ -87,7 +95,7 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
       // try again at the next check
     }
   }, [core, account, sessionId]);
-  useInterval(lookForTask, tuning.taskCheckMs, !!sessionId && !taskLive && !ended && onScreen);
+  useInterval(lookForTask, tuning.taskCheckMs, !!sessionId && !taskLive && !ended && visible);
 
   // ---- following the task: a held-open status, and its picture when rev moves ---------
   const fetchFrame = useCallback(async (id) => {
@@ -106,40 +114,45 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
     if (!taskId) return undefined;
     let stopped_ = false;
     lastRev.current = null;
+    const pause = (ms) => new Promise((r) => setTimeout(r, ms));
     (async () => {
+      let failures = 0;
       while (!stopped_) {
         const began = Date.now();
-        let t;
         try {
-          t = await taskStatus(core, account, taskId, tuning.taskWaitS);
+          const t = await taskStatus(core, account, taskId, tuning.taskWaitS);
+          // A relay that answers with no task is a failed read, not a task to follow.
+          if (!t || typeof t !== 'object' || typeof t.state !== 'string') throw new Error('the status holds no task');
+          if (stopped_ || !alive.current) return;
+          failures = 0;
+          setTask(t);
+          if (t.session_id && !sessionId) { setSessionId(t.session_id); onSessionKnown?.(t.session_id); }
+          if (!isLiveTask(t)) {
+            // The task is over. The last picture stays until a screenshot replaces it.
+            if (lastRev.current !== null && visibleRef.current) await fetchFrame(taskId);
+            setTaskId(null);
+            return;
+          }
+          if (t.rev !== lastRev.current) {
+            lastRev.current = t.rev;
+            if (visibleRef.current) await fetchFrame(taskId);
+            else lastRev.current = null; // fetch it when the tab comes back
+          }
+          // The relay holds the call until something changes. One that comes back at once
+          // (nothing new, or a relay that does not hold) must not turn this into a spin.
+          const spent = Date.now() - began;
+          if (spent < tuning.taskGapMs) await pause(tuning.taskGapMs - spent);
         } catch (e) {
           if (stopped_) return;
           if (e?.code === 'signed_out' || e?.status === 404) { setTaskId(null); return; }
-          await new Promise((r) => setTimeout(r, 2000));
-          continue;
+          // Back off, longer after each failure in a row, and ask again.
+          failures += 1;
+          await pause(Math.min(tuning.taskRetryMs * 2 ** Math.min(failures - 1, 4), MAX_RETRY_MS));
         }
-        if (stopped_ || !alive.current) return;
-        setTask(t);
-        if (t.session_id && !sessionId) { setSessionId(t.session_id); onSessionKnown?.(t.session_id); }
-        if (!isLiveTask(t)) {
-          // The task is over. The last picture stays until a screenshot replaces it.
-          if (lastRev.current !== null && visibleRef.current) await fetchFrame(taskId);
-          setTaskId(null);
-          return;
-        }
-        if (t.rev !== lastRev.current) {
-          lastRev.current = t.rev;
-          if (visibleRef.current) await fetchFrame(taskId);
-          else lastRev.current = null; // fetch it when the tab comes back
-        }
-        // The relay holds the call until something changes. One that comes back at once
-        // (nothing new, or a relay that does not hold) must not turn this into a spin.
-        const spent = Date.now() - began;
-        if (spent < tuning.taskGapMs) await new Promise((r) => setTimeout(r, tuning.taskGapMs - spent));
       }
-    })();
+    })().catch(() => { /* nothing escapes the loop */ });
     return () => { stopped_ = true; };
-  }, [core, account, taskId, tuning.taskWaitS, tuning.taskGapMs, fetchFrame]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [core, account, taskId, tuning.taskWaitS, tuning.taskGapMs, tuning.taskRetryMs, fetchFrame]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Back on screen with a task running: take its latest picture now.
   useEffect(() => {

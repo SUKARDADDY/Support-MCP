@@ -12,5 +12,8 @@ export default defineConfig({
     setupFiles: ['./src/test-setup.js'],
     include: ['src/**/*.test.{js,jsx}'],
     globals: false,
+    // A promise nobody handled fails the run. Vitest's default is the same; it is written here so
+    // nobody turns it off to quiet a test, and the screens' loops catch their own errors.
+    dangerouslyIgnoreUnhandledErrors: false,
   },
 });

@@ -90,7 +90,11 @@ export function fakeCore(initial = {}) {
       if (p === '/api/agent/tasks' && method === 'POST') {
         const id = ID('t');
         state.started = body;
-        return { task_id: id, state: 'running', device_id: body.device_id ?? null, session_id: body.session_id ?? null };
+        // The relay knows the task it started, so the screens can follow it. One started on a PC
+        // has no session yet: the relay connects, and the status carries the session later.
+        const started = { id, state: 'running', title: String(body.instructions ?? ''), device_id: body.device_id ?? null, session_id: body.session_id ?? null, created_at: Date.now(), ended_at: null, model: null, phase: 'working', rev: 1, steps: [], notes: [] };
+        state.tasks.push(started);
+        return { task_id: id, state: 'running', device_id: started.device_id, session_id: started.session_id };
       }
       const task = /^\/api\/agent\/tasks\/(\w+)(?:\/(frame|pause|resume|stop))?$/.exec(p);
       if (task) {
@@ -137,7 +141,7 @@ export function fakeCore(initial = {}) {
   return { core, state, calls, emit };
 }
 
-export const FAST = { connectPollMs: 10, devicePollMs: 60000, watchMs: 20, screenshotMs: 20, taskCheckMs: 40, statusMs: 30, taskGapMs: 15 };
+export const FAST = { connectPollMs: 10, devicePollMs: 60000, watchMs: 20, screenshotMs: 20, taskCheckMs: 40, statusMs: 30, taskGapMs: 15, taskRetryMs: 20 };
 
 export function renderApp(fake = fakeCore(), tuning = FAST) {
   const view = render(<App core={fake.core} tuning={tuning} />);

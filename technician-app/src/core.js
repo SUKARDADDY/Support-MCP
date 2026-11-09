@@ -3,11 +3,12 @@
 // Tests pass App a stand-in with the same functions.
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { t } from './i18n/index.js';
 
 // A failure from the core arrives as { code, message, status }.
 export function errorInfo(e) {
   if (e && typeof e === 'object' && typeof e.message === 'string') return { code: e.code ?? 'internal', message: e.message, status: e.status ?? null };
-  return { code: 'internal', message: typeof e === 'string' ? e : 'Something went wrong.', status: null };
+  return { code: 'internal', message: typeof e === 'string' ? e : t('error.generic'), status: null };
 }
 
 export const realCore = {

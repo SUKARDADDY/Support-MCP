@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { endSession, fetchDevices, fetchMe, fetchPlaces, listTasks, sessionStatus } from './api.js';
+import { endSession, fetchDevices, fetchMe, fetchPlaces, isLiveTask, listTasks, sessionStatus } from './api.js';
 import { Icon } from './components/Icon.jsx';
 import { useConnections } from './connections.js';
 import { AppContext } from './context.jsx';
 import { sortDevices } from './devices.js';
 import { realCore } from './core.js';
-import { useInterval, usePageVisible } from './hooks.js';
+import { tabKeyDown, useInterval, usePageVisible } from './hooks.js';
 import { t } from './i18n/index.js';
 import { AddDevice } from './screens/AddDevice.jsx';
 import { Devices } from './screens/Devices.jsx';
@@ -37,7 +37,7 @@ const write = (key, value) => {
 };
 
 // How often the app looks again. Tests pass shorter times through `tuning`.
-export const TUNING = { connectPollMs: 2000, devicePollMs: 15000, watchMs: 3000, screenshotMs: 3000, taskCheckMs: 15000, statusMs: 10000, taskWaitS: 25, taskGapMs: 1000 };
+export const TUNING = { connectPollMs: 2000, devicePollMs: 15000, watchMs: 3000, screenshotMs: 3000, taskCheckMs: 15000, statusMs: 10000, taskWaitS: 25, taskGapMs: 1000, taskRetryMs: 2000 };
 
 const NO_TUNING = {};
 
@@ -52,6 +52,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   const [selectedId, setSelectedId] = useState(null);
   const [tabs, setTabs] = useState(() => read(TABS_KEY, []));
   const [notifications, setNotifications] = useState([]);
+  const knownNotes = useRef(new Set()); // "<account>:<id>" of every item the list has seen
   const [unread, setUnread] = useState(0);
   const [linkOpen, setLinkOpen] = useState(false);
   const [toastText, setToastText] = useState(null);
@@ -93,7 +94,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   const signedIn = (accounts ?? []).filter((a) => a.signed_in);
   const account = signedIn.find((a) => a.id === activeId) ?? signedIn[0] ?? null;
   const accountId = account?.id ?? null;
-  const setActive = useCallback((id) => { setActiveId(id); write(ACTIVE_KEY, id); setSelectedId(null); }, []);
+  const setActive = useCallback((id) => { setActiveId(id); write(ACTIVE_KEY, id); setSelectedId(null); setView('devices'); }, []);
 
   useEffect(() => {
     if (!accountId) { setMe({ identity: '', permissions: [] }); return undefined; }
@@ -162,16 +163,22 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     (async () => {
       const keep = [];
       for (const tab of tabs) {
-        if (!tab.sessionId || !accounts.some((a) => a.id === tab.account && a.signed_in)) continue;
+        if (!accounts.some((a) => a.id === tab.account && a.signed_in)) continue;
         try {
-          const st = await sessionStatus(core, tab.account, tab.sessionId, 0);
-          if (st.state === 'waiting' || st.state === 'attached') keep.push(tab);
+          if (tab.sessionId) {
+            const st = await sessionStatus(core, tab.account, tab.sessionId, 0);
+            if (st.state === 'waiting' || st.state === 'attached') keep.push(tab);
+          } else if (tab.taskId) {
+            // A task started on a PC has no session yet: keep its tab while the task works.
+            const task = (await listTasks(core, tab.account)).find((x) => x.id === tab.taskId);
+            if (isLiveTask(task)) keep.push(tab);
+          }
         } catch (e) {
           if (e?.code === 'unavailable') keep.push(tab);
         }
       }
       setTabs(persist(keep));
-    })();
+    })().catch(() => {});
   }, [accounts]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const { conns, connect, cancel: cancelConnect, dismiss: dismissConnect } = useConnections({
@@ -184,16 +191,30 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   // ---- notifications -------------------------------------------------------------
   useEffect(() => {
     let live = true;
-    core.recentNotifications().then((list) => live && setNotifications(list)).catch(() => {});
+    core.recentNotifications().then((list) => {
+      if (!live) return;
+      list.forEach((n) => knownNotes.current.add(`${n.account}:${n.id}`));
+      setNotifications((cur) => {
+        // Items the feed delivered while the list was loading stay.
+        const have = new Set(list.map((n) => `${n.account}:${n.id}`));
+        return [...list, ...cur.filter((n) => !have.has(`${n.account}:${n.id}`))].slice(-100);
+      });
+    }).catch(() => {});
     const offs = [];
     const sub = (event, handler) => core.on(event, handler).then((off) => (live ? offs.push(off) : off())).catch(() => {});
     sub('feed://items', ({ account: acc, items, live: isLive }) => {
-      setNotifications((cur) => {
-        const known = new Set(cur.map((n) => `${n.account}:${n.id}`));
-        const fresh = items.filter((i) => !known.has(`${acc}:${i.id}`)).map((i) => ({ ...i, account: acc }));
-        return [...cur, ...fresh].slice(-100);
-      });
-      if (isLive) setUnread((n) => n + items.length);
+      // Only items the list has not seen are added, and only those count as unread: the
+      // feed can repeat an item after a reconnect.
+      const fresh = [];
+      for (const i of items) {
+        const key = `${acc}:${i.id}`;
+        if (knownNotes.current.has(key)) continue;
+        knownNotes.current.add(key);
+        fresh.push({ ...i, account: acc });
+      }
+      if (!fresh.length) return;
+      setNotifications((cur) => [...cur, ...fresh].slice(-100));
+      if (isLive) setUnread((n) => n + fresh.length);
     });
     sub('feed://status', ({ online }) => setRelayDown(!online));
     sub('ui://visibility', ({ visible: v }) => setWindowVisible(v !== false));
@@ -240,7 +261,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     devices: deviceData.devices, places: deviceData.places, devicesState: deviceData, reloadDevices,
     selectedId, select, conns, connect, cancelConnect, dismissConnect,
     sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true),
-    toast, copyText, notifications, openTarget, now, theme, setTheme, reloadTasks: () => {}, tuning, visible,
+    toast, copyText, notifications, openTarget, now, theme, setTheme, tuning, visible,
   }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, toast, copyText, notifications, openTarget, now, theme, tuning, visible]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (accounts === null) return <div className="app" role="status"><p className="hint">{t('common.loading')}</p></div>;
@@ -256,24 +277,29 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   const tabKey = view.startsWith('tab:') ? view.slice(4) : null;
   const activeTab = tabKey ? tabs.find((x) => x.key === tabKey) : null;
   const screen = activeTab ? 'session' : view.startsWith('tab:') ? 'devices' : view;
+  const mine = tabs.filter((x) => x.account === accountId);
 
   return (
     <AppContext.Provider value={ctx}>
       <div className="app">
         <div className="tabbar">
           <span className="app-ico" aria-hidden="true"><Icon name="app" /></span>
-          <div className="tabs" role="tablist" aria-label={t('tabs.label')}>
-            <div className="tab" data-on={screen !== 'session'}>
-              <button type="button" role="tab" aria-selected={screen !== 'session'} className="tab-b" onClick={() => go('devices')}>{t('nav.devices')}</button>
-            </div>
-            {tabs.filter((x) => x.account === accountId).map((x) => (
-              <div className="tab" key={x.key} data-on={activeTab?.key === x.key}>
-                <button type="button" role="tab" aria-selected={activeTab?.key === x.key} className="tab-b" onClick={() => showTab(x.key)}>
+          <div className="tabs">
+            <div className="tablist" role="tablist" aria-label={t('tabs.label')} onKeyDown={tabKeyDown}>
+              <button type="button" role="tab" id="tab-devices" aria-controls="panel-devices" aria-selected={screen !== 'session'} tabIndex={screen !== 'session' ? 0 : -1} className="tab-b" data-on={screen !== 'session'} style={{ order: 0 }} onClick={() => go('devices')}>{t('nav.devices')}</button>
+              {mine.map((x, i) => (
+                <button key={x.key} type="button" role="tab" id={`tab-${x.key}`} aria-controls={`panel-${x.key}`} aria-selected={activeTab?.key === x.key} tabIndex={activeTab?.key === x.key ? 0 : -1} className="tab-b has-x" data-on={activeTab?.key === x.key} style={{ order: 2 * (i + 1) }} onClick={() => showTab(x.key)}>
                   <span className="dot" aria-hidden="true" />{x.deviceName || t('session.untitled')}<span className="sr"> {t('session.connected_sr')}</span>
                 </button>
-                <button type="button" className="tab-x" onClick={() => endTab(x.key)} aria-label={t('session.end_with', { name: x.deviceName })} title={t('session.end')}><Icon name="x" /></button>
+              ))}
+            </div>
+            {mine.length ? (
+              <div className="tab-closers" role="group" aria-label={t('tabs.close_label')}>
+                {mine.map((x, i) => (
+                  <button key={x.key} type="button" className="tab-x" data-on={activeTab?.key === x.key} style={{ order: 2 * (i + 1) + 1 }} onClick={() => endTab(x.key)} aria-label={t('session.end_with', { name: x.deviceName || t('session.untitled') })} title={t('session.end')}><Icon name="x" /></button>
+                ))}
               </div>
-            ))}
+            ) : null}
           </div>
         </div>
         {relayDown ? <div className="banner" role="status">{t('app.relay_down')}</div> : null}
@@ -290,11 +316,19 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
             <button type="button" aria-current={screen === 'settings' ? 'page' : undefined} onClick={() => go('settings')}><Icon name="gear" />{t('nav.settings')}</button>
           </nav>
           <main className="view">
-            {screen === 'devices' ? <Devices /> : null}
-            {screen === 'add' ? <AddDevice /> : null}
-            {screen === 'notifications' ? <Notifications /> : null}
-            {screen === 'settings' ? <Settings /> : null}
-            {screen === 'session' && activeTab ? <SessionTab key={activeTab.key} tab={activeTab} active /> : null}
+            <div className="panel-fill" role="tabpanel" id="panel-devices" aria-labelledby="tab-devices" hidden={screen === 'session'}>
+              {screen === 'devices' ? <Devices /> : null}
+              {screen === 'add' ? <AddDevice /> : null}
+              {screen === 'notifications' ? <Notifications /> : null}
+              {screen === 'settings' ? <Settings /> : null}
+            </div>
+            {/* Every open tab stays mounted, so its task keeps being followed while another
+                screen or tab is shown. Only the tab on screen takes pictures. */}
+            {tabs.map((x) => (
+              <div key={x.key} className="panel-fill" role="tabpanel" id={`panel-${x.key}`} aria-labelledby={`tab-${x.key}`} hidden={activeTab?.key !== x.key}>
+                <SessionTab tab={x} active={activeTab?.key === x.key} />
+              </div>
+            ))}
           </main>
         </div>
         {linkOpen ? <OneOffLink onClose={() => setLinkOpen(false)} /> : null}
