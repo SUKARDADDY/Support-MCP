@@ -18,7 +18,8 @@ export function SignInForm({ relay = '', team = 'default', lockRelay = false, on
     setWaiting(true);
     try {
       const account = await core.signIn(relayText, teamText);
-      onDone?.(account);
+      // The caller's follow-up (reading the accounts again) may fail; the sign-in itself worked.
+      Promise.resolve(onDone?.(account)).catch(() => {});
     } catch (err) {
       setError(messageOf(err, t('signin.failed')));
     } finally {

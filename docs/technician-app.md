@@ -171,6 +171,13 @@ feature. Without that feature, building with either one set fails with a compile
 installer that ships cannot carry them; the CI job also checks both are unset. The `e2e` cargo feature makes sign-in write its address to the file named by
 `SUPPORT_E2E_AUTHORIZE_FILE` instead of opening a browser; it is never part of a release.
 
+On Windows with the MSVC linker, `build.rs` embeds `src-tauri/windows-app-manifest.xml` (Common
+Controls version 6) into every executable the package links: the app, the library's unit tests and
+`tests/real_relay.rs`. Tauri's windowing code imports `TaskDialogIndirect`, which only version 6
+has, so a test executable without the manifest fails to start with `0xc0000139`
+(`STATUS_ENTRYPOINT_NOT_FOUND`). Tauri's own copy of the manifest is switched off so each file
+carries one.
+
 To release: bump the version with `scripts/bump-version.mjs` (it covers the app's `package.json`,
 both entries of its `package-lock.json`, the `[package]` version in `src-tauri/Cargo.toml` and the
 app's entry in `Cargo.lock`), build the installer in CI, then sign it:
@@ -192,7 +199,10 @@ release. The key goes in on stdin and is never written to disk, as for the PC ap
 - `npm test` (in `technician-app`): the screens against a stand-in for the core that answers as the
   relay does.
 - `node e2e/core-check.mjs` runs the real core against a real relay (`wrangler dev`) on any system:
-  sign-in through the actual pages, API and tool calls, the feed, approval and token refresh.
+  sign-in through the actual pages, API and tool calls, the feed, approval and token refresh. The
+  relay runs from a folder of its own under the system's temp folder (its config, `.dev.vars` and
+  database), removed at the end; the repository's `.wrangler/state` and `.dev.vars` are never read
+  or changed.
 - The `technician-app` CI job runs all of that on Windows, builds the installer, installs an
   end-to-end build silently and drives it: Playwright opens the sign-in address the app writes,
   walks the pages, then attaches to the app's WebView2 through a debug port (opened by a

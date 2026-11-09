@@ -335,6 +335,17 @@ describe('Sign in', () => {
     expect(alert).not.toHaveTextContent('English text from the core');
   });
 
+  test('a follow-up that fails after a good sign-in raises nothing unhandled', async () => {
+    const user = userEvent.setup();
+    const fake = fakeCore({ accounts: [] });
+    // The accounts cannot be read again right after the sign-in. (The test setup fails the test on an unhandled rejection.)
+    fake.core.accounts.mockImplementationOnce(async () => []).mockImplementation(async () => { throw new Error('the core is busy'); });
+    renderApp(fake);
+    await user.click(await screen.findByRole('button', { name: 'Sign in with your browser' }));
+    await waitFor(() => expect(fake.core.signIn).toHaveBeenCalled());
+    await waitFor(() => expect(fake.core.accounts).toHaveBeenCalledTimes(2));
+  });
+
   test('an account whose sign-in ended asks to sign in again, on the same relay', async () => {
     const fake = fakeCore({ accounts: [{ ...ACCOUNT, signed_in: false }] });
     renderApp(fake);
