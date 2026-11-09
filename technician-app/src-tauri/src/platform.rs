@@ -1,7 +1,7 @@
 // The parts that reach the operating system or the Tauri shell: the system browser, events
 // to the screens, and Windows notifications. The logic around them is in core.rs and feed.rs,
 // which see only the Browser, Emitter and Notifier traits.
-use crate::error::{CoreError, CoreResult};
+use crate::error::{CoreError, CoreResult, Msg};
 use crate::feed::{Emitter, FeedItem, Notifier};
 use crate::oauth::Browser;
 use serde_json::{json, Value};
@@ -19,7 +19,7 @@ pub struct SystemBrowser;
 impl Browser for SystemBrowser {
     fn open(&self, url: &str) -> CoreResult<()> {
         if !(url.starts_with("https://") || url.starts_with("http://")) {
-            return Err(CoreError::invalid("Only web addresses are opened."));
+            return Err(CoreError::invalid(Msg::WebOnly));
         }
         open_in_browser(url)
     }
@@ -36,7 +36,7 @@ fn open_in_browser(url: &str) -> CoreResult<()> {
     if result.0 as isize > 32 {
         Ok(())
     } else {
-        Err(CoreError::other("Windows could not open your browser."))
+        Err(CoreError::other(Msg::BrowserOpen))
     }
 }
 
@@ -46,7 +46,7 @@ fn open_in_browser(url: &str) -> CoreResult<()> {
         .arg(url)
         .spawn()
         .map(|_| ())
-        .map_err(|_| CoreError::other("Could not open your browser."))
+        .map_err(|_| CoreError::other(Msg::BrowserOpen))
 }
 
 /// Sends an event to every window.
@@ -149,9 +149,20 @@ pub fn open_on_click<R: Runtime>(app: &AppHandle<R>, notifier: Arc<ToastNotifier
 
 // ---- the window, the tray ------------------------------------------------------------
 
-pub const TRAY_OPEN: &str = "Open Support";
-pub const TRAY_QUIT: &str = "Quit";
-pub const TRAY_TOOLTIP: &str = "Support";
+/// The words the app shows outside its web view, the tray's menu and tooltip. They are in
+/// src/i18n/en.json with every other string (keys tray.*); the file is built into the app, so
+/// the Rust side reads the same words the screens do.
+const STRINGS: &str = include_str!("../../src/i18n/en.json");
+
+pub fn label(key: &str) -> String {
+    static TABLE: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+    TABLE
+        .get_or_init(|| serde_json::from_str(STRINGS).expect("src/i18n/en.json is a table of strings"))
+        .get(key)
+        .cloned()
+        .unwrap_or_else(|| key.to_string())
+}
+
 /// The argument autostart passes, so the app starts in the tray with no window.
 pub const BACKGROUND_ARG: &str = "--background";
 
@@ -188,11 +199,11 @@ pub fn keep_in_tray<R: Runtime>(window: &WebviewWindow<R>) {
 
 /// The tray icon: Open and Quit, and a click on the icon opens the window.
 pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, "open", TRAY_OPEN, true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", TRAY_QUIT, true, None::<&str>)?;
+    let open = MenuItem::with_id(app, "open", label("tray.open"), true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", label("tray.quit"), true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &quit])?;
     let mut builder = TrayIconBuilder::with_id("main")
-        .tooltip(TRAY_TOOLTIP)
+        .tooltip(label("tray.tooltip"))
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -235,6 +246,20 @@ mod tests {
         assert!(book.map.len() <= TARGETS_MAX);
         assert_eq!(book.get(first), None, "the oldest are forgotten");
         assert!(book.get(book.last).is_some(), "the newest stays");
+    }
+
+    #[test]
+    fn the_tray_words_come_from_the_screens_string_table() {
+        assert_eq!(label("tray.open"), "Open Support");
+        assert_eq!(label("tray.quit"), "Quit");
+        assert_eq!(label("tray.tooltip"), "Support");
+        // A key with no entry shows itself, so a gap is easy to see.
+        assert_eq!(label("tray.nothing"), "tray.nothing");
+        // And the file holds no tray key that the code does not use.
+        let table: HashMap<String, String> = serde_json::from_str(STRINGS).unwrap();
+        let mut tray: Vec<&String> = table.keys().filter(|k| k.starts_with("tray.")).collect();
+        tray.sort();
+        assert_eq!(tray, ["tray.open", "tray.quit", "tray.tooltip"]);
     }
 
     #[test]

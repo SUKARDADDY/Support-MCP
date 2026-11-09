@@ -31,5 +31,9 @@ describe('api', () => {
     expect(messageOf({ message: 'nope' }, 'x')).toBe('nope');
     expect(messageOf(null, 'fallback')).toBe('fallback');
     expect(messageOf({ message: '' }, 'fallback')).toBe('fallback');
+    // A message of the core's own is shown in en.json's words, by its reason; the relay's words as they are.
+    expect(messageOf({ code: 'unavailable', reason: 'relay_busy', message: 'The relay is busy (English from the core).' }, 'x')).toBe('The relay is busy. Try again in a moment.');
+    expect(messageOf({ code: 'invalid', reason: 'no_such_reason_yet', message: 'kept as it is' }, 'x')).toBe('kept as it is');
+    expect(messageOf({ code: 'confirm_wrong', reason: null, message: 'That number is wrong' }, 'x')).toBe('That number is wrong');
   });
 });

@@ -1,7 +1,7 @@
 // Sealing the sign-in tokens. On Windows the sealer is DPAPI (CryptProtectData), so the
 // tokens can be opened only by the same Windows account on the same PC. Everything around it
 // talks to the Sealer trait, so the store is tested on any system with the test sealer.
-use crate::error::{CoreError, CoreResult};
+use crate::error::{CoreError, CoreResult, Msg};
 use std::sync::Arc;
 
 pub trait Sealer: Send + Sync {
@@ -40,7 +40,7 @@ impl Sealer for DevSealer {
     fn unseal(&self, sealed: &[u8]) -> CoreResult<Vec<u8>> {
         match sealed.strip_prefix(DEV_MARK) {
             Some(rest) => Ok(rest.iter().map(|b| b ^ DEV_KEY).collect()),
-            None => Err(CoreError::other("The saved sign-in could not be opened.")),
+            None => Err(CoreError::other(Msg::SealOpen)),
         }
     }
 }
@@ -51,7 +51,7 @@ pub use dpapi::DpapiSealer;
 #[cfg(windows)]
 mod dpapi {
     use super::Sealer;
-    use crate::error::{CoreError, CoreResult};
+    use crate::error::{CoreError, CoreResult, Msg};
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Cryptography::{
@@ -83,7 +83,7 @@ mod dpapi {
             // SAFETY: the blobs point at slices that outlive the call; `out` is filled by DPAPI.
             unsafe {
                 CryptProtectData(&input, PCWSTR::null(), Some(&entropy), None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut out)
-                    .map_err(|_| CoreError::other("Windows could not protect the sign-in."))?;
+                    .map_err(|_| CoreError::other(Msg::SealProtect))?;
                 Ok(take(out))
             }
         }
@@ -95,7 +95,7 @@ mod dpapi {
             // SAFETY: as in seal.
             unsafe {
                 CryptUnprotectData(&input, None, Some(&entropy), None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut out)
-                    .map_err(|_| CoreError::other("The saved sign-in could not be opened by this Windows account."))?;
+                    .map_err(|_| CoreError::other(Msg::SealOtherAccount))?;
                 Ok(take(out))
             }
         }

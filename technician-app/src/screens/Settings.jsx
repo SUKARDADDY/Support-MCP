@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { listTeams, messageOf } from '../api.js';
+import { listTeams, messageOf, reasonText } from '../api.js';
 import { useApp } from '../context.jsx';
 import { formatAgo } from '../format.js';
 import { useLoad } from '../hooks.js';
@@ -121,7 +121,7 @@ function updateText(u) {
     case 'checking': return t('settings.update_checking');
     case 'downloading': return t('settings.update_downloading', { version: u.available ?? '' });
     case 'ready': return t('settings.update_ready', { version: u.available ?? '' });
-    case 'error': return u.message ? t('settings.update_error', { message: u.message }) : t('settings.update_failed');
+    case 'error': { const why = reasonText(u.reason, u.message); return why ? t('settings.update_error', { message: why }) : t('settings.update_failed'); }
     default: return u.checked_at ? t('settings.update_current', { when: formatAgo(u.checked_at) }) : t('settings.update_unchecked');
   }
 }

@@ -6,7 +6,7 @@
 //   4. open the system browser at the authorize address (PKCE S256, state, resource)
 //   5. take the code the browser brings back, and exchange it for tokens
 // The tokens are sealed into the store. No secret is held: a desktop app cannot keep one.
-use crate::error::{CoreError, CoreResult};
+use crate::error::{CoreError, CoreResult, Msg};
 use crate::relay::{relay_error, tokens_from_answer, RetryPolicy};
 use crate::store::{StoredAccount, Store};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
@@ -93,26 +93,26 @@ pub async fn discover(http: &reqwest::Client, relay: &str, team: &str) -> CoreRe
     let (status, doc) = get_json(http, &format!("{relay}/.well-known/oauth-protected-resource/app/w/{team}")).await?;
     match status {
         200 => {}
-        404 => return Err(CoreError::invalid("This relay has no team with that name, or sign-in is not set up on it.")),
-        503 => return Err(CoreError::Unavailable("The relay is busy. Try again in a moment.".into())),
-        _ => return Err(CoreError::invalid("That address did not answer like a Support relay.")),
+        404 => return Err(CoreError::invalid(Msg::NoTeam)),
+        503 => return Err(CoreError::Unavailable(Msg::RelayBusy)),
+        _ => return Err(CoreError::invalid(Msg::NotSupportRelay)),
     }
     if doc["resource"].as_str() != Some(resource.as_str()) {
-        return Err(CoreError::invalid("The relay names a different address for itself. Use the address it names."));
+        return Err(CoreError::invalid(Msg::RelayNamesOther));
     }
     if doc["authorization_servers"].as_array().and_then(|a| a.first()).and_then(Value::as_str) != Some(relay) {
-        return Err(CoreError::invalid("The relay uses another server to sign in, which this app does not accept."));
+        return Err(CoreError::invalid(Msg::RelayOtherServer));
     }
     let (status, meta) = get_json(http, &format!("{relay}/.well-known/oauth-authorization-server")).await?;
     if status != 200 {
-        return Err(CoreError::invalid("That address did not answer like a Support relay."));
+        return Err(CoreError::invalid(Msg::NotSupportRelay));
     }
     let endpoint = |name: &str| -> CoreResult<String> {
         let v = meta[name].as_str().unwrap_or_default();
         if same_origin(v, relay) {
             Ok(v.to_string())
         } else {
-            Err(CoreError::invalid("The relay's sign-in addresses are not its own."))
+            Err(CoreError::invalid(Msg::RelayAddressesNotOwn))
         }
     };
     Ok(Discovery {
@@ -136,18 +136,18 @@ pub async fn register(http: &reqwest::Client, d: &Discovery) -> CoreResult<Strin
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
     if status == 503 {
-        return Err(CoreError::Unavailable("The relay is busy. Try again in a moment.".into()));
+        return Err(CoreError::Unavailable(Msg::RelayBusy));
     }
     if status != 201 && status != 200 {
         return Err(relay_error(status, &text));
     }
-    let v: Value = serde_json::from_str(&text).map_err(|_| CoreError::other("The relay's registration answer was not understood."))?;
-    v["client_id"].as_str().map(str::to_string).ok_or_else(|| CoreError::other("The relay sent no client id."))
+    let v: Value = serde_json::from_str(&text).map_err(|_| CoreError::other(Msg::RelayAnswerUnclear))?;
+    v["client_id"].as_str().map(str::to_string).ok_or_else(|| CoreError::other(Msg::NoClientId))
 }
 
 /// The address the person opens to sign in.
 pub fn authorize_url(d: &Discovery, client_id: &str, redirect_uri: &str, state: &str, challenge: &str) -> CoreResult<String> {
-    let mut url = url::Url::parse(&d.authorization_endpoint).map_err(|_| CoreError::other("Bad authorize address."))?;
+    let mut url = url::Url::parse(&d.authorization_endpoint).map_err(|_| CoreError::other(Msg::BadAuthorizeAddress))?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", client_id)
@@ -190,8 +190,8 @@ enum Callback {
 
 impl Loopback {
     pub async fn bind() -> CoreResult<Loopback> {
-        let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|_| CoreError::other("Could not listen for the browser on this PC."))?;
-        let port = listener.local_addr().map_err(|_| CoreError::other("Could not listen for the browser on this PC."))?.port();
+        let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|_| CoreError::other(Msg::ListenFailed))?;
+        let port = listener.local_addr().map_err(|_| CoreError::other(Msg::ListenFailed))?.port();
         Ok(Loopback { listener, port })
     }
 
@@ -211,7 +211,7 @@ impl Loopback {
         loop {
             tokio::select! {
                 accepted = self.listener.accept() => {
-                    let (sock, _) = accepted.map_err(|_| CoreError::other("The listener for the browser stopped."))?;
+                    let (sock, _) = accepted.map_err(|_| CoreError::other(Msg::ListenerStopped))?;
                     if open.len() >= MAX_OPEN {
                         continue; // dropped: closed without a word
                     }
@@ -223,7 +223,7 @@ impl Loopback {
                 }
                 Some(done) = open.join_next(), if !open.is_empty() => match done {
                     Ok(Callback::Code(code)) => return Ok(code),
-                    Ok(Callback::Denied) => return Err(CoreError::invalid("Sign-in was not approved.")),
+                    Ok(Callback::Denied) => return Err(CoreError::invalid(Msg::SignInDenied)),
                     _ => {}
                 },
             }
@@ -308,13 +308,13 @@ async fn exchange(ctx: &SignInCtx, relay: &str, d: &Discovery, client_id: &str, 
                 tokio::time::sleep((ctx.retry.base * 2u32.saturating_pow(attempt)).min(ctx.retry.cap)).await;
                 attempt += 1;
             }
-            503 => return Err(CoreError::Unavailable("The relay is busy. Try again in a moment.".into())),
+            503 => return Err(CoreError::Unavailable(Msg::RelayBusy)),
             _ => {
                 let err: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                 if err["error"] == "invalid_client" {
                     // The relay does not know the client id we kept (its database was reset).
                     let _ = ctx.store.forget_client(relay);
-                    return Err(CoreError::invalid("The relay no longer knows this app. Try signing in again."));
+                    return Err(CoreError::invalid(Msg::RelayForgotApp));
                 }
                 return Err(relay_error(status, &text));
             }
@@ -343,7 +343,7 @@ pub async fn sign_in(ctx: &SignInCtx, relay: &str, team: &str) -> CoreResult<Str
     ctx.browser.open(&url)?;
     let code = tokio::time::timeout(ctx.timeout, loopback.wait_for_code(&state))
         .await
-        .map_err(|_| CoreError::invalid("Sign-in took too long. Try again."))??;
+        .map_err(|_| CoreError::invalid(Msg::SignInTimeout))??;
     drop(loopback);
     let tokens = exchange(ctx, relay, &d, &client_id, &code, &redirect, &verifier).await?;
     let account = StoredAccount {

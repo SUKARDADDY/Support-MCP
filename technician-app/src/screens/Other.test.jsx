@@ -278,6 +278,16 @@ describe('Settings', () => {
     expect(fake.core.checkForUpdate).toHaveBeenCalled();
   });
 
+  test('a failed update check shows the core\'s message in en.json\'s words', async () => {
+    const user = userEvent.setup();
+    const fake = fakeCore({ update: { current: '0.7.0', available: null, state: 'error', checked_at: Date.now(), message: 'English text from the core', reason: 'update_signature' } });
+    renderApp(fake);
+    await screen.findByRole('button', { name: /Front counter/ });
+    await user.click(nav('Settings'));
+    expect(await screen.findByText(/Could not update: The update's signature did not check out, so it was ignored\./)).toBeInTheDocument();
+    expect(screen.queryByText(/English text from the core/)).not.toBeInTheDocument();
+  });
+
   test('removing an account that is the only one returns to sign in', async () => {
     const user = userEvent.setup();
     const fake = fakeCore();
@@ -312,6 +322,17 @@ describe('Sign in', () => {
     await user.click(await screen.findByRole('button', { name: 'Sign in with your browser' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('This relay has no team with that name');
     expect(screen.getByRole('button', { name: 'Sign in with your browser' })).toBeEnabled();
+  });
+
+  test('a failure of the core\'s own is shown in en.json\'s words, not the core\'s English', async () => {
+    const user = userEvent.setup();
+    const fake = fakeCore({ accounts: [] });
+    fake.state.signInError = Object.assign(new Error('English text from the core'), { code: 'invalid', reason: 'no_team' });
+    renderApp(fake);
+    await user.click(await screen.findByRole('button', { name: 'Sign in with your browser' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('This relay has no team with that name, or sign-in is not set up on it.');
+    expect(alert).not.toHaveTextContent('English text from the core');
   });
 
   test('an account whose sign-in ended asks to sign in again, on the same relay', async () => {

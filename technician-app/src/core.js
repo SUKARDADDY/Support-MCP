@@ -5,10 +5,10 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { t } from './i18n/index.js';
 
-// A failure from the core arrives as { code, message, status }.
+// A failure from the core arrives as { code, message, status, reason }.
 export function errorInfo(e) {
-  if (e && typeof e === 'object' && typeof e.message === 'string') return { code: e.code ?? 'internal', message: e.message, status: e.status ?? null };
-  return { code: 'internal', message: typeof e === 'string' ? e : t('error.generic'), status: null };
+  if (e && typeof e === 'object' && typeof e.message === 'string') return { code: e.code ?? 'internal', message: e.message, status: e.status ?? null, reason: e.reason ?? null };
+  return { code: 'internal', message: typeof e === 'string' ? e : t('error.generic'), status: null, reason: null };
 }
 
 export const realCore = {

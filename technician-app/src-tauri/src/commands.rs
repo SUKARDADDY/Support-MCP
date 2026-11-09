@@ -1,7 +1,7 @@
 // The commands the screens call. Each is a thin wrapper over the core; the list of them is
 // in command_list.rs and is what the app manifest and the capability file are held to.
 use crate::core::{AccountView, Core};
-use crate::error::CoreError;
+use crate::error::{CoreError, Msg};
 use crate::feed::AccountItem;
 use crate::relay::ToolOutput;
 use crate::store::Prefs;
@@ -79,14 +79,14 @@ pub fn prefs_set(core: Shared<'_>, prefs: Prefs) -> Result<(), CoreError> {
 /// Whether the app starts when the person signs in to Windows. Off until they choose it.
 #[tauri::command]
 pub fn autostart_get(app: tauri::AppHandle) -> Result<bool, CoreError> {
-    app.autolaunch().is_enabled().map_err(|_| CoreError::other("Could not read the start setting."))
+    app.autolaunch().is_enabled().map_err(|_| CoreError::other(Msg::AutostartRead))
 }
 
 #[tauri::command]
 pub fn autostart_set(app: tauri::AppHandle, enabled: bool) -> Result<(), CoreError> {
     let launch = app.autolaunch();
     let done = if enabled { launch.enable() } else { launch.disable() };
-    done.map_err(|_| CoreError::other("Could not change the start setting."))
+    done.map_err(|_| CoreError::other(Msg::AutostartWrite))
 }
 
 /// What the updater knows: the running version, a newer one found or kept, and the last check.

@@ -13,7 +13,7 @@
 //
 // The note is five lines, as the PC app's is, under its own header (src/release.js):
 //   support-mcp-technician-release 1 / version / sha256 / size / released
-use crate::error::{CoreError, CoreResult};
+use crate::error::{CoreError, CoreResult, Msg};
 use crate::store::now_ms;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -179,14 +179,14 @@ pub fn parse_note(text: &str) -> Option<Note> {
 
 /// The built-in key, or one given as 64 bytes X||Y in base64 (tests use their own).
 pub fn load_key(b64: &str) -> CoreResult<VerifyingKey> {
-    let xy = B64.decode(b64.trim()).map_err(|_| CoreError::other("The release key is not base64."))?;
+    let xy = B64.decode(b64.trim()).map_err(|_| CoreError::other(Msg::ReleaseKeyBad))?;
     if xy.len() != 64 {
-        return Err(CoreError::other("The release key is not 64 bytes."));
+        return Err(CoreError::other(Msg::ReleaseKeyBad));
     }
     let mut sec1 = Vec::with_capacity(65);
     sec1.push(0x04);
     sec1.extend_from_slice(&xy);
-    VerifyingKey::from_sec1_bytes(&sec1).map_err(|_| CoreError::other("The release key is not a point on the curve."))
+    VerifyingKey::from_sec1_bytes(&sec1).map_err(|_| CoreError::other(Msg::ReleaseKeyBad))
 }
 
 /// Does `signature_b64` (64 bytes r||s, base64) sign exactly `note` under `key`?
@@ -213,6 +213,8 @@ pub struct UpdateStatus {
     pub state: &'static str,
     pub checked_at: Option<u64>,
     pub message: Option<String>,
+    /// The key of `message` when it is one of ours (error.rs, Msg), for the screens to translate.
+    pub reason: Option<&'static str>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -244,13 +246,13 @@ fn run_silent(installer: &Path) -> CoreResult<()> {
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .spawn()
         .map(|_| ())
-        .map_err(|_| CoreError::other("Could not start the installer."))
+        .map_err(|_| CoreError::other(Msg::InstallerStart))
 }
 
 #[cfg(not(windows))]
 fn run_silent(_installer: &Path) -> CoreResult<()> {
     // The product is Windows only. Nothing is run elsewhere.
-    Err(CoreError::other("Updates install on Windows only."))
+    Err(CoreError::other(Msg::WindowsOnly))
 }
 
 pub struct UpdateConfig {
@@ -309,7 +311,7 @@ impl Updater {
             }))
             .build()
             .expect("the update client builds");
-        let status = UpdateStatus { current: cfg.current.clone(), available: None, state: "idle", checked_at: None, message: None };
+        let status = UpdateStatus { current: cfg.current.clone(), available: None, state: "idle", checked_at: None, message: None, reason: None };
         Arc::new(Updater { cfg, http, installer, status: Mutex::new(status), busy: tokio::sync::Mutex::new(()) })
     }
 
@@ -334,19 +336,19 @@ impl Updater {
     }
 
     async fn get_text(&self, url: &str, max: usize) -> CoreResult<String> {
-        let parsed = url::Url::parse(url).map_err(|_| CoreError::other("Bad release address."))?;
+        let parsed = url::Url::parse(url).map_err(|_| CoreError::other(Msg::ReleaseAddress))?;
         if !host_allowed(&parsed, self.cfg.allow_loopback) {
-            return Err(CoreError::other("The release is not on GitHub."));
+            return Err(CoreError::other(Msg::ReleaseHost));
         }
         let resp = self.http.get(url).send().await?;
         if !resp.status().is_success() {
-            return Err(CoreError::Unavailable(format!("GitHub answered {}.", resp.status().as_u16())));
+            return Err(CoreError::Unavailable(Msg::GithubStatus));
         }
         let bytes = resp.bytes().await?;
         if bytes.len() > max {
-            return Err(CoreError::other("A release file was larger than expected."));
+            return Err(CoreError::other(Msg::ReleaseFileLarge));
         }
-        String::from_utf8(bytes.to_vec()).map_err(|_| CoreError::other("A release file was not text."))
+        String::from_utf8(bytes.to_vec()).map_err(|_| CoreError::other(Msg::ReleaseFileText))
     }
 
     /// Looks for a newer signed release and, if there is one, downloads and keeps its
@@ -356,6 +358,7 @@ impl Updater {
         self.set(|s| {
             s.state = "checking";
             s.message = None;
+            s.reason = None;
         });
         let outcome = self.check_inner().await;
         // A check that fails (GitHub down, a bad release page) does not undo an installer that is
@@ -376,11 +379,13 @@ impl Updater {
                     s.available = kept;
                     s.state = "ready";
                     s.message = None;
+                    s.reason = None;
                 }
                 Err(e) => {
                     s.state = "error";
                     s.available = None;
                     s.message = Some(e.to_string());
+                    s.reason = e.reason();
                 }
             }
         });
@@ -396,9 +401,9 @@ impl Updater {
             return Ok(None);
         }
         if !(200..300).contains(&status) {
-            return Err(CoreError::Unavailable(format!("GitHub answered {status}.")));
+            return Err(CoreError::Unavailable(Msg::GithubStatus));
         }
-        let release: serde_json::Value = resp.json().await.map_err(|_| CoreError::other("The release list was not understood."))?;
+        let release: serde_json::Value = resp.json().await.map_err(|_| CoreError::other(Msg::ReleaseListUnclear))?;
         let assets: Vec<(String, String)> = release["assets"]
             .as_array()
             .map(|a| a.iter().filter_map(|x| Some((x["name"].as_str()?.to_string(), x["browser_download_url"].as_str()?.to_string()))).collect())
@@ -416,26 +421,26 @@ impl Updater {
         let sig_text = self.get_text(&sig_url, 1024).await?;
         // The signature first: nothing in the note is believed until it checks out.
         if !verify_signature(&self.cfg.key, note_text.as_bytes(), &sig_text) {
-            return Err(CoreError::other("The update's signature did not check out, so it was ignored."));
+            return Err(CoreError::other(Msg::UpdateSignature));
         }
-        let note = parse_note(&note_text).ok_or_else(|| CoreError::other("The update note was not in the expected form, so it was ignored."))?;
+        let note = parse_note(&note_text).ok_or_else(|| CoreError::other(Msg::UpdateNoteForm))?;
         if note.version != name_version {
-            return Err(CoreError::other("The update note and its file name name different versions, so it was ignored."));
+            return Err(CoreError::other(Msg::UpdateNoteName));
         }
         if note.size == 0 || note.size > MAX_INSTALLER_BYTES {
-            return Err(CoreError::other("The update's size was not acceptable, so it was ignored."));
+            return Err(CoreError::other(Msg::UpdateSize));
         }
         match compare_versions(&note.version, &self.cfg.current) {
             Some(std::cmp::Ordering::Greater) => {}
             Some(_) => return Ok(None),
-            None => return Err(CoreError::other("The update's version was not understood.")),
+            None => return Err(CoreError::other(Msg::UpdateVersion)),
         }
         // Already kept?
         if self.staged_ok(&note_text, &sig_text, &note) {
             return Ok(Some(note.version));
         }
         let exe_name = format!("support-technician-{}-setup.exe", note.version);
-        let exe_url = find(&exe_name).ok_or_else(|| CoreError::other("The release has a note but no installer."))?;
+        let exe_url = find(&exe_name).ok_or_else(|| CoreError::other(Msg::UpdateNoInstaller))?;
         self.set(|s| {
             s.available = Some(note.version.clone());
             s.state = "downloading";
@@ -453,9 +458,9 @@ impl Updater {
     }
 
     async fn download(&self, url: &str, note: &Note, note_text: &str, sig_text: &str) -> CoreResult<()> {
-        let parsed = url::Url::parse(url).map_err(|_| CoreError::other("Bad installer address."))?;
+        let parsed = url::Url::parse(url).map_err(|_| CoreError::other(Msg::ReleaseAddress))?;
         if !host_allowed(&parsed, self.cfg.allow_loopback) {
-            return Err(CoreError::other("The installer is not on GitHub."));
+            return Err(CoreError::other(Msg::ReleaseHost));
         }
         self.clear_staged();
         std::fs::create_dir_all(self.staged_dir())?;
@@ -463,12 +468,12 @@ impl Updater {
         let mut resp = self.http.get(url).send().await?;
         if !resp.status().is_success() {
             self.clear_staged();
-            return Err(CoreError::Unavailable(format!("GitHub answered {}.", resp.status().as_u16())));
+            return Err(CoreError::Unavailable(Msg::GithubStatus));
         }
         if let Some(len) = resp.content_length() {
             if len != note.size {
                 self.clear_staged();
-                return Err(CoreError::other("The installer's size is not the size in the signed note, so it was thrown away."));
+                return Err(CoreError::other(Msg::InstallerSize));
             }
         }
         let mut out = std::fs::File::create(&part)?;
@@ -480,7 +485,7 @@ impl Updater {
             if total > note.size {
                 drop(out);
                 self.clear_staged();
-                return Err(CoreError::other("The installer is bigger than the signed note says, so it was thrown away."));
+                return Err(CoreError::other(Msg::InstallerBigger));
             }
             hasher.update(&chunk);
             out.write_all(&chunk)?;
@@ -489,11 +494,11 @@ impl Updater {
         drop(out);
         if total != note.size {
             self.clear_staged();
-            return Err(CoreError::other("The installer's size is not the size in the signed note, so it was thrown away."));
+            return Err(CoreError::other(Msg::InstallerSize));
         }
         if hex(&hasher.finalize()) != note.sha256 {
             self.clear_staged();
-            return Err(CoreError::other("The installer's SHA-256 is not the one in the signed note, so it was thrown away."));
+            return Err(CoreError::other(Msg::InstallerHash));
         }
         std::fs::write(self.file("note"), note_text)?;
         std::fs::write(self.file("note.sig"), sig_text.trim())?;
@@ -883,6 +888,7 @@ mod tests {
         let f = fixture("upd-pc", &k, "0.7.0", files).await;
         let st = f.updater.check().await;
         assert_eq!(st.state, "error");
+        assert_eq!(st.reason, Some("update_note_form"), "the screens translate it by this key");
         assert!(st.message.unwrap().contains("not in the expected form"));
         assert_eq!(f.server.count("/dl/support-technician-0.8.0-setup.exe"), 0);
         assert!(staged_files(&f).is_empty());

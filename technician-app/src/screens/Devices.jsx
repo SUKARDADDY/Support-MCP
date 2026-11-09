@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { messageOf } from '../api.js';
 import { Icon, Thread } from '../components/Icon.jsx';
 import { useApp } from '../context.jsx';
 import { FILTERS, deviceStatus, filterCounts, filterDevices, placeLabel, sortDevices } from '../devices.js';
@@ -24,7 +25,7 @@ export function Devices() {
     rows = (
       <li className="empty" role="alert">
         <h2>{t('devices.load_failed')}</h2>
-        <p>{devicesState.error.message}</p>
+        <p>{messageOf(devicesState.error, '')}</p>
         <button type="button" className="btn btn-sec" onClick={app.reloadDevices}>{t('common.try_again')}</button>
       </li>
     );

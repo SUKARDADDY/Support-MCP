@@ -1,7 +1,7 @@
 // The core of the app, behind the commands the screens call: the accounts (each a relay and
 // a team), signing in and out, calls to the relay on the screens' behalf, and one feed loop
 // per signed-in account. Nothing here touches Tauri, so it is tested without a window.
-use crate::error::{CoreError, CoreResult};
+use crate::error::{CoreError, CoreResult, Msg};
 use crate::feed::{run_feed, AccountItem, CoreSink, Emitter, FeedTuning, Notifier, Recent};
 use crate::oauth::{self, Browser, SignInCtx, SIGN_IN_TIMEOUT};
 use crate::relay::{http_client, normalize_relay, route_allowed, valid_team, AccountClient, AccountEvents, RetryPolicy, ToolOutput, TOOLS};
@@ -109,7 +109,7 @@ impl Core {
             }
             clients.remove(id);
         }
-        let account = self.store.account(id).ok_or_else(|| CoreError::invalid("No such account."))?;
+        let account = self.store.account(id).ok_or_else(|| CoreError::invalid(Msg::NoAccount))?;
         if account.sealed.is_none() {
             return Err(CoreError::SignedOut);
         }
@@ -146,12 +146,12 @@ impl Core {
         let relay = normalize_relay(relay)?;
         let team = team.trim().to_ascii_lowercase();
         if !valid_team(&team) {
-            return Err(CoreError::invalid("A team name has lower-case letters, digits and dashes only."));
+            return Err(CoreError::invalid(Msg::BadTeam));
         }
         let _one = self
             .signing_in
             .try_lock()
-            .map_err(|_| CoreError::invalid("A sign-in is already open in your browser. Finish it, or cancel it here."))?;
+            .map_err(|_| CoreError::invalid(Msg::SignInOpen))?;
         let cancel = Arc::new(Notify::new());
         *self.cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(cancel.clone());
         let ctx = SignInCtx {
@@ -163,7 +163,7 @@ impl Core {
         };
         let outcome = tokio::select! {
             r = oauth::sign_in(&ctx, &relay, &team) => r,
-            _ = cancel.notified() => Err(CoreError::invalid("Sign-in was cancelled.")),
+            _ = cancel.notified() => Err(CoreError::invalid(Msg::SignInCancelled)),
         };
         *self.cancel.lock().unwrap_or_else(|p| p.into_inner()) = None;
         let id = outcome?;
@@ -171,7 +171,7 @@ impl Core {
         self.fill_profile(&id).await;
         self.ensure_feed(&id)?;
         self.emitter.emit("account://changed", serde_json::json!({ "account": id, "signed_out": false }));
-        self.store.account(&id).map(|a| view(&a)).ok_or_else(|| CoreError::other("The account was not saved."))
+        self.store.account(&id).map(|a| view(&a)).ok_or_else(|| CoreError::other(Msg::AccountNotSaved))
     }
 
     // The team's name and the person's address, for the screens. Failing here changes nothing.
@@ -207,9 +207,9 @@ impl Core {
     /// A call to a relay route the screens may reach (see relay::route_allowed).
     pub async fn request(&self, id: &str, method: &str, path: &str, body: Option<Value>) -> CoreResult<Value> {
         if !route_allowed(method, path) {
-            return Err(CoreError::invalid("The app does not make that request."));
+            return Err(CoreError::invalid(Msg::RequestRefused));
         }
-        let m = Method::from_bytes(method.as_bytes()).map_err(|_| CoreError::invalid("Bad method."))?;
+        let m = Method::from_bytes(method.as_bytes()).map_err(|_| CoreError::invalid(Msg::BadMethod))?;
         // A held-open call needs a longer wait than the default.
         let timeout = path
             .split_once("wait_s=")
@@ -222,10 +222,10 @@ impl Core {
     /// One MCP tool, from the short list in relay::TOOLS.
     pub async fn tool(&self, id: &str, name: &str, args: Value) -> CoreResult<ToolOutput> {
         if !TOOLS.contains(&name) {
-            return Err(CoreError::invalid("The app does not use that tool."));
+            return Err(CoreError::invalid(Msg::ToolRefused));
         }
         if !args.is_object() {
-            return Err(CoreError::invalid("A tool's arguments are an object."));
+            return Err(CoreError::invalid(Msg::ToolArgs));
         }
         self.client(id)?.tool(name, args).await
     }

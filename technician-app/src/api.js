@@ -3,6 +3,8 @@
 // Text that came from a customer's PC (names, notes, step details) passes through here as
 // data and is only ever shown as text.
 
+import { hasKey, t } from './i18n/index.js';
+
 const PAGE_LIMIT = 20;
 
 // Reads every page of a list that pages by `next`.
@@ -112,8 +114,16 @@ export const isLiveTask = (task) => task && (task.state === 'running' || task.st
 // The one task, if any, that is working on this session.
 export const taskOnSession = (tasks, sessionId) => tasks.find((x) => x.session_id === sessionId && isLiveTask(x)) ?? null;
 
-// The relay's words for a refused call, or a plain fallback. Never HTML.
+// The words of a message of the core's own, by the stable `reason` it carries, in en.json
+// ("error.<reason>"); `message` (the core's English, or the relay's own text) when there is no line for it.
+export function reasonText(reason, message) {
+  return typeof reason === 'string' && hasKey(`error.${reason}`) ? t(`error.${reason}`) : message;
+}
+
+// What to tell the person about a refused call: the core's message in en.json, or the relay's
+// own words, or a plain fallback. Never HTML.
 export function messageOf(e, fallback) {
-  const m = e && typeof e === 'object' ? e.message : null;
+  if (!e || typeof e !== 'object') return fallback;
+  const m = reasonText(e.reason, e.message);
   return typeof m === 'string' && m ? m : fallback;
 }

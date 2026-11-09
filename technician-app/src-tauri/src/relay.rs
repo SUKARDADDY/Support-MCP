@@ -6,7 +6,7 @@
 //   503 (and a network failure)  the relay is busy or out of reach: try again, keep the sign-in
 //   401, or invalid_grant on a refresh  the relay no longer accepts it: sign out
 //   anything else  an error to show, with the relay's own words
-use crate::error::{CoreError, CoreResult};
+use crate::error::{CoreError, CoreResult, Msg};
 use crate::store::{now_ms, Store, Tokens};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -104,16 +104,16 @@ pub fn http_client() -> reqwest::Client {
 pub fn normalize_relay(input: &str) -> CoreResult<String> {
     let text = input.trim();
     let text = if text.contains("://") { text.to_string() } else { format!("https://{text}") };
-    let url = url::Url::parse(&text).map_err(|_| CoreError::invalid("That is not a relay address."))?;
-    let host = url.host_str().ok_or_else(|| CoreError::invalid("That is not a relay address."))?.to_ascii_lowercase();
+    let url = url::Url::parse(&text).map_err(|_| CoreError::invalid(Msg::NotRelayAddress))?;
+    let host = url.host_str().ok_or_else(|| CoreError::invalid(Msg::NotRelayAddress))?.to_ascii_lowercase();
     let loopback = matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]");
     match url.scheme() {
         "https" => {}
         "http" if loopback => {}
-        _ => return Err(CoreError::invalid("The relay address must start with https://.")),
+        _ => return Err(CoreError::invalid(Msg::RelayHttps)),
     }
     if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() || !(url.path() == "/" || url.path().is_empty()) {
-        return Err(CoreError::invalid("Give the relay address only, with no path or login."));
+        return Err(CoreError::invalid(Msg::RelayAddressOnly));
     }
     let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
     Ok(format!("{}://{host}{port}", url.scheme()))
@@ -204,8 +204,8 @@ struct TokenAnswer {
 
 /// The tokens of a successful /oauth/token answer.
 pub fn tokens_from_answer(body: &str, old_refresh: Option<&str>) -> CoreResult<Tokens> {
-    let a: TokenAnswer = serde_json::from_str(body).map_err(|_| CoreError::other("The relay's sign-in answer was not understood."))?;
-    let refresh = a.refresh_token.or_else(|| old_refresh.map(str::to_string)).ok_or_else(|| CoreError::other("The relay sent no refresh token."))?;
+    let a: TokenAnswer = serde_json::from_str(body).map_err(|_| CoreError::other(Msg::RelayAnswerUnclear))?;
+    let refresh = a.refresh_token.or_else(|| old_refresh.map(str::to_string)).ok_or_else(|| CoreError::other(Msg::NoRefreshToken))?;
     Ok(Tokens { access: a.access_token, refresh, expires_at_ms: now_ms() + a.expires_in.unwrap_or(3600) * 1000 })
 }
 
@@ -217,7 +217,7 @@ impl AccountClient {
         id: &str,
         retry: RetryPolicy,
     ) -> CoreResult<AccountClient> {
-        let a = store.account(id).ok_or_else(|| CoreError::invalid("No such account."))?;
+        let a = store.account(id).ok_or_else(|| CoreError::invalid(Msg::NoAccount))?;
         Ok(AccountClient {
             id: a.id,
             relay: a.relay,
@@ -299,7 +299,7 @@ impl AccountClient {
                 }
                 503 => {
                     if attempt >= self.retry.retries {
-                        return Err(CoreError::Unavailable("The relay is busy. Try again in a moment.".into()));
+                        return Err(CoreError::Unavailable(Msg::RelayBusy));
                     }
                     tokio::time::sleep(self.retry.delay(attempt, wait)).await;
                     attempt += 1;
@@ -313,7 +313,7 @@ impl AccountClient {
                     return Err(CoreError::SignedOut);
                 }
                 // Any other answer is not proof the sign-in is gone, so it stays.
-                _ => return Err(CoreError::Unavailable("The sign-in could not be renewed. Try again.".into())),
+                _ => return Err(CoreError::Unavailable(Msg::RenewFailed)),
             }
         }
     }
@@ -339,7 +339,7 @@ impl AccountClient {
             let text = resp.text().await.unwrap_or_default();
             match status {
                 200..=299 => {
-                    return if text.trim().is_empty() { Ok(Value::Null) } else { serde_json::from_str(&text).map_err(|_| CoreError::other("The relay's answer was not understood.")) };
+                    return if text.trim().is_empty() { Ok(Value::Null) } else { serde_json::from_str(&text).map_err(|_| CoreError::other(Msg::RelayAnswerUnclear)) };
                 }
                 401 => {
                     // The token was refused. Renew once and try again; a second refusal is final.
@@ -352,7 +352,7 @@ impl AccountClient {
                 }
                 503 => {
                     if attempt >= self.retry.retries {
-                        return Err(CoreError::Unavailable("The relay is busy. Try again in a moment.".into()));
+                        return Err(CoreError::Unavailable(Msg::RelayBusy));
                     }
                     tokio::time::sleep(self.retry.delay(attempt, wait)).await;
                     attempt += 1;
@@ -373,10 +373,10 @@ impl AccountClient {
 /// An MCP answer: an image block, if any, then the tool's JSON text.
 pub fn parse_tool_answer(answer: &Value) -> CoreResult<ToolOutput> {
     if let Some(err) = answer.get("error") {
-        return Err(CoreError::Tool(clip(err["message"].as_str().unwrap_or("The tool failed."), 400)));
+        return Err(CoreError::Tool(clip(err["message"].as_str().unwrap_or(Msg::ToolFailed.text()), 400)));
     }
     let result = &answer["result"];
-    let blocks = result["content"].as_array().ok_or_else(|| CoreError::other("The relay's answer was not understood."))?;
+    let blocks = result["content"].as_array().ok_or_else(|| CoreError::other(Msg::RelayAnswerUnclear))?;
     let mut text: Option<&str> = None;
     let mut image = None;
     for b in blocks {
@@ -391,7 +391,7 @@ pub fn parse_tool_answer(answer: &Value) -> CoreResult<ToolOutput> {
         }
     }
     if result["isError"].as_bool() == Some(true) {
-        return Err(CoreError::Tool(clip(text.unwrap_or("The tool failed."), 400)));
+        return Err(CoreError::Tool(clip(text.unwrap_or(Msg::ToolFailed.text()), 400)));
     }
     let data = match text {
         Some(t) => serde_json::from_str(t).unwrap_or_else(|_| json!({ "text": t })),

@@ -6,7 +6,7 @@
 // When the loop starts it first reads what is already there without notifying (items the app
 // has not seen, or the person's whole backlog on a new account): the list shows them, but
 // nothing pops up for old news. Only items that arrive after that are "live".
-use crate::error::CoreError;
+use crate::error::{CoreError, Msg};
 use crate::relay::AccountClient;
 use crate::store::Store;
 use reqwest::Method;
@@ -83,7 +83,7 @@ async fn read_page(client: &AccountClient, after: u64, wait_s: u64) -> Result<(V
     let path = format!("/notifications?after={after}&wait_s={wait_s}");
     let timeout = Duration::from_secs(wait_s + 15);
     let v = client.request(Method::GET, &path, None, Some(timeout)).await?;
-    parse_page(&v).ok_or_else(|| CoreError::other("The relay's notification answer was not understood."))
+    parse_page(&v).ok_or_else(|| CoreError::other(Msg::RelayAnswerUnclear))
 }
 
 /// Runs until the account is signed out. Never returns otherwise: failures are waited out.

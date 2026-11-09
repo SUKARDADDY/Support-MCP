@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { endSession, fetchDevices, fetchMe, fetchPlaces, isLiveTask, listTasks, sessionStatus } from './api.js';
+import { endSession, fetchDevices, fetchMe, fetchPlaces, isLiveTask, listTasks, messageOf, sessionStatus } from './api.js';
 import { Icon } from './components/Icon.jsx';
 import { useConnections } from './connections.js';
 import { AppContext } from './context.jsx';
@@ -147,7 +147,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
         await endSession(core, tab.account, tab.sessionId);
         toast(t('session.ended_toast', { name: tab.deviceName }));
       } catch (e) {
-        toast(e?.message || t('session.end_failed'));
+        toast(messageOf(e, t('session.end_failed')));
       }
     }
     closeTab(key);
