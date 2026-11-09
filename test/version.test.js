@@ -11,7 +11,10 @@ import { VERSION_PATTERN } from '../src/version.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SCRIPT = join(ROOT, 'scripts', 'bump-version.mjs');
-const FILES = ['package.json', 'package-lock.json', 'src/version.js', 'src/agent.ps1', 'src/agent-app.cs'];
+const FILES = [
+  'package.json', 'package-lock.json', 'src/version.js', 'src/agent.ps1', 'src/agent-app.cs',
+  'technician-app/package.json', 'technician-app/package-lock.json', 'technician-app/src-tauri/Cargo.toml', 'technician-app/src-tauri/Cargo.lock',
+];
 const read = (root, file) => readFileSync(join(root, file), 'utf8');
 
 // Every copy of the version in a tree, in the shape it is written there.
@@ -23,6 +26,7 @@ function versions(root) {
     assert.ok(m, `${file} has no match for ${re}`);
     return m[1];
   };
+  const techLock = JSON.parse(read(root, 'technician-app/package-lock.json'));
   const asm = (name) => one('src/agent-app.cs', new RegExp(`\\[assembly: System\\.Reflection\\.${name}\\("([^"]*)"\\)\\]`));
   return {
     package: pkg.version,
@@ -34,6 +38,12 @@ function versions(root) {
     cs_informational: asm('AssemblyInformationalVersion'),
     cs_assembly: asm('AssemblyVersion'),
     cs_file: asm('AssemblyFileVersion'),
+    tech_package: JSON.parse(read(root, 'technician-app/package.json')).version,
+    tech_lock: techLock.version,
+    tech_lock_root: techLock.packages[''].version,
+    // The [package] section only: a dependency's version is not this one.
+    cargo_toml: one('technician-app/src-tauri/Cargo.toml', /^\[package\]\r?\n(?:(?!\[)[^\n]*\n)*?version = "([^"]*)"/m),
+    cargo_lock: one('technician-app/src-tauri/Cargo.lock', /\[\[package\]\]\r?\nname = "support-technician-app"\r?\nversion = "([^"]*)"/),
   };
 }
 
@@ -57,6 +67,7 @@ test('every copy of the version equals package.json', () => {
   assert.deepEqual(v, {
     package: want, lock: want, lockRoot: want, version_js: want, ps1: want,
     cs_const: want, cs_informational: want, cs_assembly: `${core}.0`, cs_file: `${core}.0`,
+    tech_package: want, tech_lock: want, tech_lock_root: want, cargo_toml: want, cargo_lock: want,
   });
 });
 
@@ -69,6 +80,7 @@ test('bump-version.mjs rewrites every copy, and a prerelease keeps x.y.z.0 for t
     assert.deepEqual(v, {
       package: '0.3.0-rc.1', lock: '0.3.0-rc.1', lockRoot: '0.3.0-rc.1', version_js: '0.3.0-rc.1', ps1: '0.3.0-rc.1',
       cs_const: '0.3.0-rc.1', cs_informational: '0.3.0-rc.1', cs_assembly: '0.3.0.0', cs_file: '0.3.0.0',
+      tech_package: '0.3.0-rc.1', tech_lock: '0.3.0-rc.1', tech_lock_root: '0.3.0-rc.1', cargo_toml: '0.3.0-rc.1', cargo_lock: '0.3.0-rc.1',
     });
     for (const file of FILES) assert.notEqual(read(dir, file), read(ROOT, file), `${file} changed`);
   } finally {
@@ -132,6 +144,43 @@ test('bump-version.mjs with the current version changes nothing', () => {
   try {
     const before = snapshot(dir);
     execFileSync(process.execPath, [SCRIPT, '--root', dir, versions(ROOT).package]);
+    assert.deepEqual(snapshot(dir), before);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('bump-version.mjs changes only the technician app\'s own version lines, not a dependency that has the same number', () => {
+  const dir = copyTree();
+  try {
+    const run = bump(dir, '12345.6.7');
+    assert.equal(run.status, 0, run.stderr);
+    for (const file of ['technician-app/package.json', 'technician-app/package-lock.json', 'technician-app/src-tauri/Cargo.toml', 'technician-app/src-tauri/Cargo.lock']) {
+      const before = read(ROOT, file).split('\n');
+      const after = read(dir, file).split('\n');
+      assert.equal(after.length, before.length, file);
+      const changed = after.flatMap((line, i) => (line === before[i] ? [] : [[before[i], line]]));
+      // package.json and Cargo.toml: one line. The npm lockfile: its two entries. Cargo.lock: the app's one.
+      assert.equal(changed.length, file.endsWith('package-lock.json') ? 2 : 1, `${file}: ${JSON.stringify(changed)}`);
+      for (const [was, now] of changed) assert.equal(was.replace(/\d+\.\d+\.\d+[^"]*/, '12345.6.7'), now, file);
+    }
+    // A dependency of the same number in Cargo.lock keeps its version.
+    const lock = read(dir, 'technician-app/src-tauri/Cargo.lock');
+    assert.equal((lock.match(/^version = "0\.9\.4"$/gm) ?? []).length, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('bump-version.mjs refuses when the technician app\'s Cargo.toml has no [package] version, and writes nothing', () => {
+  const dir = copyTree();
+  try {
+    const file = 'technician-app/src-tauri/Cargo.toml';
+    writeFileSync(join(dir, file), read(dir, file).replace(/^version = "[^"]*"\n/m, ''));
+    const before = snapshot(dir);
+    const run = bump(dir, '0.9.4');
+    assert.notEqual(run.status, 0);
+    assert.match(run.stderr, /Cargo\.toml: expected one match.*found 0/);
     assert.deepEqual(snapshot(dir), before);
   } finally {
     rmSync(dir, { recursive: true, force: true });

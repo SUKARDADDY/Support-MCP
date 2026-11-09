@@ -254,7 +254,10 @@ To cut a release:
 
 1. Run `node scripts/bump-version.mjs 0.3.0`. It rewrites `package.json`,
    `package-lock.json`, `src/version.js`, `src/agent.ps1` and `src/agent-app.cs`,
-   and refuses to write anything when a pattern does not match exactly once.
+   and the technician app's `technician-app/package.json`, both version entries of
+   its `package-lock.json`, the `[package]` version of `src-tauri/Cargo.toml` and
+   the app's entry in `src-tauri/Cargo.lock`. It refuses to write anything when a
+   pattern does not match exactly once.
 2. Rebuild `src/app-bundle.json` on Windows, as in
    [Build the app](#build-the-app). The version is part of the app source, so the
    bundle hash test fails until you do.
@@ -266,6 +269,9 @@ After the PR merges, tag the merge commit `v0.3.0` and create a GitHub release
 from the CHANGELOG entry. Then sign the release and deploy it, as below.
 
 ### Sign and deploy a release
+
+The technician app's installer is signed with the same key and the same stdin rule, with
+`--product technician --file <installer>`; see [technician-app.md](technician-app.md#build-and-release).
 
 Saved PCs update themselves only to a release signed with the project's release
 key ([Updates](relay-v1-spec.md#updates)). The private key is a secure note,
@@ -358,7 +364,7 @@ npx wrangler d1 migrations apply support-mcp --local   # the team tables, once
 cp .dev.vars.example .dev.vars && npx wrangler dev --port 8787
 ```
 
-`npm test` is `node --import ./test/stubs/register.mjs --test`. The OAuth library
+`npm test` is `node --import ./test/stubs/register.mjs --test "test/*.test.js"`: only the relay's test files, so the technician app's own tests (which run with `npm test` inside `technician-app/`) are not picked up. The OAuth library
 imports `cloudflare:workers`, which only the Workers runtime has, so
 `test/stubs/register.mjs` installs a resolve hook that maps it to
 `test/stubs/cloudflare-workers.mjs`, an empty `WorkerEntrypoint` plus the global
@@ -366,8 +372,7 @@ that turns on client metadata documents. The library is imported only by
 `src/index.js` and handed to `createHandler`, so `src/app.js` and every test
 that does not need OAuth load without the hook. `test/oauth.test.js` needs it:
 under a bare `node --test` its tests skip with a message, and CI runs `npm ci --ignore-scripts`
-then `npm test`, so there they all run. (`node --test` also runs the helper files
-under `test/` as one empty test each, so the totals include them.)
+then `npm test`, so there they all run.
 
 `.dev.vars` skips Access and shortens the session TTL, but only when the
 request host is `localhost` or `127.0.0.1`. The deployed hostname can never

@@ -17,6 +17,7 @@ import { SignIn } from './screens/SignIn.jsx';
 import { applyTheme, loadTheme, saveTheme } from './theme.js';
 
 const ACTIVE_KEY = 'support.active';
+const PLACES_EVERY_MS = 5 * 60 * 1000;
 const TABS_KEY = 'support.tabs';
 
 const read = (key, fallback) => {
@@ -36,7 +37,7 @@ const write = (key, value) => {
 };
 
 // How often the app looks again. Tests pass shorter times through `tuning`.
-export const TUNING = { connectPollMs: 2000, devicePollMs: 15000, watchMs: 3000, screenshotMs: 3000, taskCheckMs: 15000, statusMs: 5000, taskWaitS: 25, taskGapMs: 1000 };
+export const TUNING = { connectPollMs: 2000, devicePollMs: 15000, watchMs: 3000, screenshotMs: 3000, taskCheckMs: 15000, statusMs: 10000, taskWaitS: 25, taskGapMs: 1000 };
 
 const NO_TUNING = {};
 
@@ -105,17 +106,21 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   // ---- devices -----------------------------------------------------------------
   const [deviceData, setDeviceData] = useState({ devices: [], places: new Map(), loading: true, error: null });
   const loadSeq = useRef(0);
+  const placesAt = useRef(0);
   const reloadDevices = useCallback(async () => {
     if (!accountId) return;
     const mine = ++loadSeq.current;
+    // Sites and customers change rarely: they are read again every few minutes, not at every look at the list.
+    const stalePlaces = Date.now() - placesAt.current > PLACES_EVERY_MS;
     try {
-      const [devices, places] = await Promise.all([fetchDevices(core, accountId), fetchPlaces(core, accountId).catch(() => new Map())]);
-      if (mine === loadSeq.current) setDeviceData({ devices: sortDevices(devices), places, loading: false, error: null });
+      const [devices, places] = await Promise.all([fetchDevices(core, accountId), stalePlaces ? fetchPlaces(core, accountId).catch(() => null) : null]);
+      if (places) placesAt.current = Date.now();
+      if (mine === loadSeq.current) setDeviceData((d) => ({ devices: sortDevices(devices), places: places ?? d.places, loading: false, error: null }));
     } catch (error) {
       if (mine === loadSeq.current) setDeviceData((d) => ({ ...d, loading: false, error }));
     }
   }, [core, accountId]);
-  useEffect(() => { setDeviceData({ devices: [], places: new Map(), loading: true, error: null }); }, [accountId]);
+  useEffect(() => { placesAt.current = 0; setDeviceData({ devices: [], places: new Map(), loading: true, error: null }); }, [accountId]);
   useInterval(reloadDevices, tuning.devicePollMs, !!accountId && visible && (view === 'devices' || view === 'add'));
   useEffect(() => { if (accountId && !(view === 'devices' || view === 'add')) reloadDevices(); }, [accountId]); // eslint-disable-line react-hooks/exhaustive-deps
 

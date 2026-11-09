@@ -346,11 +346,14 @@ mod tests {
     use crate::testkit::*;
     use std::sync::Mutex;
 
+    // What the person's browser does with an authorize address: the addresses it then visits.
+    type Behave = Box<dyn Fn(&url::Url) -> Vec<String> + Send + Sync>;
+
     // A browser that plays the person: it reads the authorize address, then sends the
     // browser's return to the app's listener.
     struct ScriptedBrowser {
         urls: Arc<Mutex<Vec<String>>>,
-        behave: Box<dyn Fn(&url::Url) -> Vec<String> + Send + Sync>,
+        behave: Behave,
     }
 
     impl Browser for ScriptedBrowser {

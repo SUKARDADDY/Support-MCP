@@ -4,7 +4,10 @@
 //   node scripts/bump-version.mjs <x.y.z> --root <d> work on the files under <d> instead of the repo
 //
 // It rewrites package.json, package-lock.json (top level and packages[""]), src/version.js,
-// src/agent.ps1, and src/agent-app.cs (Wire.Version and the four assembly attributes). The
+// src/agent.ps1, and src/agent-app.cs (Wire.Version and the four assembly attributes), and the
+// technician app: technician-app/package.json, both version entries of its package-lock.json,
+// the [package] version in technician-app/src-tauri/Cargo.toml and the app's own entry in
+// src-tauri/Cargo.lock. (tauri.conf.json has no version: Tauri reads Cargo.toml.) The
 // assembly and file versions are x.y.z.0: a prerelease or build part is dropped from them.
 // A pattern that matches zero times or more than once is an error, and then no file is written.
 // Every new file is computed before the first write. The writes themselves are not atomic: an I/O
@@ -46,6 +49,14 @@ const FILES = {
     edit(/^(  "version": ")[^"]*(",)$/gm, version),
     edit(/("": \{\s*"name": "support-mcp",\s*"version": ")[^"]*(")/g, version),
   ],
+  'technician-app/package.json': [edit(/^(  "version": ")[^"]*(",)$/gm, version)],
+  'technician-app/package-lock.json': [
+    edit(/^(  "version": ")[^"]*(",)$/gm, version),
+    edit(/("": \{\s*"name": "support-mcp-technician-app",\s*"version": ")[^"]*(")/g, version),
+  ],
+  // The first `version = ` line after [package] and before the next section header.
+  'technician-app/src-tauri/Cargo.toml': [edit(/(^\[package\]\r?\n(?:(?!\[)[^\n]*\n)*?version = ")[^"]*(")/gm, version)],
+  'technician-app/src-tauri/Cargo.lock': [edit(/(\[\[package\]\]\r?\nname = "support-technician-app"\r?\nversion = ")[^"]*(")/g, version)],
   'src/version.js': [edit(/^(export const VERSION = ')[^']*(';)$/gm, version)],
   'src/agent.ps1': [edit(/(agent = '1'; version = ')[^']*(')/g, version)],
   'src/agent-app.cs': [

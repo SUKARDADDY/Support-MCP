@@ -1,0 +1,197 @@
+# The technician app (Windows)
+
+A small Windows program for the people on your team who help customers. It signs in to your
+relay, shows your saved PCs, pairs and approves new ones, lets you watch a PC's screen and
+the built-in agent's work, and tells you about the six things that need you. It is a Tauri 2
+app: a Rust core that holds the sign-in and talks to the relay, and React screens drawn by
+Windows' own web view (WebView2). The code is in `technician-app/`.
+
+Contents: [Install](#install) · [Sign in](#sign-in) · [The screens](#the-screens) ·
+[Notifications](#notifications) · [Updates](#updates) · [SmartScreen](#smartscreen) ·
+[Free-plan limits](#free-plan-limits) · [Security](#security) · [Build](#build-and-release) ·
+[How it is tested](#how-it-is-tested)
+
+## Install
+
+Run `Support_<version>_x64-setup.exe` from the GitHub release. It installs for the current
+Windows account only, so it never asks for administrator rights, and puts Support in the
+Start menu. Windows 10 and 11 on 64-bit PCs. If WebView2 is missing (an old Windows 10), the
+installer downloads Microsoft's bootstrapper and installs it first.
+
+To remove it, use Windows Settings, Apps. That deletes the app and its files. Your sign-in
+sits in `%APPDATA%\dev.support-mcp.technician\app.json`, sealed so only your Windows account
+can read it; Remove in the app's Settings deletes it too.
+
+## Sign in
+
+The first screen asks for the relay address (`support.example.com`) and the team (`default`
+unless your relay has several). Press **Sign in with your browser**. The app opens your
+default browser, you sign in there the way you do on the relay's own pages (email link or
+provider, and your authenticator code), and approve a page that reads "Support technician app:
+works as you in `<team>`, including seeing PCs and their screens, pairing and approving PCs,
+changing how they can be reached, and starting agent tasks. It can't change members, roles or
+agent keys." Only approve it when you just started signing in from the app.
+
+The browser then returns to a loopback address on your own PC and the app signs in. The
+sign-in is the app's own, separate from the one Claude Code or Codex use, and it works only on
+the app's address (`/app/w/<team>`). It is kept sealed with Windows' DPAPI. The app renews it
+before the hour is up and asks you to sign in again only when the relay refuses it, for
+example after **Sign out everywhere** or when an admin removes you. A busy relay is retried and
+never costs you the sign-in.
+
+If you belong to more than one team on the relay, Settings lists the others. Each needs its own
+approval in the browser, and the Devices screen gets a team picker.
+
+## The screens
+
+- **Devices.** Your saved PCs, with search, filter chips with counts (all, online, offline,
+  waiting, any time, asks first) and a mark for each: solid green is online, dotted grey offline,
+  solid blue connected, dashed blue waiting. Select a PC to see how it can be reached and
+  press **Connect**. A PC set to "any time" connects at once if your role may connect without
+  asking. One set to "asks first" shows "Waiting for someone at the PC to click Allow", and a
+  decline, nobody signed in, or a busy PC is explained in words. If someone else is connected,
+  holders of `sessions.unattended` see **Take over**. **Hand to the agent** starts a built-in
+  agent task on an online PC.
+- **Waiting PCs.** A PC whose owner started an install and is waiting for you shows
+  "Needs approval". Select it, ask the owner for the six-digit number on their screen, type it
+  and press **Approve**.
+- **Add a device.** Press **Get a pairing code**. The owner installs Support on the PC and enters the
+  code (it works once, for ten minutes). The screen watches the list and tells you when the PC
+  arrives. **Copy install link** copies the relay's `/install` link with the code in it.
+- **One-off link.** For a PC you will help once: creates a session link that works once, for ten
+  minutes, and nothing is saved to your devices.
+- **Session tabs.** Each open session is a tab at the top. See below.
+- **Notifications.** The recent items, and a Settings tab with a switch for each of the six
+  events, the PCs you watch for "came online", and a switch for Windows notifications on this PC.
+- **Settings.** Accounts, appearance (light, dark or the same as Windows), starting the app with
+  Windows (off until you choose it), and updates.
+
+### The session tab (view only)
+
+The tab shows the PC's screen. It never clicks or types: those arrive in a later release, and
+the app's core has no tool for them.
+
+- While a built-in agent task works on the session, the tab shows the last picture the task
+  took. The relay holds the picture in memory only, for the task's starter and the session's
+  driver. The tab keeps the task's status open on the relay and fetches the picture again whenever
+  it changes. It takes no screenshot of its own then, because the PC handles one command at a time.
+- Otherwise, if you are the driver and the tab is on screen, it takes a screenshot every 3 seconds.
+  It stops at once when the relay answers that someone else is driving or the PC is busy with the
+  agent, and starts again when you press **Try the screen again** or take over. It also stops
+  while the window is minimised or in the tray.
+- Every 15 seconds it looks for a task running on the session and switches to its picture.
+- **Activity** lists the task's steps and notes together with the session log, in time order.
+  Everything from the PC (step details, notes, log text, names) is shown as text, never as markup.
+- **End session** ends it. **Take over** appears for holders of `sessions.unattended` when someone
+  else drives. **Pause**, **Resume** and **Stop the task** control a running task.
+
+## Notifications
+
+The relay writes a row for each of six events (task finished, task needs you, session turned
+down, a watched PC came online, a PC went missing, a PC is waiting for approval) for the people
+who should hear it, and the app holds a request open on it, so an item arrives within seconds.
+It shows each as a Windows notification, and keeps the recent ones in the Notifications screen.
+Switching an event off in the app's settings stops the relay writing it for you. The first time
+the app runs for an account it reads the backlog silently: the list shows it, but no
+notification pops up for old news.
+
+Clicking a notification opens the PC or the task it is about, **while the notification is
+still on screen**. Windows reports a click only then. A notification you open later from the
+Notification Center only opens the app, so use the Notifications screen to find the item.
+Closing the window sends the app to the tray, where it keeps running so notifications keep
+coming. Use the tray icon's Quit to stop it.
+
+## Updates
+
+The app does not use Tauri's own updater. When it starts, and every 6 hours, it asks GitHub for
+the latest release and looks for `support-technician-<version>-setup.note` and `.note.sig`. A
+release without them, or with a version that is not newer, is no update. The note is five lines
+that the project's release key signed (`scripts/sign-release.mjs --product technician`); the app
+checks the ECDSA P-256 signature against the public key built into it (`release-key.pub`), then
+the note's header, version, size and SHA-256. It downloads
+`support-technician-<version>-setup.exe`, checks its size and SHA-256 against the signed note,
+and keeps the file. At the next start it checks the signature and the file again, runs the
+installer silently (`/S /R`) and exits so the installer can replace the app. An installer that
+keeps failing is not run more than twice. A PC's update note (`support-mcp-release 1`) is not a
+technician note: the headers differ and the signature covers the header.
+
+## SmartScreen
+
+The installer is not signed with a code-signing certificate (the project's release key signs the
+update note, not the installer). Windows SmartScreen may say "Windows protected your PC": press
+**More info**, then **Run anyway**. Updates the app installs itself are run by the app and do not
+carry the download mark that triggers SmartScreen.
+
+## Free-plan limits
+
+On Cloudflare's free plan the relay allows 100,000 Worker requests and 100,000 KV reads a day. The
+app's calls cost mostly Worker requests: the feed is about 3,500 requests a day for one person
+who keeps the app open, the device list is one request every 15 seconds while the Devices screen
+is on screen, and an open session tab you are driving costs about 1,800 requests an hour (a
+screenshot every 3 seconds, a status every 10 seconds, a task check every 15). Watching a task
+costs far less. The relay remembers a checked sign-in for 60 seconds, so the app's calls use
+about one KV read a minute. Close session tabs you are not using. Workers Paid lifts the limits.
+
+## Security
+
+- The screens can call only the commands listed in `technician-app/src-tauri/src/command_list.rs`.
+  The capability file grants those and event listening, and nothing else: no shell, no file
+  system, no HTTP, no plugin commands. A test holds the list, the handler and the capability to one
+  another. The content security policy is `default-src 'self'; img-src 'self' data:; connect-src
+  ipc: http://ipc.localhost` and the web view cannot navigate away from the app's own screens or
+  open another window.
+- Every relay call is made by the Rust core, which sends no `Origin` header (the relay refuses
+  one). The screens reach only the routes and MCP tools the app uses (`relay.rs`), none of which
+  clicks, types or runs a command.
+- The app holds no secret: it is a public OAuth client, and the relay checks PKCE on every
+  sign-in.
+- Fonts (Barlow Condensed, Atkinson Hyperlegible Next and Mono) are bundled, with their SIL Open
+  Font License texts in `technician-app/src/fonts/` and in the installer under `licenses/`.
+
+## Build and release
+
+```sh
+cd technician-app
+npm ci --ignore-scripts
+npm test                      # the screens
+npm run build                 # the screens into dist/
+cd src-tauri
+cargo test                    # the Rust core
+cd .. && npx tauri build      # the NSIS installer, on Windows
+```
+
+`cargo test` runs on Linux and macOS as well (the Windows-only code, DPAPI and the silent installer,
+sits behind `cfg(windows)` and a trait). Build settings read at compile time:
+`SUPPORT_DEFAULT_RELAY` (the relay address the sign-in form starts with), `SUPPORT_RELEASE_REPO`
+(the GitHub repository to check, `SUKARDADDY/Support-MCP` by default) and, for a test build only,
+`SUPPORT_RELEASE_KEY` (a throwaway public key, so a test release can be signed without the real
+one). The `e2e` cargo feature makes sign-in write its address to the file named by
+`SUPPORT_E2E_AUTHORIZE_FILE` instead of opening a browser; it is never part of a release.
+
+To release: bump the version with `scripts/bump-version.mjs` (it covers the app's `package.json`,
+both entries of its `package-lock.json`, the `[package]` version in `src-tauri/Cargo.toml` and the
+app's entry in `Cargo.lock`), build the installer in CI, then sign it:
+
+```sh
+wl-paste | node scripts/sign-release.mjs --product technician \
+  --file Support_<version>_x64-setup.exe --out release-files
+```
+
+and attach `support-technician-<version>-setup.exe`, `.note` and `.note.sig` to the GitHub
+release. The key goes in on stdin and is never written to disk, as for the PC app.
+
+## How it is tested
+
+- `cargo test` (in `technician-app/src-tauri`): the relay client's handling of 401, 503 and
+  `invalid_grant`, the OAuth flow against a fake relay (registration, PKCE, the loopback
+  listener), the sealed token store, the feed loop, the lock-down (commands, capability, CSP,
+  navigation), and the update check with good and bad notes, wrong keys, sizes and hashes.
+- `npm test` (in `technician-app`): the screens against a stand-in for the core that answers as the
+  relay does.
+- `node e2e/core-check.mjs` runs the real core against a real relay (`wrangler dev`) on any system:
+  sign-in through the actual pages, API and tool calls, the feed, approval and token refresh.
+- The `technician-app` CI job runs all of that on Windows, builds the installer, installs an
+  end-to-end build silently and drives it: Playwright opens the sign-in address the app writes,
+  walks the pages, then attaches to the app's WebView2 through a debug port (opened by a
+  machine policy, because the runner is elevated) and checks that the device list shows the
+  seeded PC, that a pairing code appears, and that a PC asking to join reaches the notification list.
