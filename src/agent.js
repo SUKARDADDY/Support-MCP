@@ -6,6 +6,7 @@
 //
 // Errors are TeamError, whose message is safe to show to the caller.
 import { randomToken } from './crypto.js';
+import { assertSecondFactor } from './oauth.js';
 import { sessionWatch } from './device-sessions.js';
 import { TeamError, normalizeIdentity, teamFromEnv } from './workspace.js';
 import { ID_RE, devicesFromEnv, newId } from './devices.js';
@@ -38,11 +39,22 @@ export function agentService(env, { origin = '', devTtlMs = 0 } = {}) {
   const taskObject = (slug, id) => object(`task:${slug}:${id}`);
 
   // The caller is a real member (open mode never counts) and holds `permission`.
-  async function member(slug, actor, permission) {
+  // `oauthCaller` is an OAuth caller's { userId, email, factor } (the technician app):
+  // then a permission that needs a second factor needs the one their grant was made
+  // with, as it does on an MCP tool call.
+  async function member(slug, actor, permission, oauthCaller = null) {
     const a = await team.authorize(slug, actor, permission, { membersOnly: true });
-    if (a.ok) return;
-    if (a.reason === 'not_member') throw new TeamError(403, 'not_member', 'you are not a member of this team');
-    throw new TeamError(403, 'permission_denied', `your role does not allow ${permission}`);
+    if (!a.ok) {
+      if (a.reason === 'not_member') throw new TeamError(403, 'not_member', 'you are not a member of this team');
+      throw new TeamError(403, 'permission_denied', `your role does not allow ${permission}`);
+    }
+    if (oauthCaller) {
+      try {
+        await assertSecondFactor(env, oauthCaller, permission);
+      } catch (e) {
+        throw new TeamError(403, 'second_factor', e.message);
+      }
+    }
   }
 
   const taskId = (v) => {

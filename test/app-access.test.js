@@ -8,6 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { appWorld, skip, BOSS, TECH, VIEW, HOST, JSON_HEADERS, unesc } from './app-world.js';
+import { oai } from './agent-fakes.js';
 import { appResourceUrl, challengeHeader, resourceTarget, resourceUrl, workspaceForAppResource } from '../src/oauth.js';
 
 const it = (name, fn) => test(name, { skip }, fn);
@@ -221,4 +222,183 @@ it('500 workspaces: an app authorize or token request builds its own small serve
   t0 = performance.now();
   assert.equal((await w.appTool(app.access, 'session_list')).status, 200);
   assert.ok(performance.now() - t0 < 400, 'checking the token');
+});
+
+// ---- the team API behind the app -------------------------------------------------------------------
+const shotCall = () => oai.call('screenshot', { display: null });
+const finish = (summary = 'ok') => oai.call('finish', { outcome: 'done', summary });
+const code = (r) => r.body && r.body.error && r.body.error.code;
+
+it('the app reaches the team API under /app/w/<team>/api with its own token, and /api/v1 still takes only Access', async (t) => {
+  const w = await appWorld(t);
+  const pc = await w.addPc({ name: 'Till' });
+  const app = await w.connect(TECH, { app: true });
+  const me = await w.appCall(app.access, 'GET', '/api');
+  assert.equal(me.status, 200);
+  assert.deepEqual([me.body.workspace, me.body.me.identity, me.body.me.role_id], [{ slug: 'default', open: false }, TECH, 'technician']);
+  const list = await w.appCall(app.access, 'GET', '/api/devices');
+  assert.equal(list.status, 200);
+  assert.deepEqual(list.body.devices.map((d) => d.id), [pc.id]);
+  assert.equal((await w.appCall(app.access, 'GET', `/api/devices/${pc.id}`)).body.device.name, 'Till');
+  assert.equal((await w.appCall(app.access, 'GET', '/api/customers')).status, 200);
+  assert.equal((await w.appCall(app.access, 'GET', '/api/sites')).status, 200);
+  assert.equal((await w.appCall(app.access, 'GET', '/api/fields')).status, 200);
+  assert.equal((await w.appCall(app.access, 'GET', '/api/pairing')).status, 200);
+  assert.equal((await w.appCall(app.access, 'GET', '/api/agent/tasks')).status, 200);
+  // A paged list keeps its query through the rewrite.
+  assert.equal((await w.appCall(app.access, 'GET', '/api/devices?status=pending')).body.devices.length, 0);
+  assert.equal((await w.appCall(app.access, 'GET', '/api/devices?status=nope')).status, 400);
+  // The Access-only team API takes no bearer, an app token included.
+  const old = await w.send('/api/v1/w/default/devices', { headers: { authorization: `Bearer ${app.access}` } });
+  assert.equal(old.status, 403);
+  assert.equal((await w.send('/api/v1/w', { headers: { authorization: `Bearer ${app.access}` } })).status, 403);
+});
+
+it('the app\'s team API is an allowlist: members, roles, the log, stop, and the agent\'s settings and models answer 404, even for an admin', async (t) => {
+  const w = await appWorld(t);
+  const admin = await w.connect(BOSS, { app: true });
+  assert.equal(admin.tokens.status, 200);
+  assert.equal((await w.appCall(admin.access, 'GET', '/api')).body.me.role_id, 'admin');
+  const gone = [
+    ['GET', '/api/members'], ['POST', '/api/members', { identity: 'x@example.com', role_id: 'viewer' }], ['PATCH', `/api/members/${TECH}`, { role_id: 'viewer' }], ['DELETE', `/api/members/${TECH}`],
+    ['GET', '/api/roles'], ['POST', '/api/roles', { id: 'x', permissions: [] }], ['DELETE', '/api/roles/viewer'],
+    ['GET', '/api/audit'], ['GET', '/api/stop'], ['POST', '/api/stop', {}], ['DELETE', '/api/stop'],
+    ['GET', '/api/agent'], ['PATCH', '/api/agent', { mode: 'agent' }], ['POST', '/api/agent/models', { provider: 'openai', id: 'gpt-x' }], ['DELETE', '/api/agent/models/openai/gpt-x'],
+    ['POST', '/api/fields', { entity: 'device', label: 'x' }], ['PATCH', '/api/fields/aaaaaaaaaaaaaaaaaaaa', { label: 'x' }], ['DELETE', '/api/fields/aaaaaaaaaaaaaaaaaaaa'],
+    ['GET', '/api/nowhere'],
+  ];
+  for (const [method, path, body] of gone) {
+    const r = await w.appCall(admin.access, method, path, body ?? (method === 'GET' ? undefined : {}));
+    assert.equal(r.status, 404, `${method} ${path}`);
+    assert.equal(code(r), 'not_found', `${method} ${path}`);
+  }
+  assert.equal(w.sql("SELECT COUNT(*) AS n FROM members WHERE workspace = 'default'")[0].n, 4, 'nobody was added or removed');
+  assert.equal(w.sql('SELECT COUNT(*) AS n FROM agent_settings')[0].n, 0, 'the agent\'s settings were not touched');
+  assert.equal((await w.appCall(admin.access, 'GET', '/api/agent/tasks')).status, 200, 'the tasks routes are open');
+});
+
+it('/app/w/<team>/teams lists the person\'s teams, and the app never serves a person who is not a member of this one', async (t) => {
+  const w = await appWorld(t);
+  w.db.sqlite.prepare("INSERT INTO workspaces(slug, name, created_by, created_at) VALUES ('acme', 'Acme Support', ?, 1)").run(BOSS);
+  w.db.sqlite.prepare("INSERT INTO members(workspace, identity, kind, name, role_id, added_at, added_by) VALUES ('acme', ?, 'person', NULL, 'viewer', 1, 'test')").run(TECH);
+  const app = await w.connect(TECH, { app: true });
+  const teams = await w.appCall(app.access, 'GET', '/teams');
+  assert.equal(teams.status, 200);
+  assert.deepEqual(teams.body, { teams: [{ slug: 'acme', name: 'Acme Support' }, { slug: 'default', name: 'Default' }] });
+  assert.equal((await w.appCall(app.access, 'POST', '/teams', {})).status, 405);
+  // Left this team: the token stops working here (403), while the account may live on in another.
+  w.db.sqlite.prepare("DELETE FROM members WHERE workspace = 'default' AND identity = ?").run(TECH);
+  for (const path of ['/teams', '/api', '/api/devices']) {
+    const r = await w.appCall(app.access, 'GET', path);
+    assert.equal(r.status, 403, path);
+    assert.equal(code(r), 'not_member', path);
+  }
+});
+
+it('the app is for members only: no sign-in in an open team, and a team that becomes open serves nobody', async (t) => {
+  const open = await appWorld(t, { members: false });
+  const none = await open.connect(TECH, { app: true, factor: false });
+  assert.notEqual(none.status, 200, 'no consent page: the team has no members');
+  assert.equal(none.access, undefined);
+
+  const w = await appWorld(t);
+  const app = await w.connect(TECH, { app: true });
+  assert.equal((await w.appCall(app.access, 'GET', '/api/devices')).status, 200);
+  w.db.sqlite.prepare("DELETE FROM members WHERE workspace = 'default'").run();
+  for (const path of ['/api', '/api/devices', '/api/agent/tasks', '/teams']) {
+    const r = await w.appCall(app.access, 'GET', path);
+    assert.equal(r.status, 403, path);
+    assert.equal(code(r), 'not_member', path);
+  }
+  assert.equal(w.sql('SELECT COUNT(*) AS n FROM callers')[0].n, 0, 'open mode did not record the app caller');
+});
+
+it('the second factor: pairing, starting a task and stopping one are refused through /app once the grant\'s authenticator is gone, and reads still work', async (t) => {
+  const w = await appWorld(t);
+  await w.ready();
+  const pc = await w.addPc({ access: 'any' });
+  const mine = await w.startOnPc(BOSS, {}, { pc });
+  const app = await w.connect(TECH, { app: true, factor: true });
+
+  // With the authenticator in place the same calls work.
+  const paired = await w.appCall(app.access, 'POST', '/api/pairing', {});
+  assert.equal(paired.status, 201, JSON.stringify(paired.body));
+  assert.match(paired.body.pairing.link, /\/install\?code=/);
+
+  w.loseFactor(app.userId);
+  const refused = [
+    ['POST', '/api/pairing', {}],
+    ['DELETE', `/api/pairing/${paired.body.pairing.id}`, {}],
+    ['PATCH', `/api/devices/${pc.id}`, { name: 'Renamed' }],
+    ['DELETE', `/api/devices/${pc.id}`, {}],
+    ['POST', '/api/customers', { name: 'Acme' }],
+    ['POST', '/api/agent/tasks', { device_id: pc.id, instructions: 'fix it' }],
+    ['POST', `/api/agent/tasks/${mine.id}/stop`, {}],
+    ['POST', `/api/agent/tasks/${mine.id}/pause`, {}],
+  ];
+  for (const [method, path, body] of refused) {
+    const r = await w.appCall(app.access, method, path, body);
+    assert.equal(r.status, 403, `${method} ${path}`);
+    assert.equal(code(r), 'second_factor', `${method} ${path}: ${JSON.stringify(r.body)}`);
+  }
+  assert.equal(w.taskRow(mine.id).state, 'running', 'the task was not stopped');
+  assert.equal(w.sql('SELECT COUNT(*) AS n FROM agent_tasks')[0].n, 1, 'no task was started');
+  assert.equal(w.sql('SELECT name FROM devices WHERE id = ?', pc.id)[0].name, 'Till');
+  // What needs no second factor still works.
+  for (const path of ['/api', '/api/devices', '/api/customers', '/api/agent/tasks', `/api/agent/tasks/${mine.id}`]) {
+    assert.equal((await w.appCall(app.access, 'GET', path)).status, 200, path);
+  }
+  // The MCP tools over the app's address are held to the same rule.
+  assert.match((await w.appTool(app.access, 'agent_start', { device_id: pc.id, instructions: 'x' })).error, /second factor is required/);
+});
+
+it('a Viewer is refused every change through /app, with the role and not the factor as the reason', async (t) => {
+  const w = await appWorld(t);
+  await w.ready();
+  const pc = await w.addPc({ access: 'any' });
+  const app = await w.connect(VIEW, { app: true, factor: false });
+  assert.equal(app.tokens.status, 200);
+  for (const [method, path, body] of [
+    ['POST', '/api/pairing', {}], ['PATCH', `/api/devices/${pc.id}`, { name: 'x' }], ['POST', '/api/agent/tasks', { device_id: pc.id, instructions: 'x' }],
+  ]) {
+    const r = await w.appCall(app.access, method, path, body);
+    assert.equal(r.status, 403, `${method} ${path}`);
+    assert.equal(code(r), 'permission_denied', `${method} ${path}`);
+  }
+  assert.equal((await w.appCall(app.access, 'GET', '/api/devices')).status, 200);
+  assert.equal((await w.appCall(app.access, 'GET', '/api/agent/tasks')).status, 200);
+});
+
+it('a task started through /app is the app caller\'s: it records the person, and stops when they lose the role or their account', async (t) => {
+  const w = await appWorld(t);
+  await w.ready();
+  const app = await w.connect(TECH, { app: true, factor: true });
+  const start = async (pc) => {
+    const r = await w.appCall(app.access, 'POST', '/api/agent/tasks', { device_id: pc.id, instructions: 'The printer stopped printing.', keep_working: true });
+    assert.equal(r.status, 201, JSON.stringify(r.body));
+    await w.alarm(r.body.task_id); // connect
+    await w.joinPc(pc);
+    return r.body.task_id;
+  };
+  const a = await start(await w.addPc({ access: 'any', name: 'One' }));
+  assert.equal(w.taskRow(a).started_by, TECH);
+  assert.equal(w.taskRow(a).started_by_user, app.userId, 'the person is recorded');
+  assert.equal(w.taskObject(a).ctx.values.get('cfg').user.userId, app.userId);
+
+  // Removed from the team: the next step ends the task.
+  w.fake.queue('openai', shotCall());
+  await w.alarm(a);
+  await w.team.removeMember('default', BOSS, TECH);
+  await w.drive(a);
+  assert.equal(w.taskRow(a).state, 'stopped');
+  assert.match(w.taskRow(a).end_reason, /not a member/);
+
+  // A disabled account, though still a member: an Access-started task would not notice, an app task does.
+  await w.team.addMember('default', BOSS, { identity: TECH, role_id: 'technician' });
+  const b = await start(await w.addPc({ access: 'any', name: 'Two' }));
+  w.db.sqlite.prepare('UPDATE users SET disabled_at = ? WHERE id = ?').run(Date.now(), app.userId);
+  w.fake.queue('openai', shotCall(), finish());
+  await w.drive(b);
+  assert.equal(w.taskRow(b).state, 'stopped');
+  assert.match(w.taskRow(b).end_reason, /not a member/);
 });

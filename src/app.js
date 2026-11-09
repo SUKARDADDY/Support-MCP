@@ -8,7 +8,7 @@ import { verifyAccessJwt, jwksKeyResolver, localBypassAllowed, callerIdentity } 
 import { handleRpc, parseToolOptions } from './mcp.js';
 import { VERSION } from './version.js';
 import { permissionForTool } from './permissions.js';
-import { DEFAULT_WORKSPACE, teamFromEnv } from './workspace.js';
+import { DEFAULT_WORKSPACE, TeamError, teamFromEnv } from './workspace.js';
 import { registryName } from './registry.js';
 import { fail, handleApi } from './api.js';
 import { handleDevice } from './device-api.js';
@@ -684,7 +684,24 @@ async function runMcp(request, env, url, origin, devTtlMs, workspace, actor, oau
 // ---- the technician app: /app/w/<slug>/... -------------------------------------
 // Routes behind one gate. The gate is stricter than /mcp's: a bearer token for this
 // workspace's app address and nothing else (no Access login, and an MCP client's
-// token is refused), no Origin header, and JSON on every write.
+// token is refused), no Origin header, and JSON on every write. Past the gate,
+//   /mcp     the same tools as /mcp, with the same checks for an OAuth caller
+//   /api/... the team API, limited to the routes the app uses (src/api.js)
+//   /teams   the teams the person belongs to
+// and every route but /mcp first checks that the person is still a member.
+
+// The person behind an app token is still enabled and invited somewhere, and a
+// real member of this workspace (open mode never counts for the app).
+async function assertAppMember(env, team, workspace, caller) {
+  try {
+    await assertPersonActive(env, team, caller);
+  } catch (e) {
+    if (e.message !== 'you are not a member of this team') throw new TeamError(503, 'unavailable', 'try again');
+    throw new TeamError(403, 'not_member', e.message);
+  }
+  if (!(await team.getMember(workspace, caller.email))) throw new TeamError(403, 'not_member', 'you are not a member of this team');
+}
+
 async function handleApp(request, env, url, origin, devTtlMs, workspace, rest, oauth) {
   if (request.headers.has('origin')) return fail(403, 'forbidden', 'cross-site requests are refused');
   const oauthOn = oauth ? oauth.available(env, url) : null;
@@ -701,7 +718,26 @@ async function handleApp(request, env, url, origin, devTtlMs, workspace, rest, o
     if (request.method !== 'POST') return json({ error: 'method not allowed' }, 405, { allow: 'POST' });
     return runMcp(request, env, url, origin, devTtlMs, workspace, caller.email, caller);
   }
-  return fail(404, 'not_found', 'not found');
+  try {
+    const team = teamFromEnv(env);
+    if (rest === '/api' || rest.startsWith('/api/')) {
+      await assertAppMember(env, team, workspace, caller);
+      // The team API router serves the same paths as /api/v1/w/<slug>/..., limited to
+      // the routes the app uses. It checks the caller's role, second factor and person.
+      const inner = new URL(url);
+      inner.pathname = `/api/v1/w/${workspace}${rest.slice('/api'.length)}`;
+      return await handleApi(request, env, inner, { accessCaller, isJsonContentType, origin, app: { caller } });
+    }
+    if (rest === '/teams') {
+      if (request.method !== 'GET') return fail(405, 'method_not_allowed', 'use GET', { allow: 'GET' });
+      await assertAppMember(env, team, workspace, caller);
+      return json({ teams: (await team.memberships(caller.email)).map(({ slug, name }) => ({ slug, name })) }, 200, noStore);
+    }
+    throw new TeamError(404, 'not_found', 'not found');
+  } catch (e) {
+    if (e instanceof TeamError) return fail(e.status, e.code, e.message, e.status === 503 ? { 'retry-after': '1' } : undefined);
+    return fail(500, 'internal', 'internal error');
+  }
 }
 
 // An OAuth route that cannot reach the database or KV answers 503, not a crash.
