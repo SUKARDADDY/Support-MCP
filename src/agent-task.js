@@ -52,6 +52,11 @@ const UNKNOWN_OUTCOME = 'outcome unknown; take a screenshot';
 // task ends as failed when it has thrown this many times in a row.
 const STEP_ERROR_BACKOFF_MS = [5000, 10000, 20000, 40000];
 const STEP_ERRORS_MAX = 5;
+// A saved-PC session that cannot be confirmed ended is tried again after these waits (the
+// last one repeats). After this many tries, about 75 minutes, the task gives up: the
+// session ends by its own time limit.
+const CLEANUP_BACKOFF_MS = [5000, 10000, 20000, 40000, 80000, 160000, 300000];
+const CLEANUP_TRIES_MAX = 20;
 const SESSION_FAILS_MAX = 3;
 const NUDGE_TEXT = 'Call a tool, or call finish.';
 const EXTRA_CALL = 'Only one tool call per reply. This one was not run.';
@@ -204,7 +209,7 @@ export class AgentTask {
   async doStatus(url) {
     const wait = Math.max(0, Math.min(WAIT_MAX_MS, (Number(url.searchParams.get('wait_s')) || 0) * 1000));
     this.st.last_read_at = Date.now();
-    if (wait > 0 && !this.st.done) {
+    if (wait > 0 && !this.st.done && !this.st.ending) {
       this.watchers += 1;
       try {
         await this.untilChange(wait);
@@ -256,22 +261,59 @@ export class AgentTask {
   // The task is over (its row says so). End the saved-PC session it opened, charge a
   // reservation nobody settled, and stop for good. Safe to run twice. The session ends only
   // while the starter still drives it: the Session refuses otherwise, because the session
-  // is then someone else's and the task may not have noticed yet.
+  // is then someone else's and the task may not have noticed yet. The task is done only
+  // once the session is confirmed ended or is someone else's. Until then an alarm tries
+  // again with a growing wait, and gives up after CLEANUP_TRIES_MAX tries.
   async cleanup() {
-    const { workspace, task_id: id, starter } = this.cfg;
+    const { workspace, task_id: id } = this.cfg;
     const st = this.st;
-    if (st.opened && st.sid && !st.closed) {
-      await deviceHooks(this.env).endSession(workspace, st.sid, undefined, starter, { expectDriver: starter });
-      st.closed = true;
-    }
+    st.ending = true;
+    const released = await this.releaseSession();
     await this.store.chargeUnsettled(workspace, id);
-    st.done = true;
     st.phase = 'ended';
     this.conv = null;
     this.owed = [];
+    if (!released) {
+      st.cleanup_tries = (st.cleanup_tries ?? 0) + 1;
+      if (st.cleanup_tries < CLEANUP_TRIES_MAX) {
+        await this.save();
+        await this.rearm(CLEANUP_BACKOFF_MS[Math.min(st.cleanup_tries - 1, CLEANUP_BACKOFF_MS.length - 1)]);
+        this.bump();
+        return;
+      }
+      const note = 'could not confirm that the PC\'s session was ended; it ends by itself when its time runs out';
+      st.closed = true;
+      st.notes.push({ ts: Date.now(), text: note });
+      this.addStep('cleanup', note, false);
+    }
+    st.done = true;
     await this.ctx.storage.deleteAlarm();
     await this.save();
     this.bump();
+  }
+
+  // End the saved-PC session the task made. True when none of it is left to end: it is
+  // ended or gone, or another person drives it now and it is theirs. False when that could
+  // not be confirmed (the Session or the database did not answer).
+  async releaseSession() {
+    const { workspace, starter } = this.cfg;
+    const st = this.st;
+    if (st.closed) return true;
+    let sid = st.opened ? st.sid : null;
+    if (!st.sid && st.connecting) {
+      // An earlier try died after the relay made the session and before this object saved
+      // it: find it the way the next step would, so it is not left attached and occupied.
+      try {
+        sid = await this.findAdoptable();
+      } catch (_) {
+        return false;
+      }
+    }
+    if (!sid) return true;
+    const ended = await deviceHooks(this.env).endSession(workspace, sid, undefined, starter, { expectDriver: starter });
+    if (ended === null) return false;
+    st.closed = true;
+    return true;
   }
 
   // leave: the session is someone else's now (they took it over): do not end it.
@@ -286,6 +328,8 @@ export class AgentTask {
   async alarm() {
     await this.load();
     if (!this.cfg || this.st.done) return;
+    // The task is over and only its session is left to end: the row is the truth, so no step.
+    if (this.st.ending) return this.cleanup();
     this.busy = true;
     try {
       await this.step();
@@ -300,7 +344,7 @@ export class AgentTask {
       this.busy = false;
     }
     // A stop, pause or resume that came in during the step is carried out now.
-    if (this.wakePending && !this.st.done) {
+    if (this.wakePending && !this.st.done && !this.st.ending) {
       this.wakePending = false;
       await this.rearm(0);
     }
@@ -434,7 +478,12 @@ export class AgentTask {
       let out = null;
       try { out = JSON.parse(res.content[0].text); } catch (_) { /* an error answer is plain text */ }
       this.fail('afterConnect');
-      if (res.isError || !out?.session_id) return { end: ['failed', `could not connect to the PC: ${clip(res.content?.[0]?.text, 200)}`] };
+      if (res.isError) {
+        // The connect was refused, so it made no session: whatever is on the PC is not ours to end.
+        st.connecting = false;
+        return { end: ['failed', `could not connect to the PC: ${clip(res.content?.[0]?.text, 200)}`] };
+      }
+      if (!out?.session_id) return { end: ['failed', `could not connect to the PC: ${clip(res.content?.[0]?.text, 200)}`] };
       return this.attach(out.session_id);
     }
     const seen = await this.watched();
@@ -464,14 +513,19 @@ export class AgentTask {
     return { later: WAIT_POLL_MS };
   }
 
-  // The live session on the task's PC that the starter drives, or null.
-  async adoptable() {
+  // The live session on the task's PC that the starter drives, or null. Throws when the
+  // lookup fails, which is not the same as there being none.
+  async findAdoptable() {
     const { cfg } = this;
+    const pointer = await devicesFromEnv(this.env).liveSession(cfg.workspace, cfg.device_id);
+    if (!pointer || normalizeIdentity(pointer.by) !== cfg.starter) return null;
+    const watch = await this.readWatch(pointer.id);
+    return ['waiting', 'attached'].includes(watch.state) && watch.device_id === cfg.device_id && normalizeIdentity(watch.driver) === cfg.starter ? pointer.id : null;
+  }
+
+  async adoptable() {
     try {
-      const pointer = await devicesFromEnv(this.env).liveSession(cfg.workspace, cfg.device_id);
-      if (!pointer || normalizeIdentity(pointer.by) !== cfg.starter) return null;
-      const watch = await this.readWatch(pointer.id);
-      return ['waiting', 'attached'].includes(watch.state) && watch.device_id === cfg.device_id && normalizeIdentity(watch.driver) === cfg.starter ? pointer.id : null;
+      return await this.findAdoptable();
     } catch (_) {
       return null;
     }

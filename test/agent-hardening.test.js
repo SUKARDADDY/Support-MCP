@@ -485,3 +485,128 @@ test('a stop whose cleanup cannot reach the database leaves an alarm to finish t
   await w.drive(a.id);
   assert.equal(w.taskObject(a.id).ctx.values.get('st').done, true);
 });
+
+// ---- 16: an end that is not confirmed is not an end ------------------------------------------------------------------------
+test('a stop whose /end cannot reach the session leaves the task cleaning up, and the next alarm ends the session', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const a = await w.startOnPc(BOSS);
+  w.fake.queue('openai', shotCall(), shotCall(), finish());
+  await w.alarm(a.id);
+  const sid = w.taskRow(a.id).sid;
+  assert.equal(w.stateOf(sid), 'attached');
+  w.hooks.endFails = 1;
+  assert.equal((await w.tool(BOSS, 'agent_control', { task_id: a.id, action: 'stop' })).state, 'stopped');
+  const st = () => w.taskObject(a.id).ctx.values.get('st');
+  assert.equal(st().done, false, 'the end was not confirmed');
+  assert.equal(w.stateOf(sid), 'attached');
+  assert.equal(w.taskObject(a.id).ctx.alarm(), w.now() + 5000, 'an alarm is left to try again');
+  assert.equal(w.taskRow(a.id).state, 'stopped', 'the row keeps the decision');
+  await w.drive(a.id);
+  assert.equal(st().done, true);
+  assert.equal(w.stateOf(sid), 'ended');
+});
+
+test('an end that never gets through is tried a bounded number of times, then the task gives up and says so', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const a = await w.startOnPc(BOSS);
+  w.fake.queue('openai', shotCall(), shotCall(), finish());
+  await w.alarm(a.id);
+  const sid = w.taskRow(a.id).sid;
+  w.hooks.endFails = Infinity;
+  await w.tool(BOSS, 'agent_control', { task_id: a.id, action: 'stop' });
+  const ends = () => w.sessionCalls.filter((c) => c.path === '/end' && c.sid === sid).length;
+  await w.drive(a.id);
+  const o = w.taskObject(a.id);
+  assert.equal(o.ctx.values.get('st').done, true);
+  assert.equal(o.ctx.alarm(), null);
+  assert.match(o.ctx.values.get('st').notes.at(-1).text, /could not confirm/);
+  assert.equal(ends(), 0, 'every try failed before it reached the session');
+  assert.equal(o.ctx.values.get('st').cleanup_tries, 20);
+  w.hooks.endFails = 0;
+  assert.equal(w.stateOf(sid), 'attached', 'the session is left to end by its own time limit');
+});
+
+test('a stop after a crash between device_connect and the save ends the session that was made', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const pc = await w.addPc({ access: 'any', name: 'Till' });
+  const out = await w.tool(BOSS, 'agent_start', { device_id: pc.id, instructions: 'Fix it.', keep_working: true });
+  w.hooks.fail = (point) => { if (point === 'afterConnect') throw new Error('crash'); };
+  await assert.rejects(w.alarm(out.task_id), /crash/);
+  w.hooks.fail = null;
+  const made = w.pointer(pc.id);
+  assert.equal(w.taskRow(out.task_id).sid, null);
+  w.restart(out.task_id);
+  assert.equal((await w.tool(BOSS, 'agent_control', { task_id: out.task_id, action: 'stop' })).state, 'stopped');
+  assert.equal(w.taskObject(out.task_id).ctx.values.get('st').done, true);
+  assert.notEqual(w.stateOf(made.id), 'waiting', 'the session the connect made is not left occupying the PC');
+  assert.equal(w.stateOf(made.id), 'ended');
+});
+
+test('that stop keeps cleaning up when the lookup of the session fails, and ends it once the lookup works', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const pc = await w.addPc({ access: 'any', name: 'Till' });
+  const out = await w.tool(BOSS, 'agent_start', { device_id: pc.id, instructions: 'Fix it.', keep_working: true });
+  w.hooks.fail = (point) => { if (point === 'afterConnect') throw new Error('crash'); };
+  await assert.rejects(w.alarm(out.task_id), /crash/);
+  w.hooks.fail = null;
+  const made = w.pointer(pc.id);
+  const realPrepare = w.db.prepare;
+  w.db.prepare = (sql) => {
+    if (/SELECT session FROM devices/.test(sql)) throw new Error('D1_ERROR: database is busy');
+    return realPrepare(sql);
+  };
+  await w.tool(BOSS, 'agent_control', { task_id: out.task_id, action: 'stop' });
+  const o = w.taskObject(out.task_id);
+  assert.equal(o.ctx.values.get('st')?.done, false);
+  assert.equal(o.ctx.alarm(), w.now() + 5000);
+  assert.equal(w.stateOf(made.id), 'waiting');
+  w.db.prepare = realPrepare;
+  await w.drive(out.task_id);
+  assert.equal(o.ctx.values.get('st').done, true);
+  assert.equal(w.stateOf(made.id), 'ended');
+});
+
+test('a stop after that crash leaves a session someone else took over, and the starter\'s own earlier session when the connect was refused', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const pc = await w.addPc({ access: 'any', name: 'Till' });
+  const out = await w.tool(BOSS, 'agent_start', { device_id: pc.id, instructions: 'Fix it.', keep_working: true });
+  w.hooks.fail = (point) => { if (point === 'afterConnect') throw new Error('crash'); };
+  await assert.rejects(w.alarm(out.task_id), /crash/);
+  w.hooks.fail = null;
+  await w.tool(LEAD, 'device_connect', { device_id: pc.id, take_over: true });
+  const lead = w.pointer(pc.id).id;
+  await w.tool(BOSS, 'agent_control', { task_id: out.task_id, action: 'stop' });
+  assert.equal(w.taskObject(out.task_id).ctx.values.get('st').done, true);
+  assert.equal(w.stateOf(lead), 'waiting', 'LEAD\'s session is untouched');
+
+  // The starter already has a session of their own on a PC: the connect is refused, and that
+  // session is not the task's to end.
+  const pc2 = await w.addPc({ access: 'any', name: 'Desk' });
+  const own = (await w.tool(BOSS, 'device_connect', { device_id: pc2.id })).session_id;
+  const b = await w.tool(BOSS, 'agent_start', { device_id: pc2.id, instructions: 'Fix it.', keep_working: true });
+  await w.drive(b.task_id);
+  assert.equal(w.taskRow(b.task_id).state, 'failed');
+  assert.match(w.taskRow(b.task_id).end_reason, /^could not connect to the PC: /);
+  assert.equal(w.taskObject(b.task_id).ctx.values.get('st').done, true);
+  assert.equal(w.stateOf(own), 'waiting', 'the starter\'s own session is still there');
+});
+
+// ---- F1: the operator's stop refuses a new task ------------------------------------------------------------------------
+test('with EMERGENCY_STOP set, the team API and agent_start both refuse to start a task, and none is made', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const pc = await w.addPc({ access: 'any', name: 'Till' });
+  w.env.EMERGENCY_STOP = '1';
+  const rest = await w.api(BOSS, 'POST', '/agent/tasks', { device_id: pc.id, instructions: 'Fix it.' });
+  assert.equal(rest.status, 503);
+  assert.deepEqual(rest.body.error, { code: 'relay_stopped', message: 'this relay is stopped by its operator' });
+  assert.match((await w.tool(BOSS, 'agent_start', { device_id: pc.id, instructions: 'Fix it.' })).error, /this relay is stopped by its operator/);
+  assert.equal(w.sql('SELECT COUNT(*) AS n FROM agent_tasks')[0].n, 0);
+  w.env.EMERGENCY_STOP = '';
+  assert.equal((await w.api(BOSS, 'POST', '/agent/tasks', { device_id: pc.id, instructions: 'Fix it.' })).status, 201);
+});

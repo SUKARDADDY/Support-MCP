@@ -50,7 +50,21 @@ export async function agentWorld(t, opts = {}) {
   const w = await world(t, opts);
   const fake = fakeProviders();
   const objects = new Map(); // object name -> { ctx, task }
-  const hooks = { fail: null, tool: null };
+  // endFails: how many of the next /end calls to a Session fail as if it were out of reach.
+  const hooks = { fail: null, tool: null, endFails: 0 };
+  const realGet = w.env.SESSION.get;
+  w.env.SESSION.get = (id) => {
+    const stub = realGet(id);
+    return {
+      fetch: async (u, init) => {
+        if (hooks.endFails > 0 && new URL(typeof u === 'string' ? u : u.url).pathname === '/end') {
+          hooks.endFails -= 1;
+          throw new Error('the session is out of reach');
+        }
+        return stub.fetch(u, init);
+      },
+    };
+  };
   const tuning = { fetch: fake.fetch, fail: (point) => hooks.fail?.(point), get tool() { return hooks.tool ?? undefined; } };
   const objectFor = (name) => {
     if (!objects.has(name)) {

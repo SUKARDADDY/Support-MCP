@@ -1459,7 +1459,10 @@ first step connects to the PC with the `device_connect` path as the starter (a P
 to ask still asks), or uses the given session, whose driver must be the starter or
 nobody. The connect is recorded before it is made; if the object died after the relay
 made the session and before it saved it, the next step takes up the live session on
-that PC whose driver is the starter instead of connecting again.
+that PC whose driver is the starter instead of connecting again, and an end of the task
+before that step ends it. A refused connect made no session, so nothing is adopted or
+ended after one. While `EMERGENCY_STOP` is set, `POST .../agent/tasks` answers 503
+`relay_stopped` and makes no task, as `agent_start` refuses.
 
 Each alarm runs one step:
 
@@ -1528,7 +1531,12 @@ object so it records them, and `wait_s` (up to 25) holds a read until something 
 A task ends the saved-PC session it opened when it finishes, stops or fails, and leaves a
 session it was given. The Session object enforces the exception: the task asks it to end
 the session only while the starter is still the driver, so a session someone else took
-over, even one the task has not noticed yet, stays open.
+over, even one the task has not noticed yet, stays open. The task counts as cleaned up
+only when the Session confirms the end, says it is already over, or says another person
+drives it. If the Session or the database cannot be reached, the task row keeps its
+stopped, done or failed state and the object keeps an alarm that tries again after 5, 10,
+20, 40, 80, 160 and then 300 seconds. After 20 tries (about 75 minutes) it gives up, adds
+a note to the task, and leaves the session to end at its own time limit.
 
 ### Providers
 

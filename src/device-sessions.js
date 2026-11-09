@@ -104,11 +104,12 @@ export function deviceHooks(env, { devTtlMs = 0 } = {}) {
     // End a session by the team's hand. Best effort. expectDriver: end it only while that
     // person still drives it (the built-in agent's own session). Returns true when the
     // session was ended or already over, false when another driver holds it, null when
-    // the Session could not be reached.
+    // the Session could not be reached or did not say.
     async endSession(slug, sid, reason, actor, { expectDriver = null } = {}) {
       try {
         const r = await post(session(sid), '/end', { actor, workspace: slug, reason, ...(expectDriver ? { expect_driver: expectDriver } : {}) });
-        return (await r.json()).ended !== false;
+        const { ended } = await r.json();
+        if (typeof ended === 'boolean') return ended;
       } catch (_) { /* the Session object clears its own pointer when it ends */ }
       return null;
     },
