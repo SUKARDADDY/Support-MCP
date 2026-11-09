@@ -378,11 +378,11 @@ test('the Session\'s watch route reports its state, driver and who has commanded
   const pc = await w.addPc({ access: 'any' });
   const { sid } = await w.attach(pc, TECH);
   const watch = async (query = 'workspace=default') => (await (await w.env.SESSION.get(w.env.SESSION.idFromString(sid)).fetch(`https://do/watch?${query}`)).json());
-  assert.deepEqual(await watch(), { state: 'attached', created_at: w.now(), ended_reason: null, device_id: pc.id, driver: TECH, actors: [] });
+  assert.deepEqual(await watch(), { state: 'attached', opened_by_task: null, ended_reason: null, device_id: pc.id, driver: TECH, actors: [] });
   assert.deepEqual(await watch('workspace=acme'), { state: 'unknown', actors: [] });
   const link = await w.tool(BOSS, 'session_create', {});
   const linkWatch = async () => (await (await w.env.SESSION.get(w.env.SESSION.idFromString(link.session_id)).fetch('https://do/watch?workspace=default')).json());
-  assert.deepEqual(await linkWatch(), { state: 'pending', created_at: w.now(), ended_reason: null, device_id: null, driver: null, actors: [] });
+  assert.deepEqual(await linkWatch(), { state: 'pending', opened_by_task: null, ended_reason: null, device_id: null, driver: null, actors: [] });
   await w.tool(BOSS, 'run', { session_id: link.session_id, command: 'x' }); // refused: nothing attached, but it was a command
   await w.tool(TECH, 'run', { session_id: link.session_id, command: 'x' });
   assert.deepEqual((await linkWatch()).actors.map((x) => x.actor).sort(), [BOSS, TECH]);

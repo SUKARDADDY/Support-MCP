@@ -1108,7 +1108,7 @@ session and connect again, so the person at the PC is asked.
 The Session writes its log row as `[<actor> via agent] <detail>`, and the actor stays the
 person who started the task for the driver check. The Session also keeps the last 10 people
 who sent it a command (past the driver check) with the time, and `GET /watch?workspace=`
-(internal, for the agent task) answers `{state, ended_reason, device_id, driver, actors}`, or
+(internal, for the agent task) answers `{state, opened_by_task, ended_reason, device_id, driver, actors}`, or
 `{state: "unknown", actors: []}` for another workspace's call. A task ends when a person other
 than its starter appears there on a session with no driver.
 
@@ -1457,12 +1457,16 @@ create the task row and the task object. The row is inserted under a guard that 
 other task is live on the same PC or session, so two starts at once make one task. The
 first step connects to the PC with the `device_connect` path as the starter (a PC set
 to ask still asks), or uses the given session, whose driver must be the starter or
-nobody. The connect is recorded before it is made; if the object died after the relay
-made the session and before it saved it, the next step takes up the live session on
-that PC whose driver is the starter instead of connecting again, and an end of the task
-before that step ends it. Only a session created by that connect counts (the Session's
-`/watch` answer carries its `created_at`: no earlier than the connect began, no more than
-60 seconds after), and a session found is saved at once, so a retry never ends a later one. A refused connect made no session, so nothing is adopted or
+nobody. The connect is recorded before it is made. The relay writes the task's id on the
+Session that connect makes (`opened_by_task`; the agent's tool path sets it, no tool
+argument can, and the Session's internal `/watch` answer returns it). If the object died
+after the relay made the session and before it saved it, the next step takes up the live
+session on that PC that carries this task's id and that the starter drives, instead of
+connecting again, and an end of the task before that step ends that session. A session
+without the tag is never taken up, however close in time: not one the starter opened by
+hand, not another task's. While the lookup fails the step waits (3 failures in a row end
+the task) and never connects again. A session found is saved at once, so a retry never
+ends another. A refused connect made no session, so nothing is adopted or
 ended after one. While `EMERGENCY_STOP` is set, `POST .../agent/tasks` answers 503
 `relay_stopped` and makes no task, as `agent_start` refuses.
 
@@ -1537,10 +1541,12 @@ over, even one the task has not noticed yet, stays open. The task counts as clea
 only when the Session confirms the end, says it is already over, or says another person
 drives it. If the Session or the database cannot be reached, the task row keeps its
 stopped, done or failed state and the object keeps an alarm that tries again after 5, 10,
-20, 40, 80, 160 and then 300 seconds. After 20 tries (about 75 minutes) it gives up, adds
-a note to the task telling the starter to end the session by hand (`session_end` or the
-PC's End session). An error inside a retry counts as a try and sets the next alarm; one
-cleanup runs at a time.
+20, 40, 80, 160 and then 300 seconds. After 20 tries (about 75 minutes), by either route
+(the session would not confirm, or the cleanup kept throwing), it gives up the same way: it
+adds a note to the task telling the starter to end the session by hand (`session_end` or
+the PC's End session), adds a step, and sets the phase to ended. An error inside a retry
+counts as a try and sets the next alarm. One cleanup runs at a time: a stop, an alarm and a
+step that finds the row ended all wait for the same run.
 
 ### Providers
 

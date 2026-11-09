@@ -706,3 +706,120 @@ test('a stop that arrives while a cleanup retry runs does not start a second cle
   assert.equal(o.ctx.values.get('st').cleanup_tries, 2, 'one try, not two');
   w.hooks.endFails = 0;
 });
+
+// ---- 20: a session is the task's own only if its connect tagged it ------------------------------------------------------------------------
+const tagOf = async (w, sid) => (await watchOf(w, sid)).opened_by_task;
+
+test('the agent\'s connect tags the session with its task, and an MCP client cannot set the tag', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const a = await w.startOnPc(BOSS);
+  assert.equal(await tagOf(w, w.taskRow(a.id).sid), a.id);
+  const pc2 = await w.addPc({ access: 'any', name: 'Desk' });
+  const by = await w.tool(BOSS, 'device_connect', { device_id: pc2.id, opened_by_task: a.id });
+  assert.equal(await tagOf(w, by.session_id), null);
+});
+
+test('after a crash, a lookup that fails once is waited out: the task adopts its own session and does not connect again', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const { pc, id, s1 } = await crashedConnect(w);
+  const realPrepare = w.db.prepare;
+  let failures = 1;
+  w.db.prepare = (sql) => {
+    if (/SELECT session FROM devices/.test(sql) && failures-- > 0) throw new Error('D1_ERROR: database is busy');
+    return realPrepare(sql);
+  };
+  await w.alarm(id);
+  const st = () => w.taskObject(id).ctx.values.get('st');
+  assert.equal(st().sid, null, 'not adopted yet, and no second connect');
+  assert.equal(st().session_fails, 1);
+  assert.equal(w.taskObject(id).ctx.alarm(), w.now() + 10_000);
+  await w.alarm(id);
+  const row = w.taskRow(id);
+  assert.deepEqual([row.state, row.sid, row.opened_session], ['running', s1, 1]);
+  assert.equal(w.sessionCalls.filter((c) => c.path === '/create').length, 1, 'no second session was made');
+  assert.equal(w.pointer(pc.id).id, s1);
+});
+
+test('a task whose cleanup lookup failed does not touch the session a later task made on the same PC', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const { pc, id: t1, s1 } = await crashedConnect(w);
+  const realPrepare = w.db.prepare;
+  w.db.prepare = (sql) => {
+    if (/SELECT session FROM devices/.test(sql)) throw new Error('D1_ERROR: database is busy');
+    return realPrepare(sql);
+  };
+  await w.tool(BOSS, 'agent_control', { task_id: t1, action: 'stop' });
+  w.db.prepare = realPrepare;
+  assert.equal(w.taskObject(t1).ctx.values.get('st').done, false);
+  await w.tool(BOSS, 'session_end', { session_id: s1 });
+  const second = await w.tool(BOSS, 'agent_start', { device_id: pc.id, instructions: 'Again.', keep_working: true });
+  await w.alarm(second.task_id);
+  const s2 = w.pointer(pc.id).id;
+  assert.equal(await tagOf(w, s2), second.task_id);
+  await w.drive(t1);
+  assert.equal(w.taskObject(t1).ctx.values.get('st').done, true);
+  assert.equal(w.stateOf(s2), 'waiting', 'T2\'s session is untouched');
+});
+
+test('a session the starter opens by hand, just after a crashed connect, is neither adopted nor ended', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  // Found by the next step.
+  const a = await crashedConnect(w);
+  await w.tool(BOSS, 'session_end', { session_id: a.s1 });
+  const m1 = (await w.tool(BOSS, 'device_connect', { device_id: a.pc.id })).session_id;
+  await w.drive(a.id);
+  assert.match(w.taskRow(a.id).end_reason, /^could not connect to the PC: /);
+  assert.equal(w.taskObject(a.id).ctx.values.get('st').done, true);
+  assert.equal(w.stateOf(m1), 'waiting');
+  // Found by a stop.
+  const b = await crashedConnect(w);
+  await w.tool(BOSS, 'session_end', { session_id: b.s1 });
+  const m2 = (await w.tool(BOSS, 'device_connect', { device_id: b.pc.id })).session_id;
+  await w.tool(BOSS, 'agent_control', { task_id: b.id, action: 'stop' });
+  assert.equal(w.taskObject(b.id).ctx.values.get('st').done, true);
+  assert.equal(w.stateOf(m2), 'waiting');
+});
+
+// ---- 21: one cleanup at a time, in both orders; one way to give up ------------------------------------------------------------------------
+test('a wake that starts first and an alarm that fires during its read run one cleanup, not two', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const a = await w.startOnPc(BOSS);
+  w.fake.queue('openai', shotCall(), shotCall());
+  await w.alarm(a.id);
+  w.hooks.endFails = Infinity;
+  // The row is ended; the object has not been told yet.
+  await agentStoreFromEnv(w.env).endTask('default', a.id, { state: 'stopped', reason: 'stopped', summary: null, actor: 'relay', steps: 1 });
+  const o = w.taskObject(a.id);
+  const wake = o.task.fetch(new Request('https://do/wake', { method: 'POST' }));
+  o.ctx.fire();
+  const alarm = o.task.alarm();
+  await Promise.all([wake, alarm]);
+  assert.equal(o.ctx.values.get('st').cleanup_tries, 1, 'one try');
+  w.hooks.endFails = 0;
+});
+
+test('a cleanup that fails on the database every time gives up the same way: a note, a step, an ended phase', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const a = await w.startOnPc(BOSS);
+  w.fake.queue('openai', shotCall(), shotCall());
+  await w.alarm(a.id);
+  const realPrepare = w.db.prepare;
+  w.db.prepare = (sql) => {
+    if (/SELECT reserved_microusd AS held/.test(sql)) throw new Error('D1_ERROR: database is busy');
+    return realPrepare(sql);
+  };
+  await w.tool(BOSS, 'agent_control', { task_id: a.id, action: 'stop' });
+  await w.drive(a.id);
+  const o = w.taskObject(a.id);
+  const st = o.ctx.values.get('st');
+  assert.deepEqual([st.done, st.phase, st.cleanup_tries], [true, 'ended', 20]);
+  assert.equal(o.ctx.alarm(), null);
+  assert.match(st.notes.at(-1).text, /end it by hand, with session_end or the PC's End session/);
+  assert.equal(st.steps.at(-1).verb, 'cleanup');
+});

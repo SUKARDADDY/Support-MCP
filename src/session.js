@@ -284,6 +284,8 @@ export class Session {
         workspace, waiting_expires_at: waitingUntil, ttl_ms: this._ttlOverride, machine: null, user: null, ps: null,
         windows_mode: 'app', transport: null, http_generation: 0, http_seen_at: 0, elevated: null, expires_at: null, ws_gen: 0,
         device_id: b.device_id, device_name: truncate(String(b.device_name ?? ''), 100), driver: this.driver,
+        // The built-in agent task whose connect made this session, so a task finds its own after a crash.
+        opened_by_task: typeof b.opened_by_task === 'string' ? truncate(b.opened_by_task, 64) : null,
       });
       this.logRow('created', `device ${b.device_id}`, b.actor);
       await this.ctx.storage.setAlarm(waitingUntil);
@@ -879,10 +881,10 @@ export class Session {
   async doWatch(url) {
     if (await this.otherWorkspace(url.searchParams.get('workspace'))) return Response.json({ state: 'unknown', actors: [] });
     await this.expireIfDue();
-    const s = await this.ctx.storage.get(['state', 'device_id', 'driver', 'ended_reason', 'actors', 'created_at']);
+    const s = await this.ctx.storage.get(['state', 'device_id', 'driver', 'ended_reason', 'actors', 'opened_by_task']);
     return Response.json({
       state: s.get('state') ?? 'unknown',
-      created_at: s.get('created_at') ?? null,
+      opened_by_task: s.get('opened_by_task') ?? null,
       ended_reason: s.get('ended_reason') ?? null,
       device_id: s.get('device_id') ?? null,
       driver: s.get('device_id') ? s.get('driver') ?? null : null,

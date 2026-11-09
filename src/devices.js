@@ -956,7 +956,7 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
           await hooks.discardSession(slug, made.sid);
           made = null;
         }
-        made ??= await hooks.createSession({ slug, actor, device: cur });
+        made ??= await hooks.createSession({ slug, actor, device: cur, openedByTask: caps.openedByTask });
         const pointer = {
           id: made.sid, by: actor, ask, expires_at: now + SESSION_WAIT_MS + SESSION_LIFE_MS, code: made.code, team: await team.workspaceName(slug),
         };

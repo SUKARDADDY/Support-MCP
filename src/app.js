@@ -127,8 +127,9 @@ function installPage(query, hasCode) {
 // Session answers a call from another workspace as it answers for a session
 // that does not exist.
 // via is "agent" when the built-in agent makes the call as its starter: the Session's
-// log row says so, and the actor stays the starter for every check.
-function makeBackend(env, origin, devTtlMs, actor, workspace, via = null) {
+// log row says so, and the actor stays the starter for every check. taskId (agent calls only,
+// never an argument of a tool) is written on a session its device_connect makes.
+function makeBackend(env, origin, devTtlMs, actor, workspace, via = null, taskId = null) {
   const sessionStub = (sid) => {
     if (sid === undefined || sid === null || sid === '') throw new Error('session_id is required; call session_list to find it');
     if (!/^[0-9a-f]{64}$/.test(String(sid))) throw new Error('session_id must be the 64 hex characters from session_create or session_list');
@@ -236,7 +237,7 @@ function makeBackend(env, origin, devTtlMs, actor, workspace, via = null) {
       for (const flag of ['ask', 'take_over']) {
         if (args[flag] !== undefined && typeof args[flag] !== 'boolean') throw new Error(`${flag} must be true or false`);
       }
-      return devicesFromEnv(env, undefined, { devTtlMs }).connect(workspace, actor, { device_id: args.device_id, ask: args.ask, take_over: args.take_over }, caps);
+      return devicesFromEnv(env, undefined, { devTtlMs }).connect(workspace, actor, { device_id: args.device_id, ask: args.ask, take_over: args.take_over }, via === 'agent' && taskId ? { ...caps, openedByTask: taskId } : caps);
     },
     async session_end(args) {
       const r = await sessionStub(args.session_id).fetch('https://do/end', {
@@ -340,8 +341,8 @@ function authorizedBackend(backend, env, actor, toolName, workspace, oauthCaller
 // starter: the same role, workspace stop and operator stop checks, members only,
 // and the starter's account checked when they signed in with OAuth. The Session's
 // log row is marked "agent". Returns the tool's MCP result, { content, isError }.
-export async function runAgentTool(env, { origin, devTtlMs = 0, starter, person = null, workspace }, name, args) {
-  const backend = authorizedBackend(makeBackend(env, origin, devTtlMs, starter, workspace, 'agent'), env, starter, name, workspace, null, { person, membersOnly: true });
+export async function runAgentTool(env, { origin, devTtlMs = 0, starter, person = null, workspace, taskId = null }, name, args) {
+  const backend = authorizedBackend(makeBackend(env, origin, devTtlMs, starter, workspace, 'agent', taskId), env, starter, name, workspace, null, { person, membersOnly: true });
   const { body } = await handleRpc({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }, backend, { ui: true });
   return body.result;
 }

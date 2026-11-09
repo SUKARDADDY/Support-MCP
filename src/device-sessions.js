@@ -75,13 +75,14 @@ export function deviceHooks(env, { devTtlMs = 0 } = {}) {
 
     // A new Session object for a saved PC, waiting for the PC to pick it up.
     // Throws when it cannot be made: nothing was claimed yet.
-    async createSession({ slug, actor, device }) {
+    // openedByTask: the built-in agent task that asked, written on the Session.
+    async createSession({ slug, actor, device, openedByTask = null }) {
       const code = newCode();
       const id = env.SESSION.idFromName(code);
       const sid = id.toString();
       const r = await post(env.SESSION.get(id), '/create', {
         code, sid, label: `PC ${device.name} (${device.id})`, windows_mode: 'app', ttl_ms: devTtlMs, actor, workspace: slug,
-        device_id: device.id, device_name: device.name, driver: actor,
+        device_id: device.id, device_name: device.name, driver: actor, ...(openedByTask ? { opened_by_task: openedByTask } : {}),
       });
       const out = await r.json();
       if (!out.ok) throw new Error(out.error || 'could not make the session');
