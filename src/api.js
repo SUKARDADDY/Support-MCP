@@ -23,7 +23,7 @@ const AUDIT_LIMIT_DEFAULT = 100;
 
 const json = (obj, status = 200, extra = {}) =>
   new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json', 'cache-control': 'no-store', ...extra } });
-const fail = (status, code, message, extra) => json({ error: { code, message } }, status, extra);
+export const fail = (status, code, message, extra) => json({ error: { code, message } }, status, extra);
 const notAllowed = (allow) => fail(405, 'method_not_allowed', `use ${allow}`, { allow });
 
 async function readBody(request, max = BODY_MAX) {

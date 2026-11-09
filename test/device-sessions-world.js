@@ -90,7 +90,8 @@ function registryContext() {
   });
 }
 
-export async function world(t, { time = 1_800_000_000_000, env: extra = {}, members = true } = {}) {
+// handlerOptions is createHandler's third argument (OAuth, a mailer, ...).
+export async function world(t, { time = 1_800_000_000_000, env: extra = {}, members = true, handlerOptions = {} } = {}) {
   let now = time;
   t.mock.method(Date, 'now', () => now);
   const db = openD1();
@@ -151,7 +152,7 @@ export async function world(t, { time = 1_800_000_000_000, env: extra = {}, memb
     await team.addMember('default', BOSS, { identity: LEAD, role_id: 'lead' });
   }
   const devs = devicesFromEnv(env);
-  const handler = createHandler('powershell agent', null);
+  const handler = createHandler('powershell agent', null, handlerOptions);
 
   const send = async (path, init = {}) => handler.fetch(new Request(`${init.base ?? HOST}${path}`, init), env);
   // One MCP tool call as `who`. A tool error is { error: text }; a result is its JSON.

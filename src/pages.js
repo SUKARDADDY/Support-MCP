@@ -162,7 +162,7 @@ export function accountPage({ email, workspaces, deploymentAdmin, factor, factor
 // every value is escaped. The page names the app, where it sends the person
 // back to, the workspace and what the person's role lets it do. The two buttons
 // are separate forms so neither can fire from the other's fields.
-export function consentPage({ email, clientName, clientDomain, redirectHost, redirectIsLoopback, redirectIsApp, workspaceName, workspaceSlug, roleName, abilities, csrf, handle }) {
+export function consentPage({ email, clientName, clientDomain, redirectHost, redirectIsLoopback, redirectIsApp, workspaceName, workspaceSlug, roleName, abilities, technicianApp = false, csrf, handle }) {
   // The client chose these, so a very long value is cut short, not allowed to fill the page.
   const clip = (v, n) => (String(v).length > n ? `${String(v).slice(0, n)}…` : String(v));
   clientName = clip(clientName, 80);
@@ -176,9 +176,13 @@ export function consentPage({ email, clientName, clientDomain, redirectHost, red
     : redirectIsApp
       ? note('This opens an app on your device through a link of its own. Continue only if you just started signing in from that app.', 'warn')
       : '';
-  const can = abilities.length
-    ? `<ul class="plain">${abilities.map((a) => `<li>${esc(a[0].toUpperCase() + a.slice(1))}</li>`).join('')}</ul>`
-    : '<p class="muted">Nothing. Your role here holds no session permissions.</p>';
+  // The technician app works as the person on its own routes, so its page says
+  // so in full, and says what it cannot do.
+  const can = technicianApp
+    ? `<p>Support technician app: works as you in ${esc(workspaceName)}, including seeing PCs and their screens, pairing and approving PCs, changing how they can be reached, and starting agent tasks. It can't change members, roles or agent keys. Only approve this if you just started signing in from the app.</p>`
+    : abilities.length
+      ? `<ul class="plain">${abilities.map((a) => `<li>${esc(a[0].toUpperCase() + a.slice(1))}</li>`).join('')}</ul>`
+      : '<p class="muted">Nothing. Your role here holds no session permissions.</p>';
   const form = (decision, label, cls) => `<form method="post" action="/oauth/authorize">${hidden('csrf', csrf)}${hidden('handle', handle)}${hidden('decision', decision)}<button class="btn${cls}" type="submit">${label}</button></form>`;
   return shell('Allow access', `<h1>Allow ${esc(clientName)} to connect?</h1>
 ${who}${local}

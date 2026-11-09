@@ -10,7 +10,7 @@ import { VERSION } from './version.js';
 import { permissionForTool } from './permissions.js';
 import { DEFAULT_WORKSPACE, teamFromEnv } from './workspace.js';
 import { registryName } from './registry.js';
-import { handleApi } from './api.js';
+import { fail, handleApi } from './api.js';
 import { handleDevice } from './device-api.js';
 import { ID_RE, devicesFromEnv, linkCode, livePointer, parseDeviceKey } from './devices.js';
 import { deviceHooks, newCode } from './device-sessions.js';
@@ -383,6 +383,7 @@ function isJsonContentType(request) {
 
 // ---- routes ----------------------------------------------------------------
 const WORKSPACE_MCP = /^\/w\/([a-z0-9-]{1,40})\/mcp$/;
+const APP_ROUTE = /^\/app\/w\/([a-z0-9-]{1,40})(\/.*)?$/;
 const isLoopback = (hostname) => hostname === 'localhost' || hostname === '127.0.0.1';
 
 // `irm` sends WindowsPowerShell/5.1.x (Windows PowerShell) or PowerShell/7.x.
@@ -603,10 +604,11 @@ function handleWs(request, env, url) {
 // A missing or failed credential on an MCP address is 401, with a challenge that
 // points an MCP client at this address's protected resource document, so it can
 // find the authorization server and sign in. `invalid` is a token that was sent
-// and failed (expired, revoked, for another address, malformed).
-function unauthorized(issuer, workspace, invalid) {
+// and failed (expired, revoked, for another address, malformed). `app` is the
+// technician app's address, whose challenge names the app's resource document.
+function unauthorized(issuer, workspace, invalid, app = false) {
   return json({ error: invalid ? 'invalid_token' : 'unauthorized' }, 401, {
-    'www-authenticate': challengeHeader(issuer, workspace, { invalid }),
+    'www-authenticate': challengeHeader(issuer, workspace, { invalid, app }),
     'cache-control': 'no-store',
   });
 }
@@ -636,6 +638,13 @@ async function handleMcp(request, env, url, origin, devTtlMs, workspace = DEFAUL
     actor = await accessCaller(request, env, url, { mcp: true });
     if (!actor) return unauthorized(oauthOn && oauthOn.origin, workspace, false);
   }
+  return runMcp(request, env, url, origin, devTtlMs, workspace, actor, oauthCaller);
+}
+
+// An MCP call once the caller is known: from /mcp, /w/<slug>/mcp, or the
+// technician app's /app/w/<slug>/mcp. All three run the same tools with the same
+// role, mode and stop checks.
+async function runMcp(request, env, url, origin, devTtlMs, workspace, actor, oauthCaller) {
   // ?ui=0|1 picks this connection's tools. The old ?shape parameter is a 400.
   let options;
   try {
@@ -670,6 +679,29 @@ async function handleMcp(request, env, url, origin, devTtlMs, workspace = DEFAUL
   const { status, body } = await handleRpc(msg, backend, options);
   if (body === null) return new Response(null, { status });
   return json(body, status);
+}
+
+// ---- the technician app: /app/w/<slug>/... -------------------------------------
+// Routes behind one gate. The gate is stricter than /mcp's: a bearer token for this
+// workspace's app address and nothing else (no Access login, and an MCP client's
+// token is refused), no Origin header, and JSON on every write.
+async function handleApp(request, env, url, origin, devTtlMs, workspace, rest, oauth) {
+  if (request.headers.has('origin')) return fail(403, 'forbidden', 'cross-site requests are refused');
+  const oauthOn = oauth ? oauth.available(env, url) : null;
+  if (!oauthOn) return new Response('not found', { status: 404 });
+  if (!['GET', 'POST', 'PATCH', 'DELETE'].includes(request.method)) return fail(405, 'method_not_allowed', 'use GET, POST, PATCH, DELETE', { allow: 'GET, POST, PATCH, DELETE' });
+  if (request.method !== 'GET' && !isJsonContentType(request)) return fail(415, 'unsupported_media_type', 'send content-type: application/json');
+  const bearer = bearerToken(request);
+  if (bearer === null) return unauthorized(oauthOn.origin, workspace, false, true);
+  const caller = await oauth.checkBearer(env, oauthOn.origin, workspace, bearer, { app: true });
+  if (caller.unavailable) return json({ error: 'temporarily_unavailable' }, 503, { 'retry-after': '60', 'cache-control': 'no-store' });
+  if (!caller.ok) return unauthorized(oauthOn.origin, workspace, true, true);
+
+  if (rest === '/mcp') {
+    if (request.method !== 'POST') return json({ error: 'method not allowed' }, 405, { allow: 'POST' });
+    return runMcp(request, env, url, origin, devTtlMs, workspace, caller.email, caller);
+  }
+  return fail(404, 'not_found', 'not found');
 }
 
 // An OAuth route that cannot reach the database or KV answers 503, not a crash.
@@ -713,6 +745,9 @@ export function createHandler(agentText, appBundle = null, options = {}) {
       // default has one address, /mcp, so /w/default/mcp is unknown too.
       const wm = WORKSPACE_MCP.exec(p);
       if (wm && wm[1] !== DEFAULT_WORKSPACE) return handleMcp(request, env, url, origin, devTtlMs, wm[1], oauth);
+      // The technician app's own address: a bearer token for it, never an Access login.
+      const am = APP_ROUTE.exec(p);
+      if (am) return handleApp(request, env, url, origin, devTtlMs, am[1], am[2] ?? '', oauth);
       // OAuth: the authorization server's own addresses and the protected
       // resource documents. They answer 404 when OAuth is not set up.
       if (p === AS_METADATA_PATH || p === TOKEN_PATH || p === REGISTER_PATH) {
