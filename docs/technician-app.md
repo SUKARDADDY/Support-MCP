@@ -13,14 +13,16 @@ Contents: [Install](#install) · [Sign in](#sign-in) · [The screens](#the-scree
 
 ## Install
 
-Run `Support_<version>_x64-setup.exe` from the GitHub release. It installs for the current
+Run `support-technician-<version>-setup.exe` from the GitHub release. It installs for the current
 Windows account only, so it never asks for administrator rights, and puts Support in the
 Start menu. Windows 10 and 11 on 64-bit PCs. If WebView2 is missing (an old Windows 10), the
 installer downloads Microsoft's bootstrapper and installs it first.
 
 To remove it, use Windows Settings, Apps. That deletes the app and its files. Your sign-in
 sits in `%APPDATA%\dev.support-mcp.technician\app.json`, sealed so only your Windows account
-can read it; Remove in the app's Settings deletes it too.
+can read it; Remove in the app's Settings deletes it too. A downloaded update waits in
+`%LOCALAPPDATA%\dev.support-mcp.technician\update\`, not in the roaming folder, because the installer is
+large and only useful on this PC.
 
 ## Sign in
 
@@ -161,11 +163,12 @@ cd .. && npx tauri build      # the NSIS installer, on Windows
 ```
 
 `cargo test` runs on Linux and macOS as well (the Windows-only code, DPAPI and the silent installer,
-sits behind `cfg(windows)` and a trait). Build settings read at compile time:
-`SUPPORT_DEFAULT_RELAY` (the relay address the sign-in form starts with), `SUPPORT_RELEASE_REPO`
-(the GitHub repository to check, `SUKARDADDY/Support-MCP` by default) and, for a test build only,
-`SUPPORT_RELEASE_KEY` (a throwaway public key, so a test release can be signed without the real
-one). The `e2e` cargo feature makes sign-in write its address to the file named by
+sits behind `cfg(windows)` and a trait). `SUPPORT_DEFAULT_RELAY` (the relay address the sign-in form
+starts with) is read at compile time. `SUPPORT_RELEASE_REPO` (the GitHub repository to check,
+`SUKARDADDY/Support-MCP` by default) and `SUPPORT_RELEASE_KEY` (a throwaway public key, so a test
+release can be signed without the real one) are read only by a build with the `test-release` cargo
+feature. Without that feature, building with either one set fails with a compile error, so the
+installer that ships cannot carry them; the CI job also checks both are unset. The `e2e` cargo feature makes sign-in write its address to the file named by
 `SUPPORT_E2E_AUTHORIZE_FILE` instead of opening a browser; it is never part of a release.
 
 To release: bump the version with `scripts/bump-version.mjs` (it covers the app's `package.json`,

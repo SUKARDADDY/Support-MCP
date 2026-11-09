@@ -5,7 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, createPublicKey } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -305,6 +305,36 @@ test('a signature over a PC note does not verify as a technician note, though ev
   const pcSignature = signNote(key, buildNote(values));
   assert.ok(verifies(key.xy, buildNote(values), pcSignature));
   assert.ok(!verifies(key.xy, buildTechnicianNote(values), pcSignature));
+});
+
+test('sign-release --product technician refuses an installer whose crate version is not the release version', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'support-mcp-sign-crate-'));
+  try {
+    const pub = join(dir, 'release-key.pub');
+    const pem = node('release-key.mjs', [pub]).stdout;
+    const installer = join(dir, `Support_${VERSION}_x64-setup.exe`);
+    writeFileSync(installer, Buffer.concat([Buffer.from('MZ'), Buffer.from('technician installer fixture')]));
+    // A tree with only the two files the check reads: package.json at the release version, and a
+    // Cargo.toml that was not bumped, as when someone bumps one file by hand.
+    const tree = join(dir, 'tree');
+    const files = ['technician-app/package.json', 'technician-app/src-tauri/Cargo.toml'];
+    for (const f of files) {
+      mkdirSync(dirname(join(tree, f)), { recursive: true });
+      writeFileSync(join(tree, f), readFileSync(join(ROOT, f)));
+    }
+    const sign = () => node('sign-release.mjs', ['--product', 'technician', '--file', installer, '--pub', pub, '--root', tree], pem);
+    assert.equal(sign().status, 0, 'a tree whose versions agree signs');
+    const toml = readFileSync(join(tree, files[1]), 'utf8');
+    writeFileSync(join(tree, files[1]), toml.replace(/^(\[package\][^\[]*?version = ")[^"]*"/m, '$10.0.1"'));
+    const stale = sign();
+    assert.notEqual(stale.status, 0);
+    assert.match(stale.stderr, /Cargo\.toml is 0\.0\.1 but the release is/);
+    assert.equal(stale.stdout, '');
+    writeFileSync(join(tree, files[1]), toml.replace(/^version = "[^"]*"\n/m, ''));
+    assert.match(sign().stderr, /Cargo\.toml is missing a version/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('sign-release --product technician signs an installer under its own header and names the three assets', () => {

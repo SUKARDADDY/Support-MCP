@@ -106,6 +106,16 @@ jobs:
       - name: Install the screens' packages
         working-directory: technician-app
         run: npm ci --ignore-scripts
+      # The installer that ships checks releases of this repository against the project's key.
+      # SUPPORT_RELEASE_REPO and SUPPORT_RELEASE_KEY are for a `test-release` build only, and the
+      # build stops with a compile error if either is set without that feature. This says so
+      # earlier and names the cause.
+      - name: Check the shipping build has no test release overrides
+        shell: pwsh
+        run: |
+          foreach ($name in 'SUPPORT_RELEASE_REPO', 'SUPPORT_RELEASE_KEY') {
+            if (Test-Path "env:$name") { throw "$name is set in the environment of the shipping build" }
+          }
       - name: Test the screens
         working-directory: technician-app
         run: npm test

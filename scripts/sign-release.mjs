@@ -1,7 +1,7 @@
 // Sign this release at deploy time.
 //
 //   <print the private key PEM> | node scripts/sign-release.mjs [--bundle <file>] [--pub <file>] [--out <folder>]
-//   <print the private key PEM> | node scripts/sign-release.mjs --product technician --file <installer> [--pub <file>] [--out <folder>]
+//   <print the private key PEM> | node scripts/sign-release.mjs --product technician --file <installer> [--pub <file>] [--out <folder>] [--root <folder>]
 //
 // It reads the release private key (PKCS#8 PEM) from stdin and never writes it
 // anywhere. It reads the app bundle (src/app-bundle.json), checks that it was
@@ -17,7 +17,10 @@
 // installer's size and SHA-256 (no bundle, no stages) and builds a note under its own header,
 // support-mcp-technician-release 1, so a PC note never passes as a technician note. --out then
 // writes support-technician-<V>-setup.exe, .note and .note.sig for the GitHub release, and
-// the app checks the note against the same release-key.pub.
+// the app checks the note against the same release-key.pub. It refuses unless the version in
+// technician-app/package.json and the [package] version in technician-app/src-tauri/Cargo.toml
+// (the version compiled into the app) both equal the release version. --root names another
+// tree to read those two files from (the tests use it).
 import { createHash, createPrivateKey, createPublicKey, sign, verify } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -31,8 +34,8 @@ const fail = (message) => {
 };
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const USAGE = 'usage: <private key PEM> | node scripts/sign-release.mjs [--bundle <file>] [--pub <file>] [--out <folder>]\n       <private key PEM> | node scripts/sign-release.mjs --product technician --file <installer> [--pub <file>] [--out <folder>]';
-const opts = { bundle: join(root, 'src', 'app-bundle.json'), pub: join(root, 'release-key.pub'), out: null, file: null };
+const USAGE = 'usage: <private key PEM> | node scripts/sign-release.mjs [--bundle <file>] [--pub <file>] [--out <folder>]\n       <private key PEM> | node scripts/sign-release.mjs --product technician --file <installer> [--pub <file>] [--out <folder>] [--root <folder>]';
+const opts = { bundle: join(root, 'src', 'app-bundle.json'), pub: join(root, 'release-key.pub'), out: null, file: null, root };
 let product = 'pc';
 const args = process.argv.slice(2);
 for (let i = 0; i < args.length; i += 2) {
@@ -78,11 +81,19 @@ if (product === 'technician') {
   // carry that version too, so the wrong build is not signed under a newer number.
   let version;
   try {
-    version = JSON.parse(readFileSync(join(root, 'technician-app', 'package.json'), 'utf8')).version;
+    version = JSON.parse(readFileSync(join(opts.root, 'technician-app', 'package.json'), 'utf8')).version;
   } catch (_) {
     fail('cannot read technician-app/package.json');
   }
   if (version !== VERSION) fail(`technician-app is ${version} but the release is ${VERSION}: run scripts/bump-version.mjs`);
+  // The version the installer carries is the crate's, not package.json's.
+  let crate;
+  try {
+    crate = /^\[package\]\r?\n(?:(?!\[)[^\n]*\n)*?version = "([^"]*)"/m.exec(readFileSync(join(opts.root, 'technician-app', 'src-tauri', 'Cargo.toml'), 'utf8'))?.[1];
+  } catch (_) {
+    fail('cannot read technician-app/src-tauri/Cargo.toml');
+  }
+  if (crate !== VERSION) fail(`technician-app/src-tauri/Cargo.toml is ${crate ?? 'missing a version'} but the release is ${VERSION}: run scripts/bump-version.mjs`);
   try {
     exe = readFileSync(opts.file);
   } catch (_) {

@@ -29,7 +29,8 @@ pub const NOTE_HEADER: &str = "support-mcp-technician-release 1";
 /// The project's public release key: 64 bytes X||Y in base64, the file the relay's tests hold
 /// equal to the key built into the PC app.
 pub const RELEASE_KEY: &str = include_str!("../../../release-key.pub");
-/// Where the app looks for releases unless the build says otherwise (SUPPORT_RELEASE_REPO).
+/// Where the app looks for releases. A `test-release` build may name another repository
+/// (SUPPORT_RELEASE_REPO at build time); no other build can.
 pub const DEFAULT_REPO: &str = "SUKARDADDY/Support-MCP";
 pub const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
 /// No installer is larger than this, whatever a note says.
@@ -38,15 +39,27 @@ pub const MAX_INSTALLER_BYTES: u64 = 100 * 1024 * 1024;
 /// old version in place must not be run at every start for ever.
 pub const MAX_ATTEMPTS: u32 = 2;
 
+#[cfg(feature = "test-release")]
 pub fn release_repo() -> &'static str {
     option_env!("SUPPORT_RELEASE_REPO").unwrap_or(DEFAULT_REPO)
 }
 
-/// The key a build checks notes against: release-key.pub, unless a test build names its own
-/// throwaway key (SUPPORT_RELEASE_KEY) so a test release can be signed without the real one.
-/// A release build sets neither this nor SUPPORT_RELEASE_REPO.
+#[cfg(not(feature = "test-release"))]
+pub fn release_repo() -> &'static str {
+    DEFAULT_REPO
+}
+
+/// The key a build checks notes against: release-key.pub, unless a `test-release` build names
+/// its own throwaway key (SUPPORT_RELEASE_KEY) so a test release can be signed without the
+/// real one. Any other build fails to compile with either variable set (lib.rs).
+#[cfg(feature = "test-release")]
 pub fn release_key() -> &'static str {
     option_env!("SUPPORT_RELEASE_KEY").unwrap_or(RELEASE_KEY)
+}
+
+#[cfg(not(feature = "test-release"))]
+pub fn release_key() -> &'static str {
+    RELEASE_KEY
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -245,7 +258,8 @@ pub struct UpdateConfig {
     pub repo: String,
     pub current: String,
     pub key: VerifyingKey,
-    /// Where the staged installer and its note live (inside the app's data folder).
+    /// Where the staged installer and its note live: inside the app's local data folder, since
+    /// the installer is large and only useful on this PC.
     pub dir: PathBuf,
     /// Tests only: allow http to a loopback address.
     pub allow_loopback: bool,
@@ -344,6 +358,9 @@ impl Updater {
             s.message = None;
         });
         let outcome = self.check_inner().await;
+        // A check that fails (GitHub down, a bad release page) does not undo an installer that is
+        // already kept and verified: it is still going to be installed at the next start.
+        let kept = if outcome.is_err() { self.kept_version() } else { None };
         self.set(|s| {
             s.checked_at = Some(now_ms());
             match outcome {
@@ -354,6 +371,11 @@ impl Updater {
                 Ok(None) => {
                     // A version kept from an earlier check is still ready.
                     s.state = if s.available.is_some() { "ready" } else { "idle" };
+                }
+                Err(_) if kept.is_some() => {
+                    s.available = kept;
+                    s.state = "ready";
+                    s.message = None;
                 }
                 Err(e) => {
                     s.state = "error";
@@ -480,6 +502,28 @@ impl Updater {
         Ok(())
     }
 
+    // The kept note, signature and installer, checked again: signed by our key, the version the
+    // kept record names, newer than this app, and the installer the note describes.
+    fn verify_kept(&self, staged: &Staged) -> Option<Note> {
+        let exe = self.file(&format!("support-technician-{}-setup.exe", staged.version));
+        let note_text = std::fs::read_to_string(self.file("note")).ok()?;
+        let sig_text = std::fs::read_to_string(self.file("note.sig")).ok()?;
+        if !verify_signature(&self.cfg.key, note_text.as_bytes(), &sig_text) {
+            return None;
+        }
+        let note = parse_note(&note_text)?;
+        if note.version != staged.version || compare_versions(&note.version, &self.cfg.current) != Some(std::cmp::Ordering::Greater) {
+            return None;
+        }
+        file_matches(&exe, &note).then_some(note)
+    }
+
+    /// The version of the installer kept from an earlier check, if it still verifies. Changes nothing.
+    fn kept_version(&self) -> Option<String> {
+        let staged: Staged = serde_json::from_slice(&std::fs::read(self.file("staged.json")).ok()?).ok()?;
+        self.verify_kept(&staged).map(|n| n.version)
+    }
+
     /// At start: if a verified installer was kept and is newer than this app, run it silently.
     /// Returns true when it was started, so the caller exits and lets it replace the files.
     /// Anything wrong with the kept files (signature, size, hash, an older version) deletes
@@ -491,18 +535,7 @@ impl Updater {
             return false;
         };
         let exe = self.file(&format!("support-technician-{}-setup.exe", staged.version));
-        let verified = (|| {
-            let note_text = std::fs::read_to_string(self.file("note")).ok()?;
-            let sig_text = std::fs::read_to_string(self.file("note.sig")).ok()?;
-            if !verify_signature(&self.cfg.key, note_text.as_bytes(), &sig_text) {
-                return None;
-            }
-            let note = parse_note(&note_text)?;
-            if note.version != staged.version || compare_versions(&note.version, &self.cfg.current) != Some(std::cmp::Ordering::Greater) {
-                return None;
-            }
-            file_matches(&exe, &note).then_some(note)
-        })();
+        let verified = self.verify_kept(&staged);
         if verified.is_none() {
             self.clear_staged();
             return false;
@@ -597,6 +630,13 @@ mod tests {
         assert!(load_key("not base64!").is_err());
         assert!(load_key(&B64.encode([1u8; 63])).is_err());
         assert!(load_key(&B64.encode([1u8; 64])).is_err(), "64 bytes that are not a point");
+    }
+
+    #[cfg(not(feature = "test-release"))]
+    #[test]
+    fn a_shipping_build_always_uses_the_built_in_key_and_repository() {
+        assert_eq!(release_key(), RELEASE_KEY);
+        assert_eq!(release_repo(), DEFAULT_REPO);
     }
 
     #[test]
@@ -784,6 +824,29 @@ mod tests {
         f.updater.check().await;
         assert_eq!(f.server.count("/dl/support-technician-0.8.0-setup.exe"), downloads);
         assert!(f.installer.0.lock().unwrap().is_empty(), "checking never runs an installer");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_check_keeps_an_installer_that_is_already_kept_and_verified() {
+        let k = keys();
+        let f = fixture("upd-keep-ready", &k, "0.7.0", good_files(&k, "0.8.0")).await;
+        assert_eq!(f.updater.check().await.state, "ready");
+        // The next check cannot reach GitHub. The kept installer is still going to be installed.
+        let cfg = UpdateConfig { api_base: "http://127.0.0.1:9".into(), repo: "o/r".into(), current: "0.7.0".into(), key: load_key(&k.xy).unwrap(), dir: f.dir.clone(), allow_loopback: true };
+        let later = Updater::new(cfg, Arc::new(Recorder::default()));
+        let st = later.check().await;
+        assert_eq!((st.state, st.available.as_deref(), st.message.as_deref()), ("ready", Some("0.8.0"), None), "{st:?}");
+        assert!(st.checked_at.is_some());
+        assert_eq!(staged_files(&f), vec!["note", "note.sig", "staged.json", "support-technician-0.8.0-setup.exe"], "the kept files stay");
+
+        // A kept installer that no longer verifies is not kept in the status either.
+        let exe = f.dir.join("update/support-technician-0.8.0-setup.exe");
+        let mut bytes = std::fs::read(&exe).unwrap();
+        bytes[0] ^= 1;
+        std::fs::write(&exe, bytes).unwrap();
+        let cfg = UpdateConfig { api_base: "http://127.0.0.1:9".into(), repo: "o/r".into(), current: "0.7.0".into(), key: load_key(&k.xy).unwrap(), dir: f.dir.clone(), allow_loopback: true };
+        let st = Updater::new(cfg, Arc::new(Recorder::default())).check().await;
+        assert_eq!((st.state, st.available.as_deref()), ("error", None), "{st:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

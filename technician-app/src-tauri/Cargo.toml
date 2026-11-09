@@ -21,6 +21,11 @@ path = "src/main.rs"
 # authorize address to the file named by SUPPORT_E2E_AUTHORIZE_FILE, so a test can walk
 # the sign-in pages in its own browser. Never part of a release build.
 e2e = []
+# A build for testing a release: SUPPORT_RELEASE_REPO and SUPPORT_RELEASE_KEY, set when it is
+# built, name the repository to look at and the throwaway key its notes are signed with. Only
+# this feature reads them. Without it, setting either at build time stops the build
+# (build.rs and lib.rs), so a shipped installer can never carry them.
+test-release = []
 # Set by `tauri build`: the screens are served from the files built into the exe.
 custom-protocol = ["tauri/custom-protocol"]
 

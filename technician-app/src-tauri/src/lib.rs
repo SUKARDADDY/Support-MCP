@@ -1,6 +1,11 @@
 // The technician app's Rust core: the part that holds the sign-in, talks to the relay and
 // reaches the operating system. The screens (../src) only call the commands listed in
 // command_list.rs.
+// A release check that looks anywhere but at our own repository with our own key is for test
+// builds only. build.rs raises the cfg when SUPPORT_RELEASE_KEY or SUPPORT_RELEASE_REPO is set.
+#[cfg(all(release_override_set, not(feature = "test-release")))]
+compile_error!("SUPPORT_RELEASE_KEY or SUPPORT_RELEASE_REPO is set in the build environment. Only a build with the `test-release` feature may use them. Unset them to build the app that ships.");
+
 pub mod command_list;
 pub mod commands;
 pub mod core;
@@ -51,10 +56,13 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec![platform::BACKGROUND_ARG])))
         .setup(|app| {
+            // The accounts and their sealed sign-in (app.json) live in the roaming folder; a
+            // downloaded installer is large and belongs to this PC, so it goes in the local one.
             let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+            let local_dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
             // A verified update kept from the last run is installed first: it replaces the
             // app's files, so this copy exits as soon as the installer has started.
-            let updater = update::Updater::new(update::UpdateConfig::production(env!("CARGO_PKG_VERSION"), dir.clone())?, Arc::new(update::SilentInstaller));
+            let updater = update::Updater::new(update::UpdateConfig::production(env!("CARGO_PKG_VERSION"), local_dir)?, Arc::new(update::SilentInstaller));
             if !cfg!(feature = "e2e") && updater.apply_staged() {
                 std::process::exit(0);
             }
@@ -95,4 +103,19 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Support app");
+}
+
+#[cfg(test)]
+mod tests {
+    // The setup code cannot run without a window, so this reads it: the accounts and their
+    // sealed sign-in stay in the roaming folder, the large installer goes in the local one.
+    #[test]
+    fn the_staged_installer_goes_in_the_local_data_folder_and_the_accounts_stay_in_the_roaming_one() {
+        let source = include_str!("lib.rs");
+        let code = &source[..source.rfind("\n#[cfg(test)]\nmod tests {").unwrap()];
+        assert!(code.contains("UpdateConfig::production(env!(\"CARGO_PKG_VERSION\"), local_dir)"));
+        assert!(code.contains("let local_dir = app.path().app_local_data_dir()"));
+        assert!(code.contains("Store::open(&dir,"));
+        assert!(code.contains("let dir = app.path().app_data_dir()"));
+    }
 }
