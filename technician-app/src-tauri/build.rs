@@ -14,9 +14,29 @@ fn main() {
             println!("cargo:rustc-cfg=release_override_set");
         }
     }
+    embed_manifest_in_every_target();
+    // Tauri embeds its own copy of the manifest, in the app only. It is left out here and the
+    // linker embeds ours below, so there is exactly one in each binary.
     tauri_build::try_build(
         tauri_build::Attributes::new()
+            .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest())
             .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS)),
     )
     .expect("failed to run the Tauri build script");
+}
+
+// On Windows with the MSVC linker, every executable this package links gets the application
+// manifest: the app, the library's unit tests and tests/real_relay.rs. Tauri's windowing code
+// imports TaskDialogIndirect, which exists only in version 6 of the Common Controls, and that
+// version is chosen by the manifest. A test executable without one fails to start with
+// STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) before its first test runs.
+fn embed_manifest_in_every_target() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let manifest = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR")).join("windows-app-manifest.xml");
+    println!("cargo:rerun-if-changed={}", manifest.display());
+    if target_os == "windows" && target_env == "msvc" {
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
+    }
 }
