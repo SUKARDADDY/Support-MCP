@@ -69,7 +69,7 @@ async fn the_core_signs_in_calls_the_relay_refreshes_and_hears_the_feed() {
     let http = reqwest::Client::new();
     let joined = http
         .post(format!("{relay}/device/pair"))
-        .json(&json!({ "workspace": "default", "name": "Real relay PC", "os": "Windows 11", "machine": "W", "app_version": "0.7.0", "access": "ask", "control": "limited", "protocol": 1 }))
+        .json(&json!({ "workspace": "default", "name": "Real relay PC", "os": "Windows 11", "machine": "W", "app_version": env!("CARGO_PKG_VERSION"), "access": "ask", "control": "limited", "protocol": 1 }))
         .send()
         .await
         .unwrap();

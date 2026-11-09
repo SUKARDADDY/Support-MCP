@@ -19,14 +19,15 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '..', '..');
 const say = (m) => console.log(`[core-check] ${m}`);
 let relay = null;
+let prepared = null;
 let browser = null;
 let test = null;
 let failed = true;
 
 try {
-  prepareConfig(root);
-  seed({ root });
-  relay = await startRelay(root);
+  prepared = prepareConfig(root);
+  seed(prepared);
+  relay = await startRelay(prepared);
   say(`relay up at ${RELAY}`);
   const file = join(mkdtempSync(join(tmpdir(), 'support-core-check-')), 'authorize.txt');
   const done = new Promise((res) => {
@@ -52,5 +53,8 @@ try {
   await browser?.close().catch(() => {});
   if (test && test.exitCode === null) test.kill();
   relay?.stop();
-  setTimeout(() => process.exit(failed ? 1 : 0), 1500);
+  setTimeout(() => {
+    prepared?.cleanup();
+    process.exit(failed ? 1 : 0);
+  }, 1500);
 }

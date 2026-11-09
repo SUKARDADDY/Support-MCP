@@ -20,7 +20,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from '@playwright/test';
 import { RELAY, prepareConfig, startRelay } from './relay.mjs';
-import { EMAIL, SEEDED_PC, seed } from './seed.mjs';
+import { APP_VERSION, EMAIL, SEEDED_PC, seed } from './seed.mjs';
 import { walkSignIn } from './signin.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -50,6 +50,7 @@ const until = async (what, fn, ms = 60_000) => {
 };
 
 let relay = null;
+let prepared = null;
 let app = null;
 let appBrowser = null;
 let ownBrowser = null;
@@ -62,9 +63,9 @@ try {
   const authorizeFile = join(workdir, 'authorize.txt');
 
   say('preparing and seeding the relay');
-  prepareConfig(root);
-  seed({ root });
-  relay = await startRelay(root);
+  prepared = prepareConfig(root);
+  seed(prepared);
+  relay = await startRelay(prepared);
   say(`relay is up at ${RELAY}`);
 
   say(`starting the app: ${APP_EXE}`);
@@ -104,7 +105,7 @@ try {
   const joined = await fetch(`${RELAY}/device/pair`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ workspace: 'default', name: 'E2E waiting PC', os: 'Windows 11', machine: 'E2E-WAIT', app_version: '0.7.0', access: 'ask', control: 'limited', protocol: 1 }),
+    body: JSON.stringify({ workspace: 'default', name: 'E2E waiting PC', os: 'Windows 11', machine: 'E2E-WAIT', app_version: APP_VERSION, access: 'ask', control: 'limited', protocol: 1 }),
   });
   assert.equal(joined.status, 202, await joined.text());
   await appPage.getByRole('navigation', { name: 'Main' }).getByRole('button', { name: /Notifications/ }).click();
@@ -130,5 +131,8 @@ try {
   }
   relay?.stop();
   // wrangler's children can hold the process open: leave explicitly.
-  setTimeout(() => process.exit(failed ? 1 : 0), 1500);
+  setTimeout(() => {
+    prepared?.cleanup();
+    process.exit(failed ? 1 : 0);
+  }, 1500);
 }
