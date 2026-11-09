@@ -123,15 +123,28 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     const stalePlaces = Date.now() - placesAt.current > PLACES_EVERY_MS;
     try {
       const [devices, places] = await Promise.all([fetchDevices(core, accountId), stalePlaces ? fetchPlaces(core, accountId).catch(() => null) : null]);
+      // A newer read, or a change of account, has made this one stale: its answer belongs to nobody now.
+      if (mine !== loadSeq.current) return;
       if (places) placesAt.current = Date.now();
-      if (mine === loadSeq.current) setDeviceData((d) => ({ devices: sortDevices(devices), places: places ?? d.places, loading: false, error: null }));
+      setDeviceData((d) => ({ devices: sortDevices(devices), places: places ?? d.places, loading: false, error: null }));
     } catch (error) {
       if (mine === loadSeq.current) setDeviceData((d) => ({ ...d, loading: false, error }));
     }
   }, [core, accountId]);
-  useEffect(() => { placesAt.current = 0; setDeviceData({ devices: [], places: new Map(), loading: true, error: null }); }, [accountId]);
+  // A change of account drops the old list and every read still on its way for the old account
+  // (devices, sites and customers are read together under one sequence number), then reads the new one.
+  const lastAccount = useRef(null);
+  useEffect(() => {
+    loadSeq.current += 1;
+    placesAt.current = 0;
+    setDeviceData({ devices: [], places: new Map(), loading: true, error: null });
+    const switched = lastAccount.current !== null && lastAccount.current !== accountId;
+    lastAccount.current = accountId;
+    // A window that is hidden reads nothing: the list is read when it is shown again.
+    if (accountId && ((switched && visible) || !(view === 'devices' || view === 'add'))) reloadDevices();
+  }, [accountId]); // eslint-disable-line react-hooks/exhaustive-deps
+  // After the effect above, so the read it starts is not the one it has just made stale.
   useInterval(reloadDevices, tuning.devicePollMs, !!accountId && visible && (view === 'devices' || view === 'add'));
-  useEffect(() => { if (accountId && !(view === 'devices' || view === 'add')) reloadDevices(); }, [accountId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---- session tabs ------------------------------------------------------------
   const persist = useCallback((next) => { write(TABS_KEY, next); return next; }, []);
@@ -142,7 +155,9 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
       if (cur.some((x) => x.key === key)) return cur;
       return persist([...cur, { key, account: accountOf ?? accountId, deviceId: device?.id ?? deviceId, deviceName: device?.name ?? deviceName ?? '', sessionId, taskId }]);
     });
-    setView(`tab:${key}`);
+    // A tab of another account than the one on screen (a connection that finished after the switch)
+    // is added under its own account and not shown: it appears when that account is used again.
+    if ((accountOf ?? accountId) === accountId) setView(`tab:${key}`);
   }, [accountId, persist]);
   const closeTab = useCallback((key) => {
     setTabs((cur) => persist(cur.filter((x) => x.key !== key)));
@@ -169,12 +184,17 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     tabGuards.current.set(key, guard);
     return () => { if (tabGuards.current.get(key) === guard) tabGuards.current.delete(key); };
   }, []);
-  const startAgentTask = useCallback((body) => guardedStart({
-    guards: guardsFor(tabGuards.current.values(), accountId, body),
+  // `forAccount` is the account the caller belongs to: a tab's dialog passes its tab's account, so
+  // a session is never driven through another account's sign-in. The default is the shown account.
+  const startAgentTask = useCallback((body, forAccount = accountId) => guardedStart({
+    guards: guardsFor(tabGuards.current.values(), forAccount, body),
     body,
-    send: (b) => startTask(core, accountId, b),
+    send: (b) => startTask(core, forAccount, b),
   }), [core, accountId]);
-  const sessionTabFor = useCallback((deviceId) => tabs.find((x) => x.deviceId === deviceId && x.account === accountId) ?? null, [tabs, accountId]);
+  // Has this tab's session ended? (Unknown tabs count as not ended.)
+  const tabEnded = useCallback((key) => !!tabGuards.current.get(key)?.ended(), []);
+  // The tab on a PC whose session is still open. One whose session ended is not it: a new session is a new tab.
+  const sessionTabFor = useCallback((deviceId) => tabs.find((x) => x.deviceId === deviceId && x.account === accountId && !tabEnded(x.key)) ?? null, [tabs, accountId, tabEnded]);
 
   // Tabs from the last run: keep only the sessions that are still open.
   const restored = useRef(false);
@@ -205,7 +225,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   const { conns, connect, cancel: cancelConnect, dismiss: dismissConnect } = useConnections({
     core,
     account: accountId,
-    onLive: ({ device, sessionId }) => openSessionTab({ device, sessionId }),
+    onLive: ({ device, sessionId, account: accountOf }) => openSessionTab({ device, sessionId, accountOf }),
     pollMs: tuning.connectPollMs,
   });
 
@@ -282,8 +302,8 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     devices: deviceData.devices, places: deviceData.places, devicesState: deviceData, reloadDevices,
     selectedId, select, conns, connect, cancelConnect, dismissConnect,
     sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true),
-    toast, copyText, notifications, openTarget, now, theme, setTheme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask,
-  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask]); // eslint-disable-line react-hooks/exhaustive-deps
+    toast, copyText, notifications, openTarget, now, theme, setTheme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, tabEnded,
+  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, tabEnded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (accounts === null) return <div className="app" role="status"><p className="hint">{t('common.loading')}</p></div>;
 
@@ -296,7 +316,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   }
 
   const tabKey = view.startsWith('tab:') ? view.slice(4) : null;
-  const activeTab = tabKey ? tabs.find((x) => x.key === tabKey) : null;
+  const activeTab = tabKey ? tabs.find((x) => x.key === tabKey && x.account === accountId) ?? null : null;
   const screen = activeTab ? 'session' : view.startsWith('tab:') ? 'devices' : view;
   const mine = tabs.filter((x) => x.account === accountId);
 

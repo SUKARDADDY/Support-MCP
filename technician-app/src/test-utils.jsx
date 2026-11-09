@@ -121,15 +121,15 @@ export function fakeCore(initial = {}) {
     tool: vi.fn(async (account, name, args) => {
       log('tool', name, args);
       switch (name) {
-        case 'device_list': return { data: { devices: structuredClone(state.devices), next: null }, image: null };
+        case 'device_list': return { data: state.deviceList ? await state.deviceList(account) : { devices: structuredClone(state.devices), next: null }, image: null };
         case 'device_connect': {
-          const out = state.connect(args);
+          const out = await state.connect(args, account);
           if (out instanceof Error) throw out;
           return { data: out, image: null };
         }
         case 'session_status': return { data: state.sessionStatus ? state.sessionStatus(args) : { state: 'attached', driver: 'tech@example.com', log: [], ...(state.sessions[args.session_id] ?? {}) }, image: null };
         case 'session_end': state.ended = [...(state.ended ?? []), args.session_id]; return { data: { ended: true }, image: null };
-        case 'session_create': return { data: { session_id: 'o'.repeat(64), windows_mode: 'app', download_url: 'https://relay.example/j/abcdefghijklmnop?client=app', code_expires_at: Date.now() + 600000 }, image: null };
+        case 'session_create': if (state.oneOffGate) await state.oneOffGate; return { data: { session_id: 'o'.repeat(64), windows_mode: 'app', download_url: 'https://relay.example/j/abcdefghijklmnop?client=app', code_expires_at: Date.now() + 600000 }, image: null };
         case 'screenshot': {
           if (state.screenshot) return state.screenshot(args);
           return { data: { width: 1280, height: 800 }, image: { mime: 'image/jpeg', data: 'QUJD' } };

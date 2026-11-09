@@ -77,6 +77,12 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
   const fails = useRef(0);
   const lastRev = useRef(null);
   useEffect(() => () => { alive.current = false; }, []);
+  // What the tab is on now. An answer that comes back for another session or task (the tab adopted
+  // a new session, or a task ended) is dropped, never applied to the new one.
+  const sessionRef = useRef(sessionId);
+  sessionRef.current = sessionId;
+  const taskRef = useRef(taskId);
+  taskRef.current = taskId;
 
   const ended = status?.state === 'ended' || status?.state === 'unknown';
   const attached = status?.state === 'attached';
@@ -87,19 +93,21 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
   // ---- the session's own status ---------------------------------------------------
   useInterval(async () => {
     if (!sessionId) return;
+    const mine = sessionId;
     try {
-      const st = await sessionStatus(core, account, sessionId, 60);
-      if (alive.current) { setStatus(st); setStatusError(null); }
+      const st = await sessionStatus(core, account, mine, 60);
+      if (alive.current && sessionRef.current === mine) { setStatus(st); setStatusError(null); }
     } catch (e) {
-      if (alive.current) setStatusError(e);
+      if (alive.current && sessionRef.current === mine) setStatusError(e);
     }
   }, tuning.statusMs, !!sessionId && !ended && visible);
 
   // ---- finding the task that works on this session ----------------------------------
   const lookForTask = useCallback(async () => {
+    const mine = sessionId;
     try {
-      const found = taskOnSession(await listTasks(core, account), sessionId);
-      if (alive.current && found) setTaskId((cur) => cur ?? found.id);
+      const found = taskOnSession(await listTasks(core, account), mine);
+      if (alive.current && found && sessionRef.current === mine) setTaskId((cur) => cur ?? found.id);
     } catch (_) {
       // try again at the next check
     }
@@ -110,11 +118,11 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
   const fetchFrame = useCallback(async (id) => {
     try {
       const f = await taskFrame(core, account, id);
-      if (alive.current) { setFrame(f); setFrameWaiting(false); }
+      if (alive.current && taskRef.current === id) { setFrame(f); setFrameWaiting(false); }
       return true;
     } catch (e) {
       // A task that has not taken a picture yet (or whose object was evicted) has none: wait for the next.
-      if (alive.current && e?.code === 'no_frame') setFrameWaiting(true);
+      if (alive.current && taskRef.current === id && e?.code === 'no_frame') setFrameWaiting(true);
       return false;
     }
   }, [core, account]);
@@ -137,7 +145,15 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
           if (stopped_ || !alive.current) return;
           failures = 0;
           setTask(t);
-          if (t.session_id && !sessionId) { setSessionId(t.session_id); onSessionKnown?.(t.session_id); }
+          // The task runs on a session this tab is not on (a task started on a PC makes its own session,
+          // and the tab's old one may have ended): the tab adopts it, and App saves it with the tab.
+          if (t.session_id && t.session_id !== sessionRef.current) {
+            sessionRef.current = t.session_id;
+            setSessionId(t.session_id);
+            setStatus(null);
+            setStatusError(null);
+            onSessionKnown?.(t.session_id);
+          }
           if (!isLiveTask(t)) {
             // The task is over. The last picture stays until a screenshot replaces it.
             if (lastRev.current !== null && visibleRef.current) await fetchFrame(taskId);
@@ -181,15 +197,16 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
   const watching = attached && isDriver && !taskId && !taskLive && !stopped && canControl && onScreen && !held;
   useInterval(async () => {
     if (holds.current > 0) return;
+    const mine = sessionId;
     try {
-      const call = screenshot(core, account, sessionId);
+      const call = screenshot(core, account, mine);
       inFlight.current = call;
       const out = await call;
       fails.current = 0;
-      if (alive.current && out.image) setShot({ mime: out.image.mime, data: out.image.data, at: Date.now() });
+      if (alive.current && sessionRef.current === mine && out.image) setShot({ mime: out.image.mime, data: out.image.data, at: Date.now() });
     } catch (e) {
       const why = stopReason(e?.message);
-      if (!alive.current) return;
+      if (!alive.current || sessionRef.current !== mine) return;
       if (why) { setStopped(why); setStoppedMessage(e.message); return; }
       // "customer is using the PC" and other passing failures: try again next time, a few times.
       fails.current += 1;
@@ -225,7 +242,10 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
 
   const refreshStatus = useCallback(async () => {
     if (!sessionId) return;
-    try { setStatus(await sessionStatus(core, account, sessionId, 60)); } catch (_) { /* the next poll tries again */ }
+    try {
+      const st = await sessionStatus(core, account, sessionId, 60);
+      if (alive.current && sessionRef.current === sessionId) setStatus(st);
+    } catch (_) { /* the next poll tries again */ }
   }, [core, account, sessionId]);
 
   const watchTask = useCallback((id) => { setTask(null); setFrame(null); setTaskId(id); }, []);
@@ -233,7 +253,7 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
   const activity = useMemo(() => mergeActivity({ log: status?.log ?? [], task }), [status, task]);
 
   return {
-    sessionId, status, statusError, ended, attached, isDriver, task, taskLive, frame, frameWaiting, shot,
+    sessionId, taskId, status, statusError, ended, attached, isDriver, task, taskLive, frame, frameWaiting, shot,
     stopped, stoppedMessage, resumeShots, activity, control, refreshStatus, watchTask, lookForTask, holdScreenshots, releaseScreenshots,
   };
 }

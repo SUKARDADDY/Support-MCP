@@ -3,7 +3,7 @@ import { guardedStart, guardsFor } from './guarded-start.js';
 
 // A tab's guard that counts what is done to it.
 function guard(over = {}) {
-  const g = { holds: 0, releases: 0, followed: [], account: 'acc', deviceId: () => 'dev', sessionId: () => 'sid', liveSession: () => null, ...over };
+  const g = { holds: 0, releases: 0, followed: [], account: 'acc', ended: () => false, deviceId: () => 'dev', sessionId: () => 'sid', liveSession: () => null, ...over };
   g.hold = over.hold ?? (async () => { g.holds += 1; });
   g.release = () => { g.releases += 1; };
   g.follow = over.follow ?? ((id) => { g.followed.push(id); g.releases += 1; });
@@ -19,6 +19,9 @@ describe('guardedStart', () => {
     const elsewhere = guard({ deviceId: () => 'x', sessionId: () => 'y' });
     expect(guardsFor([mine, other, elsewhere], 'acc', { device_id: 'dev' })).toEqual([mine]);
     expect(guardsFor([mine, other, elsewhere], 'acc', { session_id: 'sid' })).toEqual([mine]);
+    // A tab whose session has ended is not one a new task belongs to.
+    const over = guard({ ended: () => true });
+    expect(guardsFor([mine, over], 'acc', { device_id: 'dev' })).toEqual([mine]);
   });
 
   test('a start by PC goes to the live session, and a stale session is retried once by PC with the holds kept', async () => {

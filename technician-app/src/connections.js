@@ -25,7 +25,10 @@ export function declinedKey(reason) {
 
 export function useConnections({ core, account, onLive, pollMs = POLL_MS }) {
   const [conns, setConns] = useState({});
-  const active = useRef(new Map()); // deviceId -> { cancelled }
+  // deviceId -> one attempt: { cancelled, account, sessionId, ended, done }. `account` is the
+  // account that made it: everything the attempt does, ending its session included, goes through
+  // that account whatever the app shows now. An attempt stays here until its cleanup is finished.
+  const active = useRef(new Map());
   const alive = useRef(true);
   useEffect(() => () => {
     alive.current = false;
@@ -42,14 +45,36 @@ export function useConnections({ core, account, onLive, pollMs = POLL_MS }) {
     });
   }, []);
 
+  // Ends the attempt's session once, with the account that made it. It may have ended already.
+  const endAttempt = useCallback(async (attempt) => {
+    if (!attempt.sessionId || attempt.ended) return;
+    attempt.ended = true;
+    try {
+      await endSession(core, attempt.account, attempt.sessionId);
+    } catch (_) {
+      // it may have ended already
+    }
+  }, [core]);
+
   const connect = useCallback(async (device, { takeOver = false } = {}) => {
-    if (active.current.has(device.id)) return;
-    const mine = { cancelled: false };
+    const prior = active.current.get(device.id);
+    if (prior) {
+      if (!prior.cancelled) return;
+      await prior.done; // a cancelled attempt that is still cleaning up finishes first
+      if (active.current.has(device.id)) return;
+    }
+    let finish;
+    const mine = { cancelled: false, account, sessionId: null, ended: false, done: new Promise((r) => { finish = r; }) };
     active.current.set(device.id, mine);
     set(device.id, { phase: 'connecting', sessionId: null, message: null, asks: false, startedAt: Date.now() });
     try {
       const made = await connectDevice(core, account, device.id, { takeOver });
-      if (mine.cancelled) return;
+      mine.sessionId = made.session_id;
+      if (mine.cancelled) {
+        // Cancelled before the relay answered: the session it made is not shown anywhere, so end it.
+        await endAttempt(mine);
+        return;
+      }
       let state = made.state;
       set(device.id, { sessionId: made.session_id, asks: made.asks === true, phase: made.asks && state !== 'attached' ? 'awaiting' : 'connecting' });
       let startup = null;
@@ -70,31 +95,25 @@ export function useConnections({ core, account, onLive, pollMs = POLL_MS }) {
         }
       }
       set(device.id, { phase: 'live' });
-      onLive?.({ device, sessionId: made.session_id });
+      onLive?.({ device, sessionId: made.session_id, account });
       // The tab takes over from here; the attempt is done.
       set(device.id, null);
     } catch (e) {
       if (!mine.cancelled) set(device.id, { phase: 'error', message: messageOf(e, null), code: e?.code ?? null });
     } finally {
-      active.current.delete(device.id);
+      if (active.current.get(device.id) === mine) active.current.delete(device.id);
+      finish();
     }
-  }, [core, account, onLive, pollMs, set]);
+  }, [core, account, onLive, pollMs, set, endAttempt]);
 
-  // Stops waiting. If the relay already made a session, ends it.
+  // Stops waiting. If the relay already made a session, ends it; if it has not answered yet, the
+  // attempt ends the session when it does.
   const cancel = useCallback(async (deviceId) => {
     const mine = active.current.get(deviceId);
-    const sessionId = conns[deviceId]?.sessionId;
     if (mine) mine.cancelled = true;
-    active.current.delete(deviceId);
     set(deviceId, null);
-    if (sessionId) {
-      try {
-        await endSession(core, account, sessionId);
-      } catch (_) {
-        // it may have ended already
-      }
-    }
-  }, [conns, core, account, set]);
+    if (mine) await endAttempt(mine);
+  }, [set, endAttempt]);
 
   const dismiss = useCallback((deviceId) => set(deviceId, null), [set]);
 

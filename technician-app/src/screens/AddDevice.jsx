@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { createPairing, fetchDevices, listPairings, messageOf } from '../api.js';
 import { Icon } from '../components/Icon.jsx';
 import { useApp } from '../context.jsx';
@@ -17,6 +17,11 @@ export function AddDevice() {
   const [used, setUsed] = useState(false); // the code is no longer live, but its PC has not shown up yet
   const [now, setNow] = useState(() => Date.now());
   const baseline = useRef(new Set());
+  // The account this screen is for now. A code or a list that comes back for another account is
+  // dropped, and a change of account clears the code: it belongs to the team that made it.
+  const accountRef = useRef(account.id);
+  accountRef.current = account.id;
+  useEffect(() => { setPairing(null); setAdded(null); setUsed(false); setError(null); setBusy(false); }, [account.id]);
   const expired = pairing ? now >= pairing.expires_at && !used : false;
   const live = !!pairing && !added && !used && !expired;
   const waiting = !!pairing && !added && !expired;
@@ -27,7 +32,9 @@ export function AddDevice() {
   // appeared, ask whether the code is still live: a code that is gone before it ran out was
   // used (or revoked), so the countdown stops.
   useInterval(async () => {
-    const list = await fetchDevices(core, account.id);
+    const owner = account.id;
+    const list = await fetchDevices(core, owner);
+    if (accountRef.current !== owner) return;
     const fresh = list.find((d) => !baseline.current.has(d.id));
     if (fresh) {
       setAdded(fresh);
@@ -35,7 +42,8 @@ export function AddDevice() {
       return;
     }
     try {
-      const codes = await listPairings(core, account.id);
+      const codes = await listPairings(core, owner);
+      if (accountRef.current !== owner) return;
       // Not in the list while it still has time left (a margin for the two clocks): it was used.
       if (!codes.some((c) => c.id === pairing.id) && Date.now() < pairing.expires_at - 3000) setUsed(true);
     } catch (_) {
@@ -48,16 +56,19 @@ export function AddDevice() {
     setError(null);
     setAdded(null);
     setUsed(false);
+    const owner = account.id;
     try {
-      const before = await fetchDevices(core, account.id);
+      const before = await fetchDevices(core, owner);
+      if (accountRef.current !== owner) return;
       baseline.current = new Set(before.map((d) => d.id));
-      const made = await createPairing(core, account.id);
+      const made = await createPairing(core, owner);
+      if (accountRef.current !== owner) return;
       setPairing(made);
       setNow(Date.now());
     } catch (e) {
-      setError(messageOf(e, t('add.code_failed')));
+      if (accountRef.current === owner) setError(messageOf(e, t('add.code_failed')));
     } finally {
-      setBusy(false);
+      if (accountRef.current === owner) setBusy(false);
     }
   }
 

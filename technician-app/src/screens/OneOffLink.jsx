@@ -12,6 +12,8 @@ export function OneOffLink({ onClose }) {
   const [link, setLink] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  const accountRef = useRef(account.id);
+  accountRef.current = account.id;
 
   useEffect(() => {
     const d = ref.current;
@@ -26,11 +28,13 @@ export function OneOffLink({ onClose }) {
   async function make() {
     setBusy(true);
     setError(null);
+    const owner = account.id;
     try {
-      const out = await createOneOff(core, account.id);
-      setLink(out.download_url);
+      const out = await createOneOff(core, owner);
+      // A link made for the team that was shown a moment ago is not this team's.
+      if (accountRef.current === owner) setLink(out.download_url);
     } catch (e) {
-      setError(messageOf(e, t('link.failed')));
+      if (accountRef.current === owner) setError(messageOf(e, t('link.failed')));
     } finally {
       setBusy(false);
     }

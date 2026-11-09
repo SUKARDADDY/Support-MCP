@@ -30,12 +30,19 @@ export function SessionTab({ tab, active = true }) {
     account: tab.account,
     deviceId: () => latest.current.tab.deviceId ?? null,
     sessionId: () => latest.current.s.sessionId ?? null,
+    ended: () => latest.current.s.ended,
     // The session, when it is connected and the person drives it: a task can start on it.
     liveSession: () => { const { s: cur } = latest.current; return cur.attached && cur.isDriver && !cur.ended ? cur.sessionId ?? null : null; },
     hold: () => latest.current.s.holdScreenshots(),
     release: () => latest.current.s.releaseScreenshots(),
     follow: (taskId) => { try { latest.current.s.watchTask(taskId); } finally { latest.current.s.releaseScreenshots(); } },
   }), [registerTab, tab.key, tab.account]);
+
+  // The task this tab follows is saved with the tab, so a restart follows it again (the relay stops
+  // a task nobody watches for two minutes), and cleared when the task is over.
+  useEffect(() => {
+    if ((s.taskId ?? null) !== (tab.taskId ?? null)) updateTab(tab.key, { taskId: s.taskId ?? null });
+  }, [s.taskId, tab.taskId, tab.key, updateTab]);
 
   const device = devices.find((d) => d.id === tab.deviceId) ?? null;
   const name = tab.deviceName || device?.name || t('session.untitled');
@@ -180,7 +187,7 @@ export function SessionTab({ tab, active = true }) {
           </aside>
         ) : null}
       </div>
-      {agentOpen ? <AgentStartDialog sessionId={s.sessionId} onClose={() => setAgentOpen(false)} /> : null}
+      {agentOpen ? <AgentStartDialog sessionId={s.sessionId} accountId={tab.account} onClose={() => setAgentOpen(false)} /> : null}
     </div>
   );
 }

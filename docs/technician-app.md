@@ -126,6 +126,14 @@ the app's core has no tool for them.
   activity panel lists the session log only from the task's start on, and says why a task failed
   or was stopped. A task started on an open session leaves that session open when it ends: you
   keep the tab and the driver seat. Ending the tab's session ends the task with it.
+- Everything a tab asks of the relay uses the account the tab was opened under, not the one on
+  screen. A connection that finishes after you switched teams opens its tab under its own team and
+  leaves it hidden until you use that team again. Cancelling a connection before the relay has
+  answered ends the session the relay makes afterwards. An answer that comes back for an account,
+  session or task the screen has since left is dropped.
+- A task started on a PC whose session has ended gets a new tab; the ended tab keeps saying so. When a
+  task turns out to run on another session than its tab's (a start by PC that had to connect again),
+  the tab adopts that session and saves it, with the task, so a restart follows the task again.
 - Every 15 seconds it looks for a task running on the session and switches to its picture.
 - The activity panel shows what the task has cost against the team's cap for one task ("Spent
   $0.42 of the $2.00 task cap."), and the same line in the summary when the task is over. The

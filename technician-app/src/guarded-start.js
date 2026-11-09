@@ -1,12 +1,14 @@
 // How a task is started (App's startAgentTask): the open session tabs on the same PC or session
 // stop their screenshots first, and each holds exactly once and lets go exactly once. A guard is
-// what a tab registers: { account, deviceId(), sessionId(), liveSession(), hold(), release(), follow(taskId) }.
+// what a tab registers: { account, deviceId(), sessionId(), ended(), liveSession(), hold(), release(), follow(taskId) }.
 
 // The relay's refusals that mean the session we picked is not usable now (the app learns a
 // session's state only every few seconds, so it can be stale).
 const STALE_SESSION = new Set(['session_ended', 'driven']);
 
-export const guardsFor = (all, accountId, body) => [...all].filter((g) => g.account === accountId
+// Tabs whose session has ended are left out: a task started on the PC makes a new session, which is a
+// new tab, not the ended one.
+export const guardsFor = (all, accountId, body) => [...all].filter((g) => g.account === accountId && !g.ended()
   && ((body.session_id && g.sessionId() === body.session_id) || (body.device_id && g.deviceId() === body.device_id)));
 
 // Starts the task with `send(body)`. A start by PC goes to the session of an open tab that is
