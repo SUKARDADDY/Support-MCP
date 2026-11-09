@@ -1,0 +1,40 @@
+/* Fonts: bundled files, never fetched. Licences are in ../fonts (OFL-*.txt). */
+@font-face { font-family: "Barlow Condensed"; font-weight: 500; font-style: normal; font-display: swap; src: url("../fonts/BarlowCondensed-Medium.ttf") format("truetype"); }
+@font-face { font-family: "Barlow Condensed"; font-weight: 600; font-style: normal; font-display: swap; src: url("../fonts/BarlowCondensed-SemiBold.ttf") format("truetype"); }
+@font-face { font-family: "Atkinson Hyperlegible Next"; font-weight: 400 700; font-style: normal; font-display: swap; src: url("../fonts/AtkinsonHyperlegibleNext-wght.ttf") format("truetype"); }
+@font-face { font-family: "Atkinson Hyperlegible Mono"; font-weight: 400 500; font-style: normal; font-display: swap; src: url("../fonts/AtkinsonHyperlegibleMono-wght.ttf") format("truetype"); }
+
+:root {
+  --display: "Barlow Condensed", "Arial Narrow", "Segoe UI", sans-serif;
+  --body: "Atkinson Hyperlegible Next", "Segoe UI", system-ui, sans-serif;
+  --mono: "Atkinson Hyperlegible Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
+  --radius: 10px;
+}
+
+/* Porcelain: cool greys, cobalt marks a live connection. Light is the default. */
+:root, :root[data-mode="light"] {
+  color-scheme: light;
+  --desk: #DCE1EA; --surface: #F6F7FA; --card: #FFFFFF; --ink: #111827; --ink-2: #4B5565; --rule: #D8DDE6; --rule-2: #E8EBF1;
+  --chrome: #FFFFFF; --chrome-2: #EAEFFB; --chrome-edge: #DDE2EB; --on-chrome: #1F2937; --on-chrome-2: #5B6474; --on-chrome-strong: #0B1220;
+  --primary: #16213D; --primary-2: #26345C; --on-primary: #FFFFFF; --primary-soft: #EEF1F8;
+  --live: #2F5BFF; --live-hover: #4A70FF; --on-live: #FFFFFF; --live-ink: #2346D6; --live-soft: #E8EDFF; --live-line: #B9C7FF; --live-deep: #1F2F6B;
+  --online: #0E8457; --online-soft: #DCF2E8; --offline: #6B7280;
+  --danger: #C22F3A; --danger-bg: #C22F3A; --danger-bg-2: #A2242E; --on-danger: #FFFFFF; --danger-soft: #FBE4E6;
+  --end-border: #E9A9AE; --end-ink: #B0242F; --end-hover: #FBE4E6; --focus: #2346D6;
+  --chip-border: #A9B2C1; --chip-hover: #CDD3DE; --tabs-bg: #C9D0DC; --row-hover: #EDF0F6; --muted-bg: #EEF1F5;
+  --placeholder: #6B7280; --btn-border: #BAC2CF; --field-border: #AAB3C2; --viewport: #1A1F29; --seg-on: #FFFFFF;
+  --shadow: 17 24 39;
+}
+:root[data-mode="dark"] {
+  color-scheme: dark;
+  --desk: #070A10; --surface: #0F141D; --card: #151B26; --ink: #E6EAF2; --ink-2: #9AA4B5; --rule: #263046; --rule-2: #1D2534;
+  --chrome: #0B1018; --chrome-2: #1B2334; --chrome-edge: #1F2838; --on-chrome: #E6EAF2; --on-chrome-2: #9AA4B5; --on-chrome-strong: #FFFFFF;
+  --primary: #E6EAF2; --primary-2: #FFFFFF; --on-primary: #0B1220; --primary-soft: #1B2334;
+  --live: #6B8DFF; --live-hover: #86A2FF; --on-live: #07102E; --live-ink: #9DB3FF; --live-soft: #18224A; --live-line: #2E4080; --live-deep: #D3DDFF;
+  --online: #3DD598; --online-soft: #0F2D22; --offline: #7E8899;
+  --danger: #FF8A92; --danger-bg: #C93A45; --danger-bg-2: #DA4D58; --on-danger: #FFFFFF; --danger-soft: #3A1A1F;
+  --end-border: #7A3A41; --end-ink: #FFB0B6; --end-hover: #3A1A1F; --focus: #9DB3FF;
+  --chip-border: #34405A; --chip-hover: #1B2334; --tabs-bg: #151B26; --row-hover: #182030; --muted-bg: #182030;
+  --placeholder: #7E8899; --btn-border: #34405A; --field-border: #3A4762; --viewport: #05070B; --seg-on: #2D3A58;
+  --shadow: 0 0 0;
+}

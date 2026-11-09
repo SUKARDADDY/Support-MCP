@@ -18,7 +18,8 @@ use std::time::Duration;
 const REFRESH_SKEW_MS: u64 = 60_000;
 
 /// The MCP tools the screens may call. No tool that clicks, types or runs a command is here:
-/// the app is view only, and the core enforces it whatever the screens ask for.
+/// the app is view only, and the core enforces it whatever the screens ask for. Tasks are
+/// started and controlled through the team API (route_allowed), not through agent_start.
 pub const TOOLS: &[&str] = &[
     "device_list",
     "device_connect",
@@ -27,6 +28,8 @@ pub const TOOLS: &[&str] = &[
     "session_status",
     "session_end",
     "screenshot",
+    // Read only: the team's models and the month's cost, for starting a task.
+    "agent_status",
 ];
 
 #[derive(Clone, Copy, Debug)]
