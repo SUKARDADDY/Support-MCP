@@ -6,6 +6,7 @@ pub mod commands;
 pub mod core;
 pub mod error;
 pub mod feed;
+pub mod lockdown;
 pub mod oauth;
 pub mod platform;
 pub mod relay;
@@ -30,10 +31,21 @@ fn browser() -> Arc<dyn oauth::Browser> {
     }
 }
 
+// The one window. It is built here, not from the config alone, so it can refuse to
+// navigate anywhere but the app's own screens and refuse to open another window.
+fn build_main_window(app: &tauri::App) -> tauri::Result<tauri::WebviewWindow> {
+    let config = app.config().app.windows.first().cloned().expect("tauri.conf.json describes the main window");
+    tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?
+        .on_navigation(|url| lockdown::navigation_allowed(url, cfg!(debug_assertions)))
+        .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny)
+        .build()
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            build_main_window(app)?;
             let handle = app.handle().clone();
             let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
             let store = Arc::new(store::Store::open(&dir, seal::default_sealer())?);

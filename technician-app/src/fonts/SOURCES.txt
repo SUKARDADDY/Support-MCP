@@ -1,0 +1,8 @@
+Fonts bundled with the app, all under the SIL Open Font License 1.1 (OFL-*.txt, next to each family).
+Downloaded on 2026-11-09 from the google/fonts repository, commit 5bb28733cec313b63fbd415b574b5ae35c8aa8b8:
+
+  BarlowCondensed-Medium.ttf, BarlowCondensed-SemiBold.ttf   ofl/barlowcondensed  (weights 500 and 600)
+  AtkinsonHyperlegibleNext-wght.ttf                          ofl/atkinsonhyperlegiblenext  (variable, 200 to 800; the app uses 400 to 700)
+  AtkinsonHyperlegibleMono-wght.ttf                          ofl/atkinsonhyperlegiblemono  (variable, 200 to 800; the app uses 400 and 500)
+
+The installer carries the three licence texts under licenses/ (bundle.resources in src-tauri/tauri.conf.json).
