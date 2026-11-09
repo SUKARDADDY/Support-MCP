@@ -63,6 +63,12 @@ export async function createPairing(core, account) {
   return v.pairing;
 }
 
+// The pairing codes that can still be used (the relay never shows the code again): [{ id, expires_at, ... }].
+export async function listPairings(core, account) {
+  const v = await core.request(account, 'GET', '/api/pairing');
+  return Array.isArray(v?.pairings) ? v.pairings : [];
+}
+
 // Approves a waiting PC with the six digits its owner reads out.
 export const approveDevice = (core, account, id, confirm) => core.request(account, 'PATCH', `/api/devices/${id}`, { approve: { confirm } });
 
@@ -89,9 +95,11 @@ export async function listTasks(core, account) {
   const v = await core.request(account, 'GET', '/api/agent/tasks');
   return Array.isArray(v?.tasks) ? v.tasks : [];
 }
+// The task, with the team's spending caps ({ task_cap_usd, month_cap_usd, month_spent_usd }) as
+// `caps` when the relay sent them.
 export async function taskStatus(core, account, taskId, waitS = 0) {
   const v = await core.request(account, 'GET', `/api/agent/tasks/${taskId}${waitS ? `?wait_s=${waitS}` : ''}`);
-  return v.task;
+  return v.caps && v.task ? { ...v.task, caps: v.caps } : v.task;
 }
 export const taskFrame = (core, account, taskId) => core.request(account, 'GET', `/api/agent/tasks/${taskId}/frame`);
 export const controlTask = (core, account, taskId, action) => core.request(account, 'POST', `/api/agent/tasks/${taskId}/${action}`, {});

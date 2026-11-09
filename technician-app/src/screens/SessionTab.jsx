@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { connectDevice, messageOf } from '../api.js';
 import { Icon } from '../components/Icon.jsx';
 import { useApp } from '../context.jsx';
-import { formatClock, formatDuration } from '../format.js';
+import { formatClock, formatDuration, formatUsd, taskTitle } from '../format.js';
 import { t } from '../i18n/index.js';
 import { dataUrl, useSession } from '../session.js';
 import { AgentStartDialog } from './AgentStartDialog.jsx';
@@ -14,7 +14,7 @@ const KNOWN_KINDS = ['created', 'consumed', 'attached', 'hello', 'detached', 'de
 // or take it over. There are no click or type controls: this tab only watches. Everything
 // from the PC (the picture, step details, notes, log text) is untrusted and shown as text.
 export function SessionTab({ tab, active = true }) {
-  const { core, tuning, me, can, endTab, closeTab, toast, updateTab, devices, visible } = useApp();
+  const { core, tuning, me, can, endTab, closeTab, toast, updateTab, devices, visible, titleOf } = useApp();
   const [showActivity, setShowActivity] = useState(true);
   const [agentOpen, setAgentOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
@@ -48,6 +48,11 @@ export function SessionTab({ tab, active = true }) {
     else if (notes.length > seen.current.notes) setAnnouncement(String(notes[notes.length - 1].text ?? ''));
     seen.current = { notes: notes.length, over };
   }, [s.task, s.taskLive]);
+
+  // What the task has cost so far, against the team's cap for one task.
+  const cost = Number.isFinite(s.task?.cost_usd)
+    ? { spent: formatUsd(s.task.cost_usd), cap: Number.isFinite(s.task.caps?.task_cap_usd) ? formatUsd(s.task.caps.task_cap_usd) : null }
+    : null;
 
   const image = dataUrl(s.taskLive ? s.frame : s.shot ?? s.frame);
   const driver = s.status?.driver ?? null;
@@ -136,7 +141,8 @@ export function SessionTab({ tab, active = true }) {
         {showActivity ? (
           <aside className="act" aria-label={t('session.activity_label')}>
             <h3>{s.task ? t('session.agent_activity') : t('session.activity')}</h3>
-            {s.task ? <p className="task">{s.task.title}</p> : null}
+            {s.task ? <p className="task">{taskTitle(s.task.title, titleOf(s.task.id))}</p> : null}
+            {s.taskLive && cost ? <p className="cost">{cost.cap === null ? t('session.cost_running_nocap', { spent: cost.spent }) : t('session.cost_running', { spent: cost.spent, cap: cost.cap })}</p> : null}
             {s.task?.notice ? <p className="paused">{s.task.notice}</p> : null}
             {s.task?.state === 'paused' ? <p className="paused">{t('session.task_paused_note')}</p> : null}
             {s.activity.length === 0 ? <p className="hint">{t('session.activity_empty')}</p> : (
@@ -154,11 +160,12 @@ export function SessionTab({ tab, active = true }) {
               </ol>
             )}
             {s.task && !s.taskLive && s.task.summary ? <p className="tl-end"><b>{t('session.summary')}</b> {s.task.summary}</p> : null}
+            {s.task && !s.taskLive && cost ? <p className="tl-end cost">{cost.cap === null ? t('session.cost_final_nocap', { spent: cost.spent }) : t('session.cost_final', { spent: cost.spent, cap: cost.cap })}</p> : null}
             {s.task && !s.taskLive && s.task.state && s.task.state !== 'running' ? <p className="hint">{t('session.task_over', { state: t(`task.${s.task.state}`) })}</p> : null}
           </aside>
         ) : null}
       </div>
-      {agentOpen ? <AgentStartDialog sessionId={s.sessionId} onClose={() => setAgentOpen(false)} onStarted={(started) => { s.watchTask(started.task_id); }} /> : null}
+      {agentOpen ? <AgentStartDialog sessionId={s.sessionId} onClose={() => setAgentOpen(false)} beforeStart={s.holdScreenshots} onStartFailed={s.releaseScreenshots} onStarted={(started) => { s.watchTask(started.task_id); s.releaseScreenshots(); }} /> : null}
     </div>
   );
 }

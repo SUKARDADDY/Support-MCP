@@ -79,6 +79,45 @@ pub fn plain(s: &str) -> String {
     s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
+/// How much of a task's first line the relay keeps for its title (src/agent.js), in UTF-16 units.
+const TASK_TITLE_CUT: usize = 100;
+
+/// Cuts text the relay stopped at TASK_TITLE_CUT at the last whole word, and ends it with an
+/// ellipsis, so a toast does not end in half a word.
+fn cut_at_word(kept: &str) -> String {
+    let head = match kept.rfind(char::is_whitespace) {
+        Some(i) if i > 0 => &kept[..i],
+        _ => kept,
+    };
+    format!("{}\u{2026}", head.trim_end_matches(|c: char| c.is_whitespace() || ",;:-".contains(c)))
+}
+
+/// The text of a task notification as a toast should show it. The relay keeps the first 100
+/// characters of the instructions as the task's title and puts it in the body: alone for a
+/// finished task, before ": <why>" for one that needs attention. A body whose title is exactly
+/// that long was probably cut, so it is cut again at a word and ends in an ellipsis. Every other
+/// event is returned as it is. (The screens show the full instructions where the app has them.)
+pub fn tidy_task_body(event: &str, body: &str) -> String {
+    let units = |s: &str| s.encode_utf16().count();
+    match event {
+        "task_finished" if units(body) == TASK_TITLE_CUT => cut_at_word(body),
+        "task_problem" => {
+            let mut seen = 0;
+            for (at, c) in body.char_indices() {
+                if seen == TASK_TITLE_CUT {
+                    return match body[at..].strip_prefix(": ") {
+                        Some(_) => format!("{}{}", cut_at_word(&body[..at]), &body[at..]),
+                        None => body.to_string(),
+                    };
+                }
+                seen += c.len_utf16();
+            }
+            body.to_string()
+        }
+        _ => body.to_string(),
+    }
+}
+
 async fn read_page(client: &AccountClient, after: u64, wait_s: u64) -> Result<(Vec<FeedItem>, u64), CoreError> {
     let path = format!("/notifications?after={after}&wait_s={wait_s}");
     let timeout = Duration::from_secs(wait_s + 15);
@@ -200,7 +239,7 @@ impl FeedSink for CoreSink {
         self.emitter.emit("feed://items", json!({ "account": account, "items": clean, "live": live }));
         if live && self.store.prefs().desktop_notifications {
             for item in &clean {
-                self.notifier.show(account, item);
+                self.notifier.show(account, &FeedItem { body: tidy_task_body(&item.event, &item.body), ..item.clone() });
             }
         }
     }
@@ -411,6 +450,39 @@ mod tests {
         // Every item still reaches the screens and the list.
         assert_eq!(emits.0.lock().unwrap().len(), 3);
         assert_eq!(sink.recent.all().len(), 3);
+    }
+
+    struct Bodies(Mutex<Vec<String>>);
+    impl Notifier for Bodies {
+        fn show(&self, _a: &str, i: &FeedItem) {
+            self.0.lock().unwrap().push(i.body.clone());
+        }
+    }
+
+    #[test]
+    fn a_task_title_the_relay_cut_ends_at_a_whole_word_in_the_toast_and_the_list_keeps_what_it_got() {
+        let long = "Check why the receipt printer at the front counter stopped printing after the update, then finish wi";
+        assert_eq!(long.len(), 100);
+        let cut = "Check why the receipt printer at the front counter stopped printing after the update, then finish\u{2026}";
+        assert_eq!(tidy_task_body("task_finished", long), cut);
+        // "Task needs attention": the title is followed by why.
+        assert_eq!(tidy_task_body("task_problem", &format!("{long}: the agent got stuck")), format!("{cut}: the agent got stuck"));
+        // A title that fits, other events and other bodies are left alone.
+        assert_eq!(tidy_task_body("task_finished", "Fix the printer"), "Fix the printer");
+        assert_eq!(tidy_task_body("task_problem", "Fix the printer: stuck"), "Fix the printer: stuck");
+        assert_eq!(tidy_task_body("device_waiting", long), long);
+        // A cut with no space in it keeps what it has.
+        let solid = "x".repeat(100);
+        assert_eq!(tidy_task_body("task_finished", &solid), format!("{solid}\u{2026}"));
+
+        let (store, _id) = store_with_account("sink3", "http://127.0.0.1:1", &tokens("a", "b", 1000));
+        let emits = Arc::new(Emits::default());
+        let bodies = Arc::new(Bodies(Mutex::new(Vec::new())));
+        let sink = CoreSink { recent: Arc::new(Recent::default()), emitter: emits, notifier: bodies.clone(), store };
+        let item = FeedItem { body: long.into(), ..fi(1, "Task finished") };
+        sink.items("acc", &[item], true);
+        assert_eq!(*bodies.0.lock().unwrap(), vec![cut.to_string()], "the toast");
+        assert_eq!(sink.recent.all()[0].item.body, long, "the list gets the relay's text; the screens tidy it");
     }
 
     #[test]

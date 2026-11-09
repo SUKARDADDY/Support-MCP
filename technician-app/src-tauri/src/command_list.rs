@@ -15,6 +15,7 @@ pub const COMMANDS: &[&str] = &[
     "prefs_set",
     "autostart_get",
     "autostart_set",
+    "window_theme",
     "update_status",
     "update_check",
 ];

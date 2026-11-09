@@ -194,9 +194,14 @@ impl Core {
         }
     }
 
-    /// Removes the account and its tokens from this PC.
-    pub fn sign_out(&self, id: &str) -> CoreResult<()> {
+    /// Signs out: asks the relay to revoke the sign-in (best effort, a few seconds at most),
+    /// then removes the account and its tokens from this PC whatever the relay answered.
+    pub async fn sign_out(&self, id: &str) -> CoreResult<()> {
         self.stop_feed(id);
+        // An account that is already signed out has nothing to revoke.
+        if let Ok(client) = self.client(id) {
+            client.revoke().await;
+        }
         self.clients.lock().unwrap_or_else(|p| p.into_inner()).remove(id);
         self.recent.clear_account(id);
         self.store.remove_account(id)?;
@@ -340,12 +345,37 @@ mod tests {
         assert!(out.data["sessions"].is_array());
         assert!(server.seen().iter().all(|r| !r.headers.contains_key("origin")));
         // Signing out removes the account and stops the feed.
-        core.sign_out(&acc.id).unwrap();
+        core.sign_out(&acc.id).await.unwrap();
         assert!(core.accounts().is_empty());
         tokio::time::sleep(Duration::from_millis(100)).await;
         let polls = server.count("/app/w/default/notifications");
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(server.count("/app/w/default/notifications"), polls, "no more polling");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn signing_out_revokes_the_sign_in_at_the_relay_and_signs_out_here_even_when_it_cannot() {
+        let (core, server, _e) = core_with(Arc::new(Approver)).await;
+        let acc = core.sign_in(&server.url(), "default").await.unwrap();
+        core.sign_out(&acc.id).await.unwrap();
+        assert!(core.accounts().is_empty());
+        // RFC 7009 at the token endpoint: the refresh token, no grant_type, the app's client id.
+        let revoke: Vec<_> = server.seen().into_iter().filter(|r| r.path() == "/oauth/token" && r.form("grant_type").is_none()).collect();
+        assert_eq!(revoke.len(), 1, "one revocation request");
+        assert_eq!(revoke[0].form("token").as_deref(), Some("REF"));
+        assert_eq!(revoke[0].form("token_type_hint").as_deref(), Some("refresh_token"));
+        assert_eq!(revoke[0].form("client_id").as_deref(), Some("cid"));
+        assert!(revoke[0].form("client_secret").is_none());
+
+        // A relay that cannot be reached does not stop the sign-out on this PC, or hold it up.
+        let (core, server, _e) = core_with(Arc::new(Approver)).await;
+        let acc = core.sign_in(&server.url(), "default").await.unwrap();
+        drop(server);
+        let began = std::time::Instant::now();
+        core.sign_out(&acc.id).await.unwrap();
+        assert!(core.accounts().is_empty());
+        assert!(core.store.tokens(&acc.id).is_none());
+        assert!(began.elapsed() < Duration::from_secs(6), "the wait for the relay is short");
     }
 
     #[tokio::test(flavor = "multi_thread")]

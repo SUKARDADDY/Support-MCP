@@ -56,6 +56,20 @@ describe('Devices', () => {
     expect(within(detail).getByText('Kitchen screen is offline')).toBeInTheDocument();
   });
 
+  test('an online PC says it is online now, and an offline one shows when it was last seen', async () => {
+    const user = userEvent.setup();
+    // A check-in time that is old on purpose: it must not be shown for a PC that is online.
+    const stale = Date.parse('2026-09-01T08:30:00Z');
+    renderApp(fakeCore({ devices: [device({ id: ID('a'), name: 'Front counter', online: true, last_seen: stale }), device({ id: ID('c'), name: 'Kitchen screen', online: false, last_seen: stale })] }));
+    await user.click(await screen.findByRole('button', { name: /Front counter/ }));
+    const detail = screen.getByRole('region', { name: 'Device details' });
+    const lastSeen = () => [...detail.querySelectorAll('dt')].find((dt) => dt.textContent === 'Last seen').nextElementSibling;
+    expect(lastSeen().textContent).toBe('Online now');
+    await user.click(screen.getByRole('button', { name: /Kitchen screen/ }));
+    expect(lastSeen()).toHaveTextContent('Sep');
+    expect(lastSeen()).not.toHaveTextContent('Online now');
+  });
+
   test('with no saved PCs it says how to add one', async () => {
     renderApp(fakeCore({ devices: [] }));
     expect(await screen.findByText('No saved devices yet')).toBeInTheDocument();

@@ -65,6 +65,7 @@ export function fakeCore(initial = {}) {
     setAutostart: vi.fn(async (on) => { state.autostart = on; }),
     updateStatus: vi.fn(async () => state.update),
     checkForUpdate: vi.fn(async () => state.update),
+    setWindowTheme: vi.fn(async () => {}),
     on: vi.fn(async (event, handler) => {
       if (!handlers.has(event)) handlers.set(event, new Set());
       handlers.get(event).add(handler);
@@ -79,6 +80,7 @@ export function fakeCore(initial = {}) {
       if (p === '/api/customers') return { customers: state.customers, next: null };
       if (p === '/api/devices' && method === 'GET') return { devices: state.devices.map(({ online, ...d }) => d), next: null };
       if (p === '/api/pairing' && method === 'POST') return { pairing: state.pairing };
+      if (p === '/api/pairing' && method === 'GET') return { pairings: state.pairingUsed ? [] : [{ id: state.pairing.id, expires_at: state.pairing.expires_at }], next: null };
       const approve = /^\/api\/devices\/(\w+)$/.exec(p);
       if (approve && method === 'PATCH') {
         if (state.approveError) throw state.approveError;
@@ -104,7 +106,7 @@ export function fakeCore(initial = {}) {
           throw Object.assign(new Error('the task has no picture yet'), { code: 'no_frame', status: 404 });
         }
         if (task[2]) { state.controlled = [...(state.controlled ?? []), task[2]]; return { task_id: task[1], state: task[2] === 'stop' ? 'stopped' : task[2] === 'pause' ? 'paused' : 'running' }; }
-        return { task: state.taskStatus ? state.taskStatus(t, q) : t };
+        return { task: state.taskStatus ? state.taskStatus(t, q) : t, ...(state.taskCaps ? { caps: state.taskCaps } : {}) };
       }
       if (p === '/teams') return { teams: state.teams };
       if (p === '/notifications/settings') {

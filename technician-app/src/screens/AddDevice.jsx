@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import { createPairing, fetchDevices, messageOf } from '../api.js';
+import { createPairing, fetchDevices, listPairings, messageOf } from '../api.js';
 import { Icon } from '../components/Icon.jsx';
 import { useApp } from '../context.jsx';
 import { formatDuration } from '../format.js';
@@ -14,20 +14,32 @@ export function AddDevice() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [added, setAdded] = useState(null);
+  const [used, setUsed] = useState(false); // the code is no longer live, but its PC has not shown up yet
   const [now, setNow] = useState(() => Date.now());
   const baseline = useRef(new Set());
-  const expired = pairing ? now >= pairing.expires_at : false;
+  const expired = pairing ? now >= pairing.expires_at && !used : false;
+  const live = !!pairing && !added && !used && !expired;
   const waiting = !!pairing && !added && !expired;
 
-  useInterval(() => setNow(Date.now()), 1000, !!pairing && !added);
+  useInterval(() => setNow(Date.now()), 1000, live);
 
-  // Watch the team's PCs for one that was not there when the code was made.
+  // Watch the team's PCs for one that was not there when the code was made. When none has
+  // appeared, ask whether the code is still live: a code that is gone before it ran out was
+  // used (or revoked), so the countdown stops.
   useInterval(async () => {
     const list = await fetchDevices(core, account.id);
     const fresh = list.find((d) => !baseline.current.has(d.id));
     if (fresh) {
       setAdded(fresh);
       reloadDevices();
+      return;
+    }
+    try {
+      const codes = await listPairings(core, account.id);
+      // Not in the list while it still has time left (a margin for the two clocks): it was used.
+      if (!codes.some((c) => c.id === pairing.id) && Date.now() < pairing.expires_at - 3000) setUsed(true);
+    } catch (_) {
+      // the next look tries again
     }
   }, tuning.watchMs, waiting, { immediate: false });
 
@@ -35,6 +47,7 @@ export function AddDevice() {
     setBusy(true);
     setError(null);
     setAdded(null);
+    setUsed(false);
     try {
       const before = await fetchDevices(core, account.id);
       baseline.current = new Set(before.map((d) => d.id));
@@ -61,7 +74,11 @@ export function AddDevice() {
           <li>{t('add.step1')}</li>
           <li>
             {t('add.step2')}
-            {pairing && !expired ? (
+            {added ? (
+              <p className="hint" data-testid="pairing-done">{t('add.code_used_by', { name: added.name })}</p>
+            ) : used ? (
+              <p className="hint" data-testid="pairing-done">{t('add.code_used')}</p>
+            ) : pairing && !expired ? (
               <div>
                 <span className="pair" data-testid="pairing-code">{pairing.code}</span>
                 <div className="hint">{t('add.code_works_once', { left: formatDuration(Math.max(0, pairing.expires_at - now)) })}</div>
@@ -86,7 +103,7 @@ export function AddDevice() {
             <button type="button" className="btn btn-pri" onClick={() => { select(added.id); go('devices'); toast(null); }}>{t('add.view', { name: added.name })}</button>
           </>
         ) : waiting ? (
-          <div className="status" role="status"><span className="spinner" aria-hidden="true" /><span>{t('add.waiting')}</span></div>
+          <div className="status" role="status"><span className="spinner" aria-hidden="true" /><span>{used ? t('add.waiting_join') : t('add.waiting')}</span></div>
         ) : null}
       </div>
     </div>

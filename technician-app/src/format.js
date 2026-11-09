@@ -38,6 +38,40 @@ export function formatAgo(ms, now = Date.now(), locale) {
   return formatDate(ms, locale);
 }
 
+// Dollars for a task's cost: $0.42, $2.00, and three places for a few cents so $0.003 is not $0.00.
+export function formatUsd(amount, locale) {
+  if (!Number.isFinite(amount)) return '';
+  const places = amount > 0 && amount < 1 ? 3 : 2;
+  return new Intl.NumberFormat(locale, { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: places }).format(amount);
+}
+
+// The relay keeps the first 100 characters of a task's instructions as its title and cuts
+// there, mid-word. These show a title or a task notification whole where the app has the
+// instructions (it started the task: `full` is their first line), and otherwise stop at the
+// last whole word with an ellipsis. Rust does the same for the Windows toast (feed.rs).
+const TITLE_CUT = 100;
+
+export function cutAtWord(text) {
+  const s = String(text ?? '');
+  const space = s.search(/\s\S*$/);
+  const head = space > 0 ? s.slice(0, space) : s;
+  return `${head.replace(/[\s,;:-]+$/, '')}\u2026`;
+}
+
+export function taskTitle(title, full = null) {
+  const s = String(title ?? '');
+  if (full && full.length > s.length && full.startsWith(s)) return full;
+  return s.length === TITLE_CUT ? cutAtWord(s) : s;
+}
+
+// The body of a task notification: the title alone ("Task finished"), or the title, ": " and why.
+export function taskBody(event, body, full = null) {
+  const s = String(body ?? '');
+  if (event === 'task_finished') return taskTitle(s, full);
+  if (event === 'task_problem' && s.length > TITLE_CUT + 1 && s.slice(TITLE_CUT, TITLE_CUT + 2) === ': ') return taskTitle(s.slice(0, TITLE_CUT), full) + s.slice(TITLE_CUT);
+  return s;
+}
+
 // The ten-character pairing code, as the relay shows it (ABCDE-FGH23), for a field that
 // takes it with or without the hyphen.
 export const cleanCode = (v) => String(v ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');

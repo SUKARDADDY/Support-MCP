@@ -205,6 +205,7 @@ dialog::backdrop { background: rgb(0 0 0 / .45); }
 .act { background: var(--card); border-left: 1px solid var(--rule); overflow: auto; padding: 16px 18px 22px; }
 .act h3 { font-size: 15px; font-weight: 700; margin-bottom: 2px; }
 .act .task { font-size: 14px; color: var(--ink-2); margin-bottom: 16px; overflow-wrap: anywhere; }
+.act .cost { font-size: 13.5px; color: var(--ink-2); margin: -10px 0 14px; }
 .tl { list-style: none; margin: 0; padding: 0; }
 .tl li { position: relative; padding: 0 0 14px 28px; }
 .tl li::before { content: ""; position: absolute; left: 8px; top: 20px; bottom: 0; width: 2px; background: var(--rule); }

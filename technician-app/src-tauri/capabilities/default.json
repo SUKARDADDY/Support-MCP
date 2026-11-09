@@ -18,6 +18,7 @@
     "allow-prefs-set",
     "allow-autostart-get",
     "allow-autostart-set",
+    "allow-window-theme",
     "allow-update-status",
     "allow-update-check",
     "core:event:allow-listen",

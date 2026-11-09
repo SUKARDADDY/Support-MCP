@@ -8,6 +8,10 @@
 //   * Otherwise, when you are the driver, the tab is on screen and the window is visible, it
 //     takes a screenshot every few seconds. It stops at once when the relay answers "is
 //     driving" (someone else took over) or "agent busy", and starts again only on request.
+//   * Handing the session to the agent from this tab stops that loop and waits for a
+//     screenshot in flight to settle before the task is started (holdScreenshots), because
+//     the PC takes one command at a time and the agent's first step would fail with "agent
+//     busy". The loop stays off for as long as a task is followed.
 //   * Every 15 seconds it looks for a running task on the session, and switches to its picture.
 //   * The session's own status (state, driver, log) is read every few seconds.
 //
@@ -64,6 +68,9 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
   const [shot, setShot] = useState(null);
   const [stopped, setStopped] = useState(null); // null, 'driving', 'busy' or 'failed'
   const [stoppedMessage, setStoppedMessage] = useState(null);
+  const [held, setHeld] = useState(false); // a task is being started: no screenshot may begin
+  const heldRef = useRef(false);
+  const inFlight = useRef(null); // the screenshot request on its way, if any
   const alive = useRef(true);
   const fails = useRef(0);
   const lastRev = useRef(null);
@@ -154,16 +161,24 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
     return () => { stopped_ = true; };
   }, [core, account, taskId, tuning.taskWaitS, tuning.taskGapMs, tuning.taskRetryMs, fetchFrame]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Back on screen with a task running: take its latest picture now.
+  // Back on screen with a task running: take its latest picture now. The status loop then
+  // has nothing newer to fetch, so it does not fetch the same picture again.
   useEffect(() => {
-    if (onScreen && taskLive) fetchFrame(taskId);
+    if (onScreen && taskLive) {
+      lastRev.current = task.rev;
+      fetchFrame(taskId);
+    }
   }, [onScreen]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---- taking a picture every few seconds, when nobody else is -------------------------
-  const watching = attached && isDriver && !taskLive && !stopped && canControl && onScreen;
+  // Not while a task is followed (taskId), even before its first status has come back.
+  const watching = attached && isDriver && !taskId && !taskLive && !stopped && canControl && onScreen && !held;
   useInterval(async () => {
+    if (heldRef.current) return;
     try {
-      const out = await screenshot(core, account, sessionId);
+      const call = screenshot(core, account, sessionId);
+      inFlight.current = call;
+      const out = await call;
       fails.current = 0;
       if (alive.current && out.image) setShot({ mime: out.image.mime, data: out.image.data, at: Date.now() });
     } catch (e) {
@@ -173,8 +188,20 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
       // "customer is using the PC" and other passing failures: try again next time, a few times.
       fails.current += 1;
       if (fails.current >= FAILS_BEFORE_STOP) { setStopped('failed'); setStoppedMessage(e?.message ?? null); }
+    } finally {
+      inFlight.current = null;
     }
   }, tuning.screenshotMs, watching);
+
+  // Before a task is started on this session: stop the loop and let a request in flight finish
+  // (whatever it answers), so the PC is free for the agent's first step.
+  const holdScreenshots = useCallback(async () => {
+    heldRef.current = true;
+    setHeld(true);
+    const pending = inFlight.current;
+    if (pending) await pending.catch(() => {});
+  }, []);
+  const releaseScreenshots = useCallback(() => { heldRef.current = false; setHeld(false); }, []);
 
   const resumeShots = useCallback(() => { fails.current = 0; setStopped(null); setStoppedMessage(null); }, []);
 
@@ -197,6 +224,6 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
 
   return {
     sessionId, status, statusError, ended, attached, isDriver, task, taskLive, frame, frameWaiting, shot,
-    stopped, stoppedMessage, resumeShots, activity, control, refreshStatus, watchTask, lookForTask,
+    stopped, stoppedMessage, resumeShots, activity, control, refreshStatus, watchTask, lookForTask, holdScreenshots, releaseScreenshots,
   };
 }

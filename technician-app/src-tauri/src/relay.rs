@@ -17,6 +17,9 @@ use std::time::Duration;
 /// How soon before an access token ends it is refreshed.
 const REFRESH_SKEW_MS: u64 = 60_000;
 
+/// How long signing out waits for the relay to confirm the revocation.
+const REVOKE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The MCP tools the screens may call. No tool that clicks, types or runs a command is here:
 /// the app is view only, and the core enforces it whatever the screens ask for. Tasks are
 /// started and controlled through the team API (route_allowed), not through agent_start.
@@ -316,6 +319,22 @@ impl AccountClient {
                 _ => return Err(CoreError::Unavailable(Msg::RenewFailed)),
             }
         }
+    }
+
+    /// Asks the relay to revoke this sign-in (RFC 7009, at the token endpoint the relay serves
+    /// for refreshing too). Revoking the refresh token ends the whole grant on the relay, the
+    /// access token with it. Best effort and short: true when the relay confirmed, false when
+    /// it was unreachable or refused, so signing out on this PC never waits on the relay.
+    pub async fn revoke(&self) -> bool {
+        let Some(tokens) = self.store.tokens(&self.id) else { return false };
+        let sent = self
+            .http
+            .post(&self.token_endpoint)
+            .timeout(REVOKE_TIMEOUT)
+            .form(&[("token", tokens.refresh.as_str()), ("token_type_hint", "refresh_token"), ("client_id", self.client_id.as_str())])
+            .send()
+            .await;
+        matches!(sent, Ok(r) if r.status().is_success())
     }
 
     /// Calls a relay route (`path` follows `/app/w/<team>`, such as `/api/devices`) and

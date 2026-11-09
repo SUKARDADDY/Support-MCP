@@ -20,9 +20,34 @@ installer downloads Microsoft's bootstrapper and installs it first.
 
 To remove it, use Windows Settings, Apps. That deletes the app and its files. Your sign-in
 sits in `%APPDATA%\dev.support-mcp.technician\app.json`, sealed so only your Windows account
-can read it; Remove in the app's Settings deletes it too. A downloaded update waits in
+can read it; **Sign out** in the app's Settings deletes it too. A downloaded update waits in
 `%LOCALAPPDATA%\dev.support-mcp.technician\update\`, not in the roaming folder, because the installer is
 large and only useful on this PC.
+
+### What an uninstall removes
+
+Both folders, `%APPDATA%\dev.support-mcp.technician` (the sealed sign-in, `app.json`) and
+`%LOCALAPPDATA%\dev.support-mcp.technician` (the web view cache and a staged update), are the
+app's data. What happens to them depends on how the app is removed:
+
+- **Windows Settings, Apps** shows the uninstaller's window with Tauri's **Delete app data**
+  box, unchecked. Tick it to delete both folders.
+- **A silent uninstall** (`uninstall.exe /S`, as winget, Intune and scripts run it) has no window,
+  so that box is never read. `technician-app/src-tauri/windows/hooks.nsh`, set as
+  `bundle.windows.nsis.installerHooks`, runs after the template's own uninstall steps and deletes
+  both folders.
+- **An update never deletes them.** Tauri's template enters update mode only when the installer is
+  started with `/UPDATE`; `/S` and `/R` do not set it. The app starts its installer with
+  `/S /R /UPDATE` (`INSTALLER_ARGS` in `update.rs`). In update mode the template installs over the
+  old files without running the old uninstaller and tells any uninstaller it does start. The hook
+  has two guards of its own: it checks `$UpdateMode <> 1`, and it acts only when `${Silent}`
+  is true, which means that uninstaller was itself started with `/S`. The old uninstaller that a
+  new installer runs for an interactive reinstall is started without `/S`, so it never matches.
+  A test (`lockdown.rs`) holds the hook, its two guards and the installer's arguments.
+
+The hook is plain NSIS and is not built on Linux. Check it on Windows: sign in, run
+`uninstall.exe /S` and confirm both folders are gone; then sign in again and let the app update
+itself, and confirm `app.json` is still there.
 
 ## Sign in
 
@@ -58,15 +83,22 @@ approval in the browser, and the Devices screen gets a team picker.
   "Needs approval". Select it, ask the owner for the six-digit number on their screen, type it
   and press **Approve**.
 - **Add a device.** Press **Get a pairing code**. The owner installs Support on the PC and enters the
-  code (it works once, for ten minutes). The screen watches the list and tells you when the PC
-  arrives. **Copy install link** copies the relay's `/install` link with the code in it.
+  code (it works once, for ten minutes). The screen watches the list and the code. When the PC
+  arrives, or the code is no longer live, the countdown is replaced by "Code used by <PC>". **Copy install link** copies the relay's `/install` link with the code in it.
 - **One-off link.** For a PC you will help once: creates a session link that works once, for ten
   minutes, and nothing is saved to your devices.
 - **Session tabs.** Each open session is a tab at the top. See below.
 - **Notifications.** The recent items, and a Settings tab with a switch for each of the six
   events, the PCs you watch for "came online", and a switch for Windows notifications on this PC.
 - **Settings.** Accounts, appearance (light, dark or the same as Windows), starting the app with
-  Windows (off until you choose it), and updates.
+  Windows (off until you choose it), and updates. **Sign out** asks first. When you confirm,
+  the app asks the relay to revoke its sign-in (RFC 7009, `POST /oauth/token` with the refresh
+  token, which ends the whole grant) and waits at most 5 seconds for the answer. Then it deletes
+  the account and its sealed tokens from this PC, whether or not the relay answered. If the relay
+  could not be reached, the sign-in stays valid there until it expires or **Sign out everywhere**
+  on the relay ends it.
+  The native title bar and window border follow the appearance setting (the `window_theme`
+  command), so the dark theme has a dark title bar.
 
 ### The session tab (view only)
 
@@ -81,7 +113,17 @@ the app's core has no tool for them.
   It stops at once when the relay answers that someone else is driving or the PC is busy with the
   agent, and starts again when you press **Try the screen again** or take over. It also stops
   while the window is minimised or in the tray.
+- **Hand to the agent** on a tab first stops that tab's screenshots and waits for one in flight to
+  finish, then starts the task, so the agent's first step does not meet a busy PC. The tab takes
+  no screenshot again until the task is over.
 - Every 15 seconds it looks for a task running on the session and switches to its picture.
+- The activity panel shows what the task has cost against the team's cap for one task ("Spent
+  $0.42 of the $2.00 task cap."), and the same line in the summary when the task is over. The
+  relay's task status carries `cost_usd` and the caps.
+- The relay cuts a task's title at 100 characters. For a task this app started, the app keeps the
+  first line of the instructions (for the last 50 tasks, in its own storage) and shows it whole in
+  the panel header and in the Notifications list. Otherwise the title ends at the last whole word
+  with an ellipsis, as does the Windows notification, which cannot see the instructions.
 - **Activity** lists the task's steps and notes together with the session log, in time order.
   Everything from the PC (step details, notes, log text, names) is shown as text, never as markup.
 - **End session** ends it. **Take over** appears for holders of `sessions.unattended` when someone
@@ -113,7 +155,7 @@ checks the ECDSA P-256 signature against the public key built into it (`release-
 the note's header, version, size and SHA-256. It downloads
 `support-technician-<version>-setup.exe`, checks its size and SHA-256 against the signed note,
 and keeps the file. At the next start it checks the signature and the file again, runs the
-installer silently (`/S /R`) and exits so the installer can replace the app. An installer that
+installer silently (`/S /R /UPDATE`) and exits so the installer can replace the app. An installer that
 keeps failing is not run more than twice. A PC's update note (`support-mcp-release 1`) is not a
 technician note: the headers differ and the signature covers the header.
 

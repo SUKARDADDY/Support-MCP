@@ -87,6 +87,7 @@ messages! {
     InstallerHash, "installer_hash", "The installer's SHA-256 is not the one in the signed note, so it was thrown away.";
     AutostartRead, "autostart_read", "Could not read the start setting.";
     AutostartWrite, "autostart_write", "Could not change the start setting.";
+    BadTheme, "bad_theme", "The window theme is light, dark or system.";
     GithubStatus, "github_status", "GitHub did not give the release as expected. Try again later.";
     RelayTimeout, "relay_timeout", "The relay did not answer in time. Try again.";
     RelayUnreachable, "relay_unreachable", "Could not reach the relay. Check the address and your network.";

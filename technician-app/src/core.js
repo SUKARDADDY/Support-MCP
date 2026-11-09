@@ -29,6 +29,8 @@ export const realCore = {
   setAutostart: (enabled) => optional('autostart_set', { enabled }),
   updateStatus: () => optional('update_status'),
   checkForUpdate: () => optional('update_check'),
+  // Makes the native window frame follow the app's theme: 'light', 'dark' or 'system'.
+  setWindowTheme: (theme) => optional('window_theme', { theme }),
   // Subscribes to a core event; resolves to a function that stops listening.
   on: (event, handler) => listen(event, (e) => handler(e.payload)),
 };

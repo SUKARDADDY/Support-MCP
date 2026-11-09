@@ -268,6 +268,122 @@ describe('Session tab: an agent task is working', () => {
   });
 });
 
+describe('Session tab: handing the session to the agent', () => {
+  async function fillAndStart(user, text) {
+    await user.click(await screen.findByRole('button', { name: 'Hand to the agent' }));
+    const dialog = screen.getByRole('dialog', { hidden: true });
+    await user.click(within(dialog).getByLabelText('What should the agent do?'));
+    await user.paste(text);
+    await user.click(within(dialog).getByRole('button', { name: 'Start the task' }));
+  }
+
+  test('stops its screenshots and waits for the one in flight before the task is started', async () => {
+    const fake = fakeCore();
+    const order = [];
+    let finishShot = null;
+    // The first screenshot hangs until the test lets it finish: the PC is busy with it.
+    fake.state.screenshot = () => {
+      order.push('shot-start');
+      return new Promise((resolve) => { finishShot = () => { order.push('shot-end'); resolve({ data: {}, image: { mime: 'image/jpeg', data: 'QUJD' } }); }; });
+    };
+    const request = fake.core.request.getMockImplementation();
+    fake.core.request.mockImplementation(async (account, method, path, body) => {
+      if (method === 'POST' && path === '/api/agent/tasks') order.push('task-start');
+      return request(account, method, path, body);
+    });
+    const { user } = await openTab(fake);
+    await waitFor(() => expect(order).toEqual(['shot-start']));
+    await fillAndStart(user, 'Fix the printer');
+    // The task is not started while the screenshot is on its way.
+    await sleep(120);
+    expect(order).toEqual(['shot-start']);
+    expect(fake.state.started).toBeUndefined();
+    act(() => finishShot());
+    await waitFor(() => expect(fake.state.started).toEqual({ instructions: 'Fix the printer', keep_working: false, session_id: SID }));
+    expect(order).toEqual(['shot-start', 'shot-end', 'task-start']);
+    // The tab has switched to the task and takes no screenshot of its own after that.
+    await screen.findByText('Agent activity');
+    await sleep(200);
+    expect(order).toEqual(['shot-start', 'shot-end', 'task-start']);
+  });
+
+  test('a task the relay refuses to start lets the screenshots go on', async () => {
+    const fake = fakeCore();
+    fake.state.requestError = (method, p) => (method === 'POST' && p === '/api/agent/tasks' ? Object.assign(new Error('the built-in agent is off'), { code: 'caps_not_set', status: 409 }) : null);
+    const { user } = await openTab(fake);
+    await waitFor(() => expect(toolCalls(fake, 'screenshot').length).toBeGreaterThanOrEqual(1));
+    await fillAndStart(user, 'Fix the printer');
+    expect(await screen.findByText('the built-in agent is off')).toBeInTheDocument();
+    const before = toolCalls(fake, 'screenshot').length;
+    await waitFor(() => expect(toolCalls(fake, 'screenshot').length).toBeGreaterThan(before + 1));
+  });
+
+  const LONG = 'Check why the receipt printer at the front counter stopped printing after the update, then finish with a test page';
+
+  test('the activity header shows the instructions whole when the app started the task, though the relay cut the title', async () => {
+    const fake = fakeCore();
+    fake.state.taskStatus = (t) => ({ ...t, title: t.title.slice(0, 100) });
+    const { user } = await openTab(fake);
+    await fillAndStart(user, LONG);
+    expect(await screen.findByText(LONG)).toBeInTheDocument();
+    expect(LONG.slice(0, 100)).not.toBe(LONG);
+    expect(JSON.parse(localStorage.getItem('support.task_titles'))[ID('t')]).toBe(LONG);
+  });
+
+  test('a task the app did not start is cut at a whole word with an ellipsis', async () => {
+    const fake = fakeCore();
+    fake.state.tasks = [{ id: TASK, state: 'running', title: LONG.slice(0, 100), session_id: SID, device_id: ID('a'), created_at: Date.now() - 1000, ended_at: null, phase: 'working', rev: 1, steps: [], notes: [] }];
+    await openTab(fake);
+    expect(await screen.findByText('Check why the receipt printer at the front counter stopped printing after the update, then finish\u2026')).toBeInTheDocument();
+    expect(screen.queryByText(/then finish wi$/)).not.toBeInTheDocument();
+  });
+
+  test('the notification list shows the whole instructions for a task the app started, and a word-cut title for others', async () => {
+    const fake = fakeCore();
+    fake.state.taskStatus = (t) => ({ ...t, title: t.title.slice(0, 100) });
+    const { user } = await openTab(fake);
+    await fillAndStart(user, LONG);
+    await screen.findByText(LONG);
+    const item = (id, task_id) => ({ id, event: 'task_finished', at: Date.now(), title: 'Task finished', body: LONG.slice(0, 100), device_id: ID('a'), task_id, session_id: null });
+    act(() => fake.emit('feed://items', { account: 'acc1', live: true, items: [item(1, ID('t')), item(2, ID('z'))] }));
+    await user.click(within(screen.getByRole('navigation', { name: 'Main' })).getByRole('button', { name: /Notifications/ }));
+    const list = await screen.findByRole('list', { name: 'Recent' });
+    const [theirs, ours] = within(list).getAllByRole('listitem').sort((a, b) => a.textContent.length - b.textContent.length);
+    expect(ours).toHaveTextContent(LONG);
+    expect(theirs).toHaveTextContent('then finish\u2026');
+    expect(theirs).not.toHaveTextContent(/finish wi\b/);
+  });
+});
+
+describe('Session tab: what the task costs', () => {
+  const live = (over = {}) => ({ id: TASK, state: 'running', title: 'Receipt printer stopped printing', session_id: SID, device_id: ID('a'), created_at: Date.now() - 60000, ended_at: null, model: 'claude-sonnet', phase: 'working', rev: 1, steps: [], notes: [], cost_usd: 0.4231, reserved_usd: 0, ...over });
+
+  test('the header shows the cost against the task cap while the task runs, and the summary shows it when the task is over', async () => {
+    const fake = fakeCore();
+    fake.state.tasks = [live()];
+    let over = false;
+    fake.state.taskCaps = { task_cap_usd: 2, month_cap_usd: 50, month_spent_usd: 3.1 };
+    fake.state.taskStatus = () => (over ? live({ state: 'done', summary: 'The printer works.', ended_at: Date.now(), cost_usd: 0.9 }) : live());
+    fake.state.frame = () => ({ rev: 1, at: Date.now(), mime: 'image/png', data: 'QUJD' });
+    await openTab(fake);
+    expect(await screen.findByText('Spent $0.423 of the $2.00 task cap.')).toBeInTheDocument();
+    over = true;
+    fake.state.tasks = [live({ state: 'done' })];
+    expect(await screen.findByText(/The printer works\./)).toBeInTheDocument();
+    expect(await screen.findByText('The task cost $0.90 of the $2.00 task cap.')).toBeInTheDocument();
+    expect(screen.queryByText(/Spent \$/)).not.toBeInTheDocument();
+  });
+
+  test('a relay that sends no caps still shows what was spent', async () => {
+    const fake = fakeCore();
+    fake.state.tasks = [live({ cost_usd: 1.5 })];
+    fake.state.taskStatus = () => live({ cost_usd: 1.5 });
+    fake.state.frame = () => ({ rev: 1, at: Date.now(), mime: 'image/png', data: 'QUJD' });
+    await openTab(fake);
+    expect(await screen.findByText('Spent $1.50 so far.')).toBeInTheDocument();
+  });
+});
+
 describe('Session tab: ending', () => {
   test('End session ends it on the relay and closes the tab', async () => {
     const { fake, user } = await openTab();

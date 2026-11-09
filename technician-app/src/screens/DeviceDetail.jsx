@@ -48,7 +48,7 @@ export function DeviceDetail({ device }) {
 
       <dl className="facts">
         {device.pairedAt ? <><dt>{t('facts.paired')}</dt><dd>{formatDate(device.pairedAt)}</dd></> : null}
-        {device.lastSeen ? <><dt>{t('facts.last_seen')}</dt><dd>{formatDateTime(device.lastSeen)}</dd></> : null}
+        {device.online || device.lastSeen ? <><dt>{t('facts.last_seen')}</dt><dd>{device.online ? t('facts.online_now') : formatDateTime(device.lastSeen)}</dd></> : null}
         {device.os ? <><dt>{t('facts.windows')}</dt><dd>{device.os}</dd></> : null}
         {device.control ? <><dt>{t('facts.control')}</dt><dd>{t(`control.${device.control}`)}</dd></> : null}
         {device.appVersion ? <><dt>{t('facts.app_version')}</dt><dd>{device.appVersion}</dd></> : null}

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { cleanCode, formatAgo, formatDuration } from './format.js';
+import { cleanCode, cutAtWord, formatAgo, formatDuration, formatUsd, taskBody, taskTitle } from './format.js';
 
 describe('format', () => {
   test('durations', () => {
@@ -22,5 +22,44 @@ describe('format', () => {
 
   test('a pairing code with or without its hyphen', () => {
     expect(cleanCode('k7q42-m9h3x')).toBe('K7Q42M9H3X');
+  });
+
+  test('dollars', () => {
+    expect(formatUsd(0.42)).toBe('$0.42');
+    expect(formatUsd(2)).toBe('$2.00');
+    expect(formatUsd(0.003)).toBe('$0.003');
+    expect(formatUsd(0)).toBe('$0.00');
+    expect(formatUsd(undefined)).toBe('');
+  });
+
+  describe('task titles the relay cut at 100 characters', () => {
+    const cut = 'Check why the receipt printer at the front counter stopped printing after the update, then finish wi';
+    const whole = 'Check why the receipt printer at the front counter stopped printing after the update, then finish with a test page';
+
+    test('a cut title ends at a whole word with an ellipsis', () => {
+      expect(cut).toHaveLength(100);
+      expect(cutAtWord(cut)).toBe('Check why the receipt printer at the front counter stopped printing after the update, then finish\u2026');
+      expect(cutAtWord('x'.repeat(100))).toBe(`${'x'.repeat(100)}\u2026`);
+      expect(cutAtWord('one two, three: ')).toBe('one two, three\u2026');
+    });
+
+    test('the full first line wins when the app has it, and a short title is left alone', () => {
+      expect(taskTitle(cut, whole)).toBe(whole);
+      expect(taskTitle(cut)).toBe('Check why the receipt printer at the front counter stopped printing after the update, then finish\u2026');
+      expect(taskTitle('Fix the printer')).toBe('Fix the printer');
+      expect(taskTitle('Fix the printer', 'Fix the printer')).toBe('Fix the printer');
+      // Instructions for another task never replace a title they do not begin.
+      expect(taskTitle(cut, 'Something else entirely, and a long one at that, longer than the title it is offered for here')).toBe(cutAtWord(cut));
+    });
+
+    test('a notification body is the title alone, or the title and why', () => {
+      expect(taskBody('task_finished', cut, whole)).toBe(whole);
+      expect(taskBody('task_finished', cut)).toBe(cutAtWord(cut));
+      expect(taskBody('task_problem', `${cut}: the agent got stuck`, whole)).toBe(`${whole}: the agent got stuck`);
+      expect(taskBody('task_problem', `${cut}: the agent got stuck`)).toBe(`${cutAtWord(cut)}: the agent got stuck`);
+      expect(taskBody('task_problem', 'Fix the printer: stuck')).toBe('Fix the printer: stuck');
+      expect(taskBody('device_waiting', cut)).toBe(cut);
+      expect(taskBody('task_finished', undefined)).toBe('');
+    });
   });
 });

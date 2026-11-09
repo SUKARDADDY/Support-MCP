@@ -1,7 +1,7 @@
 // The commands the screens call. Each is a thin wrapper over the core; the list of them is
 // in command_list.rs and is what the app manifest and the capability file are held to.
 use crate::core::{AccountView, Core};
-use crate::error::{CoreError, Msg};
+use crate::error::{CoreError, CoreResult, Msg};
 use crate::feed::AccountItem;
 use crate::relay::ToolOutput;
 use crate::store::Prefs;
@@ -9,7 +9,7 @@ use crate::update::{UpdateStatus, Updater};
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Manager, State, Theme};
 use tauri_plugin_autostart::ManagerExt;
 
 type Shared<'a> = State<'a, Arc<Core>>;
@@ -47,8 +47,8 @@ pub fn sign_in_cancel(core: Shared<'_>) {
 }
 
 #[tauri::command]
-pub fn sign_out(core: Shared<'_>, account: String) -> Result<(), CoreError> {
-    core.sign_out(&account)
+pub async fn sign_out(core: Shared<'_>, account: String) -> Result<(), CoreError> {
+    core.sign_out(&account).await
 }
 
 #[tauri::command]
@@ -89,6 +89,27 @@ pub fn autostart_set(app: tauri::AppHandle, enabled: bool) -> Result<(), CoreErr
     done.map_err(|_| CoreError::other(Msg::AutostartWrite))
 }
 
+/// The window theme for a name from the screens: light, dark, or system (the window follows Windows).
+pub fn theme_from(name: &str) -> CoreResult<Option<Theme>> {
+    match name {
+        "light" => Ok(Some(Theme::Light)),
+        "dark" => Ok(Some(Theme::Dark)),
+        "system" => Ok(None),
+        _ => Err(CoreError::invalid(Msg::BadTheme)),
+    }
+}
+
+/// Makes the native window frame (the title bar and the border) follow the app's theme.
+#[tauri::command]
+pub fn window_theme(app: tauri::AppHandle, theme: String) -> Result<(), CoreError> {
+    let chosen = theme_from(&theme)?;
+    if let Some(window) = app.get_webview_window("main") {
+        // A theme the shell cannot apply leaves the frame as it was: the screens still follow the choice.
+        let _ = window.set_theme(chosen);
+    }
+    Ok(())
+}
+
 /// What the updater knows: the running version, a newer one found or kept, and the last check.
 #[tauri::command]
 pub fn update_status(updater: State<'_, Arc<Updater>>) -> UpdateStatus {
@@ -99,4 +120,19 @@ pub fn update_status(updater: State<'_, Arc<Updater>>) -> UpdateStatus {
 #[tauri::command]
 pub async fn update_check(updater: State<'_, Arc<Updater>>) -> Result<UpdateStatus, CoreError> {
     Ok(updater.inner().clone().check().await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_window_theme_is_light_dark_or_system_and_nothing_else() {
+        assert_eq!(theme_from("light").unwrap(), Some(Theme::Light));
+        assert_eq!(theme_from("dark").unwrap(), Some(Theme::Dark));
+        assert_eq!(theme_from("system").unwrap(), None);
+        for bad in ["", "Dark", "auto", "dark ", "high-contrast"] {
+            assert_eq!(theme_from(bad).unwrap_err().code(), "invalid", "{bad:?}");
+        }
+    }
 }

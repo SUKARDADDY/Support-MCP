@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { tabKeyDown } from '../hooks.js';
 import { useApp } from '../context.jsx';
-import { formatAgo } from '../format.js';
+import { formatAgo, taskBody } from '../format.js';
 import { t } from '../i18n/index.js';
 import { NotificationSettings } from './NotificationSettings.jsx';
 
@@ -9,7 +9,7 @@ import { NotificationSettings } from './NotificationSettings.jsx';
 // name, a task's note), so they are shown as text. A "waiting for approval" body comes from a
 // join request that anyone can send before the PC is approved, so it is labelled as the PC's own words.
 export function Notifications() {
-  const { notifications, accounts, openTarget, now } = useApp();
+  const { notifications, accounts, openTarget, now, titleOf } = useApp();
   const [tab, setTab] = useState('recent');
   const several = accounts.length > 1;
   const items = [...notifications].sort((a, b) => b.at - a.at || b.id - a.id);
@@ -35,7 +35,7 @@ export function Notifications() {
                   <span className="f-body">
                     {team ? `${team.team_name || team.team}: ` : ''}
                     {n.event === 'device_waiting' ? <span className="f-from">{t('notify.from_pc')} </span> : null}
-                    {n.body}
+                    {taskBody(n.event, n.body, titleOf(n.task_id))}
                   </span>
                   {n.device_id || n.task_id || n.session_id ? (
                     <button type="button" className="btn btn-sec btn-sm f-open" onClick={() => openTarget(n)}>{n.task_id ? t('notify.open_task') : t('notify.open_pc')}</button>

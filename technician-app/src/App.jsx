@@ -15,6 +15,7 @@ import { SessionTab } from './screens/SessionTab.jsx';
 import { Settings } from './screens/Settings.jsx';
 import { SignIn } from './screens/SignIn.jsx';
 import { applyTheme, loadTheme, saveTheme } from './theme.js';
+import { loadTitles, withTitle } from './titles.js';
 
 const ACTIVE_KEY = 'support.active';
 const PLACES_EVERY_MS = 5 * 60 * 1000;
@@ -55,6 +56,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   const knownNotes = useRef(new Set()); // "<account>:<id>" of every item the list has seen
   const [unread, setUnread] = useState(0);
   const [linkOpen, setLinkOpen] = useState(false);
+  const [titles, setTitles] = useState(loadTitles); // task id -> first line of the instructions this app sent
   const [toastText, setToastText] = useState(null);
   const [relayDown, setRelayDown] = useState(false);
   const [now, setNow] = useState(() => Date.now());
@@ -64,6 +66,8 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   const visible = usePageVisible() && windowVisible;
 
   useEffect(() => applyTheme(theme), [theme]);
+  // The native title bar and border follow the same choice (light, dark or the system's).
+  useEffect(() => { Promise.resolve(core.setWindowTheme?.(theme)).catch(() => {}); }, [core, theme]);
   const setTheme = (next) => { saveTheme(next); setThemeState(next); };
   useInterval(() => setNow(Date.now()), 30000, true, { immediate: false });
 
@@ -72,6 +76,9 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     setToastText(text);
     if (text) toastTimer.current = setTimeout(() => setToastText(null), 4200);
   }, []);
+
+  const rememberTask = useCallback((taskId, instructions) => setTitles((cur) => withTitle(cur, taskId, instructions)), []);
+  const titleOf = useCallback((taskId) => (taskId ? titles[taskId] ?? null : null), [titles]);
 
   const copyText = useCallback(async (text, message) => {
     try {
@@ -261,8 +268,8 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     devices: deviceData.devices, places: deviceData.places, devicesState: deviceData, reloadDevices,
     selectedId, select, conns, connect, cancelConnect, dismissConnect,
     sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true),
-    toast, copyText, notifications, openTarget, now, theme, setTheme, tuning, visible,
-  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, toast, copyText, notifications, openTarget, now, theme, tuning, visible]); // eslint-disable-line react-hooks/exhaustive-deps
+    toast, copyText, notifications, openTarget, now, theme, setTheme, tuning, visible, rememberTask, titleOf,
+  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (accounts === null) return <div className="app" role="status"><p className="hint">{t('common.loading')}</p></div>;
 

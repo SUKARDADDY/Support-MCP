@@ -5,8 +5,10 @@ import { t } from '../i18n/index.js';
 
 // Hands a job to the relay's built-in agent: what is wrong, which model, and whether it
 // keeps going when nobody is watching. Give it a saved PC (it connects itself) or a live session.
-export function AgentStartDialog({ device = null, sessionId = null, onClose, onStarted }) {
-  const { core, account, toast } = useApp();
+// `beforeStart` runs first and is waited for (a session tab uses it to stop its screenshots, so
+// the PC is free for the agent's first step); `onStartFailed` runs when the start is refused.
+export function AgentStartDialog({ device = null, sessionId = null, onClose, onStarted, beforeStart = null, onStartFailed = null }) {
+  const { core, account, toast, rememberTask } = useApp();
   const ref = useRef(null);
   const [text, setText] = useState('');
   const [keep, setKeep] = useState(false);
@@ -39,7 +41,15 @@ export function AgentStartDialog({ device = null, sessionId = null, onClose, onS
     try {
       const body = { instructions: text.trim(), keep_working: keep, ...(device ? { device_id: device.id } : { session_id: sessionId }) };
       if (models?.canPick && model) body.model = model;
-      const started = await startTask(core, account.id, body);
+      await beforeStart?.();
+      let started;
+      try {
+        started = await startTask(core, account.id, body);
+      } catch (err) {
+        onStartFailed?.();
+        throw err;
+      }
+      rememberTask(started.task_id, body.instructions);
       toast(t('agent.started'));
       onStarted?.(started);
       onClose();

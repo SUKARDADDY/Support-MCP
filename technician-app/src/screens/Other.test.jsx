@@ -25,6 +25,40 @@ describe('Add a device', () => {
     expect(await screen.findByRole('heading', { name: 'Bar till 2' })).toBeInTheDocument();
   });
 
+  test('once the PC shows up the countdown is replaced by a done state that names it', async () => {
+    const user = userEvent.setup();
+    const fake = fakeCore();
+    renderApp(fake);
+    await screen.findByRole('button', { name: /Front counter/ });
+    await user.click(nav('Add a device'));
+    await user.click(screen.getByRole('button', { name: 'Get a pairing code' }));
+    expect(await screen.findByTestId('pairing-code')).toBeInTheDocument();
+    expect(screen.getByText(/Works once\. \d+:\d\d left\./)).toBeInTheDocument();
+    fake.state.pairingUsed = true;
+    fake.state.devices = [...fake.state.devices, device({ id: ID('n'), name: 'Bar till 2', access: 'ask' })];
+    expect(await screen.findByTestId('pairing-done')).toHaveTextContent('Code used by Bar till 2.');
+    expect(screen.queryByText(/Works once/)).not.toBeInTheDocument();
+    expect(screen.queryByTestId('pairing-code')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Copy code' })).not.toBeInTheDocument();
+  });
+
+  test('a code that is no longer listed as live stops its countdown before the PC appears', async () => {
+    const user = userEvent.setup();
+    const fake = fakeCore();
+    renderApp(fake);
+    await screen.findByRole('button', { name: /Front counter/ });
+    await user.click(nav('Add a device'));
+    await user.click(screen.getByRole('button', { name: 'Get a pairing code' }));
+    await screen.findByTestId('pairing-code');
+    fake.state.pairingUsed = true;
+    expect(await screen.findByTestId('pairing-done')).toHaveTextContent('The code was used.');
+    expect(screen.queryByText(/Works once/)).not.toBeInTheDocument();
+    expect(screen.getByText('Waiting for the PC to finish joining.')).toBeInTheDocument();
+    // The PC arrives.
+    fake.state.devices = [...fake.state.devices, device({ id: ID('n'), name: 'Bar till 2', access: 'ask' })];
+    expect(await screen.findByText('Code used by Bar till 2.')).toBeInTheDocument();
+  });
+
   test('an expired code is replaced by a button for a new one', async () => {
     const user = userEvent.setup();
     const fake = fakeCore();
@@ -288,14 +322,65 @@ describe('Settings', () => {
     expect(screen.queryByText(/English text from the core/)).not.toBeInTheDocument();
   });
 
-  test('removing an account that is the only one returns to sign in', async () => {
+  test('signing out asks first, and Cancel signs nothing out', async () => {
     const user = userEvent.setup();
     const fake = fakeCore();
     renderApp(fake);
     await screen.findByRole('button', { name: /Front counter/ });
     await user.click(nav('Settings'));
-    await user.click(await screen.findByRole('button', { name: 'Remove Default from this PC' }));
-    expect(fake.core.signOut).toHaveBeenCalledWith(ACCOUNT.id);
+    expect(screen.queryByRole('button', { name: /^Remove/ })).not.toBeInTheDocument();
+    await user.click(await screen.findByRole('button', { name: 'Sign out of Default on this PC' }));
+    const dialog = screen.getByRole('dialog', { hidden: true });
+    expect(within(dialog).getByRole('heading', { name: 'Sign out of Default?', hidden: true })).toBeInTheDocument();
+    expect(within(dialog).getByText(/ends this PC's sign-in to the team on the relay/)).toBeInTheDocument();
+    expect(fake.core.signOut).not.toHaveBeenCalled();
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel', hidden: true }));
+    expect(screen.queryByRole('dialog', { hidden: true })).not.toBeInTheDocument();
+    expect(fake.core.signOut).not.toHaveBeenCalled();
+  });
+
+  test('the hint under start with Windows says what it does, not what the default is', async () => {
+    const user = userEvent.setup();
+    renderApp(fakeCore({ autostart: true }));
+    await screen.findByRole('button', { name: /Front counter/ });
+    await user.click(nav('Settings'));
+    const box = await screen.findByRole('checkbox', { name: /^Start Support when I sign in to Windows/ });
+    await waitFor(() => expect(box).toBeChecked());
+    expect(box.closest('label')).not.toHaveTextContent(/off by default/i);
+    expect(box.closest('label')).toHaveTextContent('Support starts hidden in the tray when you sign in to Windows, so notifications reach you.');
+  });
+
+  test('the native window follows the theme: system at start, then each choice', async () => {
+    const user = userEvent.setup();
+    const fake = fakeCore();
+    renderApp(fake);
+    await screen.findByRole('button', { name: /Front counter/ });
+    await waitFor(() => expect(fake.core.setWindowTheme).toHaveBeenCalledWith('system'));
+    await user.click(nav('Settings'));
+    const group = await screen.findByRole('group', { name: 'Appearance' });
+    await user.click(within(group).getByRole('button', { name: 'Dark' }));
+    await waitFor(() => expect(fake.core.setWindowTheme).toHaveBeenLastCalledWith('dark'));
+    await user.click(within(group).getByRole('button', { name: 'Light' }));
+    await waitFor(() => expect(fake.core.setWindowTheme).toHaveBeenLastCalledWith('light'));
+  });
+
+  test('a failure setting the native theme is not shown or thrown', async () => {
+    const fake = fakeCore();
+    fake.core.setWindowTheme.mockRejectedValue(new Error('not allowed'));
+    renderApp(fake);
+    expect(await screen.findByRole('button', { name: /Front counter/ })).toBeInTheDocument();
+    await waitFor(() => expect(fake.core.setWindowTheme).toHaveBeenCalled());
+  });
+
+  test('signing out of the only account, once confirmed, returns to sign in', async () => {
+    const user = userEvent.setup();
+    const fake = fakeCore();
+    renderApp(fake);
+    await screen.findByRole('button', { name: /Front counter/ });
+    await user.click(nav('Settings'));
+    await user.click(await screen.findByRole('button', { name: 'Sign out of Default on this PC' }));
+    await user.click(within(screen.getByRole('dialog', { hidden: true })).getByRole('button', { name: 'Sign out', hidden: true }));
+    await waitFor(() => expect(fake.core.signOut).toHaveBeenCalledWith(ACCOUNT.id));
     fake.emit('account://changed', { account: ACCOUNT.id });
     expect(await screen.findByRole('heading', { name: 'Sign in' })).toBeInTheDocument();
   });

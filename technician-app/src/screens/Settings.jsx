@@ -6,11 +6,13 @@ import { useLoad } from '../hooks.js';
 import { t } from '../i18n/index.js';
 import { THEMES } from '../theme.js';
 import { SignInForm } from './SignIn.jsx';
+import { SignOutDialog } from './SignOutDialog.jsx';
 
 // Accounts, how the app looks, whether it starts with Windows, and updates.
 export function Settings() {
   const { core, accounts, account, theme, setTheme, appInfo, toast, setActive, reloadAccounts } = useApp();
   const [adding, setAdding] = useState(null); // null, or { relay, team } for the sign-in form
+  const [leaving, setLeaving] = useState(null); // the account the person is asked to sign out of
   const [autostart, setAutostart] = useState(undefined); // undefined: loading, null: not available
   const [update, setUpdate] = useState(undefined);
   const teams = useLoad(() => (account ? listTeams(core, account.id) : []), [core, account?.id]);
@@ -19,12 +21,14 @@ export function Settings() {
   useEffect(() => { core.autostart().then(setAutostart).catch(() => setAutostart(null)); }, [core]);
   useEffect(() => { core.updateStatus().then(setUpdate).catch(() => setUpdate(null)); }, [core]);
 
-  async function remove(a) {
+  // Signs out of an account once the person has confirmed: the core asks the relay to revoke
+  // the sign-in, then removes the account and its tokens from this PC.
+  async function signOut(a) {
     try {
       await core.signOut(a.id);
       await reloadAccounts();
     } catch (e) {
-      toast(messageOf(e, t('settings.remove_failed')));
+      toast(messageOf(e, t('settings.sign_out_failed')));
     }
   }
 
@@ -64,7 +68,7 @@ export function Settings() {
                 <span>{a.email ? `${a.email} · ` : ''}{a.relay}{a.signed_in ? '' : ` · ${t('settings.signed_out')}`}</span>
               </div>
               {!a.signed_in ? <button type="button" className="btn btn-pri btn-sm" onClick={() => setAdding({ relay: a.relay, team: a.team })}>{t('settings.sign_in_again')}</button> : a.id !== account?.id ? <button type="button" className="btn btn-sec btn-sm" onClick={() => setActive(a.id)}>{t('settings.use_team')}</button> : null}
-              <button type="button" className="btn btn-sec btn-sm" onClick={() => remove(a)} aria-label={t('settings.remove_label', { name: a.team_name || a.team })}>{t('settings.remove')}</button>
+              <button type="button" className="btn btn-sec btn-sm" onClick={() => setLeaving(a)} aria-label={t('settings.sign_out_label', { name: a.team_name || a.team })}>{t('settings.sign_out')}</button>
             </div>
           ))}
           {others.length ? (
@@ -86,6 +90,8 @@ export function Settings() {
             <div className="connect-row mt-8"><button type="button" className="btn btn-sec" onClick={() => setAdding({ relay: '', team: 'default' })}>{t('settings.add_account')}</button></div>
           )}
         </section>
+
+        {leaving ? <SignOutDialog account={leaving} onConfirm={() => signOut(leaving)} onClose={() => setLeaving(null)} /> : null}
 
         <section className="panel" aria-labelledby="set-look">
           <h2 id="set-look">{t('settings.appearance')}</h2>

@@ -105,6 +105,6 @@ async fn the_core_signs_in_calls_the_relay_refreshes_and_hears_the_feed() {
     assert_ne!(after.refresh, before.refresh, "the refresh token rotated");
 
     // Signing out removes the account.
-    core.sign_out(&id).unwrap();
+    core.sign_out(&id).await.unwrap();
     assert!(core.accounts().is_empty());
 }

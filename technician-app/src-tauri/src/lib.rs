@@ -98,6 +98,7 @@ pub fn run() {
             commands::prefs_set,
             commands::autostart_get,
             commands::autostart_set,
+            commands::window_theme,
             commands::update_status,
             commands::update_check,
         ])
