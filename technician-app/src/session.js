@@ -42,13 +42,15 @@ export function stopReason(message) {
   return null;
 }
 
-// The steps, notes and log rows of a session in time order. While a task covers a stretch of
-// time its steps stand for the screenshots in the log, so those rows are left out.
+// The steps, notes and log rows of a session in time order. While a task is shown, only the log
+// rows from its start on are listed (an earlier task's commands and screens are not this one's),
+// and while it covers a stretch of time its steps stand for the screenshots in the log.
 export function mergeActivity({ log = [], task = null }) {
   const from = task?.created_at ?? null;
   const to = task ? (task.ended_at ?? Infinity) : null;
   const items = [];
   for (const r of log) {
+    if (from !== null && r.ts < from) continue;
     if (r.kind === 'screen' && from !== null && r.ts >= from && r.ts <= to) continue;
     items.push({ id: `log:${r.ts}:${r.kind}:${items.length}`, ts: r.ts, source: 'log', kind: r.kind, detail: String(r.detail ?? '') });
   }

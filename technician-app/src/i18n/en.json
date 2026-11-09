@@ -323,6 +323,7 @@
  "session.cost_final": "The task cost {spent} of the {cap} task cap.",
  "session.cost_final_nocap": "The task cost {spent}.",
  "session.task_over": "The task is over: {state}.",
+ "session.task_end_reason": "Why: {reason}",
  "session.task_paused_note": "The task is paused. It sends nothing to the PC until you resume it.",
  "session.close_tab": "Close tab",
  "session.try_again": "Try the screen again",

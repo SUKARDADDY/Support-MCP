@@ -163,7 +163,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   // Every task start goes through here. The PC takes one command at a time, so the open session
   // tab(s) on the same PC or session stop their screenshots and wait for one in flight first;
   // otherwise the agent's first step meets "agent busy". A tab registers itself in `tabGuards`.
-  const tabGuards = useRef(new Map()); // tab key -> { account, deviceId(), sessionId(), hold(), release(), follow(taskId) }
+  const tabGuards = useRef(new Map()); // tab key -> { account, deviceId(), sessionId(), liveSession(), hold(), release(), follow(taskId) }
   const registerTab = useCallback((key, guard) => {
     tabGuards.current.set(key, guard);
     return () => { if (tabGuards.current.get(key) === guard) tabGuards.current.delete(key); };
@@ -172,8 +172,13 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     const guards = [...tabGuards.current.values()].filter((g) => g.account === accountId
       && ((body.session_id && g.sessionId() === body.session_id) || (body.device_id && g.deviceId() === body.device_id)));
     await Promise.all(guards.map((g) => g.hold()));
+    // A task started on a PC makes the relay connect to it, which it refuses while this app has
+    // that PC's session open. When an open tab has a live session that the person drives, the
+    // task starts on that session instead (agent_start takes either).
+    const live = body.device_id ? guards.map((g) => g.liveSession()).find(Boolean) : null;
+    const sent = live ? { instructions: body.instructions, keep_working: body.keep_working, ...(body.model ? { model: body.model } : {}), session_id: live } : body;
     try {
-      const started = await startTask(core, accountId, body);
+      const started = await startTask(core, accountId, sent);
       guards.forEach((g) => g.follow(started.task_id));
       return started;
     } catch (e) {

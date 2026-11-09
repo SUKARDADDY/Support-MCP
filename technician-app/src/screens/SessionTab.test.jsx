@@ -209,15 +209,16 @@ describe('Session tab: an agent task is working', () => {
     const items = await waitFor(() => {
       const ol = document.querySelector('ol.tl');
       const lis = ol ? [...ol.querySelectorAll('li')] : [];
-      if (lis.length < 5) throw new Error('not yet');
+      if (lis.length < 4) throw new Error('not yet');
       return lis;
     });
     const heads = items.map((li) => li.querySelector('.tl-h span').textContent);
     // The "screen" log row falls inside the task's time and is left out: its steps stand for it.
-    expect(heads).toEqual(['PC connected', 'screenshot', 'Agent note', 'click', 'Driver changed']);
-    expect(items[3]).toHaveTextContent('Start the print queue');
-    expect(items[3].className).toContain('fail');
-    expect(items[2]).toHaveTextContent('Found 14 stuck print jobs.');
+    // The 'attached' row is from before the task began, so it is not this task's.
+    expect(heads).toEqual(['screenshot', 'Agent note', 'click', 'Driver changed']);
+    expect(items[2]).toHaveTextContent('Start the print queue');
+    expect(items[2].className).toContain('fail');
+    expect(items[1]).toHaveTextContent('Found 14 stuck print jobs.');
   });
 
   test('text the agent or the PC wrote is shown as text', async () => {
@@ -338,9 +339,10 @@ describe('Session tab: handing the session to the agent', () => {
     expect(order).toEqual(['shot-start']);
     expect(fake.state.started).toBeUndefined();
     act(() => finishShot());
-    await waitFor(() => expect(fake.state.started).toEqual({ instructions: 'Fix the printer', keep_working: false, device_id: ID('a') }));
+    await waitFor(() => expect(fake.state.started).toEqual({ instructions: 'Fix the printer', keep_working: false, session_id: SID }));
     expect(order).toEqual(['shot-start', 'shot-end', 'task-start']);
-    // The PC's open tab is shown and follows the task; no second tab is made, and no screenshot follows.
+    // The PC's session is open and driven by this person, so the task starts on it (a start by
+    // device would make the relay connect again and be refused). The PC's open tab is shown and follows the task; no second tab is made, and no screenshot follows.
     expect(await screen.findByText('Agent activity')).toBeInTheDocument();
     expect(screen.getAllByRole('tab')).toHaveLength(2);
     await sleep(200);
@@ -397,6 +399,21 @@ describe('Session tab: handing the session to the agent', () => {
     await waitFor(() => expect(screen.getByRole('img', { name: 'Screen of Front counter' }).getAttribute('src')).toBe('data:image/png;base64,REVG'));
   });
 
+  test('from the device detail, a session someone else drives is not used: the task starts by device', async () => {
+    const fake = fakeCore();
+    fake.state.sessions[SID] = { state: 'attached', driver: 'lead@example.com', machine: 'FRONT', log: [] };
+    const { user } = await openTab(fake);
+    await user.click(screen.getByRole('tab', { name: 'Devices' }));
+    await user.click(await screen.findByRole('button', { name: /^Front counter/ }));
+    const detail = screen.getByRole('region', { name: 'Device details' });
+    await user.click(within(detail).getByRole('button', { name: 'Hand to the agent' }));
+    const dialog = screen.getByRole('dialog', { hidden: true });
+    await user.click(within(dialog).getByLabelText('What should the agent do?'));
+    await user.paste('Fix the printer');
+    await user.click(within(dialog).getByRole('button', { name: 'Start the task' }));
+    await waitFor(() => expect(fake.state.started).toEqual({ instructions: 'Fix the printer', keep_working: false, device_id: ID('a') }));
+  });
+
   test('a task the relay refuses to start lets the screenshots go on', async () => {
     const fake = fakeCore();
     fake.state.requestError = (method, p) => (method === 'POST' && p === '/api/agent/tasks' ? Object.assign(new Error('the built-in agent is off'), { code: 'caps_not_set', status: 409 }) : null);
@@ -442,6 +459,79 @@ describe('Session tab: handing the session to the agent', () => {
     expect(ours).toHaveTextContent(LONG);
     expect(theirs).toHaveTextContent('then finish\u2026');
     expect(theirs).not.toHaveTextContent(/finish wi\b/);
+  });
+});
+
+describe('Session tab: the end of a task and the panel layout', () => {
+  const ended = (over = {}) => ({ id: TASK, state: 'failed', end_reason: 'could not connect to the PC: live-tech@example.com is connected', title: 'Fix', session_id: SID, device_id: ID('a'), created_at: Date.now() - 60000, ended_at: Date.now() - 1000, phase: 'ended', rev: 1, steps: [], notes: [], summary: null, ...over });
+
+  test('a task that ended failed or stopped says why, in the panel', async () => {
+    const fake = fakeCore();
+    fake.state.tasks = [ended()];
+    fake.state.taskStatus = () => ended();
+    localStorage.setItem('support.tabs', JSON.stringify([{ key: `task:${TASK}`, account: 'acc1', deviceId: ID('a'), deviceName: 'Front counter', sessionId: SID, taskId: TASK }]));
+    fake.state.sessions[SID] = { state: 'attached', driver: 'tech@example.com', log: [] };
+    renderApp(fake);
+    await userEvent.setup().click(await screen.findByRole('tab', { name: /Front counter/ }));
+    expect(await screen.findByText('The task is over: failed.')).toBeInTheDocument();
+    expect(screen.getByText('Why: could not connect to the PC: live-tech@example.com is connected')).toBeInTheDocument();
+  });
+
+  test('a finished task shows no reason line', async () => {
+    const fake = fakeCore();
+    fake.state.tasks = [ended({ state: 'done', end_reason: 'finished', summary: 'Done.' })];
+    fake.state.taskStatus = () => ended({ state: 'done', end_reason: 'finished', summary: 'Done.' });
+    localStorage.setItem('support.tabs', JSON.stringify([{ key: `task:${TASK}`, account: 'acc1', deviceId: ID('a'), deviceName: 'Front counter', sessionId: SID, taskId: TASK }]));
+    fake.state.sessions[SID] = { state: 'attached', driver: 'tech@example.com', log: [] };
+    renderApp(fake);
+    await userEvent.setup().click(await screen.findByRole('tab', { name: /Front counter/ }));
+    expect(await screen.findByText('The task is over: finished.')).toBeInTheDocument();
+    expect(screen.queryByText(/^Why:/)).not.toBeInTheDocument();
+  });
+
+  test('a long summary and the cost line are separate paragraphs in normal flow, and the stylesheet gives them no way to overlap', async () => {
+    const fake = fakeCore();
+    const summary = 'The printer queue was stuck on a job from Tuesday. I cleared it, restarted the spooler, printed a test page and checked that the receipt printer answers from the till. '.repeat(3);
+    const t = () => ended({ state: 'done', end_reason: 'finished', summary, cost_usd: 0.023, caps: { task_cap_usd: 1 } });
+    fake.state.tasks = [t()];
+    fake.state.taskStatus = t;
+    localStorage.setItem('support.tabs', JSON.stringify([{ key: `task:${TASK}`, account: 'acc1', deviceId: ID('a'), deviceName: 'Front counter', sessionId: SID, taskId: TASK }]));
+    fake.state.sessions[SID] = { state: 'attached', driver: 'tech@example.com', log: [] };
+    renderApp(fake);
+    await userEvent.setup().click(await screen.findByRole('tab', { name: /Front counter/ }));
+    const cost = await screen.findByText('The task cost $0.023 of the $1.00 task cap.');
+    const sum = screen.getByText(/The printer queue was stuck/).closest('p');
+    expect(sum).not.toBe(cost);
+    expect(sum.contains(cost)).toBe(false);
+    expect(cost.tagName).toBe('P');
+    expect(sum.parentElement).toBe(cost.parentElement);
+    expect(sum.compareDocumentPosition(cost) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Cause of the overlap: a negative top margin meant for the cost line under the title also applied
+    // under the summary and pulled it up over the summary's last line. The rule is for that case only now.
+    const css = readFileSync(join(import.meta.dirname, '..', 'styles', 'app.css'), 'utf8');
+    const rule = (selector) => [...css.matchAll(new RegExp(`^${selector.replace(/[.+]/g, '\\$&')} \\{([^}]*)\\}`, 'gm'))].map((m) => m[1]).join(' ');
+    expect(rule('.act .cost')).not.toMatch(/-\d+px/);
+    expect(rule('.act .task + .cost')).toMatch(/margin-top: -10px/);
+    for (const sel of ['.act .cost', '.act .task + .cost', '.act .tl-end', '.act .task', '.tl-d']) expect(rule(sel), sel).not.toMatch(/position:\s*(absolute|fixed)|(^|[\s;])(max-)?height:|overflow:\s*hidden/);
+    expect(rule('.act .tl-end')).toMatch(/margin-top: 8px/);
+  });
+
+  test('while a task is shown, the log lists only what happened from its start on, not an earlier task\'s', async () => {
+    const base = Date.now() - 100000;
+    const fake = fakeCore();
+    fake.state.sessions[SID] = { state: 'attached', driver: 'tech@example.com', log: [
+      { ts: base + 1000, kind: 'run', detail: 'earlier task: dir C:\\' },
+      { ts: base + 2000, kind: 'screen', detail: 'earlier task screenshot' },
+      { ts: base + 60000, kind: 'run', detail: 'this task: net stop spooler' },
+    ] };
+    const live = () => ({ id: TASK, state: 'running', title: 'Fix', session_id: SID, device_id: ID('a'), created_at: base + 50000, ended_at: null, phase: 'working', rev: 1, steps: [{ n: 1, ts: base + 55000, verb: 'screenshot', detail: '', ok: true }], notes: [{ ts: base + 56000, text: 'Looking at the queue.' }] });
+    fake.state.tasks = [live()];
+    fake.state.taskStatus = live;
+    fake.state.frame = () => ({ rev: 1, at: Date.now(), mime: 'image/png', data: 'QUJD' });
+    await openTab(fake);
+    expect(await screen.findByText('this task: net stop spooler')).toBeInTheDocument();
+    expect(screen.getByText('Looking at the queue.')).toBeInTheDocument();
+    expect(screen.queryByText(/earlier task/)).not.toBeInTheDocument();
   });
 });
 

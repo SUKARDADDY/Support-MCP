@@ -30,6 +30,8 @@ export function SessionTab({ tab, active = true }) {
     account: tab.account,
     deviceId: () => latest.current.tab.deviceId ?? null,
     sessionId: () => latest.current.s.sessionId ?? null,
+    // The session, when it is connected and the person drives it: a task can start on it.
+    liveSession: () => { const { s: cur } = latest.current; return cur.attached && cur.isDriver && !cur.ended ? cur.sessionId ?? null : null; },
     hold: () => latest.current.s.holdScreenshots(),
     release: () => latest.current.s.releaseScreenshots(),
     follow: (taskId) => { latest.current.s.watchTask(taskId); latest.current.s.releaseScreenshots(); },
@@ -174,6 +176,7 @@ export function SessionTab({ tab, active = true }) {
             {s.task && !s.taskLive && s.task.summary ? <p className="tl-end"><b>{t('session.summary')}</b> {s.task.summary}</p> : null}
             {s.task && !s.taskLive && cost ? <p className="tl-end cost">{cost.cap === null ? t('session.cost_final_nocap', { spent: cost.spent }) : t('session.cost_final', { spent: cost.spent, cap: cost.cap })}</p> : null}
             {s.task && !s.taskLive && s.task.state && s.task.state !== 'running' ? <p className="hint">{t('session.task_over', { state: t(`task.${s.task.state}`) })}</p> : null}
+            {s.task && !s.taskLive && s.task.state && s.task.state !== 'done' && s.task.end_reason ? <p className="hint">{t('session.task_end_reason', { reason: s.task.end_reason })}</p> : null}
           </aside>
         ) : null}
       </div>

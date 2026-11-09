@@ -121,6 +121,10 @@ the app's core has no tool for them.
 - Every task start (from a tab or from a PC's detail) first stops the screenshots of any open tab on
   that PC or session and waits for one in flight to finish, so the agent's first step does not meet
   a busy PC. The tab then follows the task and takes no screenshot until it is over.
+  When the PC's session is open in a tab and you drive it, a task started from the PC's detail starts
+  on that session, because starting by PC would make the relay connect again and be refused. The
+  activity panel lists the session log only from the task's start on, and says why a task failed
+  or was stopped.
 - Every 15 seconds it looks for a task running on the session and switches to its picture.
 - The activity panel shows what the task has cost against the team's cap for one task ("Spent
   $0.42 of the $2.00 task cap."), and the same line in the summary when the task is over. The
