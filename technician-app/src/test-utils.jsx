@@ -137,7 +137,7 @@ export function fakeCore(initial = {}) {
   return { core, state, calls, emit };
 }
 
-export const FAST = { connectPollMs: 10, devicePollMs: 60000, watchMs: 20, screenshotMs: 20, taskCheckMs: 40, statusMs: 30 };
+export const FAST = { connectPollMs: 10, devicePollMs: 60000, watchMs: 20, screenshotMs: 20, taskCheckMs: 40, statusMs: 30, taskGapMs: 15 };
 
 export function renderApp(fake = fakeCore(), tuning = FAST) {
   const view = render(<App core={fake.core} tuning={tuning} />);

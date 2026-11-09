@@ -36,7 +36,7 @@ const write = (key, value) => {
 };
 
 // How often the app looks again. Tests pass shorter times through `tuning`.
-export const TUNING = { connectPollMs: 2000, devicePollMs: 15000, watchMs: 3000, screenshotMs: 3000, taskCheckMs: 15000, statusMs: 5000 };
+export const TUNING = { connectPollMs: 2000, devicePollMs: 15000, watchMs: 3000, screenshotMs: 3000, taskCheckMs: 15000, statusMs: 5000, taskWaitS: 25, taskGapMs: 1000 };
 
 const NO_TUNING = {};
 
@@ -144,6 +144,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     }
     closeTab(key);
   }, [tabs, core, toast, closeTab]);
+  const updateTab = useCallback((key, patch) => setTabs((cur) => persist(cur.map((x) => (x.key === key ? { ...x, ...patch } : x)))), [persist]);
   const sessionTabFor = useCallback((deviceId) => tabs.find((x) => x.deviceId === deviceId && x.account === accountId) ?? null, [tabs, accountId]);
 
   // Tabs from the last run: keep only the sessions that are still open.
@@ -230,9 +231,9 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     core, appInfo, accounts: accounts ?? [], account, setActive, reloadAccounts: loadAccounts, can, me,
     devices: deviceData.devices, places: deviceData.places, devicesState: deviceData, reloadDevices,
     selectedId, select, conns, connect, cancelConnect, dismissConnect,
-    sessionTabFor, showTab, endTab, closeTab, openSessionTab, go, openLink: () => setLinkOpen(true),
+    sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true),
     toast, copyText, notifications, openTarget, now, theme, setTheme, reloadTasks: () => {}, tuning,
-  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, showTab, endTab, closeTab, openSessionTab, go, toast, copyText, notifications, openTarget, now, theme, tuning]); // eslint-disable-line react-hooks/exhaustive-deps
+  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, toast, copyText, notifications, openTarget, now, theme, tuning]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (accounts === null) return <div className="app" role="status"><p className="hint">{t('common.loading')}</p></div>;
 
