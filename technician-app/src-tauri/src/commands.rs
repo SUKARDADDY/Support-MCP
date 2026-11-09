@@ -9,6 +9,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
 use tauri::State;
+use tauri_plugin_autostart::ManagerExt;
 
 type Shared<'a> = State<'a, Arc<Core>>;
 
@@ -72,4 +73,17 @@ pub fn prefs_get(core: Shared<'_>) -> Prefs {
 #[tauri::command]
 pub fn prefs_set(core: Shared<'_>, prefs: Prefs) -> Result<(), CoreError> {
     core.set_prefs(prefs)
+}
+
+/// Whether the app starts when the person signs in to Windows. Off until they choose it.
+#[tauri::command]
+pub fn autostart_get(app: tauri::AppHandle) -> Result<bool, CoreError> {
+    app.autolaunch().is_enabled().map_err(|_| CoreError::other("Could not read the start setting."))
+}
+
+#[tauri::command]
+pub fn autostart_set(app: tauri::AppHandle, enabled: bool) -> Result<(), CoreError> {
+    let launch = app.autolaunch();
+    let done = if enabled { launch.enable() } else { launch.disable() };
+    done.map_err(|_| CoreError::other("Could not change the start setting."))
 }

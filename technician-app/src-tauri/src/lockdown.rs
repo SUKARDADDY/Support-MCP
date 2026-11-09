@@ -131,6 +131,18 @@ mod tests {
     }
 
     #[test]
+    fn nothing_but_the_persons_choice_switches_start_with_windows_on() {
+        let count = |file: &str| read(file).matches(".enable()").count();
+        assert_eq!(count("src/commands.rs"), 1, "only autostart_set");
+        for other in ["src/lib.rs", "src/platform.rs", "src/core.rs", "src/feed.rs", "src/oauth.rs", "src/relay.rs", "src/store.rs"] {
+            assert_eq!(count(other), 0, "{other}");
+        }
+        let src = read("src/commands.rs");
+        let at = src.find("pub fn autostart_set").expect("autostart_set exists");
+        assert!(src[at..].contains(".enable()"));
+    }
+
+    #[test]
     fn the_view_may_load_only_its_own_screens() {
         let ok = |s: &str, dev: bool| navigation_allowed(&Url::parse(s).unwrap(), dev);
         assert!(ok("tauri://localhost/", false));

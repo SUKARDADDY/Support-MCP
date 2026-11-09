@@ -3,7 +3,6 @@ import { connectDevice, messageOf } from '../api.js';
 import { Icon } from '../components/Icon.jsx';
 import { useApp } from '../context.jsx';
 import { formatClock, formatDuration } from '../format.js';
-import { usePageVisible } from '../hooks.js';
 import { t } from '../i18n/index.js';
 import { dataUrl, useSession } from '../session.js';
 import { AgentStartDialog } from './AgentStartDialog.jsx';
@@ -15,8 +14,7 @@ const KNOWN_KINDS = ['created', 'consumed', 'attached', 'hello', 'detached', 'de
 // or take it over. There are no click or type controls: this tab only watches. Everything
 // from the PC (the picture, step details, notes, log text) is untrusted and shown as text.
 export function SessionTab({ tab, active = true }) {
-  const { core, tuning, me, can, endTab, closeTab, toast, updateTab, devices } = useApp();
-  const visible = usePageVisible();
+  const { core, tuning, me, can, endTab, closeTab, toast, updateTab, devices, visible } = useApp();
   const [showActivity, setShowActivity] = useState(true);
   const [agentOpen, setAgentOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());

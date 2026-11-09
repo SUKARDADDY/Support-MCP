@@ -13,4 +13,6 @@ pub const COMMANDS: &[&str] = &[
     "notifications_recent",
     "prefs_get",
     "prefs_set",
+    "autostart_get",
+    "autostart_set",
 ];

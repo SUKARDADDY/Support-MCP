@@ -57,7 +57,9 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   const [relayDown, setRelayDown] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const toastTimer = useRef(null);
-  const visible = usePageVisible();
+  // On screen: the page is not hidden, and the shell has not hidden the window to the tray or minimised it.
+  const [windowVisible, setWindowVisible] = useState(true);
+  const visible = usePageVisible() && windowVisible;
 
   useEffect(() => applyTheme(theme), [theme]);
   const setTheme = (next) => { saveTheme(next); setThemeState(next); };
@@ -189,6 +191,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
       if (isLive) setUnread((n) => n + items.length);
     });
     sub('feed://status', ({ online }) => setRelayDown(!online));
+    sub('ui://visibility', ({ visible: v }) => setWindowVisible(v !== false));
     sub('account://changed', () => { loadAccounts().catch(() => {}); });
     sub('ui://open', (target) => openTargetRef.current?.(target));
     return () => { live = false; offs.forEach((off) => off()); };
@@ -232,8 +235,8 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     devices: deviceData.devices, places: deviceData.places, devicesState: deviceData, reloadDevices,
     selectedId, select, conns, connect, cancelConnect, dismissConnect,
     sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true),
-    toast, copyText, notifications, openTarget, now, theme, setTheme, reloadTasks: () => {}, tuning,
-  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, toast, copyText, notifications, openTarget, now, theme, tuning]); // eslint-disable-line react-hooks/exhaustive-deps
+    toast, copyText, notifications, openTarget, now, theme, setTheme, reloadTasks: () => {}, tuning, visible,
+  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, toast, copyText, notifications, openTarget, now, theme, tuning, visible]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (accounts === null) return <div className="app" role="status"><p className="hint">{t('common.loading')}</p></div>;
 

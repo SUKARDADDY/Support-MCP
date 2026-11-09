@@ -16,6 +16,8 @@
     "allow-notifications-recent",
     "allow-prefs-get",
     "allow-prefs-set",
+    "allow-autostart-get",
+    "allow-autostart-set",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

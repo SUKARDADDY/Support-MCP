@@ -32,10 +32,12 @@ fn browser() -> Arc<dyn oauth::Browser> {
 }
 
 // The one window. It is built here, not from the config alone, so it can refuse to
-// navigate anywhere but the app's own screens and refuse to open another window.
-fn build_main_window(app: &tauri::App) -> tauri::Result<tauri::WebviewWindow> {
+// navigate anywhere but the app's own screens and refuse to open another window. Started
+// by autostart (--background) it stays hidden in the tray.
+fn build_main_window(app: &tauri::App, background: bool) -> tauri::Result<tauri::WebviewWindow> {
     let config = app.config().app.windows.first().cloned().expect("tauri.conf.json describes the main window");
     tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?
+        .visible(!background)
         .on_navigation(|url| lockdown::navigation_allowed(url, cfg!(debug_assertions)))
         .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny)
         .build()
@@ -43,14 +45,20 @@ fn build_main_window(app: &tauri::App) -> tauri::Result<tauri::WebviewWindow> {
 
 pub fn run() {
     tauri::Builder::default()
+        // Registered first, as the plugin asks: a second start only opens the window of the first.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| platform::show_main_window(app)))
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec![platform::BACKGROUND_ARG])))
         .setup(|app| {
-            build_main_window(app)?;
+            let window = build_main_window(app, platform::started_in_background(std::env::args()))?;
+            platform::keep_in_tray(&window);
+            platform::build_tray(app.handle())?;
             let handle = app.handle().clone();
             let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
             let store = Arc::new(store::Store::open(&dir, seal::default_sealer())?);
             let emitter = Arc::new(platform::TauriEmitter(handle.clone()));
-            let notifier = Arc::new(platform::ToastNotifier::new(handle));
+            let notifier = Arc::new(platform::ToastNotifier::new(handle.clone()));
+            platform::open_on_click(&handle, notifier.clone());
             let core = core::Core::new(store, emitter, notifier, browser(), core::CoreConfig::NORMAL);
             core.start();
             app.manage(core);
@@ -67,6 +75,8 @@ pub fn run() {
             commands::notifications_recent,
             commands::prefs_get,
             commands::prefs_set,
+            commands::autostart_get,
+            commands::autostart_set,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Support app");

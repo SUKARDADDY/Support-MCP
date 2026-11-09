@@ -60,6 +60,18 @@ describe('Session tab: watching the screen yourself', () => {
     await waitFor(() => expect(toolCalls(fake, 'screenshot').length).toBeGreaterThan(frozen));
   });
 
+  test('stops taking pictures while the shell has hidden the window to the tray or minimised it', async () => {
+    const { fake } = await openTab();
+    await waitFor(() => expect(toolCalls(fake, 'screenshot').length).toBeGreaterThanOrEqual(2));
+    act(() => fake.emit('ui://visibility', { visible: false }));
+    await sleep(60);
+    const frozen = toolCalls(fake, 'screenshot').length;
+    await sleep(120);
+    expect(toolCalls(fake, 'screenshot').length).toBe(frozen);
+    act(() => fake.emit('ui://visibility', { visible: true }));
+    await waitFor(() => expect(toolCalls(fake, 'screenshot').length).toBeGreaterThan(frozen));
+  });
+
   test('stops at once when someone else is driving, and says so', async () => {
     const fake = fakeCore();
     let n = 0;
