@@ -97,10 +97,17 @@ jobs:
           rustup default stable
           rustc --version
           cargo --version
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # The repository allows only GitHub's own actions, so the Rust cache is actions/cache.
+      - name: Cache the Rust build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          workspaces: technician-app/src-tauri
-          cache-on-failure: true
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            technician-app/src-tauri/target
+          key: rust-${{ runner.os }}-${{ hashFiles('technician-app/src-tauri/Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-
       # The relay's one npm package, which `wrangler dev` bundles for the end-to-end run.
       - run: npm ci --ignore-scripts
       - name: Install the screens' packages
