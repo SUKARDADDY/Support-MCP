@@ -265,6 +265,34 @@ export function agentService(env, { origin = '', devTtlMs = 0 } = {}) {
     return { task: { ...taskOut(fresh), ...own }, caps: await caps(), untrusted_text: UNTRUSTED };
   }
 
+  // The last full screenshot the task took, for the technician's app: { rev, at, mime, data }.
+  // Held in the task's memory only. It is the PC's screen, so it is read on the terms a
+  // screenshot is: a real member holding sessions.control (and the second factor the app's
+  // sign-in was made with), and only the person who started the task or the one who drives
+  // its session now. 404 no_frame when there is none yet or the task has ended.
+  async function frame(slug, actorIdentity, id, oauthCaller) {
+    const actor = normalizeIdentity(actorIdentity);
+    await member(slug, actor, 'sessions.control', oauthCaller);
+    if (String(env.EMERGENCY_STOP ?? '') !== '') throw new TeamError(503, 'relay_stopped', RELAY_STOPPED);
+    if ((await team.stopState(slug)).stopped) throw new TeamError(409, 'stopped', STOPPED);
+    const task = await row(slug, taskId(id));
+    let allowed = normalizeIdentity(task.started_by) === actor;
+    if (!allowed && task.sid && task.ended_at === null) {
+      try {
+        const watch = await sessionWatch(env, slug, task.sid);
+        allowed = !!watch.driver && normalizeIdentity(watch.driver) === actor;
+      } catch (_) {
+        throw new TeamError(503, 'unavailable', 'could not reach that session; try again');
+      }
+    }
+    if (!allowed) throw new TeamError(403, 'forbidden', 'only the person who started the task, or the one driving its session, can see its screen');
+    const none = new TeamError(404, 'no_frame', 'the task has no picture yet');
+    if (task.ended_at !== null) throw none;
+    const reply = await taskObject(slug, task.id).fetch('https://do/frame');
+    if (!reply.ok) throw none;
+    return reply.json();
+  }
+
   // Wake a task's object after its row changed, so a stop is carried out and a resume
   // goes on at once. Best effort: the task reads its row at every step anyway.
   async function wake(slug, id) {
@@ -290,5 +318,5 @@ export function agentService(env, { origin = '', devTtlMs = 0 } = {}) {
     return { task_id: id, state: (await row(slug, id)).state };
   }
 
-  return { member, settings, patch, addModel, removeModel, start, list, status, control };
+  return { member, settings, patch, addModel, removeModel, start, list, status, control, frame };
 }

@@ -7,7 +7,8 @@
 // From the technician app (`app` is { caller }, src/api.js) only the tasks routes
 // are reachable. There the caller is an OAuth caller, so each route also asks for
 // the second factor its permission needs, and a task is started with the caller as
-// its person: every step of the task then checks that they are still a member.
+// its person: every step of the task then checks that they are still a member. Only the
+// app can read a task's last picture (tasks/<id>/frame).
 import { TeamError } from './workspace.js';
 import { PROVIDERS } from './agent-models.js';
 import { agentService } from './agent.js';
@@ -70,6 +71,12 @@ export async function handleAgentApi(h, { env, team, slug, caller, method, reque
       await agent.member(slug, caller, 'sessions.view', oauthCaller);
       const wait = url.searchParams.get('wait_s');
       return json(await agent.status(slug, { task_id: id, ...(wait === null || wait === '' ? {} : { wait_s: /^\d+$/.test(wait) ? Number(wait) : -1 }) }));
+    }
+    // The picture the task last took. For the app only: its sign-in is the one that holds a second factor.
+    if (b === 'frame') {
+      if (!oauthCaller) throw new TeamError(404, 'not_found', 'not found');
+      if (method !== 'GET') return notAllowed('GET');
+      return json(await agent.frame(slug, caller, id, oauthCaller));
     }
     if (!['pause', 'resume', 'stop'].includes(b)) throw new TeamError(404, 'not_found', 'not found');
     if (method !== 'POST') return notAllowed('POST');
