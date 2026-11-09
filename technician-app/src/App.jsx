@@ -16,6 +16,7 @@ import { Settings } from './screens/Settings.jsx';
 import { SignIn } from './screens/SignIn.jsx';
 import { applyTheme, loadTheme, saveTheme } from './theme.js';
 import { loadTitles, withTitle } from './titles.js';
+import { guardedStart, guardsFor } from './guarded-start.js';
 
 const ACTIVE_KEY = 'support.active';
 const PLACES_EVERY_MS = 5 * 60 * 1000;
@@ -168,24 +169,11 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     tabGuards.current.set(key, guard);
     return () => { if (tabGuards.current.get(key) === guard) tabGuards.current.delete(key); };
   }, []);
-  const startAgentTask = useCallback(async (body) => {
-    const guards = [...tabGuards.current.values()].filter((g) => g.account === accountId
-      && ((body.session_id && g.sessionId() === body.session_id) || (body.device_id && g.deviceId() === body.device_id)));
-    await Promise.all(guards.map((g) => g.hold()));
-    // A task started on a PC makes the relay connect to it, which it refuses while this app has
-    // that PC's session open. When an open tab has a live session that the person drives, the
-    // task starts on that session instead (agent_start takes either).
-    const live = body.device_id ? guards.map((g) => g.liveSession()).find(Boolean) : null;
-    const sent = live ? { instructions: body.instructions, keep_working: body.keep_working, ...(body.model ? { model: body.model } : {}), session_id: live } : body;
-    try {
-      const started = await startTask(core, accountId, sent);
-      guards.forEach((g) => g.follow(started.task_id));
-      return started;
-    } catch (e) {
-      guards.forEach((g) => g.release());
-      throw e;
-    }
-  }, [core, accountId]);
+  const startAgentTask = useCallback((body) => guardedStart({
+    guards: guardsFor(tabGuards.current.values(), accountId, body),
+    body,
+    send: (b) => startTask(core, accountId, b),
+  }), [core, accountId]);
   const sessionTabFor = useCallback((deviceId) => tabs.find((x) => x.deviceId === deviceId && x.account === accountId) ?? null, [tabs, accountId]);
 
   // Tabs from the last run: keep only the sessions that are still open.

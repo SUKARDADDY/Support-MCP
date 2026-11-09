@@ -34,7 +34,7 @@ export function SessionTab({ tab, active = true }) {
     liveSession: () => { const { s: cur } = latest.current; return cur.attached && cur.isDriver && !cur.ended ? cur.sessionId ?? null : null; },
     hold: () => latest.current.s.holdScreenshots(),
     release: () => latest.current.s.releaseScreenshots(),
-    follow: (taskId) => { latest.current.s.watchTask(taskId); latest.current.s.releaseScreenshots(); },
+    follow: (taskId) => { try { latest.current.s.watchTask(taskId); } finally { latest.current.s.releaseScreenshots(); } },
   }), [registerTab, tab.key, tab.account]);
 
   const device = devices.find((d) => d.id === tab.deviceId) ?? null;

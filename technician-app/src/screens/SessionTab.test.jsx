@@ -414,6 +414,33 @@ describe('Session tab: handing the session to the agent', () => {
     await waitFor(() => expect(fake.state.started).toEqual({ instructions: 'Fix the printer', keep_working: false, device_id: ID('a') }));
   });
 
+  test('a session the relay says is gone is retried by PC, with the screenshots still held in between', async () => {
+    const fake = fakeCore();
+    const posts = [];
+    const request = fake.core.request.getMockImplementation();
+    fake.core.request.mockImplementation(async (account, method, path, body) => {
+      if (method === 'POST' && path === '/api/agent/tasks') {
+        posts.push({ body, shots: toolCalls(fake, 'screenshot').length });
+        if (body.session_id) throw Object.assign(new Error('that session is not live'), { code: 'session_ended', status: 409 });
+      }
+      return request(account, method, path, body);
+    });
+    const { user } = await openTab(fake);
+    await waitFor(() => expect(toolCalls(fake, 'screenshot').length).toBeGreaterThanOrEqual(1));
+    await user.click(screen.getByRole('tab', { name: 'Devices' }));
+    await user.click(await screen.findByRole('button', { name: /^Front counter/ }));
+    const detail = screen.getByRole('region', { name: 'Device details' });
+    await user.click(within(detail).getByRole('button', { name: 'Hand to the agent' }));
+    const dialog = screen.getByRole('dialog', { hidden: true });
+    await user.click(within(dialog).getByLabelText('What should the agent do?'));
+    await user.paste('Fix the printer');
+    await user.click(within(dialog).getByRole('button', { name: 'Start the task' }));
+    await waitFor(() => expect(fake.state.started).toEqual({ instructions: 'Fix the printer', keep_working: false, device_id: ID('a') }));
+    expect(posts.map((p) => Object.keys(p.body).includes('session_id'))).toEqual([true, false]);
+    expect(posts[1].shots).toBe(posts[0].shots);
+    expect(await screen.findByText('Agent activity')).toBeInTheDocument();
+  });
+
   test('a task the relay refuses to start lets the screenshots go on', async () => {
     const fake = fakeCore();
     fake.state.requestError = (method, p) => (method === 'POST' && p === '/api/agent/tasks' ? Object.assign(new Error('the built-in agent is off'), { code: 'caps_not_set', status: 409 }) : null);

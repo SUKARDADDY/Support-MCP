@@ -208,6 +208,7 @@ dialog::backdrop { background: rgb(0 0 0 / .45); }
 .act .cost { font-size: 13.5px; color: var(--ink-2); margin: 0 0 14px; }
 .act .task + .cost { margin-top: -10px; } /* tucked under the title, which has 16px below it */
 .act .tl-end { margin-top: 8px; overflow-wrap: anywhere; }
+.act .hint { overflow-wrap: anywhere; }
 .tl { list-style: none; margin: 0; padding: 0; }
 .tl li { position: relative; padding: 0 0 14px 28px; }
 .tl li::before { content: ""; position: absolute; left: 8px; top: 20px; bottom: 0; width: 2px; background: var(--rule); }
