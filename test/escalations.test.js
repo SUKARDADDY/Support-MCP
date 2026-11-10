@@ -394,3 +394,24 @@ test('another team sees nothing of this queue and can claim or close nothing in 
   assert.equal(await code(svc.claim('default', BOSS, { id: theirs.id })), 'not_found');
   assert.equal((await svc.list('acme', TECH2, { status: 'open' })).escalations.length, 1);
 });
+
+test('the escalation tool: open, list mine, claim a live session and close, with the shapes the app reads', async (t) => {
+  const w = await agentWorld(t);
+  await addTech2(w);
+  const { sid, pc } = await attached(w, TECH);
+  const opened = await w.tool(TECH, 'escalation', { action: 'open', session_id: sid, note: 'Needs the vendor tool' });
+  assert.deepEqual(Object.keys(opened.escalation).sort(), ['claimed_at', 'claimed_by', 'close_note', 'closed_at', 'closed_by', 'device_id', 'device_name', 'id', 'kind', 'note', 'opened_at', 'opened_by', 'session_id', 'summary', 'task_id']);
+  assert.match(opened.untrusted_text, /untrusted|data/i);
+  assert.deepEqual((await w.tool(TECH, 'escalation', { action: 'list', status: 'mine' })).escalations.map((x) => x.id), [opened.escalation.id]);
+  assert.deepEqual((await w.tool(TECH2, 'escalation', { action: 'list' })).escalations.map((x) => x.id), [opened.escalation.id]);
+  assert.deepEqual((await w.tool(TECH2, 'escalation', { action: 'list', status: 'mine' })).escalations, []);
+  assert.match((await w.tool(TECH2, 'escalation', { action: 'list', status: 'everything' })).error, /^bad_request: status must be/);
+  const claimed = await w.tool(TECH2, 'escalation', { action: 'claim', id: opened.escalation.id });
+  assert.deepEqual([claimed.driver, claimed.session_id, claimed.device_id, claimed.escalation.claimed_by], [TECH2, sid, pc.id, TECH2]);
+  assert.deepEqual((await w.tool(TECH2, 'escalation', { action: 'list', status: 'mine' })).escalations.map((x) => x.id), [opened.escalation.id]);
+  assert.deepEqual((await w.tool(TECH2, 'escalation', { action: 'list' })).escalations, []);
+  const closed = await w.tool(TECH2, 'escalation', { action: 'close', id: opened.escalation.id, note: 'Vendor tool run' });
+  assert.deepEqual([closed.escalation.closed_by, closed.escalation.close_note], [TECH2, 'Vendor tool run']);
+  assert.match((await w.tool(TECH, 'escalation', { action: 'claim', id: opened.escalation.id })).error, /^already_claimed: /);
+  assert.equal((await w.tool(BOSS, 'escalation', { action: 'list', status: 'closed' })).escalations.length, 1);
+});

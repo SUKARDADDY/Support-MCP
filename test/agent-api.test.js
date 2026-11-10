@@ -6,6 +6,7 @@ import { agentWorld, BOSS, TECH, VIEW, LEAD, OPENAI_KEY, CLAUDE_KEY } from './ag
 import { ant, claudeUsage, oai, openaiBadKey, openaiUsage } from './agent-fakes.js';
 import { listTools } from '../src/mcp.js';
 import { AGENT_TOOL_NAMES } from '../src/agent-tools.js';
+import { oneOff } from './people-world.js';
 
 const finish = (summary = 'ok') => oai.call('finish', { outcome: 'done', summary });
 const STRANGER = 'stranger@example.com';
@@ -15,7 +16,7 @@ const NOT_MEMBER = 'you are not a member of this team';
 test('agent_start, agent_status and agent_control are tools every connection lists, whatever the team\'s mode', async (t) => {
   const w = await agentWorld(t);
   const names = (await w.rpc(BOSS, 'tools/list')).body.result.tools.map((x) => x.name);
-  assert.equal(names.length, 27);
+  assert.equal(names.length, 31);
   for (const n of ['agent_start', 'agent_status', 'agent_control']) assert.ok(names.includes(n), n);
   await w.api(BOSS, 'PATCH', '/agent', { mode: 'agent' });
   assert.deepEqual((await w.rpc(BOSS, 'tools/list')).body.result.tools.map((x) => x.name), names, 'tools/list is the same for every mode');
@@ -384,14 +385,22 @@ test('the Session\'s watch route reports its state, driver and who has commanded
     participants: [{ identity: TECH, name: null, role: 'driver', since }],
   });
   assert.deepEqual(await watch('workspace=acme'), { state: 'unknown', actors: [] });
+  // A link session a member made is driven by its creator and shows that driver here; the PC is never told.
   const link = await w.tool(BOSS, 'session_create', {});
   const linkWatch = async () => (await (await w.env.SESSION.get(w.env.SESSION.idFromString(link.session_id)).fetch('https://do/watch?workspace=default')).json());
-  assert.deepEqual(await linkWatch(), {
-    state: 'pending', opened_by_task: null, ended_reason: null, device_id: null, device_name: null, driver: null, handed_over: null, offer: null, actors: [], participants: [],
-  });
-  await w.tool(BOSS, 'run', { session_id: link.session_id, command: 'x' }); // refused: nothing attached, but it was a command
-  await w.tool(TECH, 'run', { session_id: link.session_id, command: 'x' });
-  assert.deepEqual((await linkWatch()).actors.map((x) => x.actor).sort(), [BOSS, TECH]);
+  const first = await linkWatch();
+  assert.deepEqual([first.state, first.device_id, first.driver, first.actors], ['pending', null, BOSS, []]);
+  assert.deepEqual(first.participants.map((p) => [p.identity, p.role]), [[BOSS, 'driver']]);
+  await w.tool(BOSS, 'run', { session_id: link.session_id, command: 'x' }); // refused: nothing attached, but it was the driver's command
+  await w.tool(TECH, 'run', { session_id: link.session_id, command: 'x' }); // refused: not the driver, so not an actor
+  assert.deepEqual((await linkWatch()).actors.map((x) => x.actor), [BOSS]);
+  // One with no driver key: nobody drives, and every command is an actor.
+  const legacy = await oneOff(w);
+  const legacyWatch = async () => (await (await w.env.SESSION.get(w.env.SESSION.idFromString(legacy)).fetch('https://do/watch?workspace=default')).json());
+  assert.deepEqual([(await legacyWatch()).driver, (await legacyWatch()).participants], [null, []]);
+  await w.tool(BOSS, 'run', { session_id: legacy, command: 'x' });
+  await w.tool(TECH, 'run', { session_id: legacy, command: 'x' });
+  assert.deepEqual((await legacyWatch()).actors.map((x) => x.actor).sort(), [BOSS, TECH]);
   w.advance(5000);
   await w.tool(BOSS, 'session_end', { session_id: link.session_id });
   assert.deepEqual([(await linkWatch()).state, (await linkWatch()).ended_reason], ['ended', 'ended_by_operator']);

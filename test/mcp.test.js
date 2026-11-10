@@ -14,7 +14,9 @@ const backend = {
 };
 
 const AGENT = ['agent_control', 'agent_start', 'agent_status'];
-const BASE = ['device_connect', 'device_list', 'get_file', 'put_file', 'run', 'session_create', 'session_end', 'session_list', 'session_status', ...AGENT];
+// The team's tools for people: who is on a session, handing it over, and the queue.
+const TEAM = ['escalation', 'people_list', 'session_handover', 'session_participants'];
+const BASE = ['device_connect', 'device_list', 'get_file', 'put_file', 'run', 'session_create', 'session_end', 'session_list', 'session_status', ...AGENT, ...TEAM];
 const EXTRAS = ['block_input', 'request_full_control', 'send_sas', 'type_secret'];
 const SPLIT = ['click', 'drag', 'move_mouse', 'press_key', 'screenshot', 'scroll', 'type_text', 'wait', 'zoom'];
 const names = (options) => listTools(options).map((t) => t.name).sort();
@@ -57,15 +59,15 @@ test('parseToolOptions reads ui and rejects unknown values and the removed shape
 test('tools/list follows the connection options', async () => {
   const { status, body } = await handleRpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, backend);
   assert.equal(status, 200);
-  assert.equal(body.result.tools.length, 12 + 9 + 2 + 4);
+  assert.equal(body.result.tools.length, 16 + 9 + 2 + 4);
   const noUi = await handleRpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, backend, { ui: false });
-  assert.equal(noUi.body.result.tools.length, 12 + 9 + 4);
+  assert.equal(noUi.body.result.tools.length, 16 + 9 + 4);
 });
 
 test('every tool takes a session_id, and the schemas stay JSON', () => {
   for (const t of listTools()) {
     assert.equal(t.inputSchema.type, 'object', t.name);
-    if (!['session_create', 'session_list', 'device_list', 'device_connect', ...AGENT].includes(t.name)) assert.ok(t.inputSchema.required?.includes('session_id'), t.name);
+    if (!['session_create', 'session_list', 'device_list', 'device_connect', 'people_list', 'escalation', ...AGENT].includes(t.name)) assert.ok(t.inputSchema.required?.includes('session_id'), t.name);
   }
   assert.doesNotThrow(() => JSON.stringify(listTools()));
 });
@@ -222,7 +224,7 @@ test('a tool the connection does not list is unknown', async () => {
 test('a missing session_id is a clear tool error for every tool that needs one, and nothing reaches the backend', async () => {
   const b = screenBackend();
   const withId = listTools().filter((t) => t.inputSchema.required?.includes('session_id'));
-  assert.equal(withId.length, listTools().length - 7);
+  assert.equal(withId.length, listTools().length - 9);
   for (const t of withId) {
     for (const args of [{}, { session_id: '' }, { session_id: null }, { session_id: 7 }]) {
       const r = await call(t.name, args, b);

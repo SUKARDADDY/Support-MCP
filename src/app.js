@@ -17,6 +17,8 @@ import { deviceHooks, newCode } from './device-sessions.js';
 import { agentService } from './agent.js';
 import { agentStoreFromEnv } from './agent-store.js';
 import { sweep } from './sweep.js';
+import { sessionPeople } from './session-people.js';
+import { escalationService } from './escalations.js';
 import { WAIT_MAX_S, notifyStore, waitForFeed } from './notify.js';
 import { handleAuth } from './auth.js';
 import {
@@ -145,15 +147,27 @@ function makeBackend(env, origin, devTtlMs, actor, workspace, via = null, taskId
     return r.json();
   }
   const agent = () => agentService(env, { origin, devTtlMs });
+  const people = () => sessionPeople(env, { devTtlMs });
+  const queue = () => escalationService(env, { devTtlMs, agentMode: (slug) => agentStoreFromEnv(env, teamFromEnv(env)).mode(slug) });
+  // The team tools put the code first: "<code>: <message>". The technician app reads the code.
+  const coded = async (fn) => {
+    try {
+      return await fn();
+    } catch (e) {
+      throw e instanceof TeamError ? new Error(`${e.code}: ${e.message}`) : e;
+    }
+  };
   return {
-    async session_create(args) {
+    async session_create(args, caps = {}) {
       const windowsMode = normalizeWindowsMode(args.windows_mode ?? 'app');
       const code = newCode();
       const id = env.SESSION.idFromName(code);
       const sid = id.toString();
       const r = await env.SESSION.get(id).fetch('https://do/create', {
         method: 'POST',
-        body: JSON.stringify({ code, sid, label: args.label ?? null, windows_mode: windowsMode, ttl_ms: devTtlMs, actor, workspace }),
+        // A team member who makes a link drives its session (caps.member), until they hand it over. Open mode
+        // names no driver, so a session made there stays open to anyone who may control sessions.
+        body: JSON.stringify({ code, sid, label: args.label ?? null, windows_mode: windowsMode, ttl_ms: devTtlMs, actor, workspace, ...(caps.member ? { driver: actor } : {}) }),
       });
       const out = await r.json();
       if (!out.ok) throw new Error(out.error || 'session_create failed');
@@ -181,7 +195,10 @@ function makeBackend(env, origin, devTtlMs, actor, workspace, via = null, taskId
     async session_status(args) {
       const tail = args.log_tail == null ? 20 : args.log_tail;
       const r = await sessionStub(args.session_id).fetch(`https://do/status?log_tail=${encodeURIComponent(tail)}&workspace=${workspace}`);
-      return r.json();
+      const out = await r.json();
+      // The Session knows the people by their identities; the team knows their names.
+      if (Array.isArray(out.participants) && out.participants.length) out.participants = await people().named(workspace, out.participants);
+      return out;
     },
     async run(args) {
       const r = await cmd(args.session_id, { op: 'run', command: args.command, timeout_s: args.timeout_s, as: args.as });
@@ -248,6 +265,26 @@ function makeBackend(env, origin, devTtlMs, actor, workspace, via = null, taskId
       });
       return r.json();
     },
+    // The team's tools for people: who can be invited, who is on a session, handing it over, and the queue.
+    async people_list() {
+      return coded(() => people().peopleList(workspace));
+    },
+    async session_participants(args, caps) {
+      return coded(() => people().participants(workspace, actor, args, caps));
+    },
+    async session_handover(args, caps) {
+      return coded(() => people().handover(workspace, actor, args, caps));
+    },
+    async escalation(args, caps) {
+      return coded(() => {
+        const q = queue();
+        if (args.action === 'open') return q.open(workspace, actor, args);
+        if (args.action === 'list') return q.list(workspace, actor, args);
+        if (args.action === 'claim') return q.claim(workspace, actor, args, caps);
+        if (args.action === 'close') return q.close(workspace, actor, args);
+        throw new Error('action must be open, list, claim or close');
+      });
+    },
     // The built-in agent. caps.user is the OAuth caller's { userId, email }, or null.
     async agent_start(args, caps) {
       return agent().start(workspace, actor, args, caps.user ?? null);
@@ -267,9 +304,19 @@ export class AccessDenied extends Error {}
 
 // The three agent tools are for real members only: they never run in open mode.
 const MEMBERS_ONLY_TOOLS = new Set(['agent_start', 'agent_status', 'agent_control']);
+// The team's tools for people (who is on a session, handing it over, the queue) are for real members only too.
+// They are a set of their own and are not spread into ALLOWED_IN_AGENT_MODE: a team on "built-in agent
+// only" refuses them, except the few calls named in agentModeAllows.
+const TEAM_TOOLS = new Set(['people_list', 'session_participants', 'session_handover', 'escalation']);
 // What a team on "built-in agent only" can still call from /mcp: the three agent
 // tools, and the three that only read.
 const ALLOWED_IN_AGENT_MODE = new Set([...MEMBERS_ONLY_TOOLS, 'device_list', 'session_list', 'session_status']);
+// ... and, of the team's tools, reading the queue, closing an item, and claiming one. A claim that would move
+// control of a live session is refused inside the queue with the code `mode`; only a ticket is claimed.
+export function agentModeAllows(name, args) {
+  if (ALLOWED_IN_AGENT_MODE.has(name)) return true;
+  return name === 'escalation' && ['list', 'close', 'claim'].includes(args?.action);
+}
 
 // The checks in front of a call, in order: the operator's stop, the workspace, the
 // person (an OAuth caller, or the starter of an agent task), their role, the second
@@ -278,8 +325,9 @@ const ALLOWED_IN_AGENT_MODE = new Set([...MEMBERS_ONLY_TOOLS, 'device_list', 'se
 //   person        { userId, email } of an agent task's OAuth starter: active, members only; no second factor,
 //                 which the starter passed when starting the task
 //   membersOnly   open mode never admits the caller
-//   gate(tool)    one more check, made after the role and stop checks
-async function checkCaller(env, actor, workspace, permission, { oauthCaller = null, person = null, membersOnly = false, gate = null, tool = null } = {}) {
+//   gate(tool, args)  one more check, made after the role and stop checks, with the call's arguments
+// Returns { open }: whether the caller was admitted by open mode (no members yet) rather than as a member.
+async function checkCaller(env, actor, workspace, permission, { oauthCaller = null, person = null, membersOnly = false, gate = null, tool = null, args = {} } = {}) {
   // The operator's stop for the whole relay: nothing runs, whoever asks.
   if (String(env.EMERGENCY_STOP ?? '') !== '') throw new AccessDenied('this relay is stopped by its operator');
   const team = teamFromEnv(env);
@@ -302,7 +350,8 @@ async function checkCaller(env, actor, workspace, permission, { oauthCaller = nu
   // A stopped workspace answers no tool call. Read after the role check, so
   // someone who is not a member learns nothing about the workspace.
   if ((await team.stopState(workspace)).stopped) throw new AccessDenied('this workspace is stopped; someone who can manage members must resume it');
-  if (gate) await gate(tool);
+  if (gate) await gate(tool, args);
+  return { open: a.open === true };
 }
 
 // The role check in front of every tool. A tool call runs exactly one backend
@@ -317,25 +366,28 @@ async function checkCaller(env, actor, workspace, permission, { oauthCaller = nu
 // The agent tools are members only for everyone. `extra` is { person, membersOnly,
 // gate }, see checkCaller: /mcp passes a gate that reads the team's mode, and the
 // built-in agent passes its starter as `person`, so its calls skip the mode.
+//
+// The role check is given only the permission key. The mode gate is also given the call's
+// arguments, because one tool (escalation) is allowed in some of its actions and not others.
 function authorizedBackend(backend, env, actor, toolName, workspace, oauthCaller = null, extra = {}) {
-  const check = async () => {
+  const check = async (args) => {
     const permission = permissionForTool(toolName);
     if (!permission) throw new Error(`unknown tool: ${toolName}`);
-    await checkCaller(env, actor, workspace, permission, {
-      ...extra, oauthCaller, tool: toolName, membersOnly: extra.membersOnly || MEMBERS_ONLY_TOOLS.has(toolName),
+    return checkCaller(env, actor, workspace, permission, {
+      ...extra, oauthCaller, tool: toolName, args, membersOnly: extra.membersOnly || MEMBERS_ONLY_TOOLS.has(toolName) || TEAM_TOOLS.has(toolName),
     });
   };
   // caps.factor(permission) is for a tool that checks a second permission inside
   // itself: it throws when an OAuth caller's sign-in lacks that permission's factor.
   // caps.user is the OAuth caller's { userId, email }, for a tool that starts work
-  // that outlives the call.
+  // that outlives the call. caps.member is true unless open mode admitted the caller.
   const caps = {
     factor: async (permission) => { if (oauthCaller) await assertSecondFactor(env, oauthCaller, permission); },
     user: oauthCaller ? { userId: oauthCaller.userId, email: oauthCaller.email } : null,
   };
   return Object.fromEntries(Object.entries(backend).map(([name, fn]) => [name, async (args) => {
-    await check();
-    return fn(args, caps);
+    const checked = await check(args);
+    return fn(args, { ...caps, member: !checked.open });
   }]));
 }
 
@@ -666,16 +718,18 @@ async function runMcp(request, env, url, origin, devTtlMs, workspace, actor, oau
   // A team on "built-in agent only" refuses the session tools here. The mode is read
   // after the role check, so someone who is not a member learns nothing about it.
   // It is read here and not in the shared tool path, so it never blocks the agent.
-  const gate = async (name) => {
-    if (ALLOWED_IN_AGENT_MODE.has(name)) return;
+  const gate = async (name, args) => {
+    if (agentModeAllows(name, args)) return;
+    // The team's tools put the code first, as every error of theirs does.
+    const mark = TEAM_TOOLS.has(name) ? 'mode: ' : '';
     let mode;
     try {
       mode = await agentStoreFromEnv(env, teamFromEnv(env)).mode(workspace);
     } catch (_) {
       // The mode could not be read: refuse, so a team on "built-in agent only" is never let through.
-      throw new Error('could not check whether this team uses the built-in agent; try again');
+      throw new Error(`${TEAM_TOOLS.has(name) ? 'unavailable: ' : ''}could not check whether this team uses the built-in agent; try again`);
     }
-    if (mode === 'agent') throw new Error('this team uses the built-in agent');
+    if (mode === 'agent') throw new Error(`${mark}this team uses the built-in agent`);
   };
   const backend = authorizedBackend(makeBackend(env, origin, devTtlMs, actor, workspace), env, actor, toolName, workspace, oauthCaller, { gate });
   const { status, body } = await handleRpc(msg, backend, options);
