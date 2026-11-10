@@ -1255,6 +1255,8 @@ export class Session {
         await this.applyDriver(next, { kind: 'take_over', gen: to });
       } else {
         const p = this.people;
+        // An open offer ends with the take-over, and the log says so (applyDriver's own row covers a change of driver).
+        if (p.offer) this.logRow('offer cancelled', 'by a take-over', next);
         p.offer = null;
         p.accepting = null;
         p.handed_over = null;

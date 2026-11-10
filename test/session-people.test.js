@@ -255,6 +255,24 @@ test('complete applies only in the generation the move began from, also when the
   assert.equal((await handover(w, sid, { op: 'complete', actor: LEAD, from: TECH, kind: 'accept', from_gen: 1, gen: 2 })).changed, false);
 });
 
+test('a take-over by the person who drives already, with an offer open, logs that the offer ended, and sends no notice', async (t) => {
+  const w = await agentWorld(t);
+  const { sid } = await attached(w);
+  await watching(w, sid, LEAD);
+  await handover(w, sid, { op: 'offer', actor: TECH, to: LEAD });
+  const notices = w.sql('SELECT COUNT(*) AS n FROM notifications')[0].n;
+  assert.equal((await call(w, sid, '/takeover', { actor: TECH, gen: 1 })).ok, true);
+  const rows = (await status(w, sid)).log.map((r) => r.kind);
+  assert.ok(rows.includes('offer cancelled'), rows.join(','));
+  assert.equal(rows.filter((k) => k === 'offer cancelled').length, 1);
+  assert.equal(w.sql('SELECT COUNT(*) AS n FROM notifications')[0].n, notices);
+  // With no offer open, a same-person take-over writes no such row.
+  const before = (await status(w, sid)).log.length;
+  await call(w, sid, '/takeover', { actor: TECH, gen: 2 });
+  assert.equal((await status(w, sid)).log.filter((r) => r.kind === 'offer cancelled').length, 1);
+  assert.equal((await status(w, sid)).log.length, before);
+});
+
 test('complete stops when someone else drives now: a take-over that landed in between stands', async (t) => {
   const w = await agentWorld(t);
   const { sid } = await attached(w);
