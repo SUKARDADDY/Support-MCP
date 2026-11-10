@@ -2,7 +2,7 @@
 import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, test } from 'vitest';
-import { FAST, ID, ToolFail, fakeCore, renderApp } from '../test-utils.jsx';
+import { FAST, ID, ToolFail, escalationCall, fakeCore, renderApp } from '../test-utils.jsx';
 
 const SID = 'q'.repeat(64);
 const ME = 'tech@example.com';
@@ -290,5 +290,53 @@ describe('the Queue screen reads again when someone else changes an item', () =>
     await sleep(200);
     expect(queueCalls(fake, 'list').length).toBe(before);
     expect(screen.getByText('Printer jams')).toBeInTheDocument();
+  });
+});
+
+describe('a live claim whose session step did not finish', () => {
+  const LEAD = 'lead@example.com';
+  // The claim committed on the relay (the item is the person's, the PC's record names them) but the session has not followed: busy.
+  const halfDone = () => {
+    const fake = fakeCore();
+    fake.state.claimLive = true;
+    fake.state.sessions[SID] = { state: 'attached', driver: LEAD, machine: 'FRONT', log: [] };
+    let first = true;
+    fake.state.escalationCall = (args) => {
+      const out = escalationCall(fake.state, args);
+      if (args.action === 'claim' && first) {
+        first = false;
+        throw new ToolFail('busy: control moved on the PC, but the session has not followed yet; repeat the same call', 'busy');
+      }
+      if (args.action === 'claim') fake.state.sessions[SID].driver = ME; // the repeated claim finishes the session step
+      return out;
+    };
+    return fake;
+  };
+
+  test('right after the busy answer, the action to finish is offered, and pressing it completes the claim', async () => {
+    const fake = halfDone();
+    const { user } = await openQueue([item({ session_id: SID, opened_by: LEAD })], fake);
+    await user.click(await screen.findByRole('button', { name: 'Claim' }));
+    expect(await screen.findByText('Control is being handed over right now. Try again in a moment.')).toBeInTheDocument();
+    await user.click(await screen.findByRole('button', { name: 'Finish taking control' }));
+    expect(await screen.findByRole('tab', { name: /Front counter/, selected: true })).toBeInTheDocument();
+    expect(queueCalls(fake, 'claim')).toHaveLength(2);
+    expect(await screen.findByText('You are driving')).toBeInTheDocument();
+  });
+
+  test('on Mine, an item claimed by you whose session is live and still driven by the sender has the action; one you drive does not', async () => {
+    const fake = halfDone();
+    const claimed = (over) => item({ opened_by: LEAD, claimed_by: ME, claimed_at: Date.now() - 1000, ...over });
+    const done = claimed({ id: ID('f'), session_id: 'z'.repeat(64), note: 'Already mine' });
+    fake.state.sessions['z'.repeat(64)] = { state: 'attached', driver: ME, log: [] };
+    const { user } = await openQueue([claimed({ session_id: SID, note: 'Half done' }), done], fake);
+    await user.click(await screen.findByRole('tab', { name: 'Mine' }));
+    const half = (await screen.findByText('Half done')).closest('li');
+    expect(within(half).getByRole('button', { name: 'Finish taking control' })).toBeInTheDocument();
+    expect(within((await screen.findByText('Already mine')).closest('li')).queryByRole('button', { name: 'Finish taking control' })).not.toBeInTheDocument();
+    // Claim is not offered for a claimed item; Finish repeats the claim.
+    expect(within(half).queryByRole('button', { name: 'Claim' })).not.toBeInTheDocument();
+    await user.click(within(half).getByRole('button', { name: 'Finish taking control' }));
+    await waitFor(() => expect(queueCalls(fake, 'claim')[0]?.args[1]).toEqual({ action: 'claim', id: ID('e') }));
   });
 });

@@ -473,6 +473,7 @@
  "queue.closed_by": "Closed by {who}, {when}",
  "queue.close_note": "Closing note.",
  "queue.claim": "Claim",
+ "queue.finish": "Finish taking control",
  "queue.close": "Close",
  "queue.open_pc": "Open the PC",
  "queue.open_session": "Open the session",

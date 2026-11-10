@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { claimEscalation, closeEscalation, listQueue, refusalText } from '../api.js';
+import { claimEscalation, closeEscalation, listQueue, refusalText, sessionStatus } from '../api.js';
 import { useApp } from '../context.jsx';
 import { formatAgo } from '../format.js';
 import { tabKeyDown, useDialog, useInterval, useLoad } from '../hooks.js';
@@ -20,7 +20,24 @@ export function Queue() {
   const [busy, setBusy] = useState(null); // the id of the item a claim is on its way for
   const [error, setError] = useState(null);
   const [closing, setClosing] = useState(null);
-  const { data, error: loadError, loading, reload } = useLoad(async () => ({ status, items: await listQueue(core, account.id, status) }), [core, account.id, status]);
+  const [finishItem, setFinishItem] = useState(null); // an item whose claim committed but whose session step did not (busy)
+  // On the Mine list, an item you claimed whose session is still live and still driven by the person who sent it has
+  // not finished moving control to you: it is marked `unfinished`, and its action repeats the claim.
+  const { data, error: loadError, loading, reload } = useLoad(async () => {
+    const items = await listQueue(core, account.id, status);
+    if (status !== 'mine') return { status, items };
+    const marked = await Promise.all(items.map(async (e) => {
+      if (!e.session_id || e.closed_at || !same(e.claimed_by, me.identity) || same(e.opened_by, me.identity)) return e;
+      try {
+        const st = await sessionStatus(core, account.id, e.session_id, 0);
+        const live = ['pending', 'consumed', 'waiting', 'attached'].includes(st?.state);
+        return live && st.driver && same(st.driver, e.opened_by) ? { ...e, unfinished: true } : e;
+      } catch (_) {
+        return e;
+      }
+    }));
+    return { status, items: marked };
+  }, [core, account.id, status, me.identity]);
   const shown = data && data.status === status ? data.items : null;
 
   // The list is read when the screen is shown and after a change, and again when the window is shown or focused again,
@@ -49,6 +66,7 @@ export function Queue() {
     setError(null);
     try {
       const out = await claimEscalation(core, owner, item.id);
+      setFinishItem(null);
       // The claim stands whichever team is shown now; what it opens depends on that.
       if (out.session_id) {
         openSessionTab({ deviceId: out.device_id ?? null, deviceName: out.device_name ?? (out.device_id ? '' : t('session.one_off_name')), sessionId: out.session_id, accountOf: owner });
@@ -63,6 +81,8 @@ export function Queue() {
       }
     } catch (e) {
       if (isShown(owner)) setError(refusalText(e, t('queue.claim_failed')));
+      // The claim is the person's already (it committed with the move on the PC); only the session has not followed.
+      setFinishItem(e?.code === 'busy' ? item : null);
     } finally {
       setBusy(null);
       refreshQueue(owner); // the screen may be left before its own list is read again
@@ -94,6 +114,9 @@ export function Queue() {
         </div>
         <div role="tabpanel" id="queue-panel" aria-labelledby={`queue-tab-${status}`}>
           {error ? <p className="err" role="alert">{error}</p> : null}
+          {error && finishItem ? (
+            <p><button type="button" className="btn btn-pri btn-sm" disabled={busy === finishItem.id} onClick={() => claim(finishItem)}>{t('queue.finish')}</button></p>
+          ) : null}
           {shown === null && loadError ? (
             <div role="alert"><p className="err">{refusalText(loadError, t('queue.load_failed'))}</p><button type="button" className="btn btn-sec" onClick={reload}>{t('common.try_again')}</button></div>
           ) : shown === null ? (
@@ -122,6 +145,9 @@ export function Queue() {
                       <div className="q-acts">
                         {!e.claimed_by && !e.closed_at && can('sessions.control') ? (
                           <button type="button" className="btn btn-pri btn-sm" disabled={busy === e.id} onClick={() => claim(e)}>{t('queue.claim')}</button>
+                        ) : null}
+                        {e.unfinished && can('sessions.control') ? (
+                          <button type="button" className="btn btn-pri btn-sm" disabled={busy === e.id} onClick={() => claim(e)}>{t('queue.finish')}</button>
                         ) : null}
                         {mayClose(e) ? <button type="button" className="btn btn-sec btn-sm" onClick={() => setClosing(e)}>{t('queue.close')}</button> : null}
                         {e.device_id ? <button type="button" className="btn btn-sec btn-sm" onClick={() => openTarget({ account: account.id, device_id: e.device_id })}>{t('queue.open_pc')}</button> : null}
