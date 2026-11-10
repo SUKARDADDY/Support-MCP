@@ -69,3 +69,133 @@ jobs:
           name: support-app
           path: ${{ runner.temp }}/app-build/support-mcp-app.exe
           if-no-files-found: error
+
+  # The technician app (technician-app/, a Tauri 2 shell with a Rust core and React screens).
+  # On a GitHub-hosted Windows runner it runs the Rust tests and the screens' tests, builds the
+  # NSIS installer with `tauri build` and checks it is under 25 MB, then installs an end-to-end
+  # build silently and drives it against a real local relay (technician-app/e2e/run.mjs,
+  # docs/technician-app.md, "How it is tested"). The installer is uploaded as an artifact.
+  technician-app:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            technician-app/package-lock.json
+      - name: Use the stable Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+      # The repository allows only GitHub's own actions, so the Rust cache is actions/cache.
+      - name: Cache the Rust build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            technician-app/src-tauri/target
+          key: rust-${{ runner.os }}-${{ hashFiles('technician-app/src-tauri/Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-
+      # The relay's one npm package, which `wrangler dev` bundles for the end-to-end run.
+      - run: npm ci --ignore-scripts
+      - name: Install the screens' packages
+        working-directory: technician-app
+        run: npm ci --ignore-scripts
+      # The installer that ships checks releases of this repository against the project's key.
+      # SUPPORT_RELEASE_REPO and SUPPORT_RELEASE_KEY are for a `test-release` build only, and the
+      # build stops with a compile error if either is set without that feature. This says so
+      # earlier and names the cause.
+      - name: Check the shipping build has no test release overrides
+        shell: pwsh
+        run: |
+          foreach ($name in 'SUPPORT_RELEASE_REPO', 'SUPPORT_RELEASE_KEY') {
+            if (Test-Path "env:$name") { throw "$name is set in the environment of the shipping build" }
+          }
+      - name: Test the screens
+        working-directory: technician-app
+        run: npm test
+      - name: Build the screens (the Rust tests read the built files)
+        working-directory: technician-app
+        run: npm run build
+      - name: Test the Rust core
+        working-directory: technician-app/src-tauri
+        run: cargo test --locked
+      - name: Build the installer
+        working-directory: technician-app
+        run: npx tauri build
+      - name: Check the installer is under 25 MB
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem technician-app/src-tauri/target/release/bundle/nsis -Filter *-setup.exe | Select-Object -First 1
+          if (-not $installer) { throw 'tauri build made no NSIS installer' }
+          $mb = [math]::Round($installer.Length / 1MB, 2)
+          "$($installer.Name) is $mb MB"
+          if ($installer.Length -ge 25MB) { throw "the installer is $mb MB, over the 25 MB limit" }
+          New-Item -ItemType Directory -Force -Path release-installer | Out-Null
+          Copy-Item $installer.FullName release-installer/
+      - name: Upload the installer
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: support-technician-installer
+          path: release-installer/*-setup.exe
+          if-no-files-found: error
+      # The end-to-end build writes its sign-in address to a file instead of opening a browser, and
+      # starts on the relay the run starts. It is built apart from the installer above, which is
+      # the one that ships.
+      - name: Build the end-to-end installer
+        working-directory: technician-app
+        env:
+          SUPPORT_DEFAULT_RELAY: http://127.0.0.1:8787
+        run: npx tauri build --features e2e
+      - name: Install Playwright's Chromium
+        working-directory: technician-app
+        run: npx playwright install chromium
+      - name: Install the end-to-end app silently
+        id: install
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem technician-app/src-tauri/target/release/bundle/nsis -Filter *-setup.exe | Select-Object -First 1
+          Start-Process -FilePath $setup.FullName -ArgumentList '/S' -Wait
+          $dirs = @("$env:LOCALAPPDATA\Support", "$env:LOCALAPPDATA\Programs\Support")
+          $exe = $dirs | Where-Object { Test-Path $_ } | ForEach-Object { Get-ChildItem $_ -Filter *.exe } | Where-Object { $_.Name -notmatch '^uninstall' } | Select-Object -First 1
+          if (-not $exe) {
+            Get-ChildItem $env:LOCALAPPDATA -Directory | Select-Object -ExpandProperty FullName
+            throw 'the silent install left no app under %LOCALAPPDATA%'
+          }
+          "installed $($exe.FullName)"
+          "exe=$($exe.FullName)" >> $env:GITHUB_OUTPUT
+          "name=$($exe.Name)" >> $env:GITHUB_OUTPUT
+      # The runner is elevated, so WebView2 ignores its debug-port environment variable. A machine
+      # policy opens the port for this app's exe instead.
+      - name: Open WebView2's debug port for the app
+        shell: pwsh
+        run: |
+          $key = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments'
+          New-Item -Path $key -Force | Out-Null
+          New-ItemProperty -Path $key -Name '${{ steps.install.outputs.name }}' -Value '--remote-debugging-port=9222' -PropertyType String -Force | Out-Null
+          Get-ItemProperty -Path $key
+      - name: Run the end-to-end test
+        working-directory: technician-app
+        env:
+          APP_EXE: ${{ steps.install.outputs.exe }}
+          E2E_OUT: ${{ github.workspace }}/e2e-out
+        run: npm run e2e
+      - name: Upload what the end-to-end run saw
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: technician-app-e2e
+          path: e2e-out
+          if-no-files-found: ignore

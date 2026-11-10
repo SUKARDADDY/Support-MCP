@@ -1,0 +1,27 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "What the app's own screens may call: our commands and listening for our events. No shell, no file system, no HTTP, no plugin commands.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "allow-app-info",
+    "allow-accounts-list",
+    "allow-sign-in",
+    "allow-sign-in-cancel",
+    "allow-sign-out",
+    "allow-relay-request",
+    "allow-relay-tool",
+    "allow-notifications-recent",
+    "allow-prefs-get",
+    "allow-prefs-set",
+    "allow-autostart-get",
+    "allow-autostart-set",
+    "allow-window-theme",
+    "allow-update-status",
+    "allow-update-check",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

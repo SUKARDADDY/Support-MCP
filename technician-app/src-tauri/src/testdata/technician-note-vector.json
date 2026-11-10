@@ -1,0 +1,9 @@
+{
+  "about": "Made by node:crypto with a throwaway P-256 key that was not kept. Only public data.",
+  "public_key_xy_b64": "EKTzdKxg+XVUZMCCM3/ZHt9YJrxO5C6IdDdf2XU1rWk0cmLjqRPN932soixJKxa3RRYVh1byrqUqsen8CjVDpA==",
+  "note": "support-mcp-technician-release 1\nversion 0.8.0\nsha256 b97d800ba8d0420dc6a0342045a15a97d785bd61d4cf9902d0c334ba32ec188b\nsize 17\nreleased 1794000000\n",
+  "signature_p1363_b64": "VQ7p7n42cC1A9OAtiwg/GZsaxL6to3koRQsW6Ld5G8kPCjNONyi6qMETJPEm7nc4h+AFUnQWvkypeDrtEwyZxg==",
+  "signature_der_b64": "MEQCIBIaq9g5V6+4vIZhnCeh3Q5CjksKwunyIw3svk230sKDAiBeFdWynqirtx3Sw6im96OrJIQhEBZYtuI3crNsExdxFg==",
+  "pc_note": "support-mcp-release 1\nversion 0.8.0\nsha256 b97d800ba8d0420dc6a0342045a15a97d785bd61d4cf9902d0c334ba32ec188b\nsize 17\nreleased 1794000000\n",
+  "pc_note_signature_b64": "ly8J0cbuLThi4H6Z7o92E8n+n6P51CwLpgys5gYkwY3m9PGidqodWNPbBN0o6E4l5Dwauj4+hkzSGgxA7HU0MA=="
+}

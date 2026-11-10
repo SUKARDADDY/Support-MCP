@@ -5,15 +5,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, createPublicKey } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VERSION } from '../src/version.js';
 import { fixtureBundle, signNote, throwawayKey, verifies } from './release-fixture.js';
 import {
-  buildNote, bundleDigest, compareVersions, groupOf, isPrerelease, offerAtCheckIn, offerOnRefusal, parseNote, parseReleaseSettings,
-  parseRollout, releaseFrom, scheduledStage, validVersion,
+  NOTE_HEADER, TECHNICIAN_NOTE_HEADER, buildNote, buildTechnicianNote, bundleDigest, compareVersions, groupOf, isPrerelease, offerAtCheckIn, offerOnRefusal,
+  parseNote, parseReleaseSettings, parseRollout, parseTechnicianNote, releaseFrom, scheduledStage, validVersion,
 } from '../src/release.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -278,6 +278,108 @@ test('the relay rebuilds what sign-release signed, from the two settings and the
     const release = await releaseFrom(bundle, env);
     assert.ok(release);
     assert.ok(verifies(readFileSync(pub, 'utf8').trim(), release.note, release.signature));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- the technician app's release ---------------------------------------------------------------
+test('the technician note is the same five lines under its own header, and neither product takes the other\'s', () => {
+  const values = { version: '0.8.0', sha256: SHA, size: 9_000_000, released: 1794000000 };
+  const tech = buildTechnicianNote(values);
+  const pc = buildNote(values);
+  assert.equal(TECHNICIAN_NOTE_HEADER, 'support-mcp-technician-release 1');
+  assert.equal(tech, `support-mcp-technician-release 1\nversion 0.8.0\nsha256 ${SHA}\nsize 9000000\nreleased 1794000000\n`);
+  assert.equal(pc, `${NOTE_HEADER}\nversion 0.8.0\nsha256 ${SHA}\nsize 9000000\nreleased 1794000000\n`, 'the PC note is as it was');
+  assert.deepEqual(parseTechnicianNote(tech), values);
+  assert.deepEqual(parseNote(pc), values);
+  // A PC note fails as a technician note, and the reverse.
+  assert.equal(parseTechnicianNote(pc), null);
+  assert.equal(parseNote(tech), null);
+  assert.equal(parseTechnicianNote(tech.replace('technician-release 1', 'technician-release 2')), null);
+});
+
+test('a signature over a PC note does not verify as a technician note, though every value matches', () => {
+  const key = throwawayKey();
+  const values = { version: '0.8.0', sha256: SHA, size: 9_000_000, released: 1794000000 };
+  const pcSignature = signNote(key, buildNote(values));
+  assert.ok(verifies(key.xy, buildNote(values), pcSignature));
+  assert.ok(!verifies(key.xy, buildTechnicianNote(values), pcSignature));
+});
+
+test('sign-release --product technician refuses an installer whose crate version is not the release version', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'support-mcp-sign-crate-'));
+  try {
+    const pub = join(dir, 'release-key.pub');
+    const pem = node('release-key.mjs', [pub]).stdout;
+    const installer = join(dir, `Support_${VERSION}_x64-setup.exe`);
+    writeFileSync(installer, Buffer.concat([Buffer.from('MZ'), Buffer.from('technician installer fixture')]));
+    // A tree with only the two files the check reads: package.json at the release version, and a
+    // Cargo.toml that was not bumped, as when someone bumps one file by hand.
+    const tree = join(dir, 'tree');
+    const files = ['technician-app/package.json', 'technician-app/src-tauri/Cargo.toml'];
+    for (const f of files) {
+      mkdirSync(dirname(join(tree, f)), { recursive: true });
+      writeFileSync(join(tree, f), readFileSync(join(ROOT, f)));
+    }
+    const sign = () => node('sign-release.mjs', ['--product', 'technician', '--file', installer, '--pub', pub, '--root', tree], pem);
+    assert.equal(sign().status, 0, 'a tree whose versions agree signs');
+    const toml = readFileSync(join(tree, files[1]), 'utf8');
+    writeFileSync(join(tree, files[1]), toml.replace(/^(\[package\][^\[]*?version = ")[^"]*"/m, '$10.0.1"'));
+    const stale = sign();
+    assert.notEqual(stale.status, 0);
+    assert.match(stale.stderr, /Cargo\.toml is 0\.0\.1 but the release is/);
+    assert.equal(stale.stdout, '');
+    writeFileSync(join(tree, files[1]), toml.replace(/^version = "[^"]*"\n/m, ''));
+    assert.match(sign().stderr, /Cargo\.toml is missing a version/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('sign-release --product technician signs an installer under its own header and names the three assets', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'support-mcp-sign-tech-'));
+  try {
+    const pub = join(dir, 'release-key.pub');
+    const pem = node('release-key.mjs', [pub]).stdout;
+    const installer = join(dir, `Support_${VERSION}_x64-setup.exe`);
+    const bytes = Buffer.concat([Buffer.from('MZ'), Buffer.from('technician installer fixture')]);
+    writeFileSync(installer, bytes);
+    const out = join(dir, 'out');
+    const before = Math.floor(Date.now() / 1000);
+    const signed = node('sign-release.mjs', ['--product', 'technician', '--file', installer, '--pub', pub, '--out', out], pem);
+    assert.equal(signed.status, 0, signed.stderr);
+    const [sigLine, atLine, blank, ...rest] = signed.stdout.split('\n');
+    const signature = /^TECHNICIAN_SIGNATURE=([A-Za-z0-9+/]{86}==)$/.exec(sigLine)?.[1];
+    const signedAt = Number(/^TECHNICIAN_SIGNED_AT=([0-9]+)$/.exec(atLine)?.[1]);
+    assert.ok(signature, sigLine);
+    assert.ok(signedAt >= before && signedAt <= Math.floor(Date.now() / 1000) + 1);
+    assert.equal(blank, '');
+    const note = rest.join('\n');
+    assert.deepEqual(parseTechnicianNote(note), { version: VERSION, sha256: createHash('sha256').update(bytes).digest('hex'), size: bytes.length, released: signedAt });
+    assert.equal(parseNote(note), null, 'not a PC note');
+    assert.ok(verifies(readFileSync(pub, 'utf8').trim(), note, signature));
+    assert.deepEqual(readdirSync(out).sort(), [`support-technician-${VERSION}-setup.exe`, `support-technician-${VERSION}-setup.note`, `support-technician-${VERSION}-setup.note.sig`]);
+    assert.deepEqual(readFileSync(join(out, `support-technician-${VERSION}-setup.exe`)), bytes);
+    assert.equal(readFileSync(join(out, `support-technician-${VERSION}-setup.note`), 'utf8'), note);
+    assert.equal(readFileSync(join(out, `support-technician-${VERSION}-setup.note.sig`), 'utf8'), `${signature}\n`);
+
+    // A key that is not the project's signs nothing.
+    const wrong = throwawayKey().privateKey.export({ format: 'pem', type: 'pkcs8' });
+    const refused = node('sign-release.mjs', ['--product', 'technician', '--file', installer, '--pub', pub], wrong);
+    assert.notEqual(refused.status, 0);
+    assert.match(refused.stderr, /does not match/);
+    assert.equal(refused.stdout, '');
+    // An installer whose name lacks the version, one that is not a Windows program, a missing --file, and --file for the PC all fail.
+    const misnamed = join(dir, 'Support_9.9.9_x64-setup.exe');
+    writeFileSync(misnamed, bytes);
+    assert.match(node('sign-release.mjs', ['--product', 'technician', '--file', misnamed, '--pub', pub], pem).stderr, /does not carry version/);
+    const notExe = join(dir, `Support_${VERSION}_x64-setup.txt`);
+    writeFileSync(notExe, 'plain text');
+    assert.match(node('sign-release.mjs', ['--product', 'technician', '--file', notExe, '--pub', pub], pem).stderr, /not a Windows program/);
+    assert.match(node('sign-release.mjs', ['--product', 'technician', '--pub', pub], pem).stderr, /needs --file/);
+    assert.match(node('sign-release.mjs', ['--file', installer, '--pub', pub], pem).stderr, /--file is for --product technician/);
+    assert.notEqual(node('sign-release.mjs', ['--product', 'other', '--file', installer], pem).status, 0);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

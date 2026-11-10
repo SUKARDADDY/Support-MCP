@@ -5,12 +5,29 @@ All notable changes to Support-MCP are listed here. The format follows
 [Semantic Versioning](https://semver.org). It stays at 0.x until Stage 1 is safe
 to run on unattended customer PCs.
 
-## [Unreleased]
+## [0.8.0] - 2026-11-09
 
-The relay side of the technician app (the Windows app itself comes in the next release).
-The version stays 0.7.0.
+The technician app for Windows, and the relay routes it uses.
 
 ### Added
+
+- The technician app (`technician-app/`), a Tauri 2 app for Windows 10 and 11: a Rust core and
+  React screens. It signs in through the browser with its own grant, keeps the sign-in sealed
+  with Windows DPAPI, and lists the team's saved PCs with search, filters and who is online. It
+  pairs a PC with a code, approves a PC waiting to join, makes a one-off link, opens a PC in a
+  session tab, and starts, follows, pauses and stops agent tasks. The session tab is view only:
+  it shows the agent's last picture during a task, and otherwise a fresh screenshot every 3
+  seconds while you drive and the tab is shown. Windows notifications for the six events below,
+  a tray icon, one running copy, and an optional start with Windows. See
+  `docs/technician-app.md`.
+- The app checks the latest GitHub release every 6 hours for `support-technician-<version>-setup.exe`
+  with a `.note` and `.note.sig`. It verifies the note with the project release key, needs a newer
+  version, checks the installer's size and SHA-256, and installs it silently at the next start.
+  `scripts/sign-release.mjs --product technician --file <installer>` signs it. The note's first line,
+  `support-mcp-technician-release 1`, keeps a PC note and an app note from passing as each other.
+  The installer is not code-signed, so Windows SmartScreen warns on the first install.
+- A `technician-app` CI job on `windows-latest`: the Rust and screen tests, the installer build (under
+  25 MB), and an end-to-end run of the installed app against `wrangler dev`.
 
 - The technician app's own sign-in. It uses the same consent page and OAuth server as an MCP
   client, for the resource `<origin>/app/w/<slug>` (every workspace, `default` too), so its
