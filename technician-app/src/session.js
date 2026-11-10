@@ -98,6 +98,9 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
   const meEntry = participants.find((p) => same(p.identity, me.identity));
   const role = ended ? null : isDriver ? 'driver' : meEntry?.role === 'watcher' || meEntry?.role === 'invited' ? meEntry.role : null;
   const isWatcher = role === 'watcher';
+  // This tab may end the session: its person drives it, or it has no driver (a one-off link made before drivers
+  // existed) and the tab is not a guest's. Nothing is known until the first status has been read.
+  const mayEnd = !ended && status !== null && (role === 'driver' || (!status.driver && !tab.guest));
   // Not the task's starter or the driver: the relay would refuse its picture, so the tab does not look for it.
   const mayFollowTasks = (status !== null || statusError !== null) && role !== 'watcher' && role !== 'invited';
   const taskLive = !!taskId && !!task && isLiveTask(task);
@@ -321,7 +324,7 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
   const activity = useMemo(() => mergeActivity({ log: status?.log ?? [], task }), [status, task]);
 
   return {
-    sessionId, taskId, status, statusError, ended, attached, isDriver, role, isWatcher, participants, offer, watcherFrame, frameProblem, people,
+    sessionId, taskId, status, statusError, ended, attached, isDriver, role, mayEnd, isWatcher, participants, offer, watcherFrame, frameProblem, people,
     task, taskLive, frame, frameWaiting, shot,
     stopped, stoppedMessage, resumeShots, activity, control, refreshStatus, watchTask, lookForTask, holdScreenshots, releaseScreenshots,
   };

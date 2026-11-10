@@ -329,6 +329,67 @@ describe('the driver\'s tab still ends the session', () => {
   });
 });
 
+describe('a tab ends the session only when the relay says its person drives it now', () => {
+  const noEnd = (fake) => expect(toolCalls(fake, 'session_end')).toHaveLength(0);
+  const closeTabBar = async (user) => user.click(await screen.findByRole('button', { name: /^(End session with|Close the tab for) Front counter$/ }));
+
+  test('after handing over and being removed, the old driver\'s tab only closes (A)', async () => {
+    const { user, fake } = await open({ driver: LEAD, participants: [person(LEAD, 'driver', 'Lee Lead')] });
+    await screen.findByText('Lee Lead');
+    expect(screen.queryByRole('button', { name: 'End session' })).not.toBeInTheDocument();
+    await closeTabBar(user);
+    await waitFor(() => expect(screen.queryByRole('tab', { name: /Front counter/ })).not.toBeInTheDocument());
+    noEnd(fake);
+  });
+
+  test('a restored tab whose status has not been read yet asks the relay, finds another driver, and only closes (B)', async () => {
+    const fake = fakeCore();
+    fake.state.sessionStatus = (args) => (args.log_tail === 60 ? new Promise(() => {}) : { state: 'attached', driver: LEAD, log: [] });
+    const { user } = await open({}, { fake });
+    await closeTabBar(user);
+    await waitFor(() => expect(screen.queryByRole('tab', { name: /Front counter/ })).not.toBeInTheDocument());
+    noEnd(fake);
+  });
+
+  test('a tab whose status cannot be read only closes', async () => {
+    const fake = fakeCore();
+    fake.state.sessionStatus = () => { throw new ToolFail('could not reach that session', 'unavailable'); };
+    const { user } = await open({}, { fake });
+    await closeTabBar(user);
+    await waitFor(() => expect(screen.queryByRole('tab', { name: /Front counter/ })).not.toBeInTheDocument());
+    noEnd(fake);
+  });
+
+  test('right after the offer is accepted, before the tab has polled, the old driver\'s End session only closes (C)', async () => {
+    const fake = fakeCore();
+    // The tab's own poll (a 60-line log) still says the person drives; the fresh read the click makes says who does now.
+    fake.state.sessionStatus = (args) => (args.log_tail === 60 ? { state: 'attached', driver: ME, ...asDriver(), log: [] } : { state: 'attached', driver: LEAD, log: [] });
+    const { user } = await open({}, { fake });
+    await screen.findByRole('region', { name: 'People in this session' });
+    await user.click(screen.getByRole('button', { name: 'End session' }));
+    await waitFor(() => expect(screen.queryByRole('tab', { name: /Front counter/ })).not.toBeInTheDocument());
+    noEnd(fake);
+  });
+
+  test('the driver ends it, and so does the host of a one-off session that has no driver; a guest does not', async () => {
+    const mine = await open(asDriver());
+    await screen.findByRole('region', { name: 'People in this session' });
+    await mine.user.click(screen.getByRole('button', { name: 'End session' }));
+    await waitFor(() => expect(toolCalls(mine.fake, 'session_end')).toHaveLength(1));
+    mine.unmount();
+    localStorage.clear();
+    const legacy = await open({ driver: null }, { tab: { deviceId: null, deviceName: 'One-off PC' } });
+    await legacy.user.click(await screen.findByRole('button', { name: 'End session' }));
+    await waitFor(() => expect(toolCalls(legacy.fake, 'session_end')).toHaveLength(1));
+    legacy.unmount();
+    localStorage.clear();
+    const guest = await open({ driver: null }, { tab: { deviceId: null, deviceName: 'One-off PC', guest: true } });
+    await guest.user.click(await screen.findByRole('button', { name: 'Close tab' }));
+    await waitFor(() => expect(screen.queryByRole('tab', { name: /One-off PC/ })).not.toBeInTheDocument());
+    noEnd(guest.fake);
+  });
+});
+
 describe('a session with no PC (a one-off link)', () => {
   const oneOff = { key: SID, account: 'acc1', deviceId: null, deviceName: 'One-off PC', sessionId: SID, taskId: null };
 

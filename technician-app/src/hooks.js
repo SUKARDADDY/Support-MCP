@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { fetchMe } from './api.js';
 
 // Is the page on screen? False when the tab is hidden, the window is minimised or it was
 // sent to the tray.
@@ -89,4 +90,21 @@ export function useDialog() {
     };
   }, []);
   return ref;
+}
+
+const NO_ONE = { identity: '', permissions: [] };
+
+// Who a tab's account is: the shown account's `me` when the tab is of the shown account, else the tab's own
+// account's, read once. Until it is known the person is no one, so no role follows from the wrong account's identity.
+export function useAccountMe(core, accountId, shownId, shownMe) {
+  const [own, setOwn] = useState(null);
+  const isShown = accountId === shownId;
+  useEffect(() => {
+    if (isShown || !accountId) return undefined;
+    let live = true;
+    fetchMe(core, accountId).then((m) => live && setOwn({ accountId, me: m })).catch(() => {});
+    return () => { live = false; };
+  }, [core, accountId, isShown]);
+  if (isShown) return shownMe;
+  return own?.accountId === accountId ? own.me : NO_ONE;
 }

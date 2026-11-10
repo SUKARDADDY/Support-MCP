@@ -6,6 +6,7 @@ import { AppContext } from './context.jsx';
 import { sortDevices } from './devices.js';
 import { realCore } from './core.js';
 import { tabKeyDown, useInterval, usePageVisible } from './hooks.js';
+import { same } from './session.js';
 import { t } from './i18n/index.js';
 import { AddDevice } from './screens/AddDevice.jsx';
 import { Devices } from './screens/Devices.jsx';
@@ -204,9 +205,10 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     setTabs((cur) => persist(cur.filter((x) => x.key !== key)));
     setView((v) => (v === `tab:${key}` ? 'devices' : v));
   }, [persist]);
-  // What each open tab's person is in its session (driver, watcher, invited), as the tabs report it.
-  const [roles, setRoles] = useState({});
-  const markRole = useCallback((key, role) => setRoles((cur) => ((cur[key] ?? null) === role ? cur : { ...cur, [key]: role })), []);
+  // What closing each open tab does, as the tabs report it: 'end' (the person drives it), 'leave' (they watch it) or
+  // 'close' (anything else). The tab bar's labels follow it; endTab checks the relay again before it ends anything.
+  const [stances, setStances] = useState({});
+  const markStance = useCallback((key, stance) => setStances((cur) => ((cur[key] ?? 'close') === stance ? cur : { ...cur, [key]: stance })), []);
   // A watcher goes off the session; the tab closes unless the relay refuses for a reason the tab can still fix.
   const leaveSession = useCallback(async (tab) => {
     try {
@@ -222,14 +224,30 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     const tab = tabsRef.current.find((x) => x.key === key);
     return tab?.sessionId ? leaveSession(tab) : Promise.resolve(closeTab(key));
   }, [leaveSession, closeTab]);
-  // Closing a tab ends its session for everyone, so only the driver's tab does that. A tab for a session
-  // you were invited to, or one you only watch, never ends it: a watcher leaves it, an invitee just closes.
+  // Closing a tab ends its session for everyone, so only the driver's tab does that, and only when the relay says so
+  // now: the tab's own idea of its person's role may be old (control was handed over, the person was removed) or not
+  // known yet (a tab from the last run). A session without a driver (a one-off link made before drivers) is ended by
+  // its host's tab. A watcher leaves it; every other tab just closes.
+  const mayEndNow = useCallback(async (tab) => {
+    let st;
+    try {
+      st = await sessionStatus(core, tab.account, tab.sessionId, 0);
+    } catch (_) {
+      return false;
+    }
+    if (!st || st.state === 'ended' || st.state === 'unknown') return false;
+    if (!st.driver) return !tab.guest;
+    try {
+      const who = tab.account === accountId ? me.identity : (await fetchMe(core, tab.account)).identity;
+      return same(st.driver, who);
+    } catch (_) {
+      return false;
+    }
+  }, [core, accountId, me.identity]);
   const endTab = useCallback(async (key) => {
     const tab = tabs.find((x) => x.key === key);
-    const role = roles[key] ?? null;
-    if (role === 'watcher' && tab?.sessionId) { await leaveSession(tab); return; }
-    const mayEnd = role === 'driver' || (!tab?.guest && role !== 'invited');
-    if (tab?.sessionId && mayEnd) {
+    if (stances[key] === 'leave' && tab?.sessionId) { await leaveSession(tab); return; }
+    if (tab?.sessionId && await mayEndNow(tab)) {
       try {
         await endSession(core, tab.account, tab.sessionId);
         toast(t('session.ended_toast', { name: tab.deviceName }));
@@ -238,7 +256,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
       }
     }
     closeTab(key);
-  }, [tabs, roles, core, toast, closeTab, leaveSession]);
+  }, [tabs, stances, core, toast, closeTab, leaveSession, mayEndNow]);
   const updateTab = useCallback((key, patch) => setTabs((cur) => persist(cur.map((x) => (x.key === key ? { ...x, ...patch } : x)))), [persist]);
   // Every task start goes through here. The PC takes one command at a time, so the open session
   // tab(s) on the same PC or session stop their screenshots and wait for one in flight first;
@@ -395,9 +413,9 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     core, appInfo, accounts: accounts ?? [], account, setActive, reloadAccounts: loadAccounts, can, me,
     devices: deviceData.devices, places: deviceData.places, devicesState: deviceData, reloadDevices,
     selectedId, select, conns, connect, cancelConnect, dismissConnect,
-    sessionTabFor, tabForSession, isShown: guard.isShown, showTab, endTab, closeTab, leaveTab, markRole, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true), queueCount, refreshQueue,
+    sessionTabFor, tabForSession, isShown: guard.isShown, showTab, endTab, closeTab, leaveTab, markStance, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true), queueCount, refreshQueue,
     toast, copyText, notifications, openTarget, now, theme, setTheme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded,
-  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, tabForSession, showTab, endTab, closeTab, leaveTab, markRole, updateTab, openSessionTab, go, queueCount, refreshQueue, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded]); // eslint-disable-line react-hooks/exhaustive-deps
+  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, tabForSession, showTab, endTab, closeTab, leaveTab, markStance, updateTab, openSessionTab, go, queueCount, refreshQueue, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (accounts === null) return <div className="app" role="status"><p className="hint">{t('common.loading')}</p></div>;
 
@@ -431,7 +449,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
             {mine.length ? (
               <div className="tab-closers" role="group" aria-label={t('tabs.close_label')}>
                 {mine.map((x, i) => (
-                  <button key={x.key} type="button" className="tab-x" data-on={activeTab?.key === x.key} style={{ order: 2 * (i + 1) + 1 }} onClick={() => endTab(x.key)} aria-label={t(roles[x.key] === 'watcher' ? 'people.leave_with' : roles[x.key] === 'invited' ? 'session.close_with' : 'session.end_with', { name: x.deviceName || t('session.untitled') })} title={t(roles[x.key] === 'watcher' ? 'people.leave' : roles[x.key] === 'invited' ? 'session.close_tab' : 'session.end')}><Icon name="x" /></button>
+                  <button key={x.key} type="button" className="tab-x" data-on={activeTab?.key === x.key} style={{ order: 2 * (i + 1) + 1 }} onClick={() => endTab(x.key)} aria-label={t({ leave: 'people.leave_with', end: 'session.end_with' }[stances[x.key]] ?? 'session.close_with', { name: x.deviceName || t('session.untitled') })} title={t({ leave: 'people.leave', end: 'session.end' }[stances[x.key]] ?? 'session.close_tab')}><Icon name="x" /></button>
                 ))}
               </div>
             ) : null}

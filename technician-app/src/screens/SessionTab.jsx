@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { connectDevice, messageOf, refusalText } from '../api.js';
 import { Icon } from '../components/Icon.jsx';
 import { useApp } from '../context.jsx';
+import { useAccountMe } from '../hooks.js';
 import { formatAge, formatClock, formatDuration, formatUsd, taskTitle } from '../format.js';
 import { t } from '../i18n/index.js';
 import { dataUrl, same, useSession } from '../session.js';
@@ -19,7 +20,10 @@ const KNOWN_KINDS = ['created', 'consumed', 'attached', 'hello', 'detached', 'de
 // controls. Everything from the PC (the picture, step details, notes, log text) and the people's
 // names are untrusted and shown as text.
 export function SessionTab({ tab, active = true }) {
-  const { core, tuning, me, can, endTab, closeTab, leaveTab, toast, isShown, updateTab, devices, visible, titleOf, registerTab, markEnded, markRole } = useApp();
+  const { core, tuning, me: shownMe, account: shown, endTab, closeTab, leaveTab, toast, isShown, updateTab, devices, visible, titleOf, registerTab, markEnded, markStance } = useApp();
+  // This tab's person is the one of its own account, which is not the shown account's when the tab is hidden.
+  const me = useAccountMe(core, tab.account, shown?.id, shownMe);
+  const can = (permission) => me.permissions.includes(permission);
   const [showActivity, setShowActivity] = useState(true);
   const [agentOpen, setAgentOpen] = useState(false);
   const [dialog, setDialog] = useState(null); // 'invite', 'handover' or 'escalate'
@@ -49,8 +53,9 @@ export function SessionTab({ tab, active = true }) {
 
   // Tells App whether this tab's session has ended, so a screen that looks for the tab on a PC redraws.
   useEffect(() => { markEnded(tab.key, s.ended); }, [tab.key, s.ended, markEnded]);
-  // ... and what this person is in it, so closing the tab leaves a session you only watch instead of ending it.
-  useEffect(() => { markRole(tab.key, s.role); }, [tab.key, s.role, markRole]);
+  // ... and what closing it does: end a session you drive, leave one you watch, otherwise just close.
+  const stance = s.role === 'watcher' ? 'leave' : s.mayEnd ? 'end' : 'close';
+  useEffect(() => { markStance(tab.key, stance); }, [tab.key, stance, markStance]);
 
   // The task this tab follows is saved with the tab, so a restart follows it again (the relay stops
   // a task nobody watches for two minutes), and cleared when the task is over.
@@ -138,8 +143,9 @@ export function SessionTab({ tab, active = true }) {
   const watchers = s.participants.filter((p) => p.role === 'watcher');
   const offerToMe = s.offer && same(s.offer.to, me.identity) && s.offer.expires_at > now ? s.offer : null;
   const offerByMe = s.offer && same(s.offer.by, me.identity) && s.offer.expires_at > now ? s.offer : null;
-  // A tab for a session you were invited to closes without ending it; so does one you only watch (Leave).
-  const closeOnly = s.ended || s.role === 'invited' || (tab.guest && s.role !== 'driver' && s.role !== 'watcher');
+  // Only a tab whose person drives the session, as the relay last said, ends it (see mayEnd in session.js); a tab
+  // for a session you were invited to, were removed from or have not heard of yet closes without ending it. A watcher leaves.
+  const closeOnly = s.ended || (s.role !== 'watcher' && !s.mayEnd);
 
   // A message about a person-to-person action goes to the screen only while the tab's team is the one shown:
   // an answer that comes back after a switch of team is not announced under the other team.
