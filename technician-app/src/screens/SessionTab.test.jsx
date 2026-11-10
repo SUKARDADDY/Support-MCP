@@ -87,6 +87,38 @@ describe('Session tab: watching the screen yourself', () => {
     expect(screen.getByRole('button', { name: 'Try the screen again' })).toBeInTheDocument();
   });
 
+  test('a picture refused because someone else drives refreshes the status and shows the watcher view, with no raw text and no Try again', async () => {
+    const fake = fakeCore();
+    const LEAD = 'lead@example.com';
+    const person = (identity, role) => ({ identity, name: null, role, since: Date.now() - 30000 });
+    // The tab still believes it drives (a slow status poll) when the relay refuses the picture; the fresh status says it watches.
+    let taken = false;
+    fake.state.sessionStatus = (args) => (taken && args.log_tail === 60
+      ? { state: 'attached', driver: LEAD, participants: [person(LEAD, 'driver'), person('tech@example.com', 'watcher')], log: [] }
+      : { state: 'attached', driver: 'tech@example.com', log: [] });
+    fake.state.screenshot = () => { taken = true; throw new ToolFail('lead@example.com is driving this session; use device_connect with take_over'); };
+    await openTab(fake, { tuning: { ...FAST, statusMs: 60000 } });
+    expect(await screen.findByText(/You are watching\./)).toBeInTheDocument();
+    expect(screen.queryByText(/use device_connect with take_over/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Try the screen again' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Leave' })).toBeInTheDocument();
+    const calls = toolCalls(fake, 'screenshot').length;
+    await sleep(100);
+    expect(toolCalls(fake, 'screenshot').length).toBe(calls);
+  });
+
+  test('a picture or an answer that says the session ended refreshes the status at once, and the header and toolbar show it', async () => {
+    const fake = fakeCore();
+    fake.state.screenshot = () => { fake.state.sessions[SID].state = 'ended'; throw new ToolFail('session ended'); };
+    await openTab(fake, { tuning: { ...FAST, statusMs: 60000 } });
+    expect(await screen.findByText('Ended')).toBeInTheDocument();
+    expect(screen.queryByText('You are driving')).not.toBeInTheDocument();
+    expect(screen.queryByText('session ended')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Close tab' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'End session' })).not.toBeInTheDocument();
+    expect(toolCalls(fake, 'screenshot')).toHaveLength(1);
+  });
+
   test('stops at once on "agent busy", and Try again starts the pictures again', async () => {
     const user = userEvent.setup();
     const fake = fakeCore();

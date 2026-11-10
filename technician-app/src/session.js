@@ -44,6 +44,7 @@ export function stopReason(message) {
   const m = String(message ?? '');
   if (/is driving/i.test(m)) return 'driving';
   if (/agent busy/i.test(m)) return 'busy';
+  if (/session ended|no such live session/i.test(m)) return 'ended';
   return null;
 }
 
@@ -76,6 +77,7 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
   const [stopped, setStopped] = useState(null); // null, 'driving', 'busy' or 'failed'
   const [stoppedMessage, setStoppedMessage] = useState(null);
   const [held, setHeld] = useState(false); // a task is being started: no screenshot may begin
+  const refreshRef = useRef(() => {}); // refreshStatus, for the loops above it
   const halted = useRef(false); // the loop was told to stop; set at once, before the screen has drawn `stopped`
   const holds = useRef(0); // how many task starts hold the screenshots; each releases its own
   const inFlight = useRef(null); // the screenshot request on its way, if any
@@ -247,7 +249,15 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
     } catch (e) {
       const why = stopReason(e?.message);
       if (!alive.current || sessionRef.current !== mine) return;
-      if (why) { halted.current = true; setStopped(why); setStoppedMessage(e.message); return; }
+      if (why) {
+        halted.current = true;
+        setStopped(why);
+        setStoppedMessage(e.message);
+        // Someone took over, or the session is over: ask the relay at once, so the tab shows what it now is
+        // (a watcher's view, or the ended state) and not a stop with the tool's own words.
+        if (why !== 'busy') refreshRef.current();
+        return;
+      }
       // "customer is using the PC" and other passing failures: try again next time, a few times.
       fails.current += 1;
       if (fails.current >= FAILS_BEFORE_STOP) { halted.current = true; setStopped('failed'); setStoppedMessage(e?.message ?? null); }
@@ -287,6 +297,9 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
       if (alive.current && sessionRef.current === sessionId) setStatus(st);
     } catch (_) { /* the next poll tries again */ }
   }, [core, account, sessionId]);
+  refreshRef.current = refreshStatus;
+  // A stop for being driven by someone else lasts only while the status still says the person drives.
+  useEffect(() => { if (stopped === 'driving' && status && !isDriver) resumeShots(); }, [stopped, status, isDriver, resumeShots]);
 
   // ---- the session's people: each call is made as the tab's account, and its answer is applied only
   // while the tab is still on the session it was made for ---------------------------------------
@@ -294,15 +307,20 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
     if (alive.current && sessionRef.current === mine) setStatus((st) => (st ? { ...st, ...patch } : st));
   }, []);
   const people = useMemo(() => {
+    // A refusal that says the session is over refreshes the status at once, so the tab shows it ended.
+    const overEnded = (e) => {
+      if (e?.code === 'not_found' || stopReason(e?.message) === 'ended') refreshRef.current();
+      throw e;
+    };
     const roster = async (action, identity) => {
       const mine = sessionRef.current;
-      const list = await participantsAction(core, account, mine, action, identity);
+      const list = await participantsAction(core, account, mine, action, identity).catch(overEnded);
       applyPeople(mine, { participants: list });
       return list;
     };
     const hand = async (action, identity) => {
       const mine = sessionRef.current;
-      const out = await handoverAction(core, account, mine, action, identity);
+      const out = await handoverAction(core, account, mine, action, identity).catch(overEnded);
       applyPeople(mine, { driver: out.driver, participants: out.participants, offer: out.offer });
       return out;
     };

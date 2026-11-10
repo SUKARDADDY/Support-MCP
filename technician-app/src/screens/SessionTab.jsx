@@ -111,7 +111,7 @@ export function SessionTab({ tab, active = true }) {
   else if (!s.attached) caption = t('session.cap_not_attached');
   else if (s.stopped === 'driving') caption = t('session.cap_driving', { who: driver ?? '' });
   else if (s.stopped === 'busy') caption = t('session.cap_busy');
-  else if (s.stopped === 'failed') caption = t('session.cap_failed');
+  else if (s.stopped === 'failed' || s.stopped === 'ended') caption = t('session.cap_failed');
   else if (!s.isDriver) caption = t('session.cap_not_driver', { who: driver ?? '' });
   else caption = t('session.cap_view_only');
 
@@ -263,10 +263,10 @@ export function SessionTab({ tab, active = true }) {
           )}
           <p className="vp-cap" role="status">{caption}</p>
           {s.isWatcher && s.watcherFrame && !s.taskLive ? <p className="vp-cap" role="status">{t('session.picture_age', { age: formatAge(s.watcherFrame.at, now) })}</p> : null}
-          {s.stopped && !s.taskLive && !s.ended ? (
+          {s.stopped && !s.taskLive && !s.ended && s.isDriver ? (
             <button type="button" className="btn btn-sec btn-sm" onClick={s.resumeShots}>{t('session.try_again')}</button>
           ) : null}
-          {s.stopped && s.stoppedMessage && !s.ended ? <p className="vp-cap">{s.stoppedMessage}</p> : null}
+          {s.stopped === 'failed' && s.stoppedMessage && !s.ended ? <p className="vp-cap">{s.stoppedMessage}</p> : null}
         </div>
         {showActivity ? (
           <aside className="act" aria-label={t('session.activity_label')}>
