@@ -1117,8 +1117,9 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
   // sessions.control (and sessions.unattended when the rule asks for it), the workspace is not stopped,
   // and on a saved PC the pointer is the session's and still names `from` as its driver, so the claim
   // of a take-over that landed first fails and the caller is told who drives now (not_driver). Any
-  // queue item the move is part of goes in the same batch (extra: { entries, guard, statements(proof) }),
-  // so the item is claimed exactly when control moves.
+  // queue item the move is part of goes in the same batch (extra: { check(), entries, guard, statements(proof) };
+  // check runs on every attempt and throws a refusal when the item is no longer free), so the item is
+  // claimed exactly when control moves.
   //
   // kind: accept (an offer), claim (a queue item) or take_over (an admin, on a one-off session). A
   // saved PC's take-over is device_connect. Returns { moved }; moved is false when the PC's record
@@ -1130,6 +1131,7 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
     return mutate(slug, actor, async () => {
       const ctx = await actorContext(slug, actor, 'sessions.control');
       if ((await team.stopState(slug)).stopped) throw new TeamError(409, 'stopped', STOPPED_MESSAGE);
+      await extra?.check?.();
       let pointer = null;
       let name = '';
       if (deviceId) {
