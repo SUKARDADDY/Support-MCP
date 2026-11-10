@@ -191,6 +191,30 @@ test('a ticket for a one-off session says so, and a person who claims their own 
   assert.equal(t2.escalation.claimed_by, BOSS);
 });
 
+test('a ticket claim whose item is taken after it was read, with no log row to show for it, records and claims nothing', async (t) => {
+  const w = await agentWorld(t);
+  await addTech2(w);
+  const svc = service(w);
+  const pc = await w.addPc();
+  const item = (await svc.open('default', TECH, { device_id: pc.id })).escalation;
+  // The claim read the item as free. Before its change goes in, the row is claimed without a log row (so the log head
+  // has not moved and the log number cannot stop the change): only the guard on the item can.
+  const real = w.db.batch;
+  let taken = 0;
+  w.db.batch = async (statements) => {
+    if (!taken && statements.some((s) => s.params.includes('escalation_claimed'))) {
+      taken += 1;
+      w.db.sqlite.prepare('UPDATE escalations SET claimed_by = ?, claimed_at = ? WHERE id = ?').run(LEAD, w.now(), item.id);
+    }
+    return real.call(w.db, statements);
+  };
+  assert.equal(await code(svc.claim('default', TECH2, { id: item.id })), 'already_claimed');
+  assert.equal(taken, 1);
+  assert.equal(items(w)[0].claimed_by, LEAD);
+  assert.equal((await w.log()).filter((r) => r.kind === 'escalation_claimed').length, 0, 'no claim was logged for the loser');
+  assert.equal(notes(w, 'escalation_claimed').length, 0, 'and the opener was not told of it');
+});
+
 test('two people claiming at once: exactly one wins, and the other is told who has it', async (t) => {
   const w = await agentWorld(t);
   await addTech2(w);
