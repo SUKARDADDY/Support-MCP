@@ -76,6 +76,7 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
   const [stopped, setStopped] = useState(null); // null, 'driving', 'busy' or 'failed'
   const [stoppedMessage, setStoppedMessage] = useState(null);
   const [held, setHeld] = useState(false); // a task is being started: no screenshot may begin
+  const halted = useRef(false); // the loop was told to stop; set at once, before the screen has drawn `stopped`
   const holds = useRef(0); // how many task starts hold the screenshots; each releases its own
   const inFlight = useRef(null); // the screenshot request on its way, if any
   const alive = useRef(true);
@@ -235,7 +236,7 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
   // Not while a task is followed (taskId), even before its first status has come back.
   const watching = attached && isDriver && !taskId && !taskLive && !stopped && canControl && onScreen && !held;
   useInterval(async () => {
-    if (holds.current > 0) return;
+    if (holds.current > 0 || halted.current) return;
     const mine = sessionId;
     try {
       const call = screenshot(core, account, mine);
@@ -246,10 +247,10 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
     } catch (e) {
       const why = stopReason(e?.message);
       if (!alive.current || sessionRef.current !== mine) return;
-      if (why) { setStopped(why); setStoppedMessage(e.message); return; }
+      if (why) { halted.current = true; setStopped(why); setStoppedMessage(e.message); return; }
       // "customer is using the PC" and other passing failures: try again next time, a few times.
       fails.current += 1;
-      if (fails.current >= FAILS_BEFORE_STOP) { setStopped('failed'); setStoppedMessage(e?.message ?? null); }
+      if (fails.current >= FAILS_BEFORE_STOP) { halted.current = true; setStopped('failed'); setStoppedMessage(e?.message ?? null); }
     } finally {
       inFlight.current = null;
     }
@@ -269,7 +270,7 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
     setHeld(holds.current > 0);
   }, []);
 
-  const resumeShots = useCallback(() => { fails.current = 0; setStopped(null); setStoppedMessage(null); }, []);
+  const resumeShots = useCallback(() => { fails.current = 0; halted.current = false; setStopped(null); setStoppedMessage(null); }, []);
 
   // A new task makes a stopped loop worth trying again once it is over.
   useEffect(() => { if (taskLive) resumeShots(); }, [taskLive, resumeShots]);
