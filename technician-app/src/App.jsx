@@ -338,6 +338,25 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   const openTarget = useCallback(async (n) => {
     const acc = n.account ?? accountId;
     if (acc && acc !== accountId) setActive(acc);
+    // A queue notice opens the Queue.
+    if (n.event === 'escalation_opened' || n.event === 'escalation_claimed') {
+      if (guard.isShown(acc)) setView('queue');
+      return;
+    }
+    // An invite opens the session and joins it, even with no tab yet; an offer of control opens it
+    // with the offer on top. A tab opened this way belongs to a guest: closing it never ends the session.
+    if (n.session_id && (n.event === 'session_invited' || n.event === 'control_offered')) {
+      const join = n.event === 'session_invited';
+      const existing = tabs.find((x) => x.account === acc && x.sessionId === n.session_id);
+      if (existing) {
+        if (join) updateTab(existing.key, { joinOnOpen: true });
+        showTab(existing.key);
+        return;
+      }
+      const device = n.device_id ? deviceData.devices.find((d) => d.id === n.device_id) : null;
+      openSessionTab({ device, deviceId: n.device_id ?? null, deviceName: device?.name ?? (n.device_id ? '' : t('session.one_off_name')), sessionId: n.session_id, accountOf: acc, guest: true, join });
+      return;
+    }
     if (n.session_id) {
       const existing = tabs.find((x) => x.account === acc && x.sessionId === n.session_id);
       if (existing) { showTab(existing.key); return; }

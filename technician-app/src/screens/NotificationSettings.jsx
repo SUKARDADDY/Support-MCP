@@ -4,9 +4,9 @@ import { useApp } from '../context.jsx';
 import { useLoad } from '../hooks.js';
 import { t } from '../i18n/index.js';
 
-export const EVENTS = ['task_finished', 'task_problem', 'session_declined', 'device_online', 'device_missing', 'device_waiting'];
+export const EVENTS = ['task_finished', 'task_problem', 'session_declined', 'device_online', 'device_missing', 'device_waiting', 'escalation_opened', 'escalation_claimed'];
 
-// Which of the six events you hear about, which PCs you watch for "came online", and whether
+// Which of the eight events you can switch you hear about, which PCs you watch for "came online", and whether
 // this PC shows Windows notifications at all.
 export function NotificationSettings() {
   const { core, account, devices, toast } = useApp();
@@ -55,6 +55,7 @@ export function NotificationSettings() {
       <section className="panel">
         <h2>{t('notify.events_title')}</h2>
         <p className="hint">{t('notify.events_hint')}</p>
+        <p className="hint">{t('notify.always_hint')}</p>
         {EVENTS.map((ev) => (
           <label key={ev} className="toggle">
             <input type="checkbox" checked={settings.events?.[ev] !== false} onChange={(e) => save({ events: { [ev]: e.target.checked } }, { ...settings, events: { ...settings.events, [ev]: e.target.checked } })} />
