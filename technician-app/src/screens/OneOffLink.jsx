@@ -7,15 +7,16 @@ import { t } from '../i18n/index.js';
 // A link for a PC you will help once: the customer opens it, runs the app and clicks Allow.
 // Nothing is saved to the device list.
 export function OneOffLink({ onClose }) {
-  const { core, account, copyText, can } = useApp();
+  const { core, account, copyText, can, openSessionTab, showTab, tabForSession } = useApp();
   const ref = useRef(null);
   const [link, setLink] = useState(null);
+  const [sessionId, setSessionId] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const accountRef = useRef(account.id);
   accountRef.current = account.id;
   // A link belongs to the team that made it.
-  useEffect(() => { setLink(null); setError(null); setBusy(false); }, [account.id]);
+  useEffect(() => { setLink(null); setSessionId(null); setError(null); setBusy(false); }, [account.id]);
 
   useEffect(() => {
     const d = ref.current;
@@ -33,8 +34,11 @@ export function OneOffLink({ onClose }) {
     const owner = account.id;
     try {
       const out = await createOneOff(core, owner);
+      // The session is the team's that made it, shown or not: its tab waits for the person to run the
+      // link, then works like a saved PC's tab (you are the driver). It is not brought to the front here.
+      if (out.session_id) openSessionTab({ sessionId: out.session_id, deviceId: null, deviceName: t('session.one_off_name'), accountOf: owner, show: false });
       // A link made for the team that was shown a moment ago is not this team's.
-      if (accountRef.current === owner) setLink(out.download_url);
+      if (accountRef.current === owner) { setLink(out.download_url); setSessionId(out.session_id ?? null); }
     } catch (e) {
       if (accountRef.current === owner) setError(messageOf(e, t('link.failed')));
     } finally {
@@ -54,7 +58,11 @@ export function OneOffLink({ onClose }) {
               <input id="link-url" readOnly value={link} onFocus={(e) => e.target.select()} />
               <button type="button" className="btn btn-pri btn-sm" onClick={() => copyText(link, t('link.copied'))}><Icon name="copy" />{t('common.copy')}</button>
             </div>
-            <div className="acts"><button type="button" className="btn btn-sec" onClick={onClose}>{t('common.close')}</button></div>
+            {sessionId ? <p>{t('link.tab_text')}</p> : null}
+            <div className="acts">
+              <button type="button" className="btn btn-sec" onClick={onClose}>{t('common.close')}</button>
+              {sessionId ? <button type="button" className="btn btn-pri" onClick={() => { const tab = tabForSession(sessionId); onClose(); if (tab) showTab(tab.key); }}>{t('link.open_tab')}</button> : null}
+            </div>
           </>
         ) : (
           <>

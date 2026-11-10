@@ -125,10 +125,59 @@ export const isLiveTask = (task) => task && (task.state === 'running' || task.st
 // The one task, if any, that is working on this session.
 export const taskOnSession = (tasks, sessionId) => tasks.find((x) => x.session_id === sessionId && isLiveTask(x)) ?? null;
 
+// ---- people in a session, handover and the queue (the tools people_list, session_participants,
+// session_handover and escalation; their errors start with a code the core hands over as `code`) ----
+
+// The team's people you may invite: [{ identity, name, can_control }].
+export async function listPeople(core, account) {
+  const d = (await core.tool(account, 'people_list', {})).data;
+  return Array.isArray(d?.people) ? d.people : [];
+}
+
+// invite, join, leave or remove: the session's people afterwards, [{ identity, name, role, since }].
+export async function participantsAction(core, account, sessionId, action, identity = null) {
+  const d = (await core.tool(account, 'session_participants', { session_id: sessionId, action, ...(identity ? { identity } : {}) })).data;
+  return Array.isArray(d?.participants) ? d.participants : [];
+}
+
+// offer, accept, decline, cancel or take_over: { driver, participants, offer }.
+export async function handoverAction(core, account, sessionId, action, identity = null) {
+  const d = (await core.tool(account, 'session_handover', { session_id: sessionId, action, ...(identity ? { identity } : {}) })).data;
+  return { driver: d?.driver ?? null, participants: Array.isArray(d?.participants) ? d.participants : [], offer: d?.offer ?? null };
+}
+
+// The last full screenshot of a live session, for a joined watcher: { rev, at, mime, data }.
+export const sessionFrame = (core, account, sessionId) => core.request(account, 'GET', `/api/sessions/${sessionId}/frame`);
+
+// The queue: status is open, mine or closed. Notes and summaries are text people and an agent wrote: shown as text only.
+export async function listQueue(core, account, status) {
+  const d = (await core.tool(account, 'escalation', { action: 'list', status })).data;
+  return Array.isArray(d?.escalations) ? d.escalations : [];
+}
+export async function openEscalation(core, account, sessionId, note) {
+  const d = (await core.tool(account, 'escalation', { action: 'open', session_id: sessionId, ...(note ? { note } : {}) })).data;
+  return d?.escalation ?? null;
+}
+// A live claim answers with the session (session_id, driver); a ticket with the PC (device_id) or one_off.
+export async function claimEscalation(core, account, id) {
+  return (await core.tool(account, 'escalation', { action: 'claim', id })).data ?? {};
+}
+export async function closeEscalation(core, account, id, note) {
+  const d = (await core.tool(account, 'escalation', { action: 'close', id, ...(note ? { note } : {}) })).data;
+  return d?.escalation ?? null;
+}
+
 // The words of a message of the core's own, by the stable `reason` it carries, in en.json
 // ("error.<reason>"); `message` (the core's English, or the relay's own text) when there is no line for it.
 export function reasonText(reason, message) {
   return typeof reason === 'string' && hasKey(`error.${reason}`) ? t(`error.${reason}`) : message;
+}
+
+// What to tell the person about a refused call to the tools above: our words for the codes they use
+// ("refuse.<code>" in en.json), else messageOf.
+export function refusalText(e, fallback) {
+  const code = e?.code;
+  return typeof code === 'string' && hasKey(`refuse.${code}`) ? t(`refuse.${code}`) : messageOf(e, fallback);
 }
 
 // What to tell the person about a refused call: the core's message in en.json, or the relay's

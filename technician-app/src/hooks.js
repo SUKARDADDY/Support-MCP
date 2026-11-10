@@ -75,3 +75,18 @@ export function tabKeyDown(e) {
   tabs[to].focus();
   tabs[to].click();
 }
+
+// A modal <dialog>: opened when it mounts, closed when it unmounts. Put the returned ref on the dialog.
+export function useDialog() {
+  const ref = useRef(null);
+  useEffect(() => {
+    const d = ref.current;
+    if (!d) return undefined;
+    if (typeof d.showModal === 'function') d.showModal();
+    else d.setAttribute('open', '');
+    return () => {
+      if (d.open && typeof d.close === 'function') d.close();
+    };
+  }, []);
+  return ref;
+}

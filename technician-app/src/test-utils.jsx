@@ -22,6 +22,57 @@ export class ToolFail extends Error {
   }
 }
 
+// The default answers of the people, handover and queue tools: they change what the stand-in's relay holds.
+const ME = 'tech@example.com';
+const roomOf = (state, sid) => (state.sessions[sid] ??= { state: 'attached', driver: ME, log: [] });
+function peopleCall(state, args) {
+  const room = roomOf(state, args.session_id);
+  const list = (room.participants ??= [{ identity: room.driver ?? ME, name: 'Tess Tech', role: 'driver', since: Date.now() - 60000 }]);
+  const name = (identity) => state.people.find((p) => p.identity === identity)?.name ?? null;
+  if (args.action === 'invite') list.push({ identity: args.identity, name: name(args.identity), role: 'invited', since: Date.now() });
+  if (args.action === 'join') list.forEach((p) => { if (p.identity === ME && p.role === 'invited') p.role = 'watcher'; });
+  if (args.action === 'leave') room.participants = list.filter((p) => p.identity !== ME);
+  if (args.action === 'remove') room.participants = list.filter((p) => p.identity !== args.identity);
+  return { participants: structuredClone(room.participants) };
+}
+function handoverCall(state, args) {
+  const room = roomOf(state, args.session_id);
+  const list = (room.participants ??= [{ identity: room.driver ?? ME, name: 'Tess Tech', role: 'driver', since: Date.now() - 60000 }]);
+  if (args.action === 'offer') room.offer = { to: args.identity, by: room.driver, expires_at: Date.now() + 120000 };
+  if (args.action === 'cancel' || args.action === 'decline') room.offer = null;
+  if (args.action === 'accept' || args.action === 'take_over') {
+    const old = room.driver;
+    room.driver = ME;
+    room.offer = null;
+    room.participants = list.map((p) => (p.identity === ME ? { ...p, role: 'driver' } : p.identity === old ? { ...p, role: 'watcher' } : p));
+  }
+  return { driver: room.driver, participants: structuredClone(room.participants), offer: room.offer ?? null };
+}
+function escalationCall(state, args) {
+  const q = state.queue;
+  if (args.action === 'list') {
+    const keep = args.status === 'closed' ? (e) => e.closed_at : args.status === 'mine' ? (e) => !e.closed_at && (e.opened_by === ME || e.claimed_by === ME) : (e) => !e.closed_at && !e.claimed_by;
+    return { escalations: structuredClone(q.filter(keep)) };
+  }
+  if (args.action === 'open') {
+    const e = { id: ID('e'), kind: 'technician', device_id: null, device_name: null, session_id: args.session_id ?? null, task_id: null, summary: null, note: args.note ?? null, opened_by: ME, opened_at: Date.now(), claimed_by: null, claimed_at: null, closed_by: null, closed_at: null, close_note: null };
+    q.push(e);
+    return { escalation: e };
+  }
+  const e = q.find((x) => x.id === args.id);
+  if (args.action === 'claim') {
+    e.claimed_by = ME;
+    e.claimed_at = Date.now();
+    return e.session_id && state.sessions[e.session_id]?.state !== 'ended' && state.claimLive
+      ? { escalation: e, session_id: e.session_id, driver: ME, ...(e.device_id ? { device_id: e.device_id, device_name: e.device_name } : { one_off: true }), participants: [] }
+      : { escalation: e, ...(e.device_id ? { device_id: e.device_id, device_name: e.device_name } : { one_off: true }) };
+  }
+  e.closed_by = ME;
+  e.closed_at = Date.now();
+  e.close_note = args.note ?? null;
+  return { escalation: e };
+}
+
 // Builds the stand-in. `state` is what the relay holds; tests change it between steps.
 export function fakeCore(initial = {}) {
   const state = {
@@ -33,7 +84,9 @@ export function fakeCore(initial = {}) {
     pairing: { id: ID('p'), code: 'K7Q42-M9H3X', expires_at: Date.now() + 600000, site_id: null, link: 'https://relay.example/install?code=K7Q42-M9H3X' },
     connect: () => ({ session_id: 's'.repeat(64), state: 'attached', asks: false, rang: true }),
     sessions: {},
-    notifySettings: { events: { task_finished: true, task_problem: true, session_declined: true, device_online: true, device_missing: true, device_waiting: true }, watch: [] },
+    notifySettings: { events: { task_finished: true, task_problem: true, session_declined: true, device_online: true, device_missing: true, device_waiting: true, escalation_opened: true, escalation_claimed: true }, watch: [] },
+    people: [{ identity: 'tech@example.com', name: 'Tess Tech', can_control: true }, { identity: 'lead@example.com', name: 'Lee Lead', can_control: true }, { identity: 'viewer@example.com', name: null, can_control: false }],
+    queue: [],
     teams: [{ slug: 'default', name: 'Default' }, { slug: 'acme', name: 'Acme Support' }],
     prefs: { desktop_notifications: true },
     recent: [],
@@ -109,6 +162,11 @@ export function fakeCore(initial = {}) {
         if (task[2]) { state.controlled = [...(state.controlled ?? []), task[2]]; return { task_id: task[1], state: task[2] === 'stop' ? 'stopped' : task[2] === 'pause' ? 'paused' : 'running' }; }
         return { task: state.taskStatus ? state.taskStatus(t, q) : t, ...(state.taskCaps ? { caps: state.taskCaps } : {}) };
       }
+      const frame = /^\/api\/sessions\/(\w+)\/frame$/.exec(p);
+      if (frame) {
+        if (state.sessionFrame) return state.sessionFrame(frame[1], account);
+        throw Object.assign(new Error('this session has no picture yet'), { code: 'no_frame', status: 404 });
+      }
       if (p === '/teams') return { teams: state.teams };
       if (p === '/notifications/settings') {
         if (state.notifySettingsFor) return state.notifySettingsFor(account);
@@ -141,6 +199,10 @@ export function fakeCore(initial = {}) {
           return { data: { width: 1280, height: 800 }, image: { mime: 'image/jpeg', data: 'QUJD' } };
         }
         case 'agent_status': return { data: state.models, image: null };
+        case 'people_list': return { data: state.peopleList ? await state.peopleList(account) : { people: structuredClone(state.people) }, image: null };
+        case 'session_participants': return { data: state.participantsCall ? await state.participantsCall(args, account) : peopleCall(state, args), image: null };
+        case 'session_handover': return { data: state.handoverCall ? await state.handoverCall(args, account) : handoverCall(state, args), image: null };
+        case 'escalation': return { data: state.escalationCall ? await state.escalationCall(args, account) : escalationCall(state, args), image: null };
         default: throw new Error(`unexpected tool ${name}`);
       }
     }),

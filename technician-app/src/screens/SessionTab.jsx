@@ -1,22 +1,30 @@
 import { useEffect, useRef, useState } from 'react';
-import { connectDevice, messageOf } from '../api.js';
+import { connectDevice, messageOf, refusalText } from '../api.js';
 import { Icon } from '../components/Icon.jsx';
 import { useApp } from '../context.jsx';
-import { formatClock, formatDuration, formatUsd, taskTitle } from '../format.js';
+import { formatAge, formatClock, formatDuration, formatUsd, taskTitle } from '../format.js';
 import { t } from '../i18n/index.js';
-import { dataUrl, useSession } from '../session.js';
+import { dataUrl, same, useSession } from '../session.js';
 import { AgentStartDialog } from './AgentStartDialog.jsx';
+import { EscalateDialog } from './EscalateDialog.jsx';
+import { HandOverDialog } from './HandOverDialog.jsx';
+import { InviteDialog } from './InviteDialog.jsx';
 
 const KNOWN_KINDS = ['created', 'consumed', 'attached', 'hello', 'detached', 'declined', 'driver', 'ended', 'screen', 'run', 'put_file', 'get_file', 'control'];
 
-// A session with a PC: its screen (the agent's last picture during a task, otherwise a fresh
-// one every few seconds while you are the driver), what has happened, and the ways to end it
-// or take it over. There are no click or type controls: this tab only watches. Everything
-// from the PC (the picture, step details, notes, log text) is untrusted and shown as text.
+// A session with a PC, or a one-off link's: its screen (the agent's last picture during a task,
+// otherwise a fresh one every few seconds while you are the driver, and for a watcher the last
+// picture the driver or the agent took, with its age), the people in it, what has happened, and
+// the ways to invite, hand over, escalate, leave, end or take over. There are no click or type
+// controls. Everything from the PC (the picture, step details, notes, log text) and the people's
+// names are untrusted and shown as text.
 export function SessionTab({ tab, active = true }) {
-  const { core, tuning, me, can, endTab, closeTab, toast, updateTab, devices, visible, titleOf, registerTab, markEnded } = useApp();
+  const { core, tuning, me, can, endTab, closeTab, leaveTab, toast, isShown, updateTab, devices, visible, titleOf, registerTab, markEnded, markRole } = useApp();
   const [showActivity, setShowActivity] = useState(true);
   const [agentOpen, setAgentOpen] = useState(false);
+  const [dialog, setDialog] = useState(null); // 'invite', 'handover' or 'escalate'
+  const [peopleError, setPeopleError] = useState(null);
+  const [busyPeople, setBusyPeople] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const [opened] = useState(() => Date.now());
   const s = useSession({
@@ -41,6 +49,8 @@ export function SessionTab({ tab, active = true }) {
 
   // Tells App whether this tab's session has ended, so a screen that looks for the tab on a PC redraws.
   useEffect(() => { markEnded(tab.key, s.ended); }, [tab.key, s.ended, markEnded]);
+  // ... and what this person is in it, so closing the tab leaves a session you only watch instead of ending it.
+  useEffect(() => { markRole(tab.key, s.role); }, [tab.key, s.role, markRole]);
 
   // The task this tab follows is saved with the tab, so a restart follows it again (the relay stops
   // a task nobody watches for two minutes), and cleared when the task is over.
@@ -79,8 +89,9 @@ export function SessionTab({ tab, active = true }) {
     ? { spent: formatUsd(s.task.cost_usd), cap: Number.isFinite(s.task.caps?.task_cap_usd) ? formatUsd(s.task.caps.task_cap_usd) : null }
     : null;
 
-  const image = dataUrl(s.taskLive ? s.frame : s.shot ?? s.frame);
+  const image = dataUrl(s.taskLive ? s.frame : s.isWatcher ? s.watcherFrame : s.shot ?? s.frame ?? s.watcherFrame);
   const driver = s.status?.driver ?? null;
+  const nameOf = (identity) => { const p = s.participants.find((x) => same(x.identity, identity)); return p?.name || p?.identity || identity; };
 
   let stateWord = t('session.state_waiting');
   if (s.ended) stateWord = t('session.state_ended');
@@ -90,6 +101,8 @@ export function SessionTab({ tab, active = true }) {
   if (s.ended) caption = t('session.cap_ended');
   else if (s.taskLive) caption = s.task?.state === 'paused' ? t('session.cap_task_paused') : s.frameWaiting && !image ? t('session.cap_task_waiting') : t('session.cap_task');
   else if (!can('sessions.control')) caption = t('session.cap_no_permission');
+  else if (s.role === 'invited') caption = t('session.cap_invited', { who: driver ? nameOf(driver) : '' });
+  else if (s.isWatcher) caption = s.frameProblem ? refusalText(s.frameProblem, t('session.cap_watch_failed')) : t('session.cap_watching', { who: driver ? nameOf(driver) : '' });
   else if (!s.attached) caption = t('session.cap_not_attached');
   else if (s.stopped === 'driving') caption = t('session.cap_driving', { who: driver ?? '' });
   else if (s.stopped === 'busy') caption = t('session.cap_busy');
@@ -99,12 +112,14 @@ export function SessionTab({ tab, active = true }) {
 
   async function takeOver() {
     try {
-      await connectDevice(core, tab.account, tab.deviceId, { takeOver: true });
-      toast(t('session.took_over'));
+      // A saved PC is taken over by connecting again; a one-off link's session has no PC to connect to.
+      if (tab.deviceId) await connectDevice(core, tab.account, tab.deviceId, { takeOver: true });
+      else await s.people.takeOver();
+      say(t('session.took_over'));
       s.resumeShots();
       await s.refreshStatus();
     } catch (e) {
-      toast(messageOf(e, t('session.take_over_failed')));
+      say(refusalText(e, t('session.take_over_failed')));
     }
   }
 
@@ -117,8 +132,49 @@ export function SessionTab({ tab, active = true }) {
     }
   }
 
-  const canTakeOver = can('sessions.unattended') && s.attached && !s.isDriver && !!driver && !!tab.deviceId;
+  const canTakeOver = can('sessions.unattended') && s.attached && !s.isDriver && !!driver && s.role !== 'invited';
   const canHandOver = can('sessions.control') && s.attached && s.isDriver && !s.taskLive;
+  const driving = s.role === 'driver' && !s.ended;
+  const watchers = s.participants.filter((p) => p.role === 'watcher');
+  const offerToMe = s.offer && same(s.offer.to, me.identity) && s.offer.expires_at > now ? s.offer : null;
+  const offerByMe = s.offer && same(s.offer.by, me.identity) && s.offer.expires_at > now ? s.offer : null;
+  // A tab for a session you were invited to closes without ending it; so does one you only watch (Leave).
+  const closeOnly = s.ended || s.role === 'invited' || (tab.guest && s.role !== 'driver' && s.role !== 'watcher');
+
+  // A message about a person-to-person action goes to the screen only while the tab's team is the one shown:
+  // an answer that comes back after a switch of team is not announced under the other team.
+  const say = (text) => { if (isShown(tab.account)) toast(text); };
+
+  // One person-to-person action: its refusal is told in our words for the code, and the tab stays as it is.
+  async function people(call, doneKey, vars) {
+    if (busyPeople) return;
+    setBusyPeople(true);
+    setPeopleError(null);
+    try {
+      await call();
+      if (doneKey) say(t(doneKey, vars));
+      s.resumeShots();
+      s.refreshStatus();
+    } catch (e) {
+      setPeopleError(refusalText(e, t('people.failed')));
+    } finally {
+      setBusyPeople(false);
+    }
+  }
+
+  // An invite opened from a notification joins on its own as soon as the status says you were invited.
+  const joining = useRef(false);
+  const join = () => people(() => s.people.join(), 'people.joined');
+  useEffect(() => {
+    if (!tab.joinOnOpen) return;
+    if (s.role === 'invited') {
+      if (joining.current) return;
+      joining.current = true;
+      Promise.resolve(join()).finally(() => { joining.current = false; updateTab(tab.key, { joinOnOpen: false }); });
+    } else if (s.status && (s.role || s.ended)) {
+      updateTab(tab.key, { joinOnOpen: false });
+    }
+  }, [tab.joinOnOpen, s.role, s.status, s.ended]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="sess">
@@ -143,13 +199,55 @@ export function SessionTab({ tab, active = true }) {
             </>
           ) : null}
           {canHandOver ? <button type="button" className="btn btn-sec btn-sm" onClick={() => setAgentOpen(true)}>{t('agent.hand_over')}</button> : null}
+          {driving && can('sessions.control') && s.attached ? (
+            <>
+              <button type="button" className="btn btn-sec btn-sm" onClick={() => setDialog('invite')}>{t('people.invite')}</button>
+              <button type="button" className="btn btn-sec btn-sm" onClick={() => setDialog('handover')} disabled={!!s.offer}>{t('people.hand_over')}</button>
+              <button type="button" className="btn btn-sec btn-sm" onClick={() => setDialog('escalate')}>{t('people.escalate')}</button>
+            </>
+          ) : null}
+          {s.role === 'invited' ? <button type="button" className="btn btn-pri btn-sm" onClick={join} disabled={busyPeople}>{t('people.join')}</button> : null}
           {canTakeOver ? <button type="button" className="btn btn-pri btn-sm" onClick={takeOver}>{t('connect.take_over')}</button> : null}
           <button type="button" className="btn btn-sec btn-sm" aria-pressed={showActivity} onClick={() => setShowActivity((v) => !v)}>{t('session.activity')}</button>
-          {s.ended
+          {closeOnly
             ? <button type="button" className="btn btn-sec btn-sm" onClick={() => closeTab(tab.key)}>{t('session.close_tab')}</button>
-            : <button type="button" className="btn btn-end btn-sm" onClick={() => endTab(tab.key)}>{t('session.end')}</button>}
+            : s.role === 'watcher'
+              ? <button type="button" className="btn btn-end btn-sm" onClick={() => leaveTab(tab.key)}>{t('people.leave')}</button>
+              : <button type="button" className="btn btn-end btn-sm" onClick={() => endTab(tab.key)}>{t('session.end')}</button>}
         </div>
       </div>
+      {offerToMe ? (
+        <div className="offer" role="alert">
+          <p>{t('people.offer_to_you', { who: nameOf(offerToMe.by) })}</p>
+          <div className="acts">
+            <button type="button" className="btn btn-pri btn-sm" disabled={busyPeople} onClick={() => people(() => s.people.accept(), 'people.took_control')}>{t('people.take_control')}</button>
+            <button type="button" className="btn btn-sec btn-sm" disabled={busyPeople} onClick={() => people(() => s.people.decline())}>{t('people.not_now')}</button>
+          </div>
+        </div>
+      ) : null}
+      {offerByMe ? (
+        <div className="offer" role="status">
+          <p>{t('people.offer_by_you', { who: nameOf(offerByMe.to), until: formatClock(offerByMe.expires_at) })}</p>
+          <div className="acts"><button type="button" className="btn btn-sec btn-sm" disabled={busyPeople} onClick={() => people(() => s.people.cancelOffer())}>{t('people.cancel_offer')}</button></div>
+        </div>
+      ) : null}
+      {peopleError ? <p className="err people-err" role="alert">{peopleError}</p> : null}
+      {s.participants.length && !s.ended ? (
+        <section className="roster" aria-label={t('people.label')}>
+          <h3>{t('people.label')}</h3>
+          <ul>
+            {s.participants.map((p) => (
+              <li key={p.identity} data-role={p.role}>
+                <span className="who">{p.name || p.identity}{same(p.identity, me.identity) ? ` (${t('people.you')})` : ''}</span>
+                <span className="role">{t(`people.role_${p.role}`)}</span>
+                {driving && p.role !== 'driver' ? (
+                  <button type="button" className="btn btn-sec btn-xs" disabled={busyPeople} aria-label={t('people.remove_with', { name: p.name || p.identity })} onClick={() => people(() => s.people.remove(p.identity), 'people.removed', { name: p.name || p.identity })}>{t('people.remove')}</button>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
       <div className={`sess-main${showActivity ? '' : ' wide'}`}>
         <div className="viewport">
           {image ? (
@@ -158,6 +256,7 @@ export function SessionTab({ tab, active = true }) {
             <div className="screen none" role="status">{s.ended ? t('session.no_picture_ended') : t('session.no_picture')}</div>
           )}
           <p className="vp-cap" role="status">{caption}</p>
+          {s.isWatcher && s.watcherFrame && !s.taskLive ? <p className="vp-cap" role="status">{t('session.picture_age', { age: formatAge(s.watcherFrame.at, now) })}</p> : null}
           {s.stopped && !s.taskLive && !s.ended ? (
             <button type="button" className="btn btn-sec btn-sm" onClick={s.resumeShots}>{t('session.try_again')}</button>
           ) : null}
@@ -191,6 +290,25 @@ export function SessionTab({ tab, active = true }) {
           </aside>
         ) : null}
       </div>
+      {dialog === 'invite' ? (
+        <InviteDialog
+          account={tab.account}
+          participants={s.participants}
+          onInvite={async (identity, person) => { await s.people.invite(identity); say(t('people.invited', { name: person?.name || identity })); }}
+          onClose={() => setDialog(null)}
+        />
+      ) : null}
+      {dialog === 'handover' ? (
+        <HandOverDialog
+          watchers={watchers}
+          taskLive={s.taskLive}
+          onOffer={async (identity, person) => { await s.people.offer(identity); say(t('people.offered', { name: person?.name || identity })); }}
+          onClose={() => setDialog(null)}
+        />
+      ) : null}
+      {dialog === 'escalate' ? (
+        <EscalateDialog onSend={async (note) => { await s.people.escalate(note); say(t('people.escalated')); }} onClose={() => setDialog(null)} />
+      ) : null}
       {agentOpen ? <AgentStartDialog sessionId={s.sessionId} accountId={tab.account} onClose={() => setAgentOpen(false)} /> : null}
     </div>
   );

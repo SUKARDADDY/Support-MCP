@@ -48,7 +48,7 @@ describe('Session tab: watching the screen yourself', () => {
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
     for (const b of screen.getAllByRole('button')) expect(b.textContent).not.toMatch(/click|type|keyboard|mouse|press|run command/i);
     const names = new Set(fake.calls.filter((c) => c.kind === 'tool').map((c) => c.args[0]));
-    for (const n of names) expect(['device_list', 'session_status', 'screenshot', 'agent_status', 'session_end', 'device_connect']).toContain(n);
+    for (const n of names) expect(['device_list', 'session_status', 'screenshot', 'agent_status', 'session_end', 'device_connect', 'people_list', 'session_participants', 'session_handover', 'escalation']).toContain(n);
   });
 
   test('stops taking pictures while the tab is hidden, and starts again when it is shown', async () => {

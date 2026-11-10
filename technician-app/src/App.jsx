@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { endSession, fetchDevices, fetchMe, fetchPlaces, isLiveTask, listTasks, messageOf, sessionStatus, startTask } from './api.js';
+import { endSession, fetchDevices, fetchMe, fetchPlaces, isLiveTask, listTasks, messageOf, participantsAction, refusalText, sessionStatus, startTask } from './api.js';
 import { Icon } from './components/Icon.jsx';
 import { useConnections } from './connections.js';
 import { AppContext } from './context.jsx';
@@ -163,22 +163,46 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   // `show` says whether to go to the tab. By default it does when the tab's account is the one on
   // screen *now* (asked of the guard, not of the account this callback was made under, which may be an
   // old one: a connection or a start that finished after a switch of team must not take the view).
-  const openSessionTab = useCallback(({ device, sessionId = null, taskId = null, deviceId = null, deviceName = null, accountOf = null, show = null }) => {
+  const openSessionTab = useCallback(({ device, sessionId = null, taskId = null, deviceId = null, deviceName = null, accountOf = null, show = null, guest = false, join = false }) => {
     const key = sessionId ?? `task:${taskId}`;
     setTabs((cur) => {
       if (cur.some((x) => x.key === key)) return cur;
-      return persist([...cur, { key, account: accountOf ?? accountId, deviceId: device?.id ?? deviceId, deviceName: device?.name ?? deviceName ?? '', sessionId, taskId }]);
+      return persist([...cur, { key, account: accountOf ?? accountId, deviceId: device?.id ?? deviceId, deviceName: device?.name ?? deviceName ?? '', sessionId, taskId, ...(guest ? { guest: true } : {}), ...(join ? { joinOnOpen: true } : {}) }]);
     });
     // A tab that is not shown is added under its own account and appears when that account is used.
     if (show ?? guard.isShown(accountOf ?? accountId)) setView(`tab:${key}`);
   }, [accountId, persist, guard]);
+  const tabForSession = useCallback((sid) => tabs.find((x) => x.account === accountId && x.sessionId === sid) ?? null, [tabs, accountId]);
   const closeTab = useCallback((key) => {
     setTabs((cur) => persist(cur.filter((x) => x.key !== key)));
     setView((v) => (v === `tab:${key}` ? 'devices' : v));
   }, [persist]);
+  // What each open tab's person is in its session (driver, watcher, invited), as the tabs report it.
+  const [roles, setRoles] = useState({});
+  const markRole = useCallback((key, role) => setRoles((cur) => ((cur[key] ?? null) === role ? cur : { ...cur, [key]: role })), []);
+  // A watcher goes off the session; the tab closes unless the relay refuses for a reason the tab can still fix.
+  const leaveSession = useCallback(async (tab) => {
+    try {
+      await participantsAction(core, tab.account, tab.sessionId, 'leave');
+      if (guard.isShown(tab.account)) toast(t('people.left_toast', { name: tab.deviceName || t('session.untitled') }));
+    } catch (e) {
+      if (guard.isShown(tab.account)) toast(refusalText(e, t('people.leave_failed')));
+      if (e?.code !== 'not_invited' && e?.code !== 'not_found') return;
+    }
+    closeTab(tab.key);
+  }, [core, toast, closeTab, guard]);
+  const leaveTab = useCallback((key) => {
+    const tab = tabsRef.current.find((x) => x.key === key);
+    return tab?.sessionId ? leaveSession(tab) : Promise.resolve(closeTab(key));
+  }, [leaveSession, closeTab]);
+  // Closing a tab ends its session for everyone, so only the driver's tab does that. A tab for a session
+  // you were invited to, or one you only watch, never ends it: a watcher leaves it, an invitee just closes.
   const endTab = useCallback(async (key) => {
     const tab = tabs.find((x) => x.key === key);
-    if (tab?.sessionId) {
+    const role = roles[key] ?? null;
+    if (role === 'watcher' && tab?.sessionId) { await leaveSession(tab); return; }
+    const mayEnd = role === 'driver' || (!tab?.guest && role !== 'invited');
+    if (tab?.sessionId && mayEnd) {
       try {
         await endSession(core, tab.account, tab.sessionId);
         toast(t('session.ended_toast', { name: tab.deviceName }));
@@ -187,7 +211,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
       }
     }
     closeTab(key);
-  }, [tabs, core, toast, closeTab]);
+  }, [tabs, roles, core, toast, closeTab, leaveSession]);
   const updateTab = useCallback((key, patch) => setTabs((cur) => persist(cur.map((x) => (x.key === key ? { ...x, ...patch } : x)))), [persist]);
   // Every task start goes through here. The PC takes one command at a time, so the open session
   // tab(s) on the same PC or session stop their screenshots and wait for one in flight first;
@@ -310,7 +334,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
       }
     }
     if (n.device_id && guard.isShown(acc)) { setSelectedId(n.device_id); setView('devices'); }
-  }, [accountId, tabs, core, deviceData.devices, openSessionTab, setActive, showTab, guard]);
+  }, [accountId, tabs, core, deviceData.devices, openSessionTab, setActive, showTab, guard, updateTab]);
   const openTargetRef = useRef(null);
   openTargetRef.current = openTarget;
 
@@ -324,9 +348,9 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     core, appInfo, accounts: accounts ?? [], account, setActive, reloadAccounts: loadAccounts, can, me,
     devices: deviceData.devices, places: deviceData.places, devicesState: deviceData, reloadDevices,
     selectedId, select, conns, connect, cancelConnect, dismissConnect,
-    sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true),
+    sessionTabFor, tabForSession, isShown: guard.isShown, showTab, endTab, closeTab, leaveTab, markRole, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true),
     toast, copyText, notifications, openTarget, now, theme, setTheme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded,
-  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded]); // eslint-disable-line react-hooks/exhaustive-deps
+  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, tabForSession, showTab, endTab, closeTab, leaveTab, markRole, updateTab, openSessionTab, go, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (accounts === null) return <div className="app" role="status"><p className="hint">{t('common.loading')}</p></div>;
 
@@ -360,7 +384,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
             {mine.length ? (
               <div className="tab-closers" role="group" aria-label={t('tabs.close_label')}>
                 {mine.map((x, i) => (
-                  <button key={x.key} type="button" className="tab-x" data-on={activeTab?.key === x.key} style={{ order: 2 * (i + 1) + 1 }} onClick={() => endTab(x.key)} aria-label={t('session.end_with', { name: x.deviceName || t('session.untitled') })} title={t('session.end')}><Icon name="x" /></button>
+                  <button key={x.key} type="button" className="tab-x" data-on={activeTab?.key === x.key} style={{ order: 2 * (i + 1) + 1 }} onClick={() => endTab(x.key)} aria-label={t(roles[x.key] === 'watcher' ? 'people.leave_with' : roles[x.key] === 'invited' ? 'session.close_with' : 'session.end_with', { name: x.deviceName || t('session.untitled') })} title={t(roles[x.key] === 'watcher' ? 'people.leave' : roles[x.key] === 'invited' ? 'session.close_tab' : 'session.end')}><Icon name="x" /></button>
                 ))}
               </div>
             ) : null}
