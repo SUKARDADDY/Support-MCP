@@ -226,3 +226,27 @@ dialog::backdrop { background: rgb(0 0 0 / .45); }
 
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; } }
 .mt-8 { margin-top: 8px; }
+
+/* ---------- people in a session, offers, the queue ---------- */
+.btn-xs { min-height: 28px; padding: 2px 10px; font-size: 13px; }
+.offer { display: flex; align-items: center; gap: 8px 16px; flex-wrap: wrap; padding: 10px 14px; background: var(--live-soft); border-bottom: 1px solid var(--live-line); }
+.offer p { margin: 0; font-size: 14px; color: var(--ink); }
+.offer .acts { display: flex; gap: 8px; margin-left: auto; }
+.people-err { padding: 6px 14px 0; margin: 0; }
+.roster { display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; padding: 8px 14px; border-bottom: 1px solid var(--rule); background: var(--card); font-size: 13.5px; }
+.roster h3 { font-size: 13px; font-weight: 700; color: var(--ink-2); }
+.roster ul { list-style: none; margin: 0; padding: 0; display: flex; gap: 8px 16px; flex-wrap: wrap; }
+.roster li { display: flex; align-items: center; gap: 6px; }
+.roster .who { font-weight: 600; overflow-wrap: anywhere; }
+.roster .role { color: var(--ink-2); }
+.pick { border: 0; padding: 0; margin: 0 0 8px; max-height: 260px; overflow: auto; }
+.queue { list-style: none; margin: 0; padding: 0; }
+.queue li { padding: 14px 0; border-top: 1px solid var(--rule-2); display: flex; flex-direction: column; gap: 4px; }
+.queue li:first-child { border-top: 0; }
+.queue .q-head { display: flex; align-items: baseline; gap: 4px 12px; flex-wrap: wrap; }
+.queue .q-title { font-weight: 700; font-size: 16px; overflow-wrap: anywhere; }
+.queue .q-kind { font-size: 12.5px; color: var(--ink-2); border: 1px solid var(--rule); border-radius: 999px; padding: 0 8px; }
+.queue .q-time { margin-left: auto; font-size: 13px; color: var(--ink-2); }
+.queue .q-from { font-size: 13.5px; color: var(--ink-2); overflow-wrap: anywhere; }
+.queue .q-text { font-size: 14px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.queue .q-acts { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }

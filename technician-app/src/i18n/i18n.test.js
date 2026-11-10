@@ -37,7 +37,7 @@ describe('strings', () => {
     };
     for (const [family, words] of Object.entries(families)) for (const w of words) expect(hasKey(`${family}.${w}`), `${family}.${w}`).toBe(true);
     for (const a of ['any', 'ask']) for (const part of ['label', 'title', 'tech']) expect(hasKey(`access.${a}.${part}`)).toBe(true);
-    for (const e of ['task_finished', 'task_problem', 'session_declined', 'device_online', 'device_missing', 'device_waiting']) {
+    for (const e of ['task_finished', 'task_problem', 'session_declined', 'device_online', 'device_missing', 'device_waiting', 'escalation_opened', 'escalation_claimed']) {
       expect(hasKey(`event.${e}.name`)).toBe(true);
       expect(hasKey(`event.${e}.help`)).toBe(true);
     }

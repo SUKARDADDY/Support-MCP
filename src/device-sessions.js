@@ -1,6 +1,8 @@
 // How the relay reaches the Durable Objects on behalf of a saved PC: ringing a
 // doorbell, asking who is online, making a Session object for a PC, ending or
-// taking over a session, and ending every live session when a workspace stops.
+// taking over a session, and ending every live session when a workspace stops. The same
+// hooks reach a session's people and its handover steps (src/session-people.js), for saved
+// PCs and one-off link sessions alike.
 // src/devices.js calls these through the hooks object it is built with, so the
 // device store never touches a Durable Object itself and its tests can leave
 // them out.
@@ -45,6 +47,19 @@ export async function sessionWatch(env, slug, sid) {
   const watch = await r.json();
   if (!watch || typeof watch !== 'object' || !WATCH_STATES.has(watch.state)) throw new Error('the session gave no usable answer');
   return watch;
+}
+
+// One POST to a Session. The answer is its JSON when the Session answered normally (a refusal is
+// { ok: false, code } with status 200); null for an error status or a Session that did not answer.
+async function sessionCall(stub, path, body) {
+  try {
+    const r = await stub.fetch(`https://do${path}`, { method: 'POST', body: JSON.stringify(body) });
+    if (!r.ok) return null;
+    const out = await r.json();
+    return out && typeof out === 'object' ? out : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 // env: the Worker env. devTtlMs: the dev session-length override (0 in production).
@@ -139,11 +154,34 @@ export function deviceHooks(env, { devTtlMs = 0 } = {}) {
 
     // Make `actor` the driver of a live session. Returns the Session's answer
     // ({ok, state}) or { ok: false } when it cannot be reached.
-    async takeOver(slug, sid, actor) {
+    async takeOver(slug, sid, actor, gen = null) {
       try {
-        return await (await post(session(sid), '/takeover', { actor, workspace: slug })).json();
+        return await (await post(session(sid), '/takeover', { actor, workspace: slug, ...(Number.isInteger(gen) ? { gen } : {}) })).json();
       } catch (_) {
         return { ok: false };
+      }
+    },
+
+    // What the Session says of itself to the team: its state, driver, people and last handover. Throws
+    // when it cannot be reached or gives no usable answer.
+    watch: (slug, sid) => sessionWatch(env, slug, sid),
+
+    // A call to a Session's /people or /handover: its JSON answer ({ ok, ... } or { ok: false, code,
+    // error }), or null when the Session could not be reached (a transient failure the caller may retry).
+    async people(slug, sid, body) {
+      return sessionCall(session(sid), '/people', { ...body, workspace: slug });
+    },
+    async handover(slug, sid, body) {
+      return sessionCall(session(sid), '/handover', { ...body, workspace: slug });
+    },
+
+    // The Session's last full screenshot for `actor`: { status, body }, or null when it cannot be reached.
+    async frame(slug, sid, actor) {
+      try {
+        const r = await session(sid).fetch(`https://do/frame?workspace=${encodeURIComponent(slug)}&actor=${encodeURIComponent(actor)}`);
+        return { status: r.status, body: await r.json() };
+      } catch (_) {
+        return null;
       }
     },
 

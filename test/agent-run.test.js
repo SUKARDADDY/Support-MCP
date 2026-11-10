@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { agentService } from '../src/agent.js';
 import { agentWorld, BOSS, TECH, LEAD, OPENAI_KEY, CLAUDE_KEY, until } from './agent-world.js';
+import { oneOff } from './people-world.js';
 import { ant, claudeUsage, oai, openaiBadKey, openaiUsage, OPENAI_MODEL_403, OPENAI_NO_REASONING_400 } from './agent-fakes.js';
 
 const shotCall = () => oai.call('screenshot', { display: null });
@@ -261,9 +262,10 @@ test('the task ends when its session ends: by the technician, or by the PC', asy
   assert.equal(w.fake.sent('openai').length, 1, 'no model call after the session ended');
 });
 
-// A link session with its app attached. The app answers through the attach key.
-async function linkSession(w, who = BOSS, handler = null) {
-  const made = await w.tool(who, 'session_create', {});
+// A link session with its app attached. The app answers through the attach key. One a member makes has its
+// creator as driver; with driverless, it is one made before sessions had drivers: its storage has no driver key.
+async function linkSession(w, who = BOSS, handler = null, { driverless = false } = {}) {
+  const made = driverless ? { session_id: await oneOff(w) } : await w.tool(who, 'session_create', {});
   const session = w.sessionFor(made.session_id).session;
   const { key } = await (await session.fetch(new Request('https://do/consume', { method: 'POST', body: JSON.stringify({ windows_mode: 'app' }) }))).json();
   const headers = { 'X-Attach-Key': key };
@@ -274,11 +276,11 @@ async function linkSession(w, who = BOSS, handler = null) {
 }
 let t_after = () => {};
 
-test('a task given a link session works in it and leaves it open; it ends at once when another person sends a command to that session', async (t) => {
+test('a task given a link session that has no driver works in it and leaves it open; it ends at once when another person sends a command to that session', async (t) => {
   const w = await agentWorld(t);
   t_after = (p) => t.after(() => p.stop());
   await w.ready();
-  const link = await linkSession(w);
+  const link = await linkSession(w, BOSS, null, { driverless: true });
   const start = await w.tool(BOSS, 'agent_start', { session_id: link.sid, instructions: 'Check the printer.', keep_working: true });
   assert.equal(start.error, undefined, JSON.stringify(start));
   w.fake.queue('openai', shotCall(), click(), finish('Done.'));

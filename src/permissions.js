@@ -102,6 +102,14 @@ const TOOL_PERMISSIONS = Object.freeze({
   // the tool and again when the claim commits.
   device_list: 'devices.view',
   device_connect: 'sessions.control',
+  // The team tools: who is on a session, handing it over, and the escalation queue. Each acts on a
+  // live session or hands one to a colleague, so each takes sessions.control. They are for members only
+  // (never open mode), and the access rule for watching and driving is checked inside them
+  // (src/session-people.js).
+  people_list: 'sessions.control',
+  session_participants: 'sessions.control',
+  session_handover: 'sessions.control',
+  escalation: 'sessions.control',
   // The built-in agent. Starting and controlling a task act on a PC, so they take
   // sessions.control; reading one takes sessions.view. All three are for members only,
   // never open mode (src/app.js), and team settings are never a tool.

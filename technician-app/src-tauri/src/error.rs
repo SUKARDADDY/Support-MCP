@@ -113,6 +113,10 @@ pub enum CoreError {
     /// An MCP tool answered isError. The message is the tool's own text.
     #[error("{0}")]
     Tool(String),
+    /// An MCP tool of the people-in-a-session group answered with "<code>: <message>". The code
+    /// (not_driver, needs_unattended, ...) is what a screen branches on; the message is the relay's.
+    #[error("{message}")]
+    ToolCoded { code: String, message: String },
     /// The screens asked for something the core refuses.
     #[error("{}", .0.text())]
     Invalid(Msg),
@@ -129,6 +133,7 @@ impl CoreError {
             CoreError::Unavailable(_) => "unavailable",
             CoreError::Relay { code, .. } => code,
             CoreError::Tool(_) => "tool",
+            CoreError::ToolCoded { code, .. } => code,
             CoreError::Invalid(_) => "invalid",
             CoreError::Other(_) => "internal",
         }
@@ -147,7 +152,7 @@ impl CoreError {
         match self {
             CoreError::SignedOut => Some("signed_out"),
             CoreError::Unavailable(m) | CoreError::Invalid(m) | CoreError::Other(m) => Some(m.key()),
-            CoreError::Relay { .. } | CoreError::Tool(_) => None,
+            CoreError::Relay { .. } | CoreError::Tool(_) | CoreError::ToolCoded { .. } => None,
         }
     }
 
@@ -233,5 +238,7 @@ mod tests {
         assert_eq!((relay["code"].as_str(), relay["reason"].is_null()), (Some("confirm_wrong"), true));
         let tool = serde_json::to_value(CoreError::Tool("agent busy".into())).unwrap();
         assert!(tool["reason"].is_null());
+        let coded = serde_json::to_value(CoreError::ToolCoded { code: "not_driver".into(), message: "ann@example.com is driving".into() }).unwrap();
+        assert_eq!((coded["code"].as_str(), coded["message"].as_str(), coded["reason"].is_null()), (Some("not_driver"), Some("ann@example.com is driving"), true));
     }
 }

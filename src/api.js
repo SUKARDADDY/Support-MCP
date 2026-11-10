@@ -15,11 +15,16 @@
 // member (never open mode), the second factor for a permission that needs one,
 // and only the routes the app uses (APP_ROUTES). Members, roles, the team log,
 // the stop switch and the agent's settings and models are not among them.
+//
+// One route is not a collection: GET sessions/<64 hex session id>/frame, the last full screenshot of a
+// live session, for the driver and for a person who joined it (src/session-people.js). It is held in the
+// session's memory, so a watcher's app reads it here and an AI client is not sent large images it did not ask for.
 import { TeamError, teamFromEnv } from './workspace.js';
 import { ID_RE, devicesFromEnv } from './devices.js';
 import { deviceHooks } from './device-sessions.js';
 import { handleAgentApi } from './agent-api.js';
 import { assertSecondFactor } from './oauth.js';
+import { sessionPeople } from './session-people.js';
 
 const ROOT = '/api/v1/w';
 const PREFIX = '/api/v1/w/';
@@ -108,8 +113,9 @@ async function needSecondFactor(app, permission) {
 
 // What the technician app may reach, by collection (the segment after the
 // workspace) and method. Anything else answers 404, as if the route did not exist.
-function appAllows(collection, item, method) {
+function appAllows(collection, item, method, extra = []) {
   if (collection === undefined) return true; // who am I
+  if (collection === 'sessions') return method === 'GET' && item !== undefined && extra.length === 1 && extra[0] === 'frame';
   if (collection === 'fields') return method === 'GET' && item === undefined;
   if (collection === 'agent') return item === 'tasks'; // never settings or models
   return ['customers', 'sites', 'devices', 'pairing'].includes(collection);
@@ -140,12 +146,24 @@ export async function handleApi(request, env, url, { accessCaller, isJsonContent
     const team = teamFromEnv(env);
     // A slug that was never created, or is malformed, is 404 for everyone.
     if (!(await team.workspaceExists(slug))) throw new TeamError(404, 'not_found', 'no such workspace');
-    if (app && !appAllows(collection, item, method)) throw new TeamError(404, 'not_found', 'not found');
+    if (app && !appAllows(collection, item, method, extra)) throw new TeamError(404, 'not_found', 'not found');
     // The built-in agent has routes more than one segment deep (src/agent-api.js).
     if (collection === 'agent') {
       const segments = url.pathname.slice(PREFIX.length).split('/').slice(2);
       return await handleAgentApi({ json, notAllowed, readBody, need, decodeSegment },
         { env, team, slug, caller, method, request, url, origin, segments, app });
+    }
+    // The last picture of a live session. A session id is 64 hex characters, not a 20-character item id.
+    if (collection === 'sessions') {
+      if (item === undefined || extra.length !== 1 || extra[0] !== 'frame') throw new TeamError(404, 'not_found', 'not found');
+      const sid = decodeSegment(item);
+      if (!/^[0-9a-f]{64}$/.test(sid)) throw new TeamError(404, 'not_found', 'not found');
+      if (method !== 'GET') return notAllowed('GET');
+      await need(team, slug, caller, ['sessions.control']);
+      // The picture is the PC's screen: read on the terms a screenshot is. The app's sign-in must hold the second
+      // factor of each permission the rule asks for; an Access login is exempt, as it is for every tool.
+      const caps = app ? { factor: (permission) => assertSecondFactor(env, app.caller, permission) } : {};
+      return json(await sessionPeople(env).frame(slug, caller, sid, caps));
     }
     if (extra.length || item === '') throw new TeamError(404, 'not_found', 'not found');
 

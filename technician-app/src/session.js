@@ -1,4 +1,4 @@
-// What a session tab does, as one hook. The tab is view only:
+// What a session tab does, as one hook. The tab shows a PC's screen and never clicks or types:
 //
 //   * While a built-in agent task works on the session, the tab shows the picture the task
 //     last took (GET .../frame). The task's status is held open on the relay (wait_s, up to 25
@@ -13,7 +13,12 @@
 //     the PC takes one command at a time and the agent's first step would fail with "agent
 //     busy". The loop stays off for as long as a task is followed.
 //   * Every 15 seconds it looks for a running task on the session, and switches to its picture.
-//   * The session's own status (state, driver, log) is read every few seconds.
+//   * The session's own status (state, driver, people, offer, log) is read every few seconds.
+//   * A watcher (invited, then joined) sees the last full picture the driver or the agent took:
+//     the status carries frame_rev, and the picture is fetched (GET .../frame) only when that
+//     number is one the tab has not fetched, with the time it was taken.
+//   * Everything a tab asks of the relay uses the account it was opened under (`account`), and an
+//     answer for another session than the tab is on is dropped.
 //
 // The tab stays mounted (hidden) when another tab or screen is shown, so a task's status
 // keeps being held open for as long as the task runs: the relay stops a task that nobody
@@ -24,7 +29,7 @@
 //
 // No click or type request exists here or in the core's tool list.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { controlTask, isLiveTask, listTasks, screenshot, sessionStatus, taskFrame, taskOnSession, taskStatus } from './api.js';
+import { controlTask, handoverAction, isLiveTask, listTasks, openEscalation, participantsAction, screenshot, sessionFrame, sessionStatus, taskFrame, taskOnSession, taskStatus } from './api.js';
 import { useInterval } from './hooks.js';
 
 const IMAGE_MIME = new Set(['image/jpeg', 'image/png']);
@@ -32,13 +37,16 @@ const FAILS_BEFORE_STOP = 3;
 const MAX_RETRY_MS = 30000;
 
 export const dataUrl = (img) => (img && IMAGE_MIME.has(img.mime) && /^[A-Za-z0-9+/=]+$/.test(img.data ?? '') ? `data:${img.mime};base64,${img.data}` : null);
-const same = (a, b) => !!a && !!b && String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
+export const same = (a, b) => !!a && !!b && String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
 
 // Why the screenshot loop stopped, from the relay's words, or null for a failure that passes.
 export function stopReason(message) {
   const m = String(message ?? '');
-  if (/is driving/i.test(m)) return 'driving';
-  if (/agent busy/i.test(m)) return 'busy';
+  // The relay's own sentences, whole: text a PC supplies (a command's error, a window title) that merely contains
+  // these words in another sentence is a passing failure, not a stop.
+  if (/^\S+ is driving this session(;|$)/.test(m)) return 'driving';
+  if (/^agent busy(;|$)/.test(m)) return 'busy';
+  if (/^(not_found: )?no such live session$|^session ended( by .+)?$/.test(m)) return 'ended';
   return null;
 }
 
@@ -71,6 +79,8 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
   const [stopped, setStopped] = useState(null); // null, 'driving', 'busy' or 'failed'
   const [stoppedMessage, setStoppedMessage] = useState(null);
   const [held, setHeld] = useState(false); // a task is being started: no screenshot may begin
+  const refreshRef = useRef(() => {}); // refreshStatus, for the loops above it
+  const halted = useRef(false); // the loop was told to stop; set at once, before the screen has drawn `stopped`
   const holds = useRef(0); // how many task starts hold the screenshots; each releases its own
   const inFlight = useRef(null); // the screenshot request on its way, if any
   const alive = useRef(true);
@@ -87,6 +97,17 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
   const ended = status?.state === 'ended' || status?.state === 'unknown';
   const attached = status?.state === 'attached';
   const isDriver = same(status?.driver, me.identity);
+  // The session's people and what you are in it: driver, watcher, invited (not joined yet), or none.
+  const participants = Array.isArray(status?.participants) ? status.participants : [];
+  const offer = status?.offer ?? null;
+  const meEntry = participants.find((p) => same(p.identity, me.identity));
+  const role = ended ? null : isDriver ? 'driver' : meEntry?.role === 'watcher' || meEntry?.role === 'invited' ? meEntry.role : null;
+  const isWatcher = role === 'watcher';
+  // This tab may end the session: its person drives it, or it has no driver (a one-off link made before drivers
+  // existed) and the tab is not a guest's. Nothing is known until the first status has been read.
+  const mayEnd = !ended && status !== null && (role === 'driver' || (!status.driver && !tab.guest));
+  // Not the task's starter or the driver: the relay would refuse its picture, so the tab does not look for it.
+  const mayFollowTasks = (status !== null || statusError !== null) && role !== 'watcher' && role !== 'invited';
   const taskLive = !!taskId && !!task && isLiveTask(task);
   const onScreen = active && visible;
 
@@ -112,7 +133,7 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
       // try again at the next check
     }
   }, [core, account, sessionId]);
-  useInterval(lookForTask, tuning.taskCheckMs, !!sessionId && !taskLive && !ended && visible);
+  useInterval(lookForTask, tuning.taskCheckMs, !!sessionId && !taskLive && !ended && visible && mayFollowTasks);
 
   // ---- following the task: a held-open status, and its picture when rev moves ---------
   const fetchFrame = useCallback(async (id) => {
@@ -193,11 +214,33 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
     }
   }, [onScreen]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ---- a watcher's picture: fetched when the status names a picture the tab has not fetched ---------
+  const [watchFrame, setWatchFrame] = useState(null);
+  const [frameProblem, setFrameProblem] = useState(null);
+  const fetchedRev = useRef({ sid: null, rev: null });
+  const frameRev = status?.frame_rev ?? null;
+  useEffect(() => {
+    if (!isWatcher || !onScreen || !sessionId || !Number.isFinite(frameRev)) return;
+    if (fetchedRev.current.sid === sessionId && fetchedRev.current.rev === frameRev) return;
+    const mine = sessionId;
+    fetchedRev.current = { sid: mine, rev: frameRev };
+    sessionFrame(core, account, mine).then((f) => {
+      if (!alive.current || sessionRef.current !== mine) return;
+      if (f && typeof f === 'object' && Number.isFinite(f.rev)) { setWatchFrame({ ...f, sid: mine }); setFrameProblem(null); }
+    }).catch((e) => {
+      if (!alive.current || sessionRef.current !== mine) return;
+      // Tried again at the next status read.
+      fetchedRev.current = { sid: null, rev: null };
+      setFrameProblem(e?.code === 'no_frame' ? null : e);
+    });
+  }, [status, isWatcher, onScreen, sessionId, frameRev, core, account]);
+  const watcherFrame = watchFrame && watchFrame.sid === sessionId ? watchFrame : null;
+
   // ---- taking a picture every few seconds, when nobody else is -------------------------
   // Not while a task is followed (taskId), even before its first status has come back.
   const watching = attached && isDriver && !taskId && !taskLive && !stopped && canControl && onScreen && !held;
   useInterval(async () => {
-    if (holds.current > 0) return;
+    if (holds.current > 0 || halted.current) return;
     const mine = sessionId;
     try {
       const call = screenshot(core, account, mine);
@@ -208,10 +251,18 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
     } catch (e) {
       const why = stopReason(e?.message);
       if (!alive.current || sessionRef.current !== mine) return;
-      if (why) { setStopped(why); setStoppedMessage(e.message); return; }
+      if (why) {
+        halted.current = true;
+        setStopped(why);
+        setStoppedMessage(e.message);
+        // Someone took over, or the session is over: ask the relay at once, so the tab shows what it now is
+        // (a watcher's view, or the ended state) and not a stop with the tool's own words.
+        if (why !== 'busy') refreshRef.current();
+        return;
+      }
       // "customer is using the PC" and other passing failures: try again next time, a few times.
       fails.current += 1;
-      if (fails.current >= FAILS_BEFORE_STOP) { setStopped('failed'); setStoppedMessage(e?.message ?? null); }
+      if (fails.current >= FAILS_BEFORE_STOP) { halted.current = true; setStopped('failed'); setStoppedMessage(e?.message ?? null); }
     } finally {
       inFlight.current = null;
     }
@@ -231,7 +282,7 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
     setHeld(holds.current > 0);
   }, []);
 
-  const resumeShots = useCallback(() => { fails.current = 0; setStopped(null); setStoppedMessage(null); }, []);
+  const resumeShots = useCallback(() => { fails.current = 0; halted.current = false; setStopped(null); setStoppedMessage(null); }, []);
 
   // A new task makes a stopped loop worth trying again once it is over.
   useEffect(() => { if (taskLive) resumeShots(); }, [taskLive, resumeShots]);
@@ -248,13 +299,54 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
       if (alive.current && sessionRef.current === sessionId) setStatus(st);
     } catch (_) { /* the next poll tries again */ }
   }, [core, account, sessionId]);
+  refreshRef.current = refreshStatus;
+  // A stop for being driven by someone else lasts only while the status still says the person drives.
+  useEffect(() => { if (stopped === 'driving' && status && !isDriver) resumeShots(); }, [stopped, status, isDriver, resumeShots]);
+
+  // ---- the session's people: each call is made as the tab's account, and its answer is applied only
+  // while the tab is still on the session it was made for ---------------------------------------
+  const applyPeople = useCallback((mine, patch) => {
+    if (alive.current && sessionRef.current === mine) setStatus((st) => (st ? { ...st, ...patch } : st));
+  }, []);
+  const people = useMemo(() => {
+    // A refusal that says the session is over refreshes the status at once, so the tab shows it ended.
+    const overEnded = (e) => {
+      if (e?.code === 'not_found' || stopReason(e?.message) === 'ended') refreshRef.current();
+      throw e;
+    };
+    const roster = async (action, identity) => {
+      const mine = sessionRef.current;
+      const list = await participantsAction(core, account, mine, action, identity).catch(overEnded);
+      applyPeople(mine, { participants: list });
+      return list;
+    };
+    const hand = async (action, identity) => {
+      const mine = sessionRef.current;
+      const out = await handoverAction(core, account, mine, action, identity).catch(overEnded);
+      applyPeople(mine, { driver: out.driver, participants: out.participants, offer: out.offer });
+      return out;
+    };
+    return {
+      invite: (identity) => roster('invite', identity),
+      join: () => roster('join'),
+      leave: () => roster('leave'),
+      remove: (identity) => roster('remove', identity),
+      offer: (identity) => hand('offer', identity),
+      cancelOffer: () => hand('cancel'),
+      accept: () => hand('accept'),
+      decline: () => hand('decline'),
+      takeOver: () => hand('take_over'),
+      escalate: (note) => openEscalation(core, account, sessionRef.current, note),
+    };
+  }, [core, account, applyPeople]);
 
   const watchTask = useCallback((id) => { setTask(null); setFrame(null); setTaskId(id); }, []);
 
   const activity = useMemo(() => mergeActivity({ log: status?.log ?? [], task }), [status, task]);
 
   return {
-    sessionId, taskId, status, statusError, ended, attached, isDriver, task, taskLive, frame, frameWaiting, shot,
+    sessionId, taskId, status, statusError, ended, attached, isDriver, role, mayEnd, isWatcher, participants, offer, watcherFrame, frameProblem, people,
+    task, taskLive, frame, frameWaiting, shot,
     stopped, stoppedMessage, resumeShots, activity, control, refreshStatus, watchTask, lookForTask, holdScreenshots, releaseScreenshots,
   };
 }

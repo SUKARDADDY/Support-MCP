@@ -132,14 +132,20 @@ jobs:
       - name: Test the Rust core
         working-directory: technician-app/src-tauri
         run: cargo test --locked
+      # The Rust cache restores target/, old installers included, so the bundle folder is
+      # cleared before each build and the installer is picked by this version's file name.
       - name: Build the installer
         working-directory: technician-app
-        run: npx tauri build
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force src-tauri/target/release/bundle -ErrorAction SilentlyContinue
+          npx tauri build
       - name: Check the installer is under 25 MB
         shell: pwsh
         run: |
-          $installer = Get-ChildItem technician-app/src-tauri/target/release/bundle/nsis -Filter *-setup.exe | Select-Object -First 1
-          if (-not $installer) { throw 'tauri build made no NSIS installer' }
+          $version = (Get-Content technician-app/package.json -Raw | ConvertFrom-Json).version
+          $installer = Get-Item "technician-app/src-tauri/target/release/bundle/nsis/Support_${version}_x64-setup.exe" -ErrorAction SilentlyContinue
+          if (-not $installer) { throw "tauri build made no NSIS installer for $version" }
           $mb = [math]::Round($installer.Length / 1MB, 2)
           "$($installer.Name) is $mb MB"
           if ($installer.Length -ge 25MB) { throw "the installer is $mb MB, over the 25 MB limit" }
@@ -158,7 +164,10 @@ jobs:
         working-directory: technician-app
         env:
           SUPPORT_DEFAULT_RELAY: http://127.0.0.1:8787
-        run: npx tauri build --features e2e
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force src-tauri/target/release/bundle -ErrorAction SilentlyContinue
+          npx tauri build --features e2e
       - name: Install Playwright's Chromium
         working-directory: technician-app
         run: npx playwright install chromium
@@ -166,7 +175,8 @@ jobs:
         id: install
         shell: pwsh
         run: |
-          $setup = Get-ChildItem technician-app/src-tauri/target/release/bundle/nsis -Filter *-setup.exe | Select-Object -First 1
+          $version = (Get-Content technician-app/package.json -Raw | ConvertFrom-Json).version
+          $setup = Get-Item "technician-app/src-tauri/target/release/bundle/nsis/Support_${version}_x64-setup.exe"
           Start-Process -FilePath $setup.FullName -ArgumentList '/S' -Wait
           $dirs = @("$env:LOCALAPPDATA\Support", "$env:LOCALAPPDATA\Programs\Support")
           $exe = $dirs | Where-Object { Test-Path $_ } | ForEach-Object { Get-ChildItem $_ -Filter *.exe } | Where-Object { $_.Name -notmatch '^uninstall' } | Select-Object -First 1

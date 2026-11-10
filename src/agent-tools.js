@@ -5,7 +5,8 @@
 // Not the agent's: type_secret (a background task has no operator who gave it a
 // secret), block_input, send_sas and request_full_control (these need a person),
 // the tools that make, list or end sessions and the saved-PC tools (the runner
-// owns the session), and the agent's own tools. Team settings are never a tool.
+// owns the session), the tools that invite, hand over and escalate (a person's decisions),
+// and the agent's own tools. Team settings are never a tool.
 import { listTools } from './mcp.js';
 import { auditText, normalizeAction } from './screen.js';
 
@@ -16,6 +17,8 @@ export const OUTCOMES = Object.freeze(['done', 'stuck', 'needs_human']);
 const NOT_THE_AGENTS = new Set([
   'type_secret', 'block_input', 'send_sas', 'request_full_control', 'session_create', 'session_list', 'session_end',
   'device_list', 'device_connect', 'agent_start', 'agent_status', 'agent_control',
+  // The team's tools for people: who is on a session, handing it over, and the queue. A person's decisions.
+  'people_list', 'session_participants', 'session_handover', 'escalation',
 ]);
 
 // A sentence that names a tool the agent does not have is dropped from a

@@ -15,6 +15,10 @@
 // codes and waiting PCs. A log detail holds names and ids, never a code, a key
 // or a field value.
 //
+// Watching a saved PC's session and moving its driver follow one rule (sessionRule, below), and the
+// move itself is one guarded change (handOver) that changes the PC's pointer, any queue item
+// claimed with it, and the team log together.
+//
 // Three of these changes also raise a notification for the people who should hear of
 // it (src/notify.js): a PC asking to join, a PC leaving, and a saved-PC session that
 // ended early. Their rows go into the same batch as the change, ahead of the
@@ -957,18 +961,22 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
         }
         if (live && !takeOver) throw new TeamError(409, 'connected', `${live.by} is connected`);
         if (live) {
+          // Every driver change takes the next generation, a take-over too, also by the person who already drives: a handover
+          // that began earlier can then never finish after it. The guard holds the generation the plan read, so the number
+          // the Session is told is the one the pointer took.
+          const gen = (live.gen ?? 0) + 1;
           return {
             entries: [{ kind: 'device_session_taken_over', detail: `${id} ${JSON.stringify(cur.name)} from ${live.by}` }],
             guard: and(
               base,
               actorHas(slug, actor, UNATTENDED_PERMISSION),
-              ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND status = 'active' AND json_extract(session, '$.id') = ? AND json_extract(session, '$.expires_at') > ?)", [slug, id, live.id, now]],
+              ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND status = 'active' AND json_extract(session, '$.id') = ? AND json_extract(session, '$.expires_at') > ? AND COALESCE(json_extract(session, '$.gen'), 0) = ?)", [slug, id, live.id, now, gen - 1]],
             ),
             change: ([cond, params]) => [q(
-              `UPDATE devices SET session = json_set(session, '$.by', ?) WHERE workspace = ? AND id = ? AND ${cond}`,
-              actor, slug, id, ...params,
+              `UPDATE devices SET session = json_set(session, '$.by', ?, '$.gen', ?) WHERE workspace = ? AND id = ? AND ${cond}`,
+              actor, gen, slug, id, ...params,
             )],
-            result: { takeover: true, session_id: live.id, ask: live.ask },
+            result: { takeover: true, session_id: live.id, ask: live.ask, gen },
           };
         }
         // The session asks unless the PC is set to any time, the caller did not
@@ -1009,7 +1017,8 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
     if (made && result.session_id !== made.sid) await hooks.discardSession(slug, made.sid);
     let state = 'waiting';
     if (result.takeover) {
-      const t = await hooks.takeOver(slug, result.session_id, actor);
+      const t = await hooks.takeOver(slug, result.session_id, actor, result.gen);
+      if (t?.stale) throw new TeamError(409, 'busy', 'control changed hands while this take-over was on its way; check who drives, then connect again');
       if (!t || t.ok !== true) throw new TeamError(409, 'ended', 'that session has just ended; connect again');
       state = t.state === 'attached' ? 'attached' : 'waiting';
     }
@@ -1052,7 +1061,155 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
       expiresAt, slug, deviceId, sid).run();
   }
 
+  // ---- watching a session, and moving who drives it ---------------------------------------
+  // The one rule for watching a session and for becoming its driver (used for a join, the picture, an
+  // accept and a claim). `watch` is what the Session's /watch said. The person must
+  //   - be a member who holds sessions.control, with the second factor that brings (caps.factor);
+  //   - be on a live session of this team: a saved PC's, or a one-off session that has a driver;
+  //   - on a saved PC whose pointer says ask:false (the owner was never asked), also hold
+  //     sessions.unattended with its second factor;
+  //   - to become the driver (driving), find the session attached: only then has the PC let the session in.
+  // An invited person's second factor is checked here, when they act, because it belongs to their own
+  // sign-in; at invite time only their role is checked (mayInvite).
+  // A missing second factor is its own refusal, `second_factor` (as the API says it), not a missing role.
+  const factorFor = async (caps, permission) => {
+    try {
+      await caps.factor?.(permission);
+    } catch (e) {
+      throw new TeamError(403, 'second_factor', e.message);
+    }
+  };
+  const UNASKED = 'This PC was connected without asking its owner. Only people allowed to connect without asking can join.';
+  const LIVE_STATES = ['pending', 'consumed', 'waiting', 'attached'];
+
+  async function sessionRule(slug, personIdentity, sid, watch, caps = {}, { driving = false } = {}) {
+    const person = normalizeIdentity(personIdentity);
+    if (!LIVE_STATES.includes(watch.state)) throw new TeamError(404, 'not_found', 'no such live session');
+    if (!(await holds(slug, person, 'sessions.control'))) throw new TeamError(403, 'cannot_control', 'your role does not allow sessions.control');
+    await factorFor(caps, 'sessions.control');
+    let pointer = null;
+    if (watch.device_id) {
+      pointer = await liveSession(slug, watch.device_id);
+      if (!pointer || pointer.id !== sid) throw new TeamError(404, 'not_found', 'no such live session');
+      if (pointer.ask === false) {
+        if (!(await holds(slug, person, UNATTENDED_PERMISSION))) throw new TeamError(403, 'needs_unattended', UNASKED);
+        await factorFor(caps, UNATTENDED_PERMISSION);
+      }
+    } else if (!watch.driver) {
+      throw new TeamError(403, 'not_driver', 'this session has no driver, so there is nothing to join');
+    }
+    if (driving && watch.state !== 'attached') throw new TeamError(409, 'not_attached', 'control moves only once the PC has let the session in');
+    return { pointer };
+  }
+
+  // The invite checks the target's role only: a person who holds sessions.control (and sessions.unattended
+  // on a saved PC that was never asked). Their second factor is checked when they join.
+  async function mayInvite(slug, targetIdentity, sid, watch) {
+    const target = normalizeIdentity(targetIdentity);
+    if (!LIVE_STATES.includes(watch.state)) throw new TeamError(404, 'not_found', 'no such live session');
+    // A person is whom the team stored as a person, the same field people_list reads, so the two cannot disagree.
+    // (addMember and the first-admin bootstrap store the kind from the name's shape, so a name with no "@" such as
+    // local-dev is a service when added through the API; only a hand-made row can say otherwise.)
+    const member = await team.getMember(slug, target);
+    if (member?.kind !== 'person' || !(await holds(slug, target, 'sessions.control'))) {
+      throw new TeamError(403, 'cannot_control', `${target} is not a member who can control sessions`);
+    }
+    if (watch.device_id) {
+      const pointer = await liveSession(slug, watch.device_id);
+      if (!pointer || pointer.id !== sid) throw new TeamError(404, 'not_found', 'no such live session');
+      if (pointer.ask === false && !(await holds(slug, target, UNATTENDED_PERMISSION))) {
+        throw new TeamError(403, 'needs_unattended', `${target} cannot join: this PC was connected without asking its owner, and they may not connect without asking`);
+      }
+    }
+  }
+
+  // Move the driver of a live session to the caller. One guarded change: the caller still holds
+  // sessions.control (and sessions.unattended when the rule asks for it), the workspace is not stopped,
+  // and on a saved PC the pointer is the session's and still names `from` as its driver, so the claim
+  // of a take-over that landed first fails and the caller is told who drives now (not_driver). Any
+  // queue item the move is part of goes in the same batch (extra: { check(), entries, guard, statements(proof) };
+  // check runs on every attempt and throws a refusal when the item is no longer free), so the item is
+  // claimed exactly when control moves.
+  //
+  // kind: accept (an offer), claim (a queue item) or take_over (an admin, on a one-off session). A
+  // saved PC's take-over is device_connect. Returns { moved }; moved is false when the PC's record
+  // already names the caller, which is what a retry after a failed session step finds.
+  async function handOver(slug, actorIdentity, { sid, deviceId = null, from = null, fromGen = null, kind, extra = null, settleOnly = false }, caps = {}) {
+    if (!['accept', 'claim', 'take_over'].includes(kind) || (kind === 'take_over' && deviceId)) throw new TypeError('bad handover kind');
+    const actor = normalizeIdentity(actorIdentity);
+    const was = normalizeIdentity(from);
+    return mutate(slug, actor, async () => {
+      const ctx = await actorContext(slug, actor, 'sessions.control');
+      if ((await team.stopState(slug)).stopped) throw new TeamError(409, 'stopped', STOPPED_MESSAGE);
+      await extra?.check?.();
+      let pointer = null;
+      let name = '';
+      let gen = null; // the generation the pointer takes
+      if (deviceId) {
+        const cur = await q('SELECT * FROM devices WHERE workspace = ? AND id = ?', slug, deviceId).first();
+        pointer = cur && cur.status === 'active' ? livePointer(cur) : null;
+        if (!pointer || pointer.id !== sid) throw new TeamError(404, 'not_found', 'that session is no longer live on the PC');
+        const had = pointer.gen ?? 0;
+        if (pointer.by === actor) {
+          // The pointer already names the caller. One from before generations existed (or not above the one the move
+          // began from) takes the next number now, so the Session can adopt it: the move was proven by the full guard
+          // that wrote the name, and this changes nothing else.
+          if (fromGen !== null && had <= fromGen) {
+            const r = await q(
+              "UPDATE devices SET session = json_set(session, '$.gen', ?) WHERE workspace = ? AND id = ? AND json_extract(session, '$.id') = ? AND json_extract(session, '$.by') = ? AND COALESCE(json_extract(session, '$.gen'), 0) = ?",
+              fromGen + 1, slug, deviceId, sid, actor, had).run();
+            if (r.meta.changes !== 1) throw new TeamError(403, 'not_driver', 'control changed hands since this began');
+            return { noop: true, result: { moved: false, gen: fromGen + 1 } };
+          }
+          return { noop: true, result: { moved: false, gen: had } };
+        }
+        // Finishing a step that an earlier try began must never start a move of its own.
+        if (settleOnly) throw new TeamError(403, 'not_driver', `${pointer.by} is driving this session`);
+        // Who drives, and in which generation: a take-over since the accept or claim was marked, even one that gave the
+        // pointer back to the same person, changed the generation and ends this move.
+        if (pointer.by !== was) throw new TeamError(403, 'not_driver', `${pointer.by} is driving this session`);
+        if (fromGen !== null && had !== fromGen) throw new TeamError(403, 'not_driver', 'control changed hands since this began');
+        gen = had + 1;
+        name = cur.name;
+        if (pointer.ask === false) {
+          if (!(await holds(slug, actor, UNATTENDED_PERMISSION))) throw new TeamError(403, 'needs_unattended', UNASKED);
+          await factorFor(caps, UNATTENDED_PERMISSION);
+        }
+      }
+      if (kind === 'take_over') {
+        if (!(await holds(slug, actor, UNATTENDED_PERMISSION))) throw new TeamError(403, 'needs_unattended', `taking over needs ${UNATTENDED_PERMISSION}. Ask the driver to offer control instead.`);
+        await factorFor(caps, UNATTENDED_PERMISSION);
+      }
+      const detail = deviceId ? `${deviceId} ${JSON.stringify(name)} from ${pointer.by} to ${actor}` : `${sid.slice(0, 8)}${was ? ` from ${was}` : ''} to ${actor}`;
+      const proof = deviceId
+        ? ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND json_extract(session, '$.id') = ? AND json_extract(session, '$.by') = ? AND COALESCE(json_extract(session, '$.gen'), 0) = ?)", [slug, deviceId, sid, actor, gen]]
+        : null;
+      return {
+        entries: [...(extra?.entries ?? []), { kind: deviceId ? 'device_session_handed_over' : kind === 'take_over' ? 'session_taken_over' : 'session_handed_over', detail }],
+        guard: and(
+          actorHas(slug, actor, 'sessions.control'),
+          actorUnchanged(slug, ctx),
+          notStopped(slug),
+          deviceId
+            ? ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND status = 'active' AND json_extract(session, '$.id') = ? AND json_extract(session, '$.by') = ? AND json_extract(session, '$.expires_at') > ? AND json_extract(session, '$.ask') IS ? AND COALESCE(json_extract(session, '$.gen'), 0) = ?)",
+              [slug, deviceId, sid, pointer.by, Date.now(), pointer.ask === false ? 0 : pointer.ask === true ? 1 : null, gen - 1]]
+            : lit(true),
+          pointer?.ask === false || kind === 'take_over' ? actorHas(slug, actor, UNATTENDED_PERMISSION) : lit(true),
+          extra?.guard ?? lit(true),
+        ),
+        // The PC's pointer moves first. What reads the guard comes after it only on the proof that it moved:
+        // the guard itself no longer holds once the pointer names the caller.
+        change: (cond) => [
+          ...(deviceId ? [q(`UPDATE devices SET session = json_set(session, '$.by', ?, '$.gen', ?) WHERE workspace = ? AND id = ? AND ${cond[0]}`, actor, gen, slug, deviceId, ...cond[1])] : []),
+          ...(extra ? extra.statements(proof ?? cond) : []),
+        ],
+        result: { moved: true, gen },
+      };
+    });
+  }
+
   return {
+    sessionRule, mayInvite, handOver,
     connect, sessionEnded, pinSessionEnd,
     listRecords, getRecord, addRecord, updateRecord, removeRecord,
     listFields, addField, updateField, removeField,

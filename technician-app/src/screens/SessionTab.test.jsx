@@ -48,7 +48,7 @@ describe('Session tab: watching the screen yourself', () => {
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
     for (const b of screen.getAllByRole('button')) expect(b.textContent).not.toMatch(/click|type|keyboard|mouse|press|run command/i);
     const names = new Set(fake.calls.filter((c) => c.kind === 'tool').map((c) => c.args[0]));
-    for (const n of names) expect(['device_list', 'session_status', 'screenshot', 'agent_status', 'session_end', 'device_connect']).toContain(n);
+    for (const n of names) expect(['device_list', 'session_status', 'screenshot', 'agent_status', 'session_end', 'device_connect', 'people_list', 'session_participants', 'session_handover', 'escalation']).toContain(n);
   });
 
   test('stops taking pictures while the tab is hidden, and starts again when it is shown', async () => {
@@ -80,11 +80,62 @@ describe('Session tab: watching the screen yourself', () => {
     let n = 0;
     fake.state.screenshot = () => { if (++n >= 2) throw new ToolFail('lead@example.com is driving this session; use device_connect with take_over'); return { data: {}, image: { mime: 'image/png', data: 'QUJD' } }; };
     await openTab(fake);
-    expect(await screen.findByText(/is driving this PC now, so this tab stopped taking pictures/)).toBeInTheDocument();
+    // The status still names this person (it is not refreshed here), so the caption does not name them as the other driver.
+    expect(await screen.findByText(/Someone else may be driving now, so this tab stopped taking pictures/)).toBeInTheDocument();
+    expect(screen.queryByText(/is driving this PC now/)).not.toBeInTheDocument();
     const calls = toolCalls(fake, 'screenshot').length;
     await sleep(120);
     expect(toolCalls(fake, 'screenshot').length).toBe(calls);
     expect(screen.getByRole('button', { name: 'Try the screen again' })).toBeInTheDocument();
+  });
+
+  test('a picture refused because someone else drives refreshes the status and shows the watcher view, with no raw text and no Try again', async () => {
+    const fake = fakeCore();
+    const LEAD = 'lead@example.com';
+    const person = (identity, role) => ({ identity, name: null, role, since: Date.now() - 30000 });
+    // The tab still believes it drives (a slow status poll) when the relay refuses the picture; the fresh status says it watches.
+    let taken = false;
+    fake.state.sessionStatus = (args) => (taken && args.log_tail === 60
+      ? { state: 'attached', driver: LEAD, participants: [person(LEAD, 'driver'), person('tech@example.com', 'watcher')], log: [] }
+      : { state: 'attached', driver: 'tech@example.com', log: [] });
+    fake.state.screenshot = () => { taken = true; throw new ToolFail('lead@example.com is driving this session; use device_connect with take_over'); };
+    await openTab(fake, { tuning: { ...FAST, statusMs: 60000 } });
+    expect(await screen.findByText(/You are watching\./)).toBeInTheDocument();
+    expect(screen.queryByText(/use device_connect with take_over/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Try the screen again' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Leave' })).toBeInTheDocument();
+    const calls = toolCalls(fake, 'screenshot').length;
+    await sleep(100);
+    expect(toolCalls(fake, 'screenshot').length).toBe(calls);
+  });
+
+  test('a picture or an answer that says the session ended refreshes the status at once, and the header and toolbar show it', async () => {
+    const fake = fakeCore();
+    fake.state.screenshot = () => { fake.state.sessions[SID].state = 'ended'; throw new ToolFail('session ended'); };
+    await openTab(fake, { tuning: { ...FAST, statusMs: 60000 } });
+    expect(await screen.findByText('Ended')).toBeInTheDocument();
+    expect(screen.queryByText('You are driving')).not.toBeInTheDocument();
+    expect(screen.queryByText('session ended')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Close tab' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'End session' })).not.toBeInTheDocument();
+    expect(toolCalls(fake, 'screenshot')).toHaveLength(1);
+  });
+
+  test('text from the PC that only contains the relay\'s words in another sentence is a passing failure, not a stop', async () => {
+    const fake = fakeCore();
+    const texts = [
+      'The printer said: session ended unexpectedly',
+      'Spooler: agent busy; try later',
+      'Chrome title: lead@example.com is driving this session; use device_connect',
+      'Error: no such live session was found for that window',
+    ];
+    let n = 0;
+    fake.state.screenshot = () => { throw new ToolFail(texts[n++ % texts.length]); };
+    await openTab(fake);
+    // Three in a row stop the loop as a failure; a stop for the words themselves would have come after one.
+    expect(await screen.findByText(/Taking pictures failed several times in a row/)).toBeInTheDocument();
+    expect(toolCalls(fake, 'screenshot')).toHaveLength(3);
+    expect(screen.queryByText(/Checking…/)).not.toBeInTheDocument();
   });
 
   test('stops at once on "agent busy", and Try again starts the pictures again', async () => {
@@ -94,11 +145,33 @@ describe('Session tab: watching the screen yourself', () => {
     fake.state.screenshot = () => { if (busy) throw new ToolFail('agent busy; wait for the current operation'); return { data: {}, image: { mime: 'image/png', data: 'QUJD' } }; };
     await openTab(fake);
     expect(await screen.findByText(/The PC is busy with the agent/)).toBeInTheDocument();
-    const calls = toolCalls(fake, 'screenshot').length;
-    expect(calls).toBe(1);
+    expect(toolCalls(fake, 'screenshot')).toHaveLength(1);
+    await sleep(100);
+    expect(toolCalls(fake, 'screenshot')).toHaveLength(1);
     busy = false;
     await user.click(screen.getByRole('button', { name: 'Try the screen again' }));
     expect(await screen.findByRole('img', { name: 'Screen of Front counter' })).toBeInTheDocument();
+  });
+
+  test('the stop holds even when the screen is slow to draw it: no second picture is asked for in between', async () => {
+    const fake = fakeCore();
+    fake.state.screenshot = () => { throw new ToolFail('agent busy; wait for the current operation'); };
+    fake.state.sessions[SID] = { state: 'attached', driver: 'tech@example.com', machine: 'FRONT', log: [] };
+    const props = { core: fake.core, account: 'acc1', tab: { key: SID, sessionId: SID, taskId: null }, active: true, me: { identity: 'tech@example.com' }, canControl: true, tuning: FAST, visible: true, onSessionKnown: () => {} };
+    // Drawing the stopped state takes longer than the time between pictures, so the next tick is due before the loop is switched off.
+    // Only the first render of the stopped state is slow: that is the window the stop must hold through.
+    let drawnSlowly = false;
+    const { result } = renderHook(() => {
+      const r = useSession(props);
+      if (r.stopped && !drawnSlowly) { drawnSlowly = true; for (const end = performance.now() + 150; performance.now() < end;); }
+      return r;
+    });
+    await waitFor(() => expect(result.current.stopped).toBe('busy'));
+    await sleep(100);
+    expect(toolCalls(fake, 'screenshot')).toHaveLength(1);
+    // Try again clears the stop, and the pictures are asked for again.
+    act(() => result.current.resumeShots());
+    await waitFor(() => expect(toolCalls(fake, 'screenshot').length).toBeGreaterThanOrEqual(2));
   });
 
   test('a passing failure is retried, and three in a row stop the loop', async () => {

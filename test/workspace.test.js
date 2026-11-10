@@ -114,7 +114,7 @@ test('tools/list never touches the team database', async () => {
   const r = await handler.fetch(new Request('http://127.0.0.1:8787/mcp', {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
   }), { DEV_SKIP_ACCESS: '1', DB: trap, ...fakeSessions() });
-  assert.equal((await r.json()).result.tools.length, 27);
+  assert.equal((await r.json()).result.tools.length, 31);
 });
 
 test('a tool call without a team database is refused and never reaches a session', async () => {
@@ -1040,7 +1040,8 @@ async function twoWorkspaces() {
 test('every tool that takes a session is separate per workspace; a session from another one answers as a missing session', async () => {
   const { w, sid } = await twoWorkspaces();
   // agent_start takes a session_id too, but only to name the session a task works in: it is tested with the agent.
-  const tools = listTools({ ui: true }).filter((t) => t.name !== 'agent_start' && Object.hasOwn(t.inputSchema.properties, 'session_id')).map((t) => t.name);
+  // The team's tools for people are members-only, and their cross-team answers are tested with them (participants.test.js, handover.test.js).
+  const tools = listTools({ ui: true }).filter((t) => !['agent_start', 'escalation', 'session_participants', 'session_handover'].includes(t.name) && Object.hasOwn(t.inputSchema.properties, 'session_id')).map((t) => t.name);
   assert.deepEqual([...tools].sort(), Object.keys(SESSION_TOOLS).sort(), 'a new session tool needs a line in SESSION_TOOLS');
   const missing = 'f'.repeat(64);
   // A session that does not exist answers the same way from any workspace.
@@ -1135,7 +1136,7 @@ test('tools/list on any well-formed workspace address never touches the database
     const r = await handler.fetch(new Request(`http://127.0.0.1:8787${path}`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
     }), env);
-    assert.equal((await r.json()).result.tools.length, 27, path);
+    assert.equal((await r.json()).result.tools.length, 31, path);
   }
 });
 

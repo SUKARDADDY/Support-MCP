@@ -489,7 +489,10 @@ describe('a tab whose session has ended', () => {
     renderApp(fake);
     await userEvent.setup().click(await screen.findByRole('tab', { name: /Front counter/ }));
     expect(await screen.findByText('You are driving')).toBeInTheDocument();
-    expect(await screen.findByText('session ended')).toBeInTheDocument(); // three failed pictures stop the loop with that message
+    // The picture failed with "session ended" while the status still says attached: the loop stops after that one refusal,
+    // in the app's words, not the tool's, until the status confirms.
+    expect(await screen.findByText('The relay says this session ended. Checking…')).toBeInTheDocument();
+    expect(screen.queryByText('session ended')).not.toBeInTheDocument();
     over = true;
     expect(await screen.findByText('The session ended.')).toBeInTheDocument();
     expect(screen.queryByText('You are driving')).not.toBeInTheDocument();

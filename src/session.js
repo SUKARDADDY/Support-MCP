@@ -28,6 +28,19 @@
 // pointer and writes the team log row, retrying from its alarm until that works.
 // /consume and /j/ refuse it.
 //
+// A one-off link session made by a team member has a driver too: its creator. It is
+// stored like a saved PC's, and the same refusal applies to everyone else's commands. The
+// driver is never sent to the PC (poll answers and the welcome carry it for a saved PC only),
+// so the person at a one-off PC keeps seeing the generic notice and never a technician's
+// name. A session whose storage has no driver key (made before this rule, or in open mode)
+// keeps today's behaviour: any holder of sessions.control may command it.
+//
+// A session also keeps who else is on it: people the driver invited (`invited`), those who
+// joined (`watcher`), one pending offer of control, and the last handover. Those live in
+// this object's storage and end with the session. The last full screenshot is held in
+// memory only (this.frame), never in storage, replaced by no zoom, and dropped when the
+// session ends or the object is evicted.
+//
 // A session belongs to the team workspace that created it (`workspace`, stored
 // at create; a session without one is in "default"). Operator calls to
 // /status, /command and /end name their workspace, and a call from another
@@ -55,6 +68,9 @@ const STOP_CHECK_MS = 20 * 1000; // at most this often a poll reads whether the 
 const STOP_ALARM_MS = 30 * 1000; // an attached PowerShell session wakes this often to check, since a quiet socket sends nothing
 const SCREENSHOT_FOLD_MS = 60 * 1000; // a screenshot this soon after the same person's last one joins its log row
 const CLEANUP_RETRY_MS = 30 * 1000; // a saved-PC session retries clearing its pointer this often
+const OFFER_MS = 2 * 60 * 1000; // an offer of control lasts this long
+const ACCEPTING_MS = 30 * 1000; // an accept or a claim holds the session this long while the PC's record changes
+const PEOPLE_MAX = 20; // people on a session besides its driver, invited or watching
 const DECLINE_REASONS = ['declined', 'nobody', 'busy']; // what a PC may say before hello
 const RESULT_SLACK_MS = 15 * 1000; // relay waits timeout_s + this
 const HTTP_SEEN_MS = 60 * 1000; // app mode: a client counts as attached this long after its last request
@@ -104,7 +120,13 @@ export class Session {
     this.pending = new Map(); // uuid -> {resolve, tag}
     this.httpCommands = { cmd: null, screen: null }; // app mode: per lane, {frame, tag, sent_at} waiting for its result
     this.httpPoll = null; // app mode: the parked long poll, if any, {resolve, timer, busy}
-    this.driver = undefined; // saved PC: who drives (undefined: not read yet, null: a one-off session)
+    this.gen = 0; // the driver generation (see applyDriver); read with the driver
+    this.driver = undefined; // who drives (undefined: not read yet, null: nobody; a one-off session may have none)
+    this.device = false; // a saved-PC session (read with the driver)
+    this.people = undefined; // participants, offer, accepting, handed_over: read once, then kept here and in storage
+    this.frame = null; // the last full screenshot { rev, at, mime, data }, in memory only: never in storage
+    this.frameRev = 0;
+    this.over = false; // the session ended: no picture is kept after that
     this.stopCheckedAt = 0; // when a poll last read whether the workspace is stopped
     this.sql.exec(`CREATE TABLE IF NOT EXISTS log(ts INTEGER, kind TEXT, detail TEXT)`);
   }
@@ -268,6 +290,9 @@ export class Session {
       if (p === '/end') return await this.doEnd(request);
       if (p === '/takeover') return await this.doTakeover(request);
       if (p === '/watch') return await this.doWatch(url);
+      if (p === '/people') return await this.doPeople(request);
+      if (p === '/handover') return await this.doHandover(request);
+      if (p === '/frame') return await this.doFrame(url);
     } catch (e) {
       return Response.json({ ok: false, error: String(e && e.message ? e.message : e) }, { status: 500 });
     }
@@ -290,6 +315,7 @@ export class Session {
       return Response.json({ ok: false, error: 'bad workspace' }, { status: 400 });
     }
     const now = Date.now();
+    this.people.created_at = now;
     this._ttlOverride = Number(b.ttl_ms) > 0 ? Number(b.ttl_ms) : 0;
     // A saved PC's session: no link, no key, no consume. It waits for the PC.
     const device = b.device_id !== undefined;
@@ -299,11 +325,13 @@ export class Session {
       }
       const waitingUntil = now + this.ttlMs(WAITING_MS);
       this.driver = sameIdentity(b.driver);
+      this.device = true;
+      this.people.driver_since = now;
       await this.setMany({
         code: b.code, sid: b.sid, label: b.label ?? null, state: 'waiting', created_at: now, created_by: b.actor ?? null,
         workspace, waiting_expires_at: waitingUntil, ttl_ms: this._ttlOverride, machine: null, user: null, ps: null,
         windows_mode: 'app', transport: null, http_generation: 0, http_seen_at: 0, elevated: null, expires_at: null, ws_gen: 0,
-        device_id: b.device_id, device_name: truncate(String(b.device_name ?? ''), 100), driver: this.driver,
+        device_id: b.device_id, device_name: truncate(String(b.device_name ?? ''), 100), driver: this.driver, driver_since: now,
         // The built-in agent task whose connect made this session, so a task finds its own after a crash.
         opened_by_task: typeof b.opened_by_task === 'string' ? truncate(b.opened_by_task, 64) : null,
       });
@@ -313,7 +341,13 @@ export class Session {
       return Response.json({ ok: true, sid: b.sid, waiting_until: waitingUntil });
     }
     const codeExpiry = now + this.ttlMs(CODE_TTL_MS);
+    // A link session made by a team member is driven by its creator. A caller that names no driver (open
+    // mode) leaves the key out, and the session stays open to anyone who holds sessions.control.
+    const driver = typeof b.driver === 'string' && sameIdentity(b.driver) ? sameIdentity(b.driver) : null;
+    this.driver = driver;
+    if (driver) this.people.driver_since = now;
     await this.setMany({
+      ...(driver ? { driver, driver_since: now } : {}),
       code: b.code,
       sid: b.sid,
       label: b.label ?? null,
@@ -460,7 +494,11 @@ export class Session {
     const attached = s.get('transport') === 'https-poll'
       ? s.get('state') === 'attached' && Date.now() - (s.get('http_seen_at') || 0) < HTTP_SEEN_MS
       : !!(await this.currentSocket());
-    return Response.json(statusBody(s, rows, attached));
+    // An ended session has no people: its roster, offer and picture go with it.
+    const over = s.get('state') === 'ended';
+    return Response.json(statusBody(s, rows, attached, {
+      participants: over ? [] : this.roster(), offer: over ? null : this.offerView(), frame_rev: this.frame ? this.frame.rev : null, frame_at: this.frame ? this.frame.at : null,
+    }));
   }
 
   async doCommand(request) {
@@ -469,9 +507,11 @@ export class Session {
     await this.expireIfDue();
     const state = await this.get('state');
     if (state === 'ended' || state === undefined) return Response.json({ ok: false, error: 'session ended' });
-    // One technician drives a saved PC's session at a time.
+    // One technician drives at a time: a saved PC's session, and a one-off session that has a driver.
     if (this.driver && sameIdentity(b.actor) !== this.driver) {
-      return Response.json({ ok: false, error: `${this.driver} is driving this session; use device_connect with take_over` });
+      return Response.json({ ok: false, error: `${this.driver} is driving this session; ${this.device
+        ? 'use device_connect with take_over'
+        : 'ask them to offer control with session_handover, or an admin can take over with session_handover'}` });
     }
     await this.noteActor(b.actor);
     // The built-in agent acts as the person who started its task. The log says so,
@@ -560,8 +600,24 @@ export class Session {
     }
     const result = await this.awaitResult(id, target, isHttp ? tag : this.socketTag(ws), frame, waitMs,
       b.op === 'control' ? { control_request: true } : {});
-    if (b.op === 'control' || b.op === 'screen') return Response.json(await this.finishScreen(result, action, who));
+    if (b.op === 'control' || b.op === 'screen') {
+      const out = await this.finishScreen(result, action, who);
+      this.holdFrame(action, out);
+      return Response.json(out);
+    }
     return Response.json(result);
+  }
+
+  // Keep the picture a screen action returned, for the people watching, if it is a full screenshot: a
+  // zoom is a piece of the screen and never replaces it, and nothing is kept for type_secret, whose
+  // picture may show what was typed. Memory only: this is never written to storage, and nothing is
+  // kept once the session has ended. rev only ever grows, also across a restart of this object, so a
+  // reader that has a picture can tell a new one by its rev.
+  holdFrame(action, result) {
+    if (!action || this.over || !result?.ok || typeof result.image_b64 !== 'string') return;
+    if (action.name === 'zoom' || action.name === 'type_secret') return;
+    this.frameRev = Math.max(this.frameRev + 1, Date.now());
+    this.frame = { rev: this.frameRev, at: Date.now(), mime: result.mime, data: result.image_b64 };
   }
 
   // Last touches on a screen or control result, before the operator sees it.
@@ -622,13 +678,265 @@ export class Session {
   }
 
   // A saved-PC session adds the driver to every poll answer, so the PC's corner
-  // window can show a take-over. A one-off session's frames are unchanged.
+  // window can show a take-over. A one-off session's frames are unchanged even when it has a
+  // driver: the person at that PC sees the generic notice, never a technician's name.
   withDriver(frame) {
-    return this.driver ? { ...frame, driver: this.driver } : frame;
+    return this.device && this.driver ? { ...frame, driver: this.driver } : frame;
   }
 
   async loadDriver() {
-    if (this.driver === undefined) this.driver = (await this.get('driver', null)) || null;
+    if (this.driver === undefined) {
+      this.driver = (await this.get('driver', null)) || null;
+      this.gen = (await this.get('driver_gen', 0)) || 0;
+      this.device = !!(await this.get('device_id', null));
+    }
+    if (this.people === undefined) {
+      const s = await this.ctx.storage.get(['participants', 'offer', 'accepting', 'handed_over', 'driver_since', 'created_at']);
+      this.people = {
+        participants: s.get('participants') ?? {}, offer: s.get('offer') ?? null, accepting: s.get('accepting') ?? null,
+        handed_over: s.get('handed_over') ?? null, driver_since: s.get('driver_since') ?? null, created_at: s.get('created_at') ?? null,
+      };
+    }
+  }
+
+  // ---- who is on the session -------------------------------------------------------
+  // The people of the session as the team sees them: the driver, then everyone else. `name` is filled in
+  // by the relay from the team's members; this object does not know it.
+  roster() {
+    const p = this.people;
+    const out = [];
+    if (this.driver) out.push({ identity: this.driver, name: null, role: 'driver', since: p.driver_since ?? p.created_at });
+    for (const [identity, who] of Object.entries(p.participants)) out.push({ identity, name: null, role: who.role, since: who.since });
+    return out;
+  }
+
+  // The offer of control that can still be accepted: not past its 2 minutes, unless its accept is in
+  // progress. null when there is none.
+  currentOffer() {
+    const { offer, accepting } = this.people;
+    if (!offer) return null;
+    return offer.expires_at > Date.now() || (accepting && accepting.until > Date.now() && accepting.to === offer.to) ? offer : null;
+  }
+
+  currentAccepting() {
+    const a = this.people.accepting;
+    return a && a.until > Date.now() ? a : null;
+  }
+
+  offerView() {
+    const o = this.currentOffer();
+    return o ? { to: o.to, by: o.by, expires_at: o.expires_at } : null;
+  }
+
+  savePeople() {
+    const { participants, offer, accepting, handed_over: handedOver, driver_since: driverSince } = this.people;
+    return this.setMany({ participants, offer, accepting, handed_over: handedOver, driver_since: driverSince });
+  }
+
+  // The answer for a person's call to /people or /handover that cannot go on: a session of another
+  // workspace and one that has ended both answer "no such live session".
+  async peopleGate(b) {
+    if (await this.otherWorkspace(b.workspace)) return refusal('not_found', 'no such live session');
+    await this.expireIfDue();
+    const state = await this.get('state');
+    if (state === undefined || state === 'ended') return refusal('not_found', 'no such live session');
+    return null;
+  }
+
+  // invite, join, leave and remove. The driver invites and removes; an invited person joins; a watcher leaves.
+  async doPeople(request) {
+    const b = await request.json().catch(() => ({}));
+    const gone = await this.peopleGate(b);
+    if (gone) return gone;
+    const actor = sameIdentity(b.actor);
+    const who = sameIdentity(b.identity);
+    const p = this.people;
+    const now = Date.now();
+    const done = (extra = {}) => Response.json({ ok: true, participants: this.roster(), ...extra });
+    if (b.action === 'invite' || b.action === 'remove') {
+      if (!this.driver || actor !== this.driver) return refusal('not_driver', this.driver ? `${this.driver} is driving this session; only the driver can ${b.action}` : 'this session has no driver');
+      if (!who) return refusal('bad_request', 'identity is required');
+      if (who === this.driver) return refusal('bad_request', 'that person is the driver');
+    }
+    if (b.action === 'invite') {
+      if (Object.hasOwn(p.participants, who)) return done({ changed: false, since: p.participants[who].since });
+      if (Object.keys(p.participants).length >= PEOPLE_MAX) return refusal('bad_request', `a session holds at most ${PEOPLE_MAX} people besides its driver`);
+      p.participants[who] = { role: 'invited', since: now, by: actor };
+      await this.savePeople();
+      this.logRow('invited', who, actor);
+      return done({ changed: true, since: now });
+    }
+    if (b.action === 'remove') {
+      if (!Object.hasOwn(p.participants, who)) return refusal('not_invited', 'that person is not on this session');
+      this.dropPerson(who);
+      await this.savePeople();
+      this.logRow('removed', who, actor);
+      return done({ changed: true });
+    }
+    if (b.action === 'join') {
+      if (actor && actor === this.driver) return done({ changed: false });
+      const me = Object.hasOwn(p.participants, actor) ? p.participants[actor] : null;
+      if (!me) return refusal('not_invited', 'you were not invited to this session');
+      if (me.role === 'watcher') return done({ changed: false });
+      p.participants[actor] = { role: 'watcher', since: now, by: me.by };
+      await this.savePeople();
+      this.logRow('joined', '', actor);
+      return done({ changed: true });
+    }
+    if (b.action === 'leave') {
+      if (actor && actor === this.driver) return refusal('not_invited', 'you are driving this session; offer control to someone, or end the session');
+      if (!Object.hasOwn(p.participants, actor)) return refusal('not_invited', 'you are not on this session');
+      this.dropPerson(actor);
+      await this.savePeople();
+      this.logRow('left', '', actor);
+      return done({ changed: true });
+    }
+    return refusal('bad_request', 'action must be invite, join, leave or remove');
+  }
+
+  // Take a person off the session, and any offer made to them.
+  dropPerson(identity) {
+    const p = this.people;
+    delete p.participants[identity];
+    if (p.offer && p.offer.to === identity) p.offer = null;
+    if (p.accepting && p.accepting.to === identity) p.accepting = null;
+  }
+
+  // The offer, its answer, and the three steps of moving control (see src/session-people.js). Control
+  // moves with `complete` only: `accepting` is the reservation made before the PC's record changes.
+  async doHandover(request) {
+    const b = await request.json().catch(() => ({}));
+    const gone = await this.peopleGate(b);
+    if (gone) return gone;
+    const actor = sameIdentity(b.actor);
+    const p = this.people;
+    const now = Date.now();
+    const state = await this.get('state');
+    const notDriver = () => refusal('not_driver', this.driver ? `${this.driver} is driving this session` : 'this session has no driver');
+    const ok = (extra = {}) => Response.json({ ok: true, driver: this.driver, participants: this.roster(), offer: this.offerView(), ...extra });
+
+    if (b.op === 'offer') {
+      if (!this.driver || actor !== this.driver) return notDriver();
+      const to = sameIdentity(b.to);
+      if (!to || to === this.driver) return refusal('bad_request', 'offer control to someone else on the session');
+      if (p.participants[to]?.role !== 'watcher') return refusal('not_invited', 'that person has not joined this session');
+      const pending = this.currentOffer();
+      if (this.currentAccepting()) return refusal('busy', 'control is being handed over right now');
+      if (pending && pending.to !== to) return refusal('offer_pending', `an offer to ${pending.to} is still open; cancel it first`);
+      if (!pending) {
+        p.offer = { to, by: actor, at: now, expires_at: now + OFFER_MS };
+        await this.savePeople();
+        this.logRow('offer', to, actor);
+      }
+      return ok({ changed: !pending, offer_at: this.currentOffer().at });
+    }
+    if (b.op === 'cancel') {
+      if (!this.driver || actor !== this.driver) return notDriver();
+      if (!this.currentOffer() || this.currentAccepting()) return refusal('no_offer', this.currentAccepting() ? 'that offer is being accepted' : 'there is no offer to cancel');
+      p.offer = null;
+      await this.savePeople();
+      this.logRow('offer cancelled', '', actor);
+      return ok();
+    }
+    if (b.op === 'decline') {
+      const offer = this.currentOffer();
+      if (!offer) return refusal('no_offer', 'there is no offer');
+      if (offer.to !== actor) return refusal('not_offered_to_you', 'that offer is not for you');
+      if (this.currentAccepting()) return refusal('no_offer', 'that offer is being accepted');
+      p.offer = null;
+      await this.savePeople();
+      this.logRow('offer declined', '', actor);
+      return ok();
+    }
+    if (b.op === 'accepting') {
+      if (state !== 'attached') return refusal('not_attached', 'control moves only once the PC has let the session in');
+      if (!this.driver) return notDriver();
+      if (actor === this.driver) return refusal('bad_request', 'you are already the driver');
+      const held = this.currentAccepting();
+      if (held && held.to !== actor) return b.claim && held.claim
+        ? refusal('already_claimed', 'someone else is claiming this session right now')
+        : refusal('busy', 'control is being handed over to someone else right now');
+      if (b.claim && b.claim.expect_driver !== undefined) {
+        // A claim takes control from the person who escalated, and only while they still drive.
+        if (sameIdentity(b.claim.expect_driver) !== this.driver) return notDriver();
+      } else {
+        const offer = this.currentOffer();
+        if (!offer) return refusal('no_offer', 'there is no offer');
+        if (offer.to !== actor) return refusal('not_offered_to_you', 'that offer is not for you');
+        if (offer.by !== this.driver) return refusal('no_offer', 'that offer is out of date');
+      }
+      p.accepting = { to: actor, from: this.driver, until: now + ACCEPTING_MS, claim: !!b.claim };
+      await this.savePeople();
+      return ok({ from: this.driver, gen: this.gen, device_id: await this.get('device_id', null) });
+    }
+    if (b.op === 'release') {
+      if (p.accepting && p.accepting.to === actor) {
+        p.accepting = null;
+        await this.savePeople();
+      }
+      return ok();
+    }
+    if (b.op === 'complete') {
+      // Three outcomes, so it can be repeated: the driver and the generation are those the step began from, so `actor`
+      // takes over; `actor` drives already, so nothing changes; anything else drives or has driven since (a take-over
+      // landed in between, even one by the same person who drove before), so it stops and the later change stands.
+      // `from_gen` is the generation the accept or claim marked, and `gen` the one the move gives (a saved PC's
+      // pointer has already taken it, and the Session adopts that number: it never makes one up). A call with no
+      // `from_gen` compares the driver only.
+      const to = actor;
+      if (!to) return refusal('bad_request', 'actor is required');
+      if (this.driver === to) {
+        if (p.accepting && p.accepting.to === to) {
+          p.accepting = null;
+          await this.savePeople();
+        }
+        return ok({ changed: false });
+      }
+      const takeOver = b.kind === 'take_over';
+      const checked = Number.isInteger(b.from_gen);
+      if (!this.driver || (!takeOver && this.driver !== sameIdentity(b.from)) || (checked && this.gen !== b.from_gen)) return notDriver();
+      if (checked && !(Number.isInteger(b.gen) && b.gen > this.gen)) return notDriver();
+      await this.applyDriver(to, { kind: takeOver ? 'take_over' : b.kind === 'claim' ? 'claim' : 'accept', gen: Number.isInteger(b.gen) ? b.gen : undefined });
+      return ok({ changed: true });
+    }
+    return refusal('bad_request', 'op must be offer, cancel, decline, accepting, release or complete');
+  }
+
+  // `next` becomes the driver. The one who drove watches now, `next` leaves the lists they were on, any offer
+  // is gone, and a saved PC is told at once so its corner window shows the new name. A handover (accept
+  // or claim) is recorded for the built-in agent, which stops quietly when its starter handed over; a
+  // take-over clears that record, so the agent raises its notice.
+  async applyDriver(next, { kind, gen }) {
+    const p = this.people;
+    const previous = this.driver;
+    const now = Date.now();
+    if (previous) p.participants[previous] = { role: 'watcher', since: now, by: next };
+    delete p.participants[next];
+    p.offer = null;
+    p.accepting = null;
+    p.handed_over = kind === 'take_over' ? null : { from: previous, to: next, at: now };
+    p.driver_since = now;
+    this.driver = next;
+    this.gen = Number.isInteger(gen) && gen > this.gen ? gen : this.gen + 1;
+    await this.setMany({ driver: next, driver_gen: this.gen });
+    await this.savePeople();
+    this.logRow(kind === 'take_over' ? 'driver' : 'handover', `${previous} to ${next}`);
+    if (this.device) this.replyToPoll({ type: 'idle' });
+  }
+
+  // The last full screenshot, to the driver or a person who joined, as { rev, at, mime, data }. The relay
+  // has already checked the person's role, second factor and the access rule; this object checks that they
+  // are on the session. A session of another workspace is no session, and an ended one has no picture.
+  async doFrame(url) {
+    const gone = await this.peopleGate({ workspace: url.searchParams.get('workspace') });
+    if (gone) return Response.json((await gone.json()), { status: 404 });
+    const actor = sameIdentity(url.searchParams.get('actor'));
+    const joined = this.people.participants[actor]?.role === 'watcher';
+    if (!actor || (actor !== this.driver && !joined)) {
+      return Response.json({ ok: false, code: 'not_invited', error: 'you are not on this session' }, { status: 403 });
+    }
+    if (!this.frame) return Response.json({ ok: false, code: 'no_frame', error: 'there is no picture yet' }, { status: 404 });
+    return Response.json({ rev: this.frame.rev, at: this.frame.at, mime: this.frame.mime, data: this.frame.data });
   }
 
   // Is this relay or this workspace stopped? EMERGENCY_STOP (any non-empty value)
@@ -902,13 +1210,21 @@ export class Session {
   async doWatch(url) {
     if (await this.otherWorkspace(url.searchParams.get('workspace'))) return Response.json({ state: 'unknown', actors: [] });
     await this.expireIfDue();
-    const s = await this.ctx.storage.get(['state', 'device_id', 'driver', 'ended_reason', 'actors', 'opened_by_task']);
+    const s = await this.ctx.storage.get(['state', 'device_id', 'device_name', 'driver', 'ended_reason', 'actors', 'opened_by_task']);
     return Response.json({
       state: s.get('state') ?? 'unknown',
       opened_by_task: s.get('opened_by_task') ?? null,
       ended_reason: s.get('ended_reason') ?? null,
       device_id: s.get('device_id') ?? null,
-      driver: s.get('device_id') ? s.get('driver') ?? null : null,
+      device_name: s.get('device_id') ? s.get('device_name') ?? null : null,
+      // A one-off session shows its driver here too (never to the PC), or null when it has none.
+      driver: s.get('driver') ?? null,
+      gen: this.gen,
+      // The reservation made before the PC's record changes, for the queue to tell a claim that is still finishing.
+      accepting: this.currentAccepting() ? { to: this.people.accepting.to, claim: !!this.people.accepting.claim } : null,
+      handed_over: this.people.handed_over,
+      participants: this.roster(),
+      offer: this.offerView(),
       actors: Object.entries(s.get('actors') ?? {}).map(([actor, ts]) => ({ actor, ts })),
     });
   }
@@ -918,20 +1234,38 @@ export class Session {
   async doTakeover(request) {
     let actor = null;
     let workspace;
+    let gen = null;
     try {
-      ({ actor = null, workspace } = await request.json());
+      ({ actor = null, workspace, gen = null } = await request.json());
     } catch (_) {}
     if (await this.otherWorkspace(workspace)) return Response.json({ ok: false });
     await this.expireIfDue();
     const state = await this.get('state');
     const next = sameIdentity(actor);
     if (!(await this.get('device_id', null)) || !['waiting', 'attached'].includes(state) || !next) return Response.json({ ok: false });
-    const previous = this.driver;
-    await this.setMany({ driver: next });
-    this.driver = next;
-    this.logRow('driver', `${previous} to ${next}`);
-    this.replyToPoll({ type: 'idle' });
-    return Response.json({ ok: true, state, driver: next });
+    // Every take-over is a new generation, also by the person who drives already (a pointer taken back from an accept
+    // that has not finished): what began before it can no longer apply. `gen` is the one the PC's pointer took. An
+    // older one than the session's own is a late delivery of a take-over that a newer change has passed.
+    const to = Number.isInteger(gen) ? gen : this.gen + 1;
+    // A take-over that is not above the session's own generation and names someone else does not apply, and says so: the
+    // PC's pointer took the number first, so the session has passed it, and the caller must not be told they drive.
+    if (to <= this.gen && !(to === this.gen && this.driver === next)) return Response.json({ ok: false, stale: true });
+    if (to > this.gen) {
+      if (this.driver !== next) {
+        await this.applyDriver(next, { kind: 'take_over', gen: to });
+      } else {
+        const p = this.people;
+        // An open offer ends with the take-over, and the log says so (applyDriver's own row covers a change of driver).
+        if (p.offer) this.logRow('offer cancelled', 'by a take-over', next);
+        p.offer = null;
+        p.accepting = null;
+        p.handed_over = null;
+        this.gen = to;
+        await this.setMany({ driver_gen: to });
+        await this.savePeople();
+      }
+    }
+    return Response.json({ ok: true, state, driver: this.driver });
   }
 
   // A saved-PC session pins its pointer's end to the real one at the first hello.
@@ -943,6 +1277,9 @@ export class Session {
   }
 
   async markEnded(reason, actor = null, { quiet = false } = {}) {
+    // Nothing is kept of the screen once the session is over.
+    this.over = true;
+    this.frame = null;
     const device = await this.get('device_id', null);
     await this.setMany({
       state: 'ended',
@@ -1076,6 +1413,11 @@ export class Session {
   }
 }
 
+// A refusal from /people, /handover or /frame: the relay turns `code` into the tool's error code.
+function refusal(code, error) {
+  return Response.json({ ok: false, code, error });
+}
+
 // An identity as the session compares it: trimmed and lowercased. Empty when absent.
 function sameIdentity(v) {
   return String(v ?? '').trim().toLowerCase();
@@ -1091,7 +1433,7 @@ function decodeVersion(v) {
 }
 
 // The /status answer. A session that does not exist is statusBody(new Map(), [], false).
-function statusBody(s, rows, attached) {
+function statusBody(s, rows, attached, people = { participants: [], offer: null, frame_rev: null, frame_at: null }) {
   const app = s.get('windows_mode') === 'app';
   return {
     state: s.get('state') ?? 'unknown',
@@ -1113,7 +1455,11 @@ function statusBody(s, rows, attached) {
     expires_at: s.get('expires_at') ?? null,
     startup_expires_at: s.get('state') === 'consumed' ? s.get('consumed_expires_at') ?? null
       : s.get('state') === 'waiting' ? s.get('waiting_expires_at') ?? null : null,
-    ...(s.get('device_id') ? { device_id: s.get('device_id'), driver: s.get('driver') ?? null } : {}),
+    ...(s.get('device_id') ? { device_id: s.get('device_id'), driver: s.get('driver') ?? null } : s.get('driver') ? { driver: s.get('driver') } : {}),
+    participants: people.participants,
+    offer: people.offer,
+    frame_rev: people.frame_rev,
+    frame_at: people.frame_at,
     ended_reason: s.get('ended_reason') ?? null,
     attached,
     log: rows,

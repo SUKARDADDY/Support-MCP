@@ -62,6 +62,8 @@ impl<R: Runtime> Emitter for TauriEmitter<R> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Target {
     pub account: String,
+    /// The relay's event name, so the screens can tell an invite from a queue notice.
+    pub event: String,
     pub device_id: Option<String>,
     pub task_id: Option<String>,
     pub session_id: Option<String>,
@@ -69,7 +71,7 @@ pub struct Target {
 
 impl Target {
     pub fn payload(&self) -> Value {
-        json!({ "account": self.account, "device_id": self.device_id, "task_id": self.task_id, "session_id": self.session_id })
+        json!({ "account": self.account, "event": self.event, "device_id": self.device_id, "task_id": self.task_id, "session_id": self.session_id })
     }
 }
 
@@ -123,6 +125,7 @@ impl<R: Runtime> Notifier for ToastNotifier<R> {
     fn show(&self, account: &str, item: &FeedItem) {
         let id = self.book.lock().unwrap_or_else(|p| p.into_inner()).remember(Target {
             account: account.to_string(),
+            event: item.event.clone(),
             device_id: item.device_id.clone(),
             task_id: item.task_id.clone(),
             session_id: item.session_id.clone(),
@@ -228,7 +231,7 @@ mod tests {
     use super::*;
 
     fn target(n: &str) -> Target {
-        Target { account: "acc".into(), device_id: Some(n.into()), task_id: None, session_id: None }
+        Target { account: "acc".into(), event: "device_waiting".into(), device_id: Some(n.into()), task_id: None, session_id: None }
     }
 
     #[test]
@@ -270,8 +273,8 @@ mod tests {
     }
 
     #[test]
-    fn the_target_payload_names_the_account_pc_task_and_session() {
-        let t = Target { account: "a".into(), device_id: Some("d".into()), task_id: Some("t".into()), session_id: None };
-        assert_eq!(t.payload(), json!({ "account": "a", "device_id": "d", "task_id": "t", "session_id": null }));
+    fn the_target_payload_names_the_account_event_pc_task_and_session() {
+        let t = Target { account: "a".into(), event: "session_invited".into(), device_id: Some("d".into()), task_id: Some("t".into()), session_id: None };
+        assert_eq!(t.payload(), json!({ "account": "a", "event": "session_invited", "device_id": "d", "task_id": "t", "session_id": null }));
     }
 }

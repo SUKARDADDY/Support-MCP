@@ -10,7 +10,7 @@ An MCP server on Cloudflare Workers that lets your AI agent see, control and run
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers%20%2B%20Durable%20Objects-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/durable-objects/)
 [![.NET Framework 4.5.2+](https://img.shields.io/badge/.NET%20Framework-4.5.2%2B-512BD4)](src/agent-app.cs)
 [![PowerShell 5.1](https://img.shields.io/badge/PowerShell-5.1-5391FE)](src/agent.ps1)
-[![MCP](https://img.shields.io/badge/MCP-27%20tools-d97757)](#mcp-tools)
+[![MCP](https://img.shields.io/badge/MCP-31%20tools-d97757)](#mcp-tools)
 
 <img src="docs/hero.svg" alt="Claude Code calls session_create, run and put_file. A Cloudflare Worker relays them to the customer's PC, where a small Remote support window in the corner of the screen shows that an agent is connected, with an End session button." width="100%">
 
@@ -214,6 +214,10 @@ an error.
 | `session_end` | tells the client to stop and marks the session ended |
 | `device_list` | the team's saved PCs with their fields and `online` (true while the PC's doorbell is connected). Needs `devices.view`. Names and custom field values are untrusted text |
 | `device_connect` | connect to a saved PC by its id: `{device_id, ask?, take_over?}`. Returns `{session_id, state: "waiting", asks, rang}`; poll `session_status` until it is attached, then use the session tools. The PC asks its person first when it is set to ask, when you pass `ask: true`, or when your role may not connect without asking. `take_over: true` takes the driving seat of a session another technician started |
+| `people_list` | the members you can invite: `{people: [{identity, name, can_control}]}`. See [Working together](#working-together). Needs `sessions.control`, members only |
+| `session_participants` | who is on a session: `{session_id, action, identity?}` with `invite`, `join`, `leave` or `remove`. Returns `{participants: [{identity, name, role, since}]}`. Needs `sessions.control`, members only |
+| `session_handover` | pass control to a colleague who joined: `{session_id, action, identity?}` with `offer`, `accept`, `decline`, `cancel` or `take_over` (one-off links only). Returns `{driver, participants, offer}`. Needs `sessions.control`, members only |
+| `escalation` | the team's queue: `{action: open \| list \| claim \| close, ...}`. Needs `sessions.control`, members only. Notes and summaries are untrusted text |
 | `agent_start` | hand a task to the relay's [built-in agent](#built-in-agent): `{device_id \| session_id, instructions, keep_working?, model?}`. Returns `{task_id, state, model, ...}`. Needs `sessions.control`, and a team that allows the built-in agent |
 | `agent_status` | follow a task: `{task_id, wait_s?}` returns its state, cost, the tool calls it made, its notes and its summary. With no `task_id` it lists recent tasks and the models the team can use, with prices. Needs `sessions.view`. Notes and summaries are untrusted text |
 | `agent_control` | `{task_id, action}` with `pause`, `resume` or `stop`. Needs `sessions.control` |
@@ -227,7 +231,7 @@ an error.
 Add `?ui=0` to the MCP URL to hide `ui_tree` and `ui_act`; any other value is a
 400 error. The old `?shape=` parameter is gone: the server offers only the tools
 above, and a request that still sends `shape` gets a 400 error. Every tool except
-`session_create`, `session_list`, `device_list`, `device_connect` and the three agent tools needs a `session_id`; a call without one
+`session_create`, `session_list`, `device_list`, `device_connect`, the three agent tools, `people_list` and `escalation` needs a `session_id`; a call without one
 fails with `session_id is required; call session_list to find it`, and the relay
 never picks a session for you. `run`, `put_file` and `get_file` use their own
 lane, so a long command does not block the screen.
@@ -548,13 +552,42 @@ A saved PC and a one-off support session are separate. A one-off session uses
 its own service, folder and pipe, and removes itself when it ends. Uninstalling a
 saved PC does not touch it.
 
+## Working together
+
+A technician, or their AI client, can bring a colleague into a live session, hand control over, and send a
+session they cannot finish to a shared queue. It works on a saved PC's session and on a one-off link's, through four
+tools (`people_list`, `session_participants`, `session_handover` and `escalation`) that the technician app calls too.
+They are for members only. Details for MCP clients are in [docs/mcp-clients.md](docs/mcp-clients.md#working-together-people_list-session_participants-session_handover-and-escalation).
+
+- **Invite and watch.** The driver invites a colleague, who gets a notification and joins. A watcher sees the last
+  full screenshot the driver or the agent took, with its age, and sends no commands. The people on a session, a pending offer and
+  the last handover live in the session itself and end with it.
+- **Hand over.** The driver offers control to a watcher for 2 minutes. They accept, and the old driver watches. On a saved
+  PC the corner window shows the new driver. The session, its history and the owner's single approval carry over.
+  Control never moves while the session is still waiting for the PC (`not_attached`).
+- **The queue.** A technician puts a session or a PC in the queue with a note. Whoever is free claims it: a live
+  session moves to them as the driver, anything else becomes theirs as a ticket naming the PC. A built-in agent task that
+  finishes with "needs a person" puts its summary in the queue too. Notes and summaries are untrusted text.
+- **No new access.** Watching and driving take `sessions.control` and its second factor. On a saved PC that was
+  connected without asking the person at it, they also take `sessions.unattended` and its factor, else the error is
+  `needs_unattended`. An invite checks the person's role, and their factor is checked when they join, see the
+  picture or accept.
+- **One-off links have a driver.** The member who makes a link drives its session until they hand it over or an admin
+  takes it over, and a command from anyone else is refused. The person at the PC is never told who drives. Sessions made
+  before 0.8.1 stay open until they end, at most 24 hours.
+- **A watcher can still end the session.** A member holding `sessions.end` can end any session through MCP or the API,
+  as before. The app shows a watcher Leave, not End session, but this is not an enforced boundary.
+
+The design and the checks are in the [security model](docs/security-model.md) and the
+[spec](docs/relay-v1-spec.md#people-on-a-session-and-the-escalation-queue).
+
 ## Built-in agent
 
 A technician can hand a task to an agent that runs on the relay itself. It uses the
 same tools an MCP client has, acts as the person who started it, and keeps working
 after they close their window. It runs on any OpenAI or Claude model the team
 chooses (GPT-6.1 Terra by default), with the team's own key, and stops at the caps
-the team set. Your own MCP clients and the 24 session tools work as before.
+the team set. Your own MCP clients and the session tools work as before.
 
 An admin sets it up through the team API (`PATCH /api/v1/w/<slug>/agent`). Nothing
 runs until both caps and a key are saved:
@@ -675,10 +708,11 @@ A new `scheduled` handler runs hourly (a Cron Trigger in `wrangler.toml`); see
 ## The technician app
 
 A small Windows app for your technicians: it signs in to the relay, lists saved PCs, pairs and
-approves them, shows a PC's screen and the built-in agent's work in a tab, and raises Windows
-notifications for the six events that need a person. It is a Tauri 2 app (a Rust core and React
-screens) in `technician-app/`, installs per user, updates itself from signed releases, and is
-view only until a later release. Install, sign-in, what each screen does, updates, the
+approves them, shows a PC's screen and the built-in agent's work in a tab, lets a driver invite
+colleagues to watch a session, hand control over and send a session to a shared queue, and raises Windows
+notifications for what needs a person. It is a Tauri 2 app (a Rust core and React
+screens) in `technician-app/`, installs per user, updates itself from signed releases, and never clicks or
+types on a PC itself (that comes in a later release). Install, sign-in, what each screen does, updates, the
 notification click limitation, SmartScreen and the free-plan ceilings are in
 [docs/technician-app.md](docs/technician-app.md).
 
@@ -709,7 +743,8 @@ flowchart LR
 | `/api/v1/w/<slug>/...` | Cloudflare Access, then the caller's role | the team API: members, roles, the team log, stop and resume, customers, sites, saved PCs, custom fields, pairing codes, and the built-in agent's settings, models and tasks |
 | `POST /app/w/<slug>/mcp` | a bearer token made for the technician app, then the caller's role | the same tools as `/mcp`, for the technician app. Any workspace, `default` included. An MCP client's token is a 401 here |
 | `/app/w/<slug>/api/...` | the app's bearer token, then the caller's role and second factor | the part of the team API the app uses: who you are, customers, sites, saved PCs, custom fields (read only), pairing codes, and the built-in agent's tasks. Members, roles, the team log, stop and the agent's settings and models answer 404 here. `GET .../api/agent/tasks/<id>/frame` returns the last full screenshot the agent took |
-| `GET /app/w/<slug>/teams`, `GET /app/w/<slug>/notifications`, `GET` and `PATCH /app/w/<slug>/notifications/settings` | the app's bearer token, a member | the person's teams, their notification feed (held open up to 25 seconds for a new item), and which of the six events they hear of and which PCs they watch |
+| `GET /api/v1/w/<slug>/sessions/<sid>/frame`, `GET /app/w/<slug>/api/sessions/<sid>/frame` | Cloudflare Access, or the app's bearer token; `sessions.control` and the access rule for watching | the last full screenshot of a live session, for its driver and for a person who joined it. Held in memory only |
+| `GET /app/w/<slug>/teams`, `GET /app/w/<slug>/notifications`, `GET` and `PATCH /app/w/<slug>/notifications/settings` | the app's bearer token, a member | the person's teams, their notification feed (held open up to 25 seconds for a new item), and which of the eight switchable events they hear of and which PCs they watch |
 | `POST /device/pair`, `hello`, `update`, `leave` | public, https only; a saved PC's key in a header (pair: a pairing code or a workspace in the body) | the PC's side of saved devices. Not behind Access |
 | `GET /device/ring?protocol=1` | public, https only; a saved PC's key in a header | the doorbell: a WebSocket the relay rings when the PC should check in. Not behind Access |
 | `POST /api/v1/w`, `GET /api/v1/w` | Cloudflare Access, a deployment admin to create | create a workspace, list yours |
@@ -733,15 +768,16 @@ keyed by workspace. So do the built-in agent's settings and tasks.
 | `src/api.js` | the team API under `/api/v1/w/<slug>`, and workspace creation and listing |
 | `src/devices.js` | customers, sites, saved PCs, custom fields and pairing codes in D1. All their SQL is here; each change goes through `src/workspace.js`'s guarded change |
 | `src/device-api.js` | the PC wire under `/device/`: pair, hello, update, leave and the doorbell |
+| `src/session-people.js`, `src/escalations.js` | who is on a live session and who drives it (invites, offers of control, the picture a watcher sees), and the escalation queue |
 | `src/agent.js`, `src/agent-api.js`, `src/agent-store.js` | the built-in agent: starting, following and controlling tasks, its settings and models, its team API routes and its D1 queries |
 | `src/agent-task.js`, `src/agent-providers.js`, `src/agent-check.js` | the `AgentTask` Durable Object (one step per alarm), the OpenAI and Claude adapters, and the check a new model passes |
 | `src/agent-models.js`, `src/agent-tools.js` | the model table with its prices and the cost arithmetic, and the tools the agent's model sees |
-| `migrations/` | the D1 tables, applied in name order: `0001_team.sql` (members, roles, callers, the team log, each keyed by workspace), `0002_workspaces.sql` (the workspaces table and an index on members by identity), `0003_signin.sql` (people, sign-ins, links and authenticators) `0004_devices.sql` (customers, sites, devices, custom field definitions and pairing codes), `0005_device_sessions.sql` (the live session pointer on a device) `0006_agent.sql` (the built-in agent's settings and tasks) and `0007_notify.sql` (notifications, and each member's notification settings) |
+| `migrations/` | the D1 tables, applied in name order: `0001_team.sql` (members, roles, callers, the team log, each keyed by workspace), `0002_workspaces.sql` (the workspaces table and an index on members by identity), `0003_signin.sql` (people, sign-ins, links and authenticators) `0004_devices.sql` (customers, sites, devices, custom field definitions and pairing codes), `0005_device_sessions.sql` (the live session pointer on a device) `0006_agent.sql` (the built-in agent's settings and tasks) `0007_notify.sql` (notifications, and each member's notification settings) and `0008_escalations.sql` (the escalation queue) |
 | `src/mcp.js` | JSON-RPC dispatch, the tool schemas, and the mapping of each screen tool to one normalized action |
 | `src/screen.js` | the screen actions, their audit text, and the strict check of every field an app result may carry |
 | `src/jwt.js` | RS256 verification of the Access JWT with WebCrypto |
 | `src/template.js` | builds the served script and the downloaded executable, validates every value placed in them, and maps the mode aliases |
-| `src/notify.js`, `src/sweep.js` | notifications for the technician app: who hears of each of the six events, the rows, the feed and each member's settings; and the hourly run that finds PCs missing for 7 days and deletes notifications older than 30 days |
+| `src/notify.js`, `src/sweep.js` | notifications for the technician app: who hears of each of the eight switchable events and the two that are not, the rows, the feed and each member's settings; and the hourly run that finds PCs missing for 7 days and deletes notifications older than 30 days |
 | `src/agent-app.cs` | the Windows app: C# source for .NET Framework 4.5.2 or later. One exe with several roles: the customer's app (WPF window, dialogs, HTTPS polling client with two lanes, normal-mode screen control), `--elevate-install`, the full-control `--service`, the SYSTEM `--helper` that runs screen operations on the console session, and the `--window` corner window. For a saved PC it also has the setup wizard (no arguments, with a device footer), `--device-install`, the `--device-service` (which also hosts a session), the `--device-ask` question, the `--tray` and `--uninstall` with `--device-remove` |
 | `src/agent-app.manifest` | the app's `asInvoker` manifest. The app asks for elevation only through `--elevate-install`, after the customer started it |
 | `src/app-bundle.json` | the compiled x86 app with the SHA-256 of its source and manifest. Tests fail when the source changed without a rebuild |

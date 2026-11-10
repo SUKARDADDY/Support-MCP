@@ -75,3 +75,13 @@ export function taskBody(event, body, full = null) {
 // The ten-character pairing code, as the relay shows it (ABCDE-FGH23), for a field that
 // takes it with or without the hyphen.
 export const cleanCode = (v) => String(v ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+// How long ago a moment was, short: "12 s", "3 min", "2 h". For the age of a picture.
+export function formatAge(ms, now = Date.now()) {
+  if (!Number.isFinite(ms)) return '';
+  const s = Math.max(0, Math.round((now - ms) / 1000));
+  if (s < 90) return t('time.age_s', { count: s });
+  const m = Math.round(s / 60);
+  if (m < 90) return t('time.age_min', { count: m });
+  return t('time.age_h', { count: Math.round(m / 60) });
+}

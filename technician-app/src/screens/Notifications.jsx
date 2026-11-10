@@ -5,9 +5,19 @@ import { formatAgo, taskBody } from '../format.js';
 import { t } from '../i18n/index.js';
 import { NotificationSettings } from './NotificationSettings.jsx';
 
-// The six things the relay tells you about. Titles and bodies repeat text from the PC (a PC's
+// The things the relay tells you about: eight you can switch off, and an invite to a session or an offer of control, which always arrive. Titles and bodies repeat text from the PC (a PC's
 // name, a task's note), so they are shown as text. A "waiting for approval" body comes from a
 // join request that anyone can send before the PC is approved, so it is labelled as the PC's own words.
+// What the button on a notification says, by what it opens.
+function openLabel(n) {
+  if (n.event === 'escalation_opened' || n.event === 'escalation_claimed') return 'notify.open_queue';
+  if (n.event === 'session_invited' && n.session_id) return 'notify.join_session';
+  if (n.event === 'control_offered' && n.session_id) return 'notify.open_session';
+  if (n.task_id) return 'notify.open_task';
+  if (n.device_id || n.session_id) return 'notify.open_pc';
+  return null;
+}
+
 export function Notifications() {
   const { notifications, accounts, account, openTarget, now, titleOf } = useApp();
   const [tab, setTab] = useState('recent');
@@ -37,8 +47,8 @@ export function Notifications() {
                     {n.event === 'device_waiting' ? <span className="f-from">{t('notify.from_pc')} </span> : null}
                     {taskBody(n.event, n.body, titleOf(n.task_id))}
                   </span>
-                  {n.device_id || n.task_id || n.session_id ? (
-                    <button type="button" className="btn btn-sec btn-sm f-open" onClick={() => openTarget(n)}>{n.task_id ? t('notify.open_task') : t('notify.open_pc')}</button>
+                  {openLabel(n) ? (
+                    <button type="button" className="btn btn-sec btn-sm f-open" onClick={() => openTarget(n)}>{t(openLabel(n))}</button>
                   ) : null}
                 </li>
               );

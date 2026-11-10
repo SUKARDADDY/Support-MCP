@@ -210,11 +210,15 @@ it('no storage write holds image bytes: not the task\'s storage, not D1, not KV,
     look('KV', JSON.stringify([...w.kv.rows]));
     return found;
   };
+  // The Session keeps the last full screenshot for the people watching it, in memory: the scan below covers its storage.
+  const session = w.sessionFor(a.joined.sid).session;
+  assert.ok(session.frame && needles.some((n) => session.frame.data.includes(n)), 'the Session holds a picture in memory');
   assert.deepEqual(everywhere(), [], 'while the task works');
   await w.drive(a.id);
   assert.equal(w.taskRow(a.id).state, 'done');
   assert.deepEqual(everywhere(), [], 'after it ends');
   assert.equal(w.taskObject(a.id).task.frame, null);
+  assert.equal(session.frame, null, 'the Session dropped its picture when the session ended');
 });
 
 it('a tool call still in flight when the task ends does not put the picture back in memory', async (t) => {

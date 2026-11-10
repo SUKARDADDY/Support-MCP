@@ -1,14 +1,15 @@
 // Notifications: who hears of what, and that each row is written with the event that
-// caused it. The six events (task finished, task problem, session declined, PC online,
-// PC missing, PC waiting), the settings that switch them off, the isolation between
-// teams, the hourly run, and the 30-day pruning.
+// caused it. The eight switchable events (task finished, task problem, session declined, PC online,
+// PC missing, PC waiting, queue item opened, queue item claimed), the two that are not (invited,
+// offered control), the settings that switch them off, the isolation between teams, the hourly
+// run, and the 30-day pruning.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { agentWorld, BOSS, TECH, VIEW, LEAD, OTHER } from './agent-world.js';
 import { appWorld, skip } from './app-world.js';
 import { socket } from './device-sessions-world.js';
 import { oai } from './agent-fakes.js';
-import { EVENTS, KEEP_MS, notifyStore, readNotify } from '../src/notify.js';
+import { DIRECT_EVENTS, EVENTS, KEEP_MS, notifyStore, readNotify } from '../src/notify.js';
 import { sweep, MISSING_MS, MISSING_WINDOW_MS } from '../src/sweep.js';
 import { ONLINE_AFTER_MS } from '../src/registry.js';
 
@@ -76,7 +77,9 @@ test('a task that gets stuck, needs a person, fails or is stopped by the relay t
   assert.equal((await w.tool(TECH, 'agent_control', { task_id: mine.id, action: 'stop' })).state, 'stopped');
   await w.drive(mine.id);
 
-  const rows = rowsOf(w);
+  // The task that needs a person also tells the others who control sessions that the queue has an item (tested in escalations.test.js).
+  assert.deepEqual(rowsOf(w).filter((r) => r.event === 'escalation_opened').map((r) => r.task_id), [cases[1][1], cases[1][1]]);
+  const rows = rowsOf(w).filter((r) => r.event !== 'escalation_opened');
   assert.deepEqual(rows.map((r) => [r.event, r.recipient, r.task_id]), cases.map(([, id]) => ['task_problem', TECH, id]));
   assert.ok(rows.every((r) => r.title === 'Task needs attention'));
   assert.match(rows[0].body, /: finished: stuck$/);
@@ -570,6 +573,63 @@ test('a team\'s events reach only its own members, and settings are per team', a
   assert.equal((await notify.feed('default', OTHER)).items.length, 0);
   assert.equal((await notify.feed('acme', OTHER)).items.length, 2);
   assert.equal((await notify.feed('acme', TECH)).items.length, 1);
+});
+
+// ---- invites and offers, and the queue's two events ----------------------------------------------------
+test('the queue\'s two events are switchable and on by default; the invite and the offer are neither', async (t) => {
+  const w = await agentWorld(t);
+  const notify = notifyStore(w.db, w.team);
+  assert.deepEqual(EVENTS.slice(-2), ['escalation_opened', 'escalation_claimed']);
+  assert.deepEqual(DIRECT_EVENTS, ['session_invited', 'control_offered']);
+  assert.equal(DIRECT_EVENTS.some((e) => EVENTS.includes(e)), false);
+  assert.deepEqual((await notify.settings('default', TECH)).events.escalation_opened, true);
+  const off = await notify.patchSettings('default', TECH, { events: { escalation_opened: false } });
+  assert.deepEqual([off.events.escalation_opened, off.events.escalation_claimed], [false, true]);
+  // A direct event has no switch: it is not a setting to name, and the writer for switchable events does not take it.
+  for (const name of DIRECT_EVENTS) {
+    await assert.rejects(() => notify.patchSettings('default', TECH, { events: { [name]: false } }), (e) => e.status === 400 && /unknown event/.test(e.message), name);
+    await assert.rejects(() => notify.recipients('default', name, { to: [TECH] }), /unknown notification event/, name);
+  }
+  assert.deepEqual(Object.keys((await notify.settings('default', TECH)).events), EVENTS);
+});
+
+test('recipients can leave out the person who caused the event', async (t) => {
+  const w = await agentWorld(t);
+  const notify = notifyStore(w.db, w.team);
+  const all = await notify.recipients('default', 'escalation_opened', { holding: 'sessions.control' });
+  assert.deepEqual(all.sort(), [BOSS, LEAD, TECH].sort());
+  assert.deepEqual((await notify.recipients('default', 'escalation_opened', { holding: 'sessions.control', except: [TECH.toUpperCase()] })).sort(), [BOSS, LEAD].sort());
+  await notify.patchSettings('default', LEAD, { events: { escalation_opened: false } });
+  assert.deepEqual((await notify.recipients('default', 'escalation_opened', { holding: 'sessions.control', except: [TECH] })), [BOSS], 'a switched-off event reaches nobody who switched it off');
+  assert.equal(all.includes(VIEW), false, 'a Viewer holds no sessions.control');
+});
+
+test('a direct event goes to one named person, whatever their settings say, once per occurrence', async (t) => {
+  const w = await agentWorld(t);
+  await acme(w);
+  const notify = notifyStore(w.db, w.team);
+  const what = (n) => ({ session_id: 's'.repeat(64), title: 'You were invited', body: 'x'.repeat(500), dedupe: `invited:${n}` });
+  // Every switchable event off does not matter.
+  await notify.patchSettings('default', LEAD, { events: Object.fromEntries(EVENTS.map((e) => [e, false])) });
+  const rows = await notify.direct('default', 'session_invited', LEAD.toUpperCase(), what(1));
+  assert.equal(rows.length, 1);
+  assert.deepEqual([rows[0].recipient, rows[0].event, rows[0].body.length <= 300, rows[0].device_id], [LEAD, 'session_invited', true, null]);
+  await notify.write('default', rows);
+  await notify.write('default', await notify.direct('default', 'session_invited', LEAD, what(1)));
+  assert.equal(rowsOf(w).length, 1, 'the same occurrence adds nothing');
+  await notify.write('default', await notify.direct('default', 'session_invited', LEAD, what(2)));
+  await notify.write('default', await notify.direct('default', 'control_offered', LEAD, { session_id: 's'.repeat(64), title: 'Control offered', body: 'b', dedupe: 'offered:1' }));
+  assert.deepEqual(rowsOf(w).map((r) => r.event), ['session_invited', 'session_invited', 'control_offered']);
+  assert.deepEqual((await notify.feed('default', LEAD)).items.map((i) => i.event), ['session_invited', 'session_invited', 'control_offered']);
+  // Nobody else hears of it: not the admin, not a member of another team.
+  assert.equal((await notify.feed('default', BOSS)).items.length, 0);
+  // Not a member of the team, not a person, not in this team: nothing.
+  assert.deepEqual(await notify.direct('default', 'session_invited', 'stranger@example.com', what(3)), []);
+  assert.deepEqual(await notify.direct('default', 'session_invited', 'a-service-token-client-id', what(3)), []);
+  assert.deepEqual(await notify.direct('acme', 'session_invited', VIEW, what(3)), [], 'a member of default is no member of acme');
+  assert.equal((await notify.direct('acme', 'session_invited', OTHER, what(3))).length, 1);
+  assert.deepEqual(await notify.direct('default', 'session_invited', '', what(3)), []);
+  await assert.rejects(() => notify.direct('default', 'task_finished', LEAD, what(4)), /unknown direct notification event/);
 });
 
 // ---- the writer and the settings ------------------------------------------------------------------------

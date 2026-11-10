@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { fetchMe } from './api.js';
 
 // Is the page on screen? False when the tab is hidden, the window is minimised or it was
 // sent to the tray.
@@ -74,4 +75,36 @@ export function tabKeyDown(e) {
   e.preventDefault();
   tabs[to].focus();
   tabs[to].click();
+}
+
+// A modal <dialog>: opened when it mounts, closed when it unmounts. Put the returned ref on the dialog.
+export function useDialog() {
+  const ref = useRef(null);
+  useEffect(() => {
+    const d = ref.current;
+    if (!d) return undefined;
+    if (typeof d.showModal === 'function') d.showModal();
+    else d.setAttribute('open', '');
+    return () => {
+      if (d.open && typeof d.close === 'function') d.close();
+    };
+  }, []);
+  return ref;
+}
+
+const NO_ONE = { identity: '', permissions: [] };
+
+// Who a tab's account is: the shown account's `me` when the tab is of the shown account, else the tab's own
+// account's, read once. Until it is known the person is no one, so no role follows from the wrong account's identity.
+export function useAccountMe(core, accountId, shownId, shownMe) {
+  const [own, setOwn] = useState(null);
+  const isShown = accountId === shownId;
+  useEffect(() => {
+    if (isShown || !accountId) return undefined;
+    let live = true;
+    fetchMe(core, accountId).then((m) => live && setOwn({ accountId, me: m })).catch(() => {});
+    return () => { live = false; };
+  }, [core, accountId, isShown]);
+  if (isShown) return shownMe;
+  return own?.accountId === accountId ? own.me : NO_ONE;
 }

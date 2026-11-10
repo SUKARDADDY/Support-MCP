@@ -2,11 +2,12 @@
 
 A small Windows program for the people on your team who help customers. It signs in to your
 relay, shows your saved PCs, pairs and approves new ones, lets you watch a PC's screen and
-the built-in agent's work, and tells you about the six things that need you. It is a Tauri 2
+the built-in agent's work, lets you invite a colleague into a session, hand control over and send
+a session you cannot finish to a shared queue, and tells you about what needs you. It is a Tauri 2
 app: a Rust core that holds the sign-in and talks to the relay, and React screens drawn by
 Windows' own web view (WebView2). The code is in `technician-app/`.
 
-Contents: [Install](#install) · [Sign in](#sign-in) · [The screens](#the-screens) ·
+Contents: [Install](#install) · [Sign in](#sign-in) · [The screens](#the-screens) · [Colleagues and the queue](#colleagues-and-the-queue) ·
 [Notifications](#notifications) · [Updates](#updates) · [SmartScreen](#smartscreen) ·
 [Free-plan limits](#free-plan-limits) · [Security](#security) · [Build](#build-and-release) ·
 [How it is tested](#how-it-is-tested)
@@ -91,10 +92,16 @@ approval in the browser, and the Devices screen gets a team picker.
   code (it works once, for ten minutes). The screen watches the list and the code. When the PC
   arrives, or the code is no longer live, the countdown is replaced by "Code used by <PC>". **Copy install link** copies the relay's `/install` link with the code in it.
 - **One-off link.** For a PC you will help once: creates a session link that works once, for ten
-  minutes, and nothing is saved to your devices.
+  minutes, and nothing is saved to your devices. Making the link also opens a tab for its session
+  ("One-off PC"). The tab waits for the person to run the link and click Allow, and then works like a
+  saved PC's tab, with you as the driver.
 - **Session tabs.** Each open session is a tab at the top. See below.
-- **Notifications.** The recent items, and a Settings tab with a switch for each of the six
-  events, the PCs you watch for "came online", and a switch for Windows notifications on this PC.
+- **Queue.** Sessions and PCs your colleagues (or a stuck agent) sent for help. See
+  [Colleagues and the queue](#colleagues-and-the-queue). The rail item shows how many items nobody has
+  claimed. It is there for roles that can control sessions.
+- **Notifications.** The recent items, and a Settings tab with a switch for each of the eight
+  events you can switch (the six below and the two queue events), the PCs you watch for "came online",
+  and a switch for Windows notifications on this PC.
 - **Settings.** Accounts, appearance (light, dark or the same as Windows), starting the app with
   Windows (off until you choose it), and updates. **Sign out** asks first. When you confirm,
   the app asks the relay to revoke its sign-in (RFC 7009, `POST /oauth/token` with the refresh
@@ -105,10 +112,11 @@ approval in the browser, and the Devices screen gets a team picker.
   The native title bar and window border follow the appearance setting (the `window_theme`
   command), so the dark theme has a dark title bar.
 
-### The session tab (view only)
+### The session tab
 
-The tab shows the PC's screen. It never clicks or types: those arrive in a later release, and
-the app's core has no tool for them.
+The tab shows the PC's screen, who is in the session and what has happened. It never clicks or types:
+those arrive in a later release, and the app's core has no tool for them. A tab works with or
+without a saved PC: a one-off link's session has no PC id and is read and driven the same way.
 
 - While a built-in agent task works on the session, the tab shows the last picture the task
   took. The relay holds the picture in memory only, for the task's starter and the session's
@@ -149,21 +157,72 @@ the app's core has no tool for them.
   with an ellipsis, as does the Windows notification, which cannot see the instructions.
 - **Activity** lists the task's steps and notes together with the session log, in time order.
   Everything from the PC (step details, notes, log text, names) is shown as text, never as markup.
-- **End session** ends it. **Take over** appears for holders of `sessions.unattended` when someone
-  else drives. **Pause**, **Resume** and **Stop the task** control a running task.
+- **End session** ends it for everyone, and only the driver sees it. A tab you only watch shows
+  **Leave** instead, and so does its close button; closing a tab for a session you were invited to but
+  have not joined just closes it. Only the driver's tab ends a session. **Take over** appears for
+  holders of `sessions.unattended` when someone else drives: on a saved PC it connects again with
+  take-over, on a one-off link's session it asks `session_handover` to take over. **Pause**, **Resume**
+  and **Stop the task** control a running task.
+- Everything a tab does about people (invite, join, leave, remove, offer, accept, decline, cancel,
+  escalate) is asked as the tab's own account. An answer that comes back after you switched teams is
+  not announced under the other team and lands in its own tab. A refusal is told in the app's words for
+  the relay's code (`refuse.*` in `en.json`: for example `needs_unattended`, "This PC was connected
+  without asking its owner. Only people allowed to connect without asking can join."). An error that has no
+  code, such as a lost second factor, shows the relay's own text.
+
+## Colleagues and the queue
+
+These use the relay's four tools `people_list`, `session_participants`, `session_handover` and
+`escalation`, and one route, the watcher's picture. An invite never widens anyone's access: the person
+needs the permission to control sessions with its second factor, and on a saved PC that was connected
+without asking its owner, also the permission to connect without asking.
+
+- **People.** Below the title bar a tab lists the session's people with what each is: driving,
+  watching, or invited and not joined yet. Names come from the team and are shown as text.
+- **Invite** (the driver). Pick a colleague from the people the relay lists as able to control sessions.
+  They get a notification. **Remove** takes a watcher or an invitee off the session.
+- **Join.** Opening an invite, from its notification, opens the session in a tab (a saved PC's or a
+  one-off link's, even if you have no tab for it yet) and joins it. A tab you open another way for a session
+  you were invited to shows **Join**.
+- **Watching.** A watcher sees the last full screenshot the driver or the agent took, with its age
+  ("Picture from 12 s ago"). The tab reads the session's status every 10 seconds, which carries `frame_rev`,
+  and fetches the picture (`GET .../api/sessions/<session>/frame`) only when that number is one it has not
+  fetched. A watcher takes no screenshot of its own and does not follow the driver's agent task. The picture
+  is held in the relay's memory only.
+- **Hand over** (the driver). Offer control to someone who is watching. The offer lasts 2 minutes, and the
+  banner shows the driver **Cancel the offer**. The person it was made to sees "<name> offered you control"
+  with **Take control** and **Not now**, in the tab and from the notification. They become the driver once the PC
+  has let the session in; the old driver watches. A running built-in agent task stops quietly when its starter
+  hands the session over.
+- **Escalate** (the driver). Sends the session to the queue with a note of up to 600 characters. You stay in
+  it until someone claims it.
+- **Queue.** Three lists, **Open** (nobody has claimed it), **Mine** (opened or claimed by you, not closed) and
+  **Closed**, each read when you open it and again after a change, never by a timer. **Claim**: for a live
+  session the person who escalated still drives, you become the driver and its tab opens; for anything else the
+  item is marked yours and the PC's detail opens, or the app says it was a one-off session that is over.
+  **Close** asks for a note, and is there for the opener, the claimer and admins. From an item you can open the
+  PC, the task, or the session when you have its tab. A stuck agent's item carries its summary. Notes and summaries
+  were written by people and by an agent that read a customer's PC, so they are shown as text and labelled.
+  The rail badge counts the open items. It is read when the app starts, when the screen is shown or
+  changes something, and when a queue notification arrives.
+- In a team that uses only the built-in agent the relay refuses most of this (`mode`). The queue's lists,
+  Close and ticket claims still work.
 
 ## Notifications
 
-The relay writes a row for each of six events (task finished, task needs you, session turned
-down, a watched PC came online, a PC went missing, a PC is waiting for approval) for the people
-who should hear it, and the app holds a request open on it, so an item arrives within seconds.
-It shows each as a Windows notification, and keeps the recent ones in the Notifications screen.
-Switching an event off in the app's settings stops the relay writing it for you. The first time
+The relay writes a row for each of eight events you can switch (task finished, task needs you,
+session turned down, a watched PC came online, a PC went missing, a PC is waiting for approval,
+something was sent to the queue, your queue item was claimed) and two you cannot (you were invited to a
+session, you were offered control) for the people who should hear them, and the app holds a request open on
+it, so an item arrives within seconds. It shows each as a Windows notification, and keeps the recent ones in
+the Notifications screen. Switching an event off in the app's settings stops the relay writing it for you.
+Invites and offers have no switch: they are sent to one named person and always arrive. The first time
 the app runs for an account it reads the backlog silently: the list shows it, but no
 notification pops up for old news.
 
-Clicking a notification opens the PC or the task it is about, **while the notification is
-still on screen**. Windows reports a click only then. A notification you open later from the
+Clicking a notification opens what it is about, **while the notification is still on screen**: the PC
+or the task; for an invite the session, joined; for an offer of control the session with the offer on top (nothing
+is accepted for you); for a queue notice the Queue. The click carries the event's name for this. Windows reports a click only then. A notification you open later from the
 Notification Center only opens the app, so use the Notifications screen to find the item.
 Closing the window sends the app to the tray, where it keeps running so notifications keep
 coming. Use the tray icon's Quit to stop it.
@@ -196,7 +255,8 @@ app's calls cost mostly Worker requests: the feed is about 3,500 requests a day 
 who keeps the app open, the device list is one request every 15 seconds while the Devices screen
 is on screen, and an open session tab you are driving costs about 1,800 requests an hour (a
 screenshot every 3 seconds, a status every 10 seconds, a task check every 15). Watching a task
-costs far less. The relay remembers a checked sign-in for 60 seconds, so the app's calls use
+costs far less, and so does watching a colleague's session: a status every 10 seconds and a picture only
+when it changed. The Queue reads its list when you show it, and the badge when something changes. The relay remembers a checked sign-in for 60 seconds, so the app's calls use
 about one KV read a minute. Close session tabs you are not using. Workers Paid lifts the limits.
 
 ## Security
@@ -209,7 +269,10 @@ about one KV read a minute. Close session tabs you are not using. Workers Paid l
   open another window.
 - Every relay call is made by the Rust core, which sends no `Origin` header (the relay refuses
   one). The screens reach only the routes and MCP tools the app uses (`relay.rs`), none of which
-  clicks, types or runs a command.
+  clicks, types or runs a command. The four people and queue tools are in that list, and the one route they
+  add is the picture of a session (`GET /api/sessions/<64 hex>/frame`, checked in the core). The core reads
+  a tool error that starts with a code (`<code>: <message>`) into a code for the screens; an error with no
+  code stays plain text.
 - The app holds no secret: it is a public OAuth client, and the relay checks PKCE on every
   sign-in.
 - Fonts (Barlow Condensed, Atkinson Hyperlegible Next and Mono) are bundled, with their SIL Open

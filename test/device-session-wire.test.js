@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { world, BOSS, TECH, VIEW, LEAD, HOST } from './device-sessions-world.js';
+import { oneOff } from './people-world.js';
 
 const HOUR = 3_600_000;
 const tick = () => new Promise((r) => setImmediate(r));
@@ -254,15 +255,22 @@ test('the driver runs a command, and every poll answer carries the driver', asyn
   assert.deepEqual(await running, { exit_code: 0, stdout: 'nt authority\\system', stderr: '', timed_out: false });
 });
 
-test('a link session never shows a driver and any caller may command it, as before', async (t) => {
+test('a link session made by a member shows its creator as driver and refuses everyone else; one with no driver key stays open to anyone', async (t) => {
   const w = await world(t);
   const link = await w.tool(BOSS, 'session_create', {});
   const status = await w.tool(TECH, 'session_status', { session_id: link.session_id });
-  assert.equal(Object.hasOwn(status, 'driver'), false);
+  assert.equal(status.driver, BOSS);
   assert.equal(Object.hasOwn(status, 'device_id'), false);
-  // Not attached yet, but the answer is the old one, not a driver refusal.
-  assert.equal((await w.tool(TECH, 'run', { session_id: link.session_id, command: 'x' })).error, 'agent not attached');
-  assert.equal((await w.tool(LEAD, 'run', { session_id: link.session_id, command: 'x' })).error, 'agent not attached');
+  // Not attached yet: the driver gets the old answer; another person is refused by name, and the refusal names session_handover.
+  assert.equal((await w.tool(BOSS, 'run', { session_id: link.session_id, command: 'x' })).error, 'agent not attached');
+  const refused = await w.tool(TECH, 'run', { session_id: link.session_id, command: 'x' });
+  assert.match(refused.error, new RegExp(`^${BOSS} is driving this session; .*session_handover`));
+  assert.doesNotMatch(refused.error, /device_connect/);
+  // A session made before sessions had drivers, or in open mode: its storage has no driver key, and it behaves as it did.
+  const open = await oneOff(w);
+  assert.equal(Object.hasOwn(await w.tool(TECH, 'session_status', { session_id: open }), 'driver'), false);
+  assert.equal((await w.tool(TECH, 'run', { session_id: open, command: 'x' })).error, 'agent not attached');
+  assert.equal((await w.tool(LEAD, 'run', { session_id: open, command: 'x' })).error, 'agent not attached');
 });
 
 // ---- take-over -----------------------------------------------------------------------------

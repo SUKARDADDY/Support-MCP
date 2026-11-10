@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { endSession, fetchDevices, fetchMe, fetchPlaces, isLiveTask, listTasks, messageOf, sessionStatus, startTask } from './api.js';
+import { endSession, fetchDevices, fetchMe, fetchPlaces, isLiveTask, listQueue, listTasks, messageOf, participantsAction, refusalText, sessionStatus, startTask } from './api.js';
 import { Icon } from './components/Icon.jsx';
 import { useConnections } from './connections.js';
 import { AppContext } from './context.jsx';
 import { sortDevices } from './devices.js';
 import { realCore } from './core.js';
 import { tabKeyDown, useInterval, usePageVisible } from './hooks.js';
+import { same } from './session.js';
 import { t } from './i18n/index.js';
 import { AddDevice } from './screens/AddDevice.jsx';
 import { Devices } from './screens/Devices.jsx';
 import { Notifications } from './screens/Notifications.jsx';
 import { OneOffLink } from './screens/OneOffLink.jsx';
+import { Queue } from './screens/Queue.jsx';
 import { SessionTab } from './screens/SessionTab.jsx';
 import { Settings } from './screens/Settings.jsx';
 import { SignIn } from './screens/SignIn.jsx';
@@ -40,7 +42,7 @@ const write = (key, value) => {
 };
 
 // How often the app looks again. Tests pass shorter times through `tuning`.
-export const TUNING = { connectPollMs: 2000, devicePollMs: 15000, watchMs: 3000, screenshotMs: 3000, taskCheckMs: 15000, statusMs: 10000, taskWaitS: 25, taskGapMs: 1000, taskRetryMs: 2000 };
+export const TUNING = { connectPollMs: 2000, devicePollMs: 15000, watchMs: 3000, screenshotMs: 3000, taskCheckMs: 15000, statusMs: 10000, taskWaitS: 25, taskGapMs: 1000, taskRetryMs: 2000, queueMs: 30000 };
 
 const NO_TUNING = {};
 
@@ -57,6 +59,8 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   const [notifications, setNotifications] = useState([]);
   const knownNotes = useRef(new Set()); // "<account>:<id>" of every item the list has seen
   const [unread, setUnread] = useState(0);
+  const [queueCount, setQueueCount] = useState(0); // items in the queue nobody has claimed
+  const [queueTick, setQueueTick] = useState(0); // counts the queue notices that arrived, so the Queue screen reads its list again
   const [linkOpen, setLinkOpen] = useState(false);
   const [titles, setTitles] = useState(loadTitles); // task id -> first line of the instructions this app sent
   const [toastText, setToastText] = useState(null);
@@ -115,6 +119,38 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   }, [core, accountId]);
   const can = useCallback((permission) => me.permissions.includes(permission), [me]);
 
+  // ---- the queue's badge: the items nobody has claimed ----------------------------------
+  // Read when the app starts and when the relay says the queue changed (a notification). While the Queue screen
+  // is on show it reads its own list (on a timer, on focus and on a notice), and the badge takes the count from
+  // the Open list instead of asking again (reportOpen). An answer counts only if its team is still the one on
+  // screen and no newer read has begun.
+  const queueSeq = useRef(0);
+  const canQueue = me.permissions.includes('sessions.control');
+  const refreshQueue = useCallback(async (owner = accountId) => {
+    if (!owner || !guard.isShown(owner) || !canQueue) return;
+    queueSeq.current += 1;
+    const mine = queueSeq.current;
+    try {
+      const items = await listQueue(core, owner, 'open');
+      if (guard.isShown(owner) && queueSeq.current === mine) setQueueCount(items.length);
+    } catch (_) {
+      // the badge stays as it was
+    }
+  }, [core, accountId, guard, canQueue]);
+  // The Queue screen's Open list is the badge's count: no second request.
+  const reportOpen = useCallback((owner, count) => {
+    if (!guard.isShown(owner)) return;
+    queueSeq.current += 1;
+    setQueueCount(count);
+  }, [guard]);
+  const refreshQueueRef = useRef(refreshQueue);
+  refreshQueueRef.current = refreshQueue;
+  useEffect(() => {
+    queueSeq.current += 1;
+    setQueueCount(0);
+    refreshQueue();
+  }, [accountId, canQueue]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ---- devices -----------------------------------------------------------------
   const [deviceData, setDeviceData] = useState({ devices: [], places: new Map(), loading: true, error: null });
   const placesAt = useRef(0);
@@ -163,22 +199,63 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   // `show` says whether to go to the tab. By default it does when the tab's account is the one on
   // screen *now* (asked of the guard, not of the account this callback was made under, which may be an
   // old one: a connection or a start that finished after a switch of team must not take the view).
-  const openSessionTab = useCallback(({ device, sessionId = null, taskId = null, deviceId = null, deviceName = null, accountOf = null, show = null }) => {
+  const openSessionTab = useCallback(({ device, sessionId = null, taskId = null, deviceId = null, deviceName = null, accountOf = null, show = null, guest = false, join = false }) => {
     const key = sessionId ?? `task:${taskId}`;
     setTabs((cur) => {
       if (cur.some((x) => x.key === key)) return cur;
-      return persist([...cur, { key, account: accountOf ?? accountId, deviceId: device?.id ?? deviceId, deviceName: device?.name ?? deviceName ?? '', sessionId, taskId }]);
+      return persist([...cur, { key, account: accountOf ?? accountId, deviceId: device?.id ?? deviceId, deviceName: device?.name ?? deviceName ?? '', sessionId, taskId, ...(guest ? { guest: true } : {}), ...(join ? { joinOnOpen: true } : {}) }]);
     });
     // A tab that is not shown is added under its own account and appears when that account is used.
     if (show ?? guard.isShown(accountOf ?? accountId)) setView(`tab:${key}`);
   }, [accountId, persist, guard]);
+  const tabForSession = useCallback((sid) => tabs.find((x) => x.account === accountId && x.sessionId === sid) ?? null, [tabs, accountId]);
   const closeTab = useCallback((key) => {
     setTabs((cur) => persist(cur.filter((x) => x.key !== key)));
     setView((v) => (v === `tab:${key}` ? 'devices' : v));
   }, [persist]);
+  // What closing each open tab does, as the tabs report it: 'end' (the person drives it), 'leave' (they watch it) or
+  // 'close' (anything else). The tab bar's labels follow it; endTab checks the relay again before it ends anything.
+  const [stances, setStances] = useState({});
+  const markStance = useCallback((key, stance) => setStances((cur) => ((cur[key] ?? 'close') === stance ? cur : { ...cur, [key]: stance })), []);
+  // A watcher goes off the session; the tab closes unless the relay refuses for a reason the tab can still fix.
+  const leaveSession = useCallback(async (tab) => {
+    try {
+      await participantsAction(core, tab.account, tab.sessionId, 'leave');
+      if (guard.isShown(tab.account)) toast(t('people.left_toast', { name: tab.deviceName || t('session.untitled') }));
+    } catch (e) {
+      if (guard.isShown(tab.account)) toast(refusalText(e, t('people.leave_failed')));
+      if (e?.code !== 'not_invited' && e?.code !== 'not_found') return;
+    }
+    closeTab(tab.key);
+  }, [core, toast, closeTab, guard]);
+  const leaveTab = useCallback((key) => {
+    const tab = tabsRef.current.find((x) => x.key === key);
+    return tab?.sessionId ? leaveSession(tab) : Promise.resolve(closeTab(key));
+  }, [leaveSession, closeTab]);
+  // Closing a tab ends its session for everyone, so only the driver's tab does that, and only when the relay says so
+  // now: the tab's own idea of its person's role may be old (control was handed over, the person was removed) or not
+  // known yet (a tab from the last run). A session without a driver (a one-off link made before drivers) is ended by
+  // its host's tab. A watcher leaves it; every other tab just closes.
+  const mayEndNow = useCallback(async (tab) => {
+    let st;
+    try {
+      st = await sessionStatus(core, tab.account, tab.sessionId, 0);
+    } catch (_) {
+      return false;
+    }
+    if (!st || st.state === 'ended' || st.state === 'unknown') return false;
+    if (!st.driver) return !tab.guest;
+    try {
+      const who = tab.account === accountId ? me.identity : (await fetchMe(core, tab.account)).identity;
+      return same(st.driver, who);
+    } catch (_) {
+      return false;
+    }
+  }, [core, accountId, me.identity]);
   const endTab = useCallback(async (key) => {
     const tab = tabs.find((x) => x.key === key);
-    if (tab?.sessionId) {
+    if (stances[key] === 'leave' && tab?.sessionId) { await leaveSession(tab); return; }
+    if (tab?.sessionId && await mayEndNow(tab)) {
       try {
         await endSession(core, tab.account, tab.sessionId);
         toast(t('session.ended_toast', { name: tab.deviceName }));
@@ -187,7 +264,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
       }
     }
     closeTab(key);
-  }, [tabs, core, toast, closeTab]);
+  }, [tabs, stances, core, toast, closeTab, leaveSession, mayEndNow]);
   const updateTab = useCallback((key, patch) => setTabs((cur) => persist(cur.map((x) => (x.key === key ? { ...x, ...patch } : x)))), [persist]);
   // Every task start goes through here. The PC takes one command at a time, so the open session
   // tab(s) on the same PC or session stop their screenshots and wait for one in flight first;
@@ -224,7 +301,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
         try {
           if (tab.sessionId) {
             const st = await sessionStatus(core, tab.account, tab.sessionId, 0);
-            if (st.state === 'waiting' || st.state === 'attached') keep.push(tab);
+            if (['pending', 'consumed', 'waiting', 'attached'].includes(st.state)) keep.push(tab);
           } else if (tab.taskId) {
             // A task started on a PC has no session yet: keep its tab while the task works.
             const task = (await listTasks(core, tab.account)).find((x) => x.id === tab.taskId);
@@ -273,6 +350,10 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
         fresh.push({ ...i, account: acc });
       }
       if (!fresh.length) return;
+      if (isLive && fresh.some((i) => i.event === 'escalation_opened' || i.event === 'escalation_claimed')) {
+        refreshQueueRef.current?.(acc);
+        setQueueTick((n) => n + 1);
+      }
       setNotifications((cur) => [...cur, ...fresh].slice(-100));
       if (isLive) setUnread((n) => n + fresh.length);
     });
@@ -286,6 +367,25 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   const openTarget = useCallback(async (n) => {
     const acc = n.account ?? accountId;
     if (acc && acc !== accountId) setActive(acc);
+    // A queue notice opens the Queue.
+    if (n.event === 'escalation_opened' || n.event === 'escalation_claimed') {
+      if (guard.isShown(acc)) setView('queue');
+      return;
+    }
+    // An invite opens the session and joins it, even with no tab yet; an offer of control opens it
+    // with the offer on top. A tab opened this way belongs to a guest: closing it never ends the session.
+    if (n.session_id && (n.event === 'session_invited' || n.event === 'control_offered')) {
+      const join = n.event === 'session_invited';
+      const existing = tabs.find((x) => x.account === acc && x.sessionId === n.session_id);
+      if (existing) {
+        if (join) updateTab(existing.key, { joinOnOpen: true });
+        showTab(existing.key);
+        return;
+      }
+      const device = n.device_id ? deviceData.devices.find((d) => d.id === n.device_id) : null;
+      openSessionTab({ device, deviceId: n.device_id ?? null, deviceName: device?.name ?? (n.device_id ? '' : t('session.one_off_name')), sessionId: n.session_id, accountOf: acc, guest: true, join });
+      return;
+    }
     if (n.session_id) {
       const existing = tabs.find((x) => x.account === acc && x.sessionId === n.session_id);
       if (existing) { showTab(existing.key); return; }
@@ -310,7 +410,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
       }
     }
     if (n.device_id && guard.isShown(acc)) { setSelectedId(n.device_id); setView('devices'); }
-  }, [accountId, tabs, core, deviceData.devices, openSessionTab, setActive, showTab, guard]);
+  }, [accountId, tabs, core, deviceData.devices, openSessionTab, setActive, showTab, guard, updateTab]);
   const openTargetRef = useRef(null);
   openTargetRef.current = openTarget;
 
@@ -324,9 +424,9 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     core, appInfo, accounts: accounts ?? [], account, setActive, reloadAccounts: loadAccounts, can, me,
     devices: deviceData.devices, places: deviceData.places, devicesState: deviceData, reloadDevices,
     selectedId, select, conns, connect, cancelConnect, dismissConnect,
-    sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true),
+    sessionTabFor, tabForSession, isShown: guard.isShown, showTab, endTab, closeTab, leaveTab, markStance, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true), queueCount, queueTick, refreshQueue, reportOpen,
     toast, copyText, notifications, openTarget, now, theme, setTheme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded,
-  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, showTab, endTab, closeTab, updateTab, openSessionTab, go, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded]); // eslint-disable-line react-hooks/exhaustive-deps
+  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, tabForSession, showTab, endTab, closeTab, leaveTab, markStance, updateTab, openSessionTab, go, queueCount, queueTick, refreshQueue, reportOpen, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (accounts === null) return <div className="app" role="status"><p className="hint">{t('common.loading')}</p></div>;
 
@@ -360,7 +460,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
             {mine.length ? (
               <div className="tab-closers" role="group" aria-label={t('tabs.close_label')}>
                 {mine.map((x, i) => (
-                  <button key={x.key} type="button" className="tab-x" data-on={activeTab?.key === x.key} style={{ order: 2 * (i + 1) + 1 }} onClick={() => endTab(x.key)} aria-label={t('session.end_with', { name: x.deviceName || t('session.untitled') })} title={t('session.end')}><Icon name="x" /></button>
+                  <button key={x.key} type="button" className="tab-x" data-on={activeTab?.key === x.key} style={{ order: 2 * (i + 1) + 1 }} onClick={() => endTab(x.key)} aria-label={t({ leave: 'people.leave_with', end: 'session.end_with' }[stances[x.key]] ?? 'session.close_with', { name: x.deviceName || t('session.untitled') })} title={t({ leave: 'people.leave', end: 'session.end' }[stances[x.key]] ?? 'session.close_tab')}><Icon name="x" /></button>
                 ))}
               </div>
             ) : null}
@@ -372,6 +472,12 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
             <button type="button" aria-current={screen === 'devices' ? 'page' : undefined} onClick={() => go('devices')}><Icon name="monitor" />{t('nav.devices')}</button>
             <button type="button" aria-current={screen === 'add' ? 'page' : undefined} onClick={() => go('add')}><Icon name="plus" />{t('nav.add')}</button>
             <button type="button" onClick={() => setLinkOpen(true)}><Icon name="link" />{t('nav.link')}</button>
+            {canQueue ? (
+              <button type="button" aria-current={screen === 'queue' ? 'page' : undefined} onClick={() => go('queue')}>
+                <Icon name="queue" />{t('nav.queue')}
+                {queueCount ? <span className="count" aria-label={t('nav.queue_open', { count: queueCount })}>{queueCount}</span> : null}
+              </button>
+            ) : null}
             <span className="grow" />
             <button type="button" aria-current={screen === 'notifications' ? 'page' : undefined} onClick={() => go('notifications')}>
               <Icon name="bell" />{t('nav.notifications')}
@@ -383,6 +489,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
             <div className="panel-fill" role="tabpanel" id="panel-devices" aria-labelledby="tab-devices" hidden={screen === 'session'}>
               {screen === 'devices' ? <Devices /> : null}
               {screen === 'add' ? <AddDevice /> : null}
+              {screen === 'queue' ? <Queue key={account.id} /> : null}
               {screen === 'notifications' ? <Notifications /> : null}
               {screen === 'settings' ? <Settings /> : null}
             </div>

@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { agentWorld, BOSS, TECH, LEAD, OTHER } from './agent-world.js';
+import { oneOff } from './people-world.js';
 import { ant, oai, openaiUsage } from './agent-fakes.js';
 import { untrusted } from '../src/agent-task.js';
 import { estimateTokens } from '../src/agent-providers.js';
@@ -279,10 +280,10 @@ test('a takeover during a model call is seen before the action is sent', async (
   assert.equal(w.stateOf(w.taskRow(a.id).sid), 'attached');
 });
 
-test('a command from another person on a link session during a model call is seen before the action is sent', async (t) => {
+test('a command from another person on a link session that has no driver, during a model call, is seen before the action is sent', async (t) => {
   const w = await agentWorld(t);
   await w.ready();
-  const made = await w.tool(BOSS, 'session_create', {});
+  const made = { session_id: await oneOff(w) }; // made before sessions had drivers: any holder of control may command it
   const session = w.sessionFor(made.session_id).session;
   const { key } = await (await session.fetch(new Request('https://do/consume', { method: 'POST', body: JSON.stringify({ windows_mode: 'app' }) }))).json();
   const headers = { 'X-Attach-Key': key };
