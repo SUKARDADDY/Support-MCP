@@ -16,6 +16,7 @@ import { Settings } from './screens/Settings.jsx';
 import { SignIn } from './screens/SignIn.jsx';
 import { applyTheme, loadTheme, saveTheme } from './theme.js';
 import { loadTitles, withTitle } from './titles.js';
+import { useAccountGuard } from './account-guard.js';
 import { guardedStart, guardsFor } from './guarded-start.js';
 
 const ACTIVE_KEY = 'support.active';
@@ -102,7 +103,9 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   const signedIn = (accounts ?? []).filter((a) => a.signed_in);
   const account = signedIn.find((a) => a.id === activeId) ?? signedIn[0] ?? null;
   const accountId = account?.id ?? null;
-  const setActive = useCallback((id) => { setActiveId(id); write(ACTIVE_KEY, id); setSelectedId(null); setView('devices'); }, []);
+  // Every relay read or answer that belongs to an account asks this whether that account is still the one shown.
+  const guard = useAccountGuard(accountId);
+  const setActive = useCallback((id) => { guard.select(id); setActiveId(id); write(ACTIVE_KEY, id); setSelectedId(null); setView('devices'); }, [guard]);
 
   useEffect(() => {
     if (!accountId) { setMe({ identity: '', permissions: [] }); return undefined; }
@@ -114,28 +117,28 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
 
   // ---- devices -----------------------------------------------------------------
   const [deviceData, setDeviceData] = useState({ devices: [], places: new Map(), loading: true, error: null });
-  const loadSeq = useRef(0);
   const placesAt = useRef(0);
+  // Devices, sites and customers are read together for one account. The callback may be an old one
+  // (a screen calls the one it was given before the team changed): it starts nothing and advances
+  // nothing unless its account is the one on screen, and its answer is applied only if that is still so.
   const reloadDevices = useCallback(async () => {
-    if (!accountId) return;
-    const mine = ++loadSeq.current;
+    const token = guard.begin(accountId);
+    if (!token) return;
     // Sites and customers change rarely: they are read again every few minutes, not at every look at the list.
     const stalePlaces = Date.now() - placesAt.current > PLACES_EVERY_MS;
     try {
       const [devices, places] = await Promise.all([fetchDevices(core, accountId), stalePlaces ? fetchPlaces(core, accountId).catch(() => null) : null]);
-      // A newer read, or a change of account, has made this one stale: its answer belongs to nobody now.
-      if (mine !== loadSeq.current) return;
+      if (!guard.fresh(token)) return;
       if (places) placesAt.current = Date.now();
       setDeviceData((d) => ({ devices: sortDevices(devices), places: places ?? d.places, loading: false, error: null }));
     } catch (error) {
-      if (mine === loadSeq.current) setDeviceData((d) => ({ ...d, loading: false, error }));
+      if (guard.fresh(token)) setDeviceData((d) => ({ ...d, loading: false, error }));
     }
-  }, [core, accountId]);
-  // A change of account drops the old list and every read still on its way for the old account
-  // (devices, sites and customers are read together under one sequence number), then reads the new one.
+  }, [core, accountId, guard]);
+  // A change of account drops the old list and every read still on its way, then reads the new one.
   const lastAccount = useRef(null);
   useEffect(() => {
-    loadSeq.current += 1;
+    guard.invalidate(accountId);
     placesAt.current = 0;
     setDeviceData({ devices: [], places: new Map(), loading: true, error: null });
     const switched = lastAccount.current !== null && lastAccount.current !== accountId;
@@ -148,21 +151,27 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
 
   // ---- session tabs ------------------------------------------------------------
   const persist = useCallback((next) => { write(TABS_KEY, next); return next; }, []);
-  const showTab = useCallback((key) => setView(`tab:${key}`), []);
-  const accountRef = useRef(null); // the account on screen now, for callbacks made under an earlier one
-  accountRef.current = accountId;
-  // `show` says whether to go to the tab. The caller knows: a connection that finished after a switch
-  // of team must not take the view, and a click on another team's notification must (this function's
-  // own idea of the shown account is the one it was made with, which may be the old one).
-  const openSessionTab = useCallback(({ device, sessionId = null, taskId = null, deviceId = null, deviceName = null, accountOf = null, show = true }) => {
+  // A tab of another account than the one on screen is never made the view (it would hide the lists
+  // and stop their reads): it is shown when its account is.
+  const showTab = useCallback((key) => {
+    const tab = tabsRef.current.find((x) => x.key === key);
+    if (tab && !guard.isShown(tab.account)) return;
+    setView(`tab:${key}`);
+  }, [guard]);
+  const tabsRef = useRef(tabs);
+  tabsRef.current = tabs;
+  // `show` says whether to go to the tab. By default it does when the tab's account is the one on
+  // screen *now* (asked of the guard, not of the account this callback was made under, which may be an
+  // old one: a connection or a start that finished after a switch of team must not take the view).
+  const openSessionTab = useCallback(({ device, sessionId = null, taskId = null, deviceId = null, deviceName = null, accountOf = null, show = null }) => {
     const key = sessionId ?? `task:${taskId}`;
     setTabs((cur) => {
       if (cur.some((x) => x.key === key)) return cur;
       return persist([...cur, { key, account: accountOf ?? accountId, deviceId: device?.id ?? deviceId, deviceName: device?.name ?? deviceName ?? '', sessionId, taskId }]);
     });
     // A tab that is not shown is added under its own account and appears when that account is used.
-    if (show) setView(`tab:${key}`);
-  }, [accountId, persist]);
+    if (show ?? guard.isShown(accountOf ?? accountId)) setView(`tab:${key}`);
+  }, [accountId, persist, guard]);
   const closeTab = useCallback((key) => {
     setTabs((cur) => persist(cur.filter((x) => x.key !== key)));
     setView((v) => (v === `tab:${key}` ? 'devices' : v));
@@ -209,6 +218,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     restored.current = true;
     (async () => {
       const keep = [];
+      const asked = new Set(tabs.map((x) => x.key));
       for (const tab of tabs) {
         if (!accounts.some((a) => a.id === tab.account && a.signed_in)) continue;
         try {
@@ -224,14 +234,16 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
           if (e?.code === 'unavailable') keep.push(tab);
         }
       }
-      setTabs(persist(keep));
+      // Only the tabs from the last run that are over are dropped; a tab opened while this was asking stays.
+      const kept = new Set(keep.map((x) => x.key));
+      setTabs((cur) => persist(cur.filter((x) => !asked.has(x.key) || kept.has(x.key))));
     })().catch(() => {});
   }, [accounts]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const { conns, connect, cancel: cancelConnect, dismiss: dismissConnect } = useConnections({
     core,
     account: accountId,
-    onLive: ({ device, sessionId, account: accountOf }) => openSessionTab({ device, sessionId, accountOf, show: accountOf === accountRef.current }),
+    onLive: ({ device, sessionId, account: accountOf }) => openSessionTab({ device, sessionId, accountOf }),
     onEndFailed: (device) => toast(t('connect.cleanup_failed', { name: device.name })),
     pollMs: tuning.connectPollMs,
   });
@@ -290,14 +302,15 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
             openSessionTab({ device, deviceId: task.device_id, deviceName: device?.name, sessionId: task.session_id, taskId: task.id, accountOf: acc });
             return;
           }
-          if (task.device_id) { setSelectedId(task.device_id); setView('devices'); return; }
+          // The answer came after the team was switched again: it is not this team's PC to select.
+          if (task.device_id) { if (guard.isShown(acc)) { setSelectedId(task.device_id); setView('devices'); } return; }
         }
       } catch (_) {
         // fall through to the PC
       }
     }
-    if (n.device_id) { setSelectedId(n.device_id); setView('devices'); }
-  }, [accountId, tabs, core, deviceData.devices, openSessionTab, setActive, showTab]);
+    if (n.device_id && guard.isShown(acc)) { setSelectedId(n.device_id); setView('devices'); }
+  }, [accountId, tabs, core, deviceData.devices, openSessionTab, setActive, showTab, guard]);
   const openTargetRef = useRef(null);
   openTargetRef.current = openTarget;
 

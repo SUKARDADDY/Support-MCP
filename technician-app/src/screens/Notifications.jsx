@@ -9,7 +9,7 @@ import { NotificationSettings } from './NotificationSettings.jsx';
 // name, a task's note), so they are shown as text. A "waiting for approval" body comes from a
 // join request that anyone can send before the PC is approved, so it is labelled as the PC's own words.
 export function Notifications() {
-  const { notifications, accounts, openTarget, now, titleOf } = useApp();
+  const { notifications, accounts, account, openTarget, now, titleOf } = useApp();
   const [tab, setTab] = useState('recent');
   const several = accounts.length > 1;
   const items = [...notifications].sort((a, b) => b.at - a.at || b.id - a.id);
@@ -22,7 +22,7 @@ export function Notifications() {
           <button type="button" role="tab" id="notify-tab-settings" aria-controls="notify-panel" aria-selected={tab === 'settings'} tabIndex={tab === 'settings' ? 0 : -1} onClick={() => setTab('settings')}>{t('notify.settings')}</button>
         </div>
         <div role="tabpanel" id="notify-panel" aria-labelledby={`notify-tab-${tab}`}>
-        {tab === 'settings' ? <NotificationSettings /> : items.length === 0 ? (
+        {tab === 'settings' ? <NotificationSettings key={account?.id} /> : items.length === 0 ? (
           <p className="hint">{t('notify.empty')}</p>
         ) : (
           <ul className="feed" aria-label={t('notify.recent')}>

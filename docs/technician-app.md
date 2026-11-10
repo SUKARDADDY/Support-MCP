@@ -132,7 +132,10 @@ the app's core has no tool for them.
   answered ends the session the relay makes afterwards. A session end that fails is tried once more,
   and if the session may still be there the app names the PC in a message, because its user may still be
   asked to click Allow. A new connection to the PC waits for that cleanup. An answer that comes back for an account,
-  session or task the screen has since left is dropped.
+  session or task the screen has since left is dropped. For the lists, one guard (`account-guard.js`) holds a sequence
+  number per account: a read starts only for the account on screen, and its answer is applied only if that is still
+  so, so a callback a screen kept from before a switch (an approval that finishes late, say) cannot fill the new
+  team's list. A tab of another account is never made the view.
 - A task started on a PC whose session has ended gets a new tab; the ended tab keeps saying so. When a
   task turns out to run on another session than its tab's (a start by PC that had to connect again),
   the tab adopts that session and saves it, with the task, so a restart follows the task again.

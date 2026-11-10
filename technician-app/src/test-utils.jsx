@@ -83,12 +83,13 @@ export function fakeCore(initial = {}) {
       if (p === '/api/pairing' && method === 'GET') return state.pairingList ? state.pairingList() : { pairings: state.pairingUsed ? [] : [{ id: state.pairing.id, expires_at: state.pairing.expires_at }], next: null };
       const approve = /^\/api\/devices\/(\w+)$/.exec(p);
       if (approve && method === 'PATCH') {
+        if (state.approveGate) await state.approveGate;
         if (state.approveError) throw state.approveError;
         const d = state.devices.find((x) => x.id === approve[1]);
         d.status = 'active';
         return { device: d };
       }
-      if (p === '/api/agent/tasks' && method === 'GET') return { tasks: state.tasks };
+      if (p === '/api/agent/tasks' && method === 'GET') { if (state.tasksGate) await state.tasksGate; return { tasks: state.tasks }; }
       if (p === '/api/agent/tasks' && method === 'POST') {
         const id = ID('t');
         state.started = body;
@@ -110,6 +111,7 @@ export function fakeCore(initial = {}) {
       }
       if (p === '/teams') return { teams: state.teams };
       if (p === '/notifications/settings') {
+        if (state.notifySettingsFor) return state.notifySettingsFor(account);
         if (method === 'PATCH') {
           state.patches = [...(state.patches ?? []), body];
           state.notifySettings = { events: { ...state.notifySettings.events, ...(body.events ?? {}) }, watch: body.watch ?? state.notifySettings.watch };

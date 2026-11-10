@@ -5,6 +5,7 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, test } from 'vitest';
 import { AppContext } from './context.jsx';
 import { AddDevice } from './screens/AddDevice.jsx';
+import { Notifications } from './screens/Notifications.jsx';
 import { useSession } from './session.js';
 import { ACCOUNT, FAST, ID, device, fakeCore, renderApp } from './test-utils.jsx';
 
@@ -495,5 +496,123 @@ describe('a tab whose session has ended', () => {
     expect(screen.queryByText('session ended')).not.toBeInTheDocument();
     expect(screen.getByText('Ended')).toBeInTheDocument();
     expect(screen.getByText('IEWIN7')).toBeInTheDocument();
+  });
+});
+
+describe('calls a screen made under the old team', () => {
+  const acmeList = () => ({ devices: [device({ id: ID('q'), name: 'Acme PC' })], next: null });
+  const readsOf = (fake, acc) => toolCalls(fake, 'device_list').filter((c) => c[0] === acc).length;
+
+  test('approving a PC and switching teams before it finishes does not put the old team\'s PCs in the new team\'s list', async () => {
+    const user = userEvent.setup();
+    const gate = deferred();
+    const pending = device({ id: ID('w'), name: 'OLD TEAM SECRET PC', status: 'pending', online: true, expires_at: Date.now() + 600000 });
+    const fake = fakeCore({ accounts: [ACCOUNT, SECOND], devices: [pending] });
+    fake.state.approveGate = gate.promise;
+    fake.state.deviceList = async (account) => (account === 'acc2' ? acmeList() : { devices: structuredClone(fake.state.devices), next: null });
+    renderApp(fake);
+    await user.click(await screen.findByRole('button', { name: /OLD TEAM SECRET PC/ }));
+    const detail = screen.getByRole('region', { name: 'Device details' });
+    await user.type(within(detail).getByLabelText('Six-digit number shown on the PC'), '123456');
+    await user.click(within(detail).getByRole('button', { name: 'Approve' }));
+    await waitFor(() => expect(fake.core.request.mock.calls.some((c) => c[1] === 'PATCH')).toBe(true));
+    await switchTeam(user);
+    expect(await screen.findByRole('button', { name: /Acme PC/ })).toBeInTheDocument();
+    const before = readsOf(fake, 'acc1');
+    await act(async () => { gate.resolve(); });
+    await sleep(120);
+    expect(screen.queryByRole('button', { name: /OLD TEAM SECRET PC/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Acme PC/ })).toBeInTheDocument();
+    expect(readsOf(fake, 'acc1')).toBe(before); // the old team's list is not even asked for
+  });
+
+  test('a task that is looked up for a notification after the team was switched again does not take the view', async () => {
+    const user = userEvent.setup();
+    const gate = deferred();
+    const fake = fakeCore({ accounts: [ACCOUNT, SECOND] });
+    fake.state.tasks = [liveTask()];
+    fake.state.sessions[SID] = { state: 'attached', driver: 'tech@example.com', machine: 'FRONT', log: [] };
+    fake.state.tasksGate = gate.promise;
+    renderApp(fake, { ...FAST, devicePollMs: 40 });
+    await screen.findByRole('button', { name: /Front counter/ });
+    await waitFor(() => expect(fake.core.on).toHaveBeenCalledWith('ui://open', expect.any(Function)));
+    act(() => fake.emit('ui://open', { account: 'acc2', task_id: TASK, session_id: null, device_id: ID('a') }));
+    await waitFor(() => expect(fake.core.request.mock.calls.some((c) => c[0] === 'acc2' && c[2] === '/api/agent/tasks')).toBe(true));
+    await switchTeam(user); // back to the first team while the lookup is still on its way
+    await act(async () => { gate.resolve(); });
+    await sleep(100);
+    expect(screen.getByRole('tab', { name: 'Devices', selected: true })).toBeInTheDocument();
+    expect(screen.queryByRole('tab', { name: /Front counter/ })).not.toBeInTheDocument();
+    const before = readsOf(fake, 'acc1');
+    await sleep(200);
+    expect(readsOf(fake, 'acc1')).toBeGreaterThan(before + 1); // the view is the device list, so it keeps being read
+    expect(JSON.parse(localStorage.getItem('support.tabs')).map((t) => t.account)).toEqual(['acc2']);
+  });
+
+  test('a task started from a PC\'s detail that finishes after a switch of team opens its tab under its own team and leaves the view alone', async () => {
+    const user = userEvent.setup();
+    const gate = deferred();
+    const fake = fakeCore({ accounts: [ACCOUNT, SECOND] });
+    const request = fake.core.request.getMockImplementation();
+    fake.core.request.mockImplementation(async (account, method, path, body) => {
+      if (method === 'POST' && path === '/api/agent/tasks') await gate.promise;
+      return request(account, method, path, body);
+    });
+    renderApp(fake, { ...FAST, devicePollMs: 40 });
+    await user.click(await screen.findByRole('button', { name: /^Front counter/ }));
+    await user.click(within(screen.getByRole('region', { name: 'Device details' })).getByRole('button', { name: 'Hand to the agent' }));
+    const dialog = screen.getByRole('dialog', { hidden: true });
+    await user.click(within(dialog).getByLabelText('What should the agent do?'));
+    await user.paste('Fix the printer');
+    await user.click(within(dialog).getByRole('button', { name: 'Start the task' }));
+    await waitFor(() => expect(fake.core.request.mock.calls.some((c) => c[1] === 'POST' && c[2] === '/api/agent/tasks')).toBe(true));
+    await switchTeam(user);
+    await act(async () => { gate.resolve(); });
+    await sleep(100);
+    expect(screen.getByRole('tab', { name: 'Devices', selected: true })).toBeInTheDocument();
+    expect(screen.queryByRole('tab', { name: /Front counter/ })).not.toBeInTheDocument();
+    const before = readsOf(fake, 'acc2');
+    await sleep(200);
+    expect(readsOf(fake, 'acc2')).toBeGreaterThan(before + 1);
+    expect(JSON.parse(localStorage.getItem('support.tabs')).map((t) => [t.account, t.key])).toEqual([['acc1', `task:${TASK}`]]);
+  });
+});
+
+describe('tabs from the last run, while the app asks which are still open', () => {
+  test('a tab opened meanwhile is kept', async () => {
+    const user = userEvent.setup();
+    const gate = deferred();
+    const fake = fakeCore();
+    fake.state.sessions[SID2] = { state: 'attached', driver: 'tech@example.com', machine: 'BACK', log: [] };
+    fake.state.connect = () => ({ session_id: SID2, state: 'attached', asks: false });
+    fake.state.sessionStatus = (args) => (args.session_id === SID ? gate.promise : { state: 'attached', driver: 'tech@example.com', log: [] });
+    saveTab();
+    renderApp(fake);
+    await user.click(await screen.findByRole('button', { name: /Back office/ }));
+    await user.click(screen.getByRole('button', { name: 'Connect' }));
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('support.tabs')).map((t) => t.key)).toContain(SID2));
+    await act(async () => { gate.resolve({ state: 'attached', driver: 'tech@example.com', log: [] }); });
+    await sleep(100);
+    expect(JSON.parse(localStorage.getItem('support.tabs')).map((t) => t.key).sort()).toEqual([SID, SID2].sort());
+  });
+});
+
+describe('notification settings, and the team changes under them', () => {
+  test('the old team\'s switches are not shown while the new team\'s are read', async () => {
+    const gate = deferred();
+    const fake = fakeCore();
+    fake.state.notifySettingsFor = async (account) => {
+      if (account === 'acc2') await gate.promise;
+      return { events: { task_finished: account === 'acc1', task_problem: true, session_declined: true, device_online: true, device_missing: true, device_waiting: true }, watch: [] };
+    };
+    const ctx = (id) => ({ core: fake.core, account: { id }, accounts: [{ id: 'acc1' }, { id: 'acc2' }], notifications: [], openTarget() {}, now: Date.now(), titleOf: () => null, devices: [], toast() {} });
+    const view = render(<AppContext.Provider value={ctx('acc1')}><Notifications /></AppContext.Provider>);
+    await userEvent.setup().click(screen.getByRole('tab', { name: 'Settings' }));
+    expect(await screen.findByRole('checkbox', { name: /Task finished/i })).toBeChecked();
+    view.rerender(<AppContext.Provider value={ctx('acc2')}><Notifications /></AppContext.Provider>);
+    await sleep(40);
+    expect(screen.queryByRole('checkbox', { name: /Task finished/i })).not.toBeInTheDocument(); // not the old team's switch
+    await act(async () => { gate.resolve(); });
+    expect(await screen.findByRole('checkbox', { name: /Task finished/i })).not.toBeChecked();
   });
 });
