@@ -3,7 +3,7 @@
 import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, test } from 'vitest';
-import { ID, ToolFail, fakeCore, renderApp } from '../test-utils.jsx';
+import { FAST, ID, ToolFail, fakeCore, renderApp } from '../test-utils.jsx';
 
 const SID = 's'.repeat(64);
 const ME = 'tech@example.com';
@@ -17,11 +17,11 @@ const person = (identity, role, name = null) => ({ identity, name, role, since: 
 const OTHER_TAB = { key: SID, account: 'acc1', deviceId: ID('a'), deviceName: 'Front counter', sessionId: SID, taskId: null };
 
 // A session tab from the last run. `session` is what the relay says about it.
-async function open(session = {}, { fake = fakeCore(), tab = {}, permissions } = {}) {
+async function open(session = {}, { fake = fakeCore(), tab = {}, permissions, tuning } = {}) {
   localStorage.setItem('support.tabs', JSON.stringify([{ ...OTHER_TAB, ...tab }]));
   if (permissions) fake.state.permissions = permissions;
   fake.state.sessions[SID] = { state: 'attached', driver: ME, machine: 'FRONT', log: [], ...session };
-  const view = renderApp(fake);
+  const view = renderApp(fake, tuning);
   const user = userEvent.setup();
   await user.click(await screen.findByRole('tab', { name: new RegExp(tab.deviceName ?? 'Front counter') }));
   return { ...view, user, fake };
@@ -94,6 +94,15 @@ describe('the driver: Invite, Hand over, Remove, Escalate', () => {
     const { user } = await open(asDriver(), { fake });
     await user.click(await screen.findByRole('button', { name: 'Remove Wat Watcher from the session' }));
     expect(await screen.findByText(text)).toBeInTheDocument();
+  });
+
+  test('a refusal that says the session is gone refreshes the status at once, and the tab shows it ended', async () => {
+    const fake = fakeCore();
+    fake.state.participantsCall = () => { fake.state.sessions[SID].state = 'ended'; throw new ToolFail('not_found: no such live session', 'not_found'); };
+    const { user } = await open(asDriver(), { fake, tuning: { ...FAST, statusMs: 60000 } });
+    await user.click(await screen.findByRole('button', { name: 'Remove Wat Watcher from the session' }));
+    expect(await screen.findByText('Ended')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'End session' })).not.toBeInTheDocument();
   });
 
   test('an error with no code (a lost second factor) shows the relay\'s own text', async () => {
