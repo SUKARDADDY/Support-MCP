@@ -1066,11 +1066,12 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
   //   - to become the driver (driving), find the session attached: only then has the PC let the session in.
   // An invited person's second factor is checked here, when they act, because it belongs to their own
   // sign-in; at invite time only their role is checked (mayInvite).
-  const factorFor = async (caps, permission, code) => {
+  // A missing second factor is its own refusal, `second_factor` (as the API says it), not a missing role.
+  const factorFor = async (caps, permission) => {
     try {
       await caps.factor?.(permission);
     } catch (e) {
-      throw new TeamError(403, code, e.message);
+      throw new TeamError(403, 'second_factor', e.message);
     }
   };
   const UNASKED = 'This PC was connected without asking its owner. Only people allowed to connect without asking can join.';
@@ -1080,14 +1081,14 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
     const person = normalizeIdentity(personIdentity);
     if (!LIVE_STATES.includes(watch.state)) throw new TeamError(404, 'not_found', 'no such live session');
     if (!(await holds(slug, person, 'sessions.control'))) throw new TeamError(403, 'cannot_control', 'your role does not allow sessions.control');
-    await factorFor(caps, 'sessions.control', 'cannot_control');
+    await factorFor(caps, 'sessions.control');
     let pointer = null;
     if (watch.device_id) {
       pointer = await liveSession(slug, watch.device_id);
       if (!pointer || pointer.id !== sid) throw new TeamError(404, 'not_found', 'no such live session');
       if (pointer.ask === false) {
         if (!(await holds(slug, person, UNATTENDED_PERMISSION))) throw new TeamError(403, 'needs_unattended', UNASKED);
-        await factorFor(caps, UNATTENDED_PERMISSION, 'needs_unattended');
+        await factorFor(caps, UNATTENDED_PERMISSION);
       }
     } else if (!watch.driver) {
       throw new TeamError(403, 'not_driver', 'this session has no driver, so there is nothing to join');
@@ -1143,12 +1144,12 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
         name = cur.name;
         if (pointer.ask === false) {
           if (!(await holds(slug, actor, UNATTENDED_PERMISSION))) throw new TeamError(403, 'needs_unattended', UNASKED);
-          await factorFor(caps, UNATTENDED_PERMISSION, 'needs_unattended');
+          await factorFor(caps, UNATTENDED_PERMISSION);
         }
       }
       if (kind === 'take_over') {
         if (!(await holds(slug, actor, UNATTENDED_PERMISSION))) throw new TeamError(403, 'needs_unattended', `taking over needs ${UNATTENDED_PERMISSION}. Ask the driver to offer control instead.`);
-        await factorFor(caps, UNATTENDED_PERMISSION, 'needs_unattended');
+        await factorFor(caps, UNATTENDED_PERMISSION);
       }
       const detail = deviceId ? `${deviceId} ${JSON.stringify(name)} from ${pointer.by} to ${actor}` : `${sid.slice(0, 8)}${was ? ` from ${was}` : ''} to ${actor}`;
       const proof = deviceId

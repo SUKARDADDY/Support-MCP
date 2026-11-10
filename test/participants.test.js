@@ -76,7 +76,7 @@ test('an error of these tools starts with its code: "<code>: <message>"', async 
   assert.match((await w.tool(BOSS, 'session_participants', { session_id: 'f'.repeat(64), action: 'join' })).error, /^not_found: no such live session$/);
   assert.match((await w.tool(BOSS, 'session_participants', { session_id: sid, action: 'dance' })).error, /^bad_request: action must be/);
   assert.match((await w.tool(BOSS, 'escalation', { action: 'claim', id: 'a'.repeat(20) })).error, /^not_found: /);
-  assert.match((await w.tool(BOSS, 'escalation', { action: 'nope' })).error, /^action must be open, list, claim or close$/);
+  assert.match((await w.tool(BOSS, 'escalation', { action: 'nope' })).error, /^bad_request: action must be open, list, claim or close$/);
   // The old tools' errors are as they were: plain text.
   assert.equal((await w.tool(BOSS, 'run', { session_id: sid, command: 'x' })).error, `${TECH} is driving this session; use device_connect with take_over`);
 });

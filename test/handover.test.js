@@ -202,19 +202,19 @@ test('without the second factor, join, the picture and accept are each refused, 
   await part(a.people, a.sid, TECH, 'invite', TECH2);
   assert.equal(await code(part(a.people, a.sid, TECH2, 'join', undefined)), 'ok');
   await hand(a.people, a.sid, TECH, 'offer', TECH2);
-  assert.equal(await code(a.people.participants('default', TECH2, { session_id: a.sid, action: 'join' }, NO_FACTOR)), 'cannot_control');
-  assert.equal(await code(a.people.frame('default', TECH2, a.sid, NO_FACTOR)), 'cannot_control');
-  assert.equal(await code(hand(a.people, a.sid, TECH2, 'accept', undefined, NO_FACTOR)), 'cannot_control');
+  assert.equal(await code(a.people.participants('default', TECH2, { session_id: a.sid, action: 'join' }, NO_FACTOR)), 'second_factor');
+  assert.equal(await code(a.people.frame('default', TECH2, a.sid, NO_FACTOR)), 'second_factor');
+  assert.equal(await code(hand(a.people, a.sid, TECH2, 'accept', undefined, NO_FACTOR)), 'second_factor');
   assert.equal(w.pointer(a.pc.id).by, TECH, 'nothing moved');
   // A session that was never asked needs the second factor of both permissions.
   const u = await unasked(w);
   await part(u.people, u.sid, LEAD, 'invite', BOSS);
   await part(u.people, u.sid, BOSS, 'join');
   await hand(u.people, u.sid, LEAD, 'offer', BOSS);
-  assert.equal(await code(u.people.participants('default', BOSS, { session_id: u.sid, action: 'join' }, NO_FACTOR)), 'cannot_control');
-  assert.equal(await code(u.people.participants('default', BOSS, { session_id: u.sid, action: 'join' }, NO_UNATTENDED_FACTOR)), 'needs_unattended');
-  assert.equal(await code(u.people.frame('default', BOSS, u.sid, NO_UNATTENDED_FACTOR)), 'needs_unattended');
-  assert.equal(await code(hand(u.people, u.sid, BOSS, 'accept', undefined, NO_UNATTENDED_FACTOR)), 'needs_unattended');
+  assert.equal(await code(u.people.participants('default', BOSS, { session_id: u.sid, action: 'join' }, NO_FACTOR)), 'second_factor');
+  assert.equal(await code(u.people.participants('default', BOSS, { session_id: u.sid, action: 'join' }, NO_UNATTENDED_FACTOR)), 'second_factor');
+  assert.equal(await code(u.people.frame('default', BOSS, u.sid, NO_UNATTENDED_FACTOR)), 'second_factor');
+  assert.equal(await code(hand(u.people, u.sid, BOSS, 'accept', undefined, NO_UNATTENDED_FACTOR)), 'second_factor');
   assert.equal(w.pointer(u.pc.id).by, LEAD);
   assert.equal(await code(hand(u.people, u.sid, BOSS, 'accept')), 'ok', 'with the factors it goes through');
 });
@@ -305,6 +305,25 @@ test('a session step that kept failing until the offer lapsed is finished by a r
   await hand(people, sid, TECH2, 'offer', TECH);
   assert.equal((await hand(people, sid, TECH, 'accept')).driver, TECH);
   assert.equal(w.pointer(pc.id).by, TECH);
+});
+
+test('an open offer, a handover in progress and a missing second factor are each their own refusal, not already_claimed', async (t) => {
+  const w = await agentWorld(t);
+  const { sid, people } = await asked(w);
+  await part(people, sid, TECH, 'invite', TECH2);
+  await part(people, sid, TECH2, 'join');
+  await part(people, sid, TECH, 'invite', LEAD);
+  await part(people, sid, LEAD, 'join');
+  await hand(people, sid, TECH, 'offer', TECH2);
+  assert.equal(await code(hand(people, sid, TECH, 'offer', LEAD)), 'offer_pending');
+  // While TECH2's accept is between its steps, another offer and another accept find control being handed over.
+  let during = null;
+  around(w, { op: 'accepting', after: async (n) => { if (n === 1) during = [await code(hand(people, sid, TECH, 'offer', LEAD)), await code(hand(people, sid, LEAD, 'accept'))]; } });
+  await hand(people, sid, TECH2, 'accept');
+  assert.deepEqual(during, ['busy', 'busy']);
+  // A missing second factor is told as such, with the tool's "<code>: <message>" text.
+  const e = await hand(people, sid, TECH, 'accept', undefined, NO_FACTOR).catch((x) => x);
+  assert.equal(e.code, 'second_factor');
 });
 
 test('a cancel between the steps leaves one driver, whichever way it lands', async (t) => {

@@ -709,7 +709,8 @@ apply to only one client say which.
     team; if it is a saved PC's session whose pointer says `ask:false` (the person at the PC
     was never asked), they must also hold `sessions.unattended` with its second factor, else
     `needs_unattended`; and to become the driver the session must be `attached`, else
-    `not_attached`. Seeing a PC's screen is a lesser right than driving it, but on a session
+    `not_attached`. A sign-in that lacks the authenticator code for either permission is refused
+    `second_factor`, not as a missing role. Seeing a PC's screen is a lesser right than driving it, but on a session
     started without asking it is exactly what "connect without asking" protects, so a watcher
     needs the same permission as a driver there. A one-off session counts as approved once
     attached, because the person at the PC ran the link themselves. An invite checks only the
@@ -726,6 +727,12 @@ apply to only one client say which.
     take-over that lands after the change wins too, because the Session's step stops when
     someone else drives. A Session step that fails is retried at once and, if it keeps failing,
     reported, and repeating the call runs only that step. Fault tests cover each of these.
+  - *A take-over makes the previous driver a watcher, and access is rechecked on every read.* When an
+    admin takes a session over (`device_connect` with `take_over`, or `session_handover` on a one-off
+    session), the previous driver stays on it as a watcher. That is a lesser right, not a leftover
+    one: the picture route and every other read run the one rule again on each call, so a person
+    whose role, permission or second factor has gone since they joined is refused at once, whether
+    they drive or watch.
   - *Invites and watchers stay with the session.* Who is invited or watching, a pending offer
     (2 minutes) and the last handover are in the Session's own storage and end with it. There
     is no table. At most 20 people besides the driver. The team log holds `device_session_handed_over`
@@ -747,6 +754,9 @@ apply to only one client say which.
   - *The queue holds ids, names and text from people and an agent.* An item has the PC and the
     session, who opened it, who claimed and closed it, and a note, a summary or a close note.
     Those texts are untrusted: they may repeat a customer's screen, and a reader shows them as text.
+    Every item, including an agent's summary, is visible to everyone who can control sessions in the
+    team: the queue is a shared list, not a private hand-off, so a note should hold nothing a colleague
+    with that permission should not read.
     The log names the item's id and the PC, never the text. A built-in agent task that finishes with
     `needs_human` opens an item with its summary in the same batch as its end, and nothing else that
     ends a task does. A claim moves control only from the

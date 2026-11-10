@@ -205,8 +205,10 @@ checked when they join, read the picture or accept.
 
 **Errors start with a code.** A failed call answers plain text `<code>: <message>`, for example
 `needs_unattended: This PC was connected without asking its owner. Only people allowed to connect without asking can
-join.` Codes: `not_driver`, `cannot_control`, `needs_unattended`, `not_attached`, `no_offer`, `not_offered_to_you`,
-`not_invited`, `already_claimed`, `not_found` and `mode`. A malformed call is `bad_request`.
+join.` Codes: `not_driver`, `cannot_control`, `second_factor` (the role allows it, the sign-in lacks the authenticator
+code), `needs_unattended`, `not_attached`, `no_offer`, `not_offered_to_you`, `not_invited`, `offer_pending` (an offer
+to someone else is still open), `busy` (control is being handed over right now; try again), `already_claimed` (a queue
+item that someone else claimed first), `not_found` and `mode`. A malformed call, or an unknown `action`, is `bad_request`.
 
 **One-off links now have a driver.** The member who makes a link with `session_create` drives its session, and
 a command from anyone else is refused with their name and a pointer to `session_handover`. The person at the PC is never

@@ -817,9 +817,8 @@ export class Session {
       if (!to || to === this.driver) return refusal('bad_request', 'offer control to someone else on the session');
       if (p.participants[to]?.role !== 'watcher') return refusal('not_invited', 'that person has not joined this session');
       const pending = this.currentOffer();
-      if (this.currentAccepting() || (pending && pending.to !== to)) {
-        return refusal('already_claimed', pending ? `an offer to ${pending.to} is still open; cancel it first` : 'control is being handed over right now');
-      }
+      if (this.currentAccepting()) return refusal('busy', 'control is being handed over right now');
+      if (pending && pending.to !== to) return refusal('offer_pending', `an offer to ${pending.to} is still open; cancel it first`);
       if (!pending) {
         p.offer = { to, by: actor, at: now, expires_at: now + OFFER_MS };
         await this.savePeople();
@@ -850,7 +849,9 @@ export class Session {
       if (!this.driver) return notDriver();
       if (actor === this.driver) return refusal('bad_request', 'you are already the driver');
       const held = this.currentAccepting();
-      if (held && held.to !== actor) return refusal('already_claimed', 'control is being handed over to someone else right now');
+      if (held && held.to !== actor) return b.claim && held.claim
+        ? refusal('already_claimed', 'someone else is claiming this session right now')
+        : refusal('busy', 'control is being handed over to someone else right now');
       if (b.claim && b.claim.expect_driver !== undefined) {
         // A claim takes control from the person who escalated, and only while they still drive.
         if (sameIdentity(b.claim.expect_driver) !== this.driver) return notDriver();

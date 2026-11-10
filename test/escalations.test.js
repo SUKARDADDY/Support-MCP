@@ -245,9 +245,9 @@ test('a live claim follows the same rule as an accept: needs_unattended on a ses
   assert.equal(w.pointer(u.pc.id).ask, false);
   const item = (await svc.open('default', LEAD, { session_id: u.sid })).escalation;
   assert.equal(await code(svc.claim('default', TECH2, { id: item.id })), 'needs_unattended');
-  assert.equal(await code(svc.claim('default', TECH2, { id: item.id }, { factor: async (p) => { throw new Error(`${p} needs a code`); } })), 'cannot_control');
+  assert.equal(await code(svc.claim('default', TECH2, { id: item.id }, { factor: async (p) => { throw new Error(`${p} needs a code`); } })), 'second_factor');
   assert.deepEqual([items(w).find((r) => r.id === item.id).claimed_by, w.pointer(u.pc.id).by], [null, LEAD], 'nothing moved, nothing claimed');
-  assert.equal(await code(svc.claim('default', BOSS, { id: item.id }, { factor: async (p) => { if (p === 'sessions.control') throw new Error('no'); } })), 'cannot_control');
+  assert.equal(await code(svc.claim('default', BOSS, { id: item.id }, { factor: async (p) => { if (p === 'sessions.control') throw new Error('no'); } })), 'second_factor');
   assert.equal((await svc.claim('default', BOSS, { id: item.id })).driver, BOSS, 'an admin passes');
 
   // Waiting: the PC has not let the session in.

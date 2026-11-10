@@ -282,7 +282,7 @@ function makeBackend(env, origin, devTtlMs, actor, workspace, via = null, taskId
         if (args.action === 'list') return q.list(workspace, actor, args);
         if (args.action === 'claim') return q.claim(workspace, actor, args, caps);
         if (args.action === 'close') return q.close(workspace, actor, args);
-        throw new Error('action must be open, list, claim or close');
+        throw new TeamError(400, 'bad_request', 'action must be open, list, claim or close');
       });
     },
     // The built-in agent. caps.user is the OAuth caller's { userId, email }, or null.

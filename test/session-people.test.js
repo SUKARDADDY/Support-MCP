@@ -179,7 +179,7 @@ test('an offer goes to a watcher, lasts 2 minutes, is answered by its target and
   assert.deepEqual(offered.offer, { to: LEAD, by: TECH, expires_at: w.now() + 120_000 });
   // One at a time.
   await watching(w, sid, BOSS);
-  assert.equal((await handover(w, sid, { op: 'offer', actor: TECH, to: BOSS })).code, 'already_claimed');
+  assert.equal((await handover(w, sid, { op: 'offer', actor: TECH, to: BOSS })).code, 'offer_pending');
   // The same offer again is the same offer.
   assert.equal((await handover(w, sid, { op: 'offer', actor: TECH, to: LEAD })).changed, false);
   // Only its target declines, and only the driver cancels.
@@ -207,10 +207,10 @@ test('accepting reserves the session, complete moves control once and again chan
   const mark = await handover(w, sid, { op: 'accepting', actor: LEAD });
   assert.deepEqual([mark.ok, mark.from, mark.device_id], [true, TECH, pc.id]);
   // The reservation holds the session: nobody else accepts, the offer cannot be cancelled or declined.
-  assert.equal((await handover(w, sid, { op: 'accepting', actor: BOSS })).code, 'already_claimed');
+  assert.equal((await handover(w, sid, { op: 'accepting', actor: BOSS })).code, 'busy');
   assert.equal((await handover(w, sid, { op: 'cancel', actor: TECH })).code, 'no_offer');
   assert.equal((await handover(w, sid, { op: 'decline', actor: LEAD })).code, 'no_offer');
-  assert.equal((await handover(w, sid, { op: 'offer', actor: TECH, to: LEAD })).code, 'already_claimed', 'no new offer while one is accepted');
+  assert.equal((await handover(w, sid, { op: 'offer', actor: TECH, to: LEAD })).code, 'busy', 'no new offer while one is accepted');
   // Still the old driver until complete.
   assert.equal((await watch(w, sid)).driver, TECH);
   // The parked poll of a saved PC is answered at once when control moves.

@@ -4,8 +4,9 @@
 // object (src/session.js) and, for a saved PC, in the PC's session pointer (src/devices.js).
 //
 // Errors are TeamError. Its `code` is the tool error code the technician app reads
-// (not_driver, cannot_control, needs_unattended, not_attached, no_offer, not_offered_to_you,
-// not_invited, already_claimed, not_found); the frame route turns the same errors into HTTP statuses.
+// (not_driver, cannot_control, second_factor, needs_unattended, not_attached, no_offer, not_offered_to_you,
+// not_invited, offer_pending, busy, already_claimed, not_found, bad_request); the frame route turns the same
+// errors into HTTP statuses.
 //
 // Control moves in three steps, in this order, so the PC's record and the Session cannot disagree for good:
 //   1. the Session marks the offer as being accepted (or reserves itself for a claim). Nothing else
@@ -31,7 +32,7 @@ const STOPPED = 'this workspace is stopped; someone who can manage members must 
 // The HTTP status a code has where there is one (the picture route).
 const STATUS = {
   not_driver: 403, cannot_control: 403, needs_unattended: 403, not_attached: 409, no_offer: 409, not_offered_to_you: 403,
-  not_invited: 403, already_claimed: 409, not_found: 404, mode: 409, bad_request: 400,
+  not_invited: 403, already_claimed: 409, offer_pending: 409, busy: 409, second_factor: 403, not_found: 404, mode: 409, bad_request: 400,
 };
 
 const bad = (message) => new TeamError(400, 'bad_request', message);

@@ -1514,9 +1514,11 @@ lock every old session.
 A take-over by `device_connect` (saved PC) also ends the offer, makes the old driver a watcher, and clears `handed_over`.
 
 **Tool errors** of these four tools are plain text with the code first: `<code>: <message>`. Codes: `not_driver`,
-`cannot_control`, `needs_unattended`, `not_attached`, `no_offer`, `not_offered_to_you`, `not_invited`,
-`already_claimed`, `not_found`, `mode`, plus `bad_request` for a malformed call and the team's own codes (`stopped`,
-`busy`, `unavailable`, `permission_denied`, `second_factor`). The picture route uses HTTP statuses with the same codes
+`cannot_control`, `second_factor`, `needs_unattended`, `not_attached`, `no_offer`, `not_offered_to_you`, `not_invited`,
+`offer_pending` (an offer to someone else is open), `busy` (control is being handed over right now, or the session
+step has not followed yet), `already_claimed` (a queue item someone else claimed first), `not_found`, `mode`, plus
+`bad_request` for a malformed call or an unknown `action` and the team's own codes (`stopped`, `unavailable`,
+`permission_denied`). The picture route uses HTTP statuses with the same codes
 in `{"error":{"code","message"}}`.
 
 **The escalation queue.** One row per item in `escalations`. `E` is `{id, kind:"technician"|"agent", device_id,
