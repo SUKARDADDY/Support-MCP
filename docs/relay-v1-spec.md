@@ -51,7 +51,9 @@ refuses the other mode's transport (`/ws` for an `app` session, `/agent` for a
 | `src/api.js` | the team API under `/api/v1/w/<slug>/`, plus `POST` and `GET /api/v1/w` |
 | `src/agent.js`, `src/agent-api.js`, `src/agent-store.js`, `src/agent-models.js` | the built-in agent: its service (settings, models, tasks), its team API routes, its D1 queries, and its model table and cost arithmetic. See [The built-in agent](#the-built-in-agent) |
 | `src/agent-task.js`, `src/agent-providers.js`, `src/agent-check.js`, `src/agent-tools.js` | the `AgentTask` Durable Object (one per task, and one per model check), the OpenAI and Claude adapters, the two-turn model check, and the tool list the model sees |
+| `src/session-people.js`, `src/escalations.js` | who is on a live session and who drives it (invites, offers, the three steps that move control, the picture), and the escalation queue (its D1 queries, claim and close). See [People on a session](#people-on-a-session-and-the-escalation-queue) |
 | `migrations/0006_agent.sql` | the D1 tables `agent_settings` and `agent_tasks` |
+| `migrations/0008_escalations.sql` | the D1 table `escalations` and its indexes |
 | `migrations/0001_team.sql`, `migrations/0002_workspaces.sql` | the D1 tables `members`, `roles`, `callers` and `audit`, each keyed by workspace first; then `workspaces` (one row per workspace other than `default`) and the index `members_by_identity`. `wrangler d1 migrations apply` runs them in name order, and so does `test/d1-fake.js` |
 | `src/agent.ps1` | PowerShell agent template (imported as text, placeholders substituted) |
 | `src/agent-app.cs`, `src/agent-app.manifest` | the Windows app: .NET Framework 4 source (WPF window) and an `asInvoker` manifest |
@@ -178,7 +180,7 @@ The session's own log keeps it as sent, in the `[identity] detail` form.
 ### Role check (`tools/call`)
 
 `initialize`, `ping`, `tools/list` and every refusal above never read team
-data, so `tools/list` answers the same 27 tools on any well-formed
+data, so `tools/list` answers the same 31 tools on any well-formed
 `/w/<slug>/mcp`, created or not, without touching D1 or a Durable Object. On
 `tools/call` for a listed tool, after the `session_id` check, the relay checks
 that the workspace exists (`default` always does; any other slug needs a row in
@@ -198,6 +200,7 @@ tool's arguments.
 | `device_connect` | `sessions.control`, and `sessions.unattended` inside the tool when the session will not ask or the call is a take-over |
 | `agent_status` | `sessions.view`, members only |
 | `agent_start`, `agent_control` | `sessions.control`, members only |
+| `people_list`, `session_participants`, `session_handover`, `escalation` | `sessions.control`, members only (open mode never admits them). The access rule for watching and driving, below, is checked inside them, and the call's arguments reach the agent-mode gate |
 | every other tool | `sessions.control` |
 
 - No members in `default` (open): allowed, and the caller is recorded in
@@ -333,6 +336,12 @@ edited `technician` or `viewer`, and a deleted one keeps a row with `deleted = 1
 | 403 | `confirm_wrong` | approving a waiting PC with a number that does not match |
 | 503 | `unavailable` | a pairing or approval route when `AUTH_SECRET` is unset or under 32 characters (`Retry-After: 1`) |
 | 503 | `busy` | six tries in a row lost the race to another change (`Retry-After: 1`) |
+
+One route is not a collection: `GET /api/v1/w/<slug>/sessions/<sid>/frame` returns the last
+full screenshot of a live session, `{rev, at, mime, data}`, to its driver and to a person who joined it
+([below](#people-on-a-session-and-the-escalation-queue)). It needs `sessions.control`, takes only `GET`, and
+only a `<sid>` of 64 hex characters (anything else, including a longer path, is 404 `not_found`).
+Through `/app/w/<slug>/api/sessions/<sid>/frame` it is the one part of `sessions` the app reaches.
 
 Open mode and the first-member rule below apply to `default` only. A created
 workspace starts with its admin. If it ever has no members, it is closed: no
@@ -968,6 +977,7 @@ are never remembered.
 | `GET /app/w/<slug>/notifications?after=<id>&wait_s=0..25` | `{"items":[{"id","event","at","title","body","device_id","task_id","session_id"}],"next":<id>}`, the caller's own, oldest first, at most 50 after `after`. With `wait_s` and no item, the relay looks again every 2 seconds until there is one or the wait ends, then answers `{"items":[],"next":<after>}` |
 | `GET`, `PATCH /app/w/<slug>/notifications/settings` | `{"events":{"<event>":bool},"watch":["<device id>"]}`. Every event is on until switched off. A `PATCH` may send part: events not named keep their value, and `watch` replaces the list (at most 500 ids, all PCs of this team). Unknown events or fields, and a non-boolean, are 400 |
 | `GET /app/w/<slug>/api/agent/tasks/<id>/frame` | `{"rev","at","mime":"image/jpeg"\|"image/png","data":"<base64>"}`, the last full screenshot the task took (never a zoom). 404 `no_frame` when there is none yet or the task has ended; 403 for anyone but the task's starter or the current driver of its session, and for a role without `sessions.control`; 409 `stopped` and 503 `relay_stopped` as for a screenshot |
+| `GET /app/w/<slug>/api/sessions/<sid>/frame` | `{"rev","at","mime","data"}`, the last full screenshot of a live session, for its driver and for a person who joined it ([People on a session](#people-on-a-session-and-the-escalation-queue)). `<sid>` is the session's 64 hex characters. 404 `no_frame` when there is none yet, 404 `not_found` for a session that is not live in this team; 403 `permission_denied`, `second_factor`, `cannot_control`, `needs_unattended` or `not_invited` as the rule says; 409 `stopped` and 503 `relay_stopped` as for the agent's picture |
 
 **Every call checks the caller live**, as an OAuth tool call does: the account exists and is
 enabled, the person is invited somewhere, and is a real member of this workspace (open mode
@@ -995,13 +1005,21 @@ read sees. The relay does not store the picture in the Session or Registry eithe
 | `device_online` | a watched PC's doorbell returns after 10 minutes or more away | its watchers |
 | `device_missing` | a PC removes itself; or it has no doorbell and its last contact is over 7 days old (`last_seen`, which a closing doorbell also moves up to the drop, or `paired_at` when `last_seen` is empty) | its watchers, and for a PC that left also holders of `devices.manage` |
 | `device_waiting` | a PC asks to join | holders of `devices.manage` |
+| `escalation_opened` | an item is put in the queue, by a technician or by a task that finishes with "needs a person" | holders of `sessions.control` except the person who opened it |
+| `escalation_claimed` | a queue item is claimed | the person who opened it, unless they claimed it |
+| `session_invited` | the driver invited the person to a session | the invited person only. Not switchable |
+| `control_offered` | the driver offered the person control of a session | the person offered only. Not switchable |
 
-A person's own settings can switch an event off, and `device_online` and `device_missing` for a
+A person's own settings can switch an event off, except `session_invited` and `control_offered`. Those
+are addressed to one named person, written by a path that does not read their settings (`notify.direct`),
+and are not names the settings accept. Their `dedupe` carries the occurrence
+(`invited:<sid>:<person>:<invite time>`, `offered:<sid>:<person>:<offer time>`), as the queue's do
+(`escalation:<id>:opened`, `escalation:<id>:claimed`). `device_online` and `device_missing` for a
 watched PC go only to people who watch it. Each row is written in the same batch as the change that
 caused it (the end of a task, a PC joining or leaving, a session's end), so it exists exactly when
 the change does. The ones with no change of their own are written alone: a PC coming online (from the
 Registry, which learns its workspace from the Worker's hand-off and records when a PC's last
-doorbell closed), a task whose cleanup gave up, and the hourly run (`scheduled` in `src/app.js`,
+doorbell closed), a task whose cleanup gave up, an invite and an offer of control (after the Session recorded them), and the hourly run (`scheduled` in `src/app.js`,
 `src/sweep.js`, a Cron Trigger in `wrangler.toml`), which also deletes rows older than 30 days. A
 `dedupe` key per occurrence, unique per person, makes a retry add nothing; for a missing PC it is
 the PC plus that last contact, so it is told of once. The run picks only PCs that some watcher, who has not switched the event off, has no row for yet, oldest absence first, so a PC already told of costs nothing on later runs and a crowd of PCs that go quiet together is worked through over the hours. A PC whose last contact is more than 14 days past the 7 is left out, which is before the 30-day deletion of rows could make the same absence look new. The run stays under 50 subrequests and takes teams in turn, starting from a different team each hour, so a big team cannot crowd out the others. For each team it asks the Registry which doorbells are connected before it picks the team's PCs, and leaves those out of the query, so connected PCs never fill the list ahead of missing ones. The team log is not written. Title and body are
@@ -1201,7 +1219,7 @@ session and connect again, so the person at the PC is asked.
 The Session writes its log row as `[<actor> via agent] <detail>`, and the actor stays the
 person who started the task for the driver check. The Session also keeps the last 10 people
 who sent it a command (past the driver check) with the time, and `GET /watch?workspace=`
-(internal, for the agent task) answers `{state, opened_by_task, ended_reason, device_id, driver, actors}`, or
+(internal, for the agent task) answers `{state, opened_by_task, ended_reason, device_id, driver, actors}` (and the fields listed under [People on a session](#people-on-a-session-and-the-escalation-queue)), or
 `{state: "unknown", actors: []}` for another workspace's call. A task ends when a person other
 than its starter appears there on a session with no driver.
 
@@ -1419,6 +1437,122 @@ the socket that has already sent one, and a reattach gets a new tag.
 The `ended` row records the reason (`code TTL`, `consume TTL`, `expired`,
 `ended_by_operator`, `customer`) and `session_status` returns it as
 `ended_reason`. Rows for the caller-attributed kinds are prefixed `[<caller>]`.
+
+## People on a session and the escalation queue
+
+Code: `src/session.js` (the roster, the offer, the picture), `src/session-people.js` (the checks and the three steps),
+`src/devices.js` (`sessionRule`, `mayInvite`, `handOver`), `src/device-sessions.js` (the Session hooks),
+`src/escalations.js` and `migrations/0008_escalations.sql` (the queue), `src/notify.js`. A driver can invite a
+colleague to watch a live session, offer them control, and send a session they cannot finish to the team's queue.
+These work on a saved PC's session and on a one-off link's, through the four tools `people_list`,
+`session_participants`, `session_handover` and `escalation`, which the technician app calls too.
+
+**The access rule.** One rule decides who may watch a session and who may become its driver, and it is used
+for a join, for the picture, for an accept and for a claim. A person P passes when all of these hold:
+
+1. P is a member (open mode never counts) holding `sessions.control`, and an OAuth caller has the second factor that
+   permission needs (`assertSecondFactor`; an Access login is exempt, as it is for every tool).
+2. The session is live in this workspace: a saved PC's, whose pointer is this session, or a one-off session that has a
+   driver. A session of another workspace is answered as a session that does not exist.
+3. If it is a saved PC's session and the PC's pointer says `ask:false` (the person at the PC was never asked), P also
+   holds `sessions.unattended` with its second factor. Otherwise P is refused `needs_unattended`.
+4. To become the driver, the session must be `attached`. Otherwise `not_attached`. The PC may let a session in
+   or decline it up to the first `hello`, so an offer or claim made while it is `waiting` moves nothing.
+
+A one-off session counts as approved once attached, because the person at the PC ran the link themselves, so rule 3
+does not apply to it. **An invite checks only the target's role** (rules 1 and 3 without the second factor): their
+second factor belongs to their own sign-in and is checked when they join, read the picture or accept. No invite, offer or claim
+widens anyone's access.
+
+**What a Session keeps.** In its own storage, ending with it: `participants` (`{identity: {role: "invited"|"watcher",
+since, by}}`, at most 20 people besides the driver), `offer` (`{to, by, at, expires_at}`, 2 minutes), `accepting`
+(`{to, from, until, claim}`, a reservation that lapses after 30 seconds), `handed_over` (`{from, to, at}` for the
+last accept or claim, `null` after a take-over) and `driver_since`. In memory only, never in storage: `frame`, the last
+full screenshot `{rev, at, mime, data}`. Routes of the object, all internal, all naming `workspace` and answering a
+session of another workspace as one that does not exist (`{ok:false, code:"not_found"}`):
+
+| Route | What |
+|---|---|
+| `POST /people` `{action, actor, identity?}` | `invite` and `remove` are the driver's; `join` is for an invited person (the driver joining is a no-op); `leave` is for a watcher. Answers `{ok, participants, changed, since?}` or `{ok:false, code, error}` |
+| `POST /handover` `{op, actor, ...}` | `offer` (`to`, a joined watcher; one at a time; the same offer again is the same offer), `cancel` (the driver; not while it is being accepted), `decline` (its target), `accepting` (the reservation; `claim:{expect_driver}` for a claim), `release`, `complete` (`from`, `kind`: `accept`, `claim` or `take_over`) |
+| `GET /frame?workspace=&actor=` | `{rev, at, mime, data}` for the driver and a joined watcher; 403 `not_invited` for anyone else; 404 `no_frame` |
+| `GET /status`, `GET /watch` | `status` gains `participants` (`[{identity, name, role, since}]`; `name` is filled in by the relay), `offer`, `frame_rev`, `frame_at` and, for a one-off session that has one, `driver`. `watch` gains `driver` for a one-off session, `device_name`, `handed_over`, `participants` and `offer` |
+
+**The picture.** `frame` is replaced by any screen result that carries an image, except a `zoom` and `type_secret` (whose
+picture may show what was typed). `rev` only grows, also across a restart of the object (it is at least the clock in
+milliseconds), so a reader that holds a picture can tell a new one. It is dropped when the session ends or the object is evicted. No
+test finds picture bytes in any D1 row, KV value, Session or Registry storage, or statement.
+
+**One-off drivers.** `session_create` by a real member (authorized, not through open mode) stores the caller as the
+session's `driver`, like a saved PC's. In open mode no driver is stored. A command from anyone else is refused
+`<driver> is driving this session; ask them to offer control with session_handover, or an admin can take over with
+session_handover`. The driver is in `session_status` and `/watch` and **never** in a poll answer or the welcome: the
+person at a one-off PC keeps seeing "A remote support agent is connected to your machine" and never a technician's name. A session
+whose storage has no `driver` key (made before 0.8.1, or in open mode) keeps the old behaviour, so any holder of
+`sessions.control` may command it until it ends, at most 24 hours; there is no fallback to `created_by`, which would
+lock every old session.
+
+**Moving control, in three steps** (an accept, a claim of a live item, and an admin's take-over of a one-off session):
+
+1. *Mark.* The Session reserves itself: for an accept it checks the offer is live, is for the caller, and is from the
+   driver; for a claim it checks the driver is still the person who escalated. Nothing else can take the offer meanwhile.
+   The session must be `attached`.
+2. *Record.* For a saved PC, one guarded `DB.batch`: `devices.session` gets `json_set(session, '$.by', <caller>)`
+   guarded on the pointer still being this session, still naming the old driver, and still having the `ask` the rule
+   read; the caller still holds `sessions.control` (and `sessions.unattended` when the pointer says `ask:false`); the
+   workspace is not stopped. A claim adds its `UPDATE escalations SET claimed_by ... WHERE claimed_by IS NULL AND
+   closed_at IS NULL` and the opener's notice in the same batch, after the pointer, on the proof that the pointer moved.
+   The log gets `device_session_handed_over` (and `escalation_claimed` first, for a claim). A one-off session has no pointer: its claim and log row
+   (`session_handed_over`, or `session_taken_over` for a take-over) are their own guarded batch.
+3. *Follow.* The Session sets its driver with `complete`. It has three outcomes, so it can be repeated: still the old
+   driver, so the caller becomes the driver; already the caller, so nothing changes; someone else (a take-over landed
+   in between), so it stops with `not_driver` and the later take-over stands. On success the old driver watches, any offer
+   is gone, `handed_over` is recorded, and a saved PC's parked poll is answered at once so its corner window shows the new
+   name. A step that fails transiently is retried at once up to three times; after that the call answers `busy`, and
+   repeating it finds the pointer already naming the caller and runs only this step.
+
+A take-over by `device_connect` (saved PC) also ends the offer, makes the old driver a watcher, and clears `handed_over`.
+
+**Tool errors** of these four tools are plain text with the code first: `<code>: <message>`. Codes: `not_driver`,
+`cannot_control`, `needs_unattended`, `not_attached`, `no_offer`, `not_offered_to_you`, `not_invited`,
+`already_claimed`, `not_found`, `mode`, plus `bad_request` for a malformed call and the team's own codes (`stopped`,
+`busy`, `unavailable`, `permission_denied`, `second_factor`). The picture route uses HTTP statuses with the same codes
+in `{"error":{"code","message"}}`.
+
+**The escalation queue.** One row per item in `escalations`. `E` is `{id, kind:"technician"|"agent", device_id,
+device_name, session_id, task_id, summary, note, opened_by, opened_at, claimed_by, claimed_at, closed_by, closed_at,
+close_note}`.
+
+- `open`: `session_id` (the driver of a live session) or `device_id` (a saved PC), and `note` of at most 600
+  characters. A session that already has an unclaimed item gets no second. Writes `escalation_opened` (switchable) to
+  every holder of `sessions.control` except the opener.
+- `list`: `status` `open` (unclaimed, not closed; the default), `mine` (opened or claimed by the caller, not closed) or
+  `closed`; newest first, at most 100.
+- `claim`: if the item carries a session that is live, attached, still driven by the person who opened the item, and not
+  the claimer's own, it is a **live claim**: the access rule applies to the claimer and the three steps above move control with the claim
+  in step 2. Otherwise it is a **ticket claim**: one guarded `UPDATE`, and the answer names the PC (`device_id`,
+  `device_name`) or says `one_off:true`. Two people claiming at once: exactly one wins, the other gets `already_claimed`.
+  A repeat by the claimer is the same answer; a live claim whose last step failed is finished by repeating it. Writes
+  `escalation_claimed` (switchable) to the opener.
+- `close`: the claimer, the opener or an admin; records `close_note`. Closing a closed item changes nothing.
+- A built-in agent task that finishes with `needs_human` opens an item in the same batch as its end (`endTask` with
+  `escalate`): `kind:"agent"`, `opened_by` the starter, the PC, the summary, and the session only when the task was given
+  it and leaves it open. At most one per task (a unique index). A task that ran out of time or calls, or gave up, opens
+  nothing.
+- A team on "built-in agent only" refuses the four tools with `mode:` except `escalation` `list`, `close` and a claim
+  that is not live; a live claim is `mode`. The gate is given the call's arguments (`agentModeAllows`); the four tools
+  are not in the list of tools allowed in that mode.
+
+The team log holds ids and names, never a note, a summary or a picture: `escalation_opened`, `escalation_claimed`,
+`escalation_closed`, `device_session_handed_over`, `session_handed_over` and `session_taken_over`. Notes, summaries and close
+notes are text from people and from an agent that read a customer's screen; a reader shows them as text, and the tools say they are
+untrusted.
+
+**The built-in agent.** The four tools are not in the agent's tool list. A task checks a session with a driver by the
+driver rule, a one-off session included: if the driver is not the starter, the task ends. When `handed_over`
+names the starter and the person who drives now, that was the starter's own handover and the task ends quietly (`stopped`,
+`handed over to <identity>`, the starter as actor, no "needs attention"); a take-over by anyone else ends it as before, with the
+notice. A session with no driver keeps the old rule: another person's command ends the task.
 
 ## Agent wire (JSON text frames over `/ws`)
 
@@ -1713,6 +1847,10 @@ text content item, not JSON-RPC errors.
 | `agent_start` | `device_id` or `session_id`, `instructions`, `keep_working?`, `model?` | `{task_id, state:"running", provider, model, device_id, session_id, task_cap_usd, month_cap_usd, keep_working, next}`. See [The built-in agent](#the-built-in-agent) |
 | `agent_status` | `task_id?`, `wait_s?` (0 to 25) | with a `task_id`: `{task, caps, untrusted_text}`, where `task` has the state, end reason, model, cost, the tool calls (verb and short detail), the notes and the summary. Without one: `{tasks, caps, default_model, starters_pick_model, models, untrusted_text}` |
 | `agent_control` | `task_id`, `action` (`pause`, `resume`, `stop`) | `{task_id, state}` |
+| `people_list` | none | `{people:[{identity, name\|null, can_control}]}`: members who are people. `can_control` is true when their role holds `sessions.control` |
+| `session_participants` | `session_id`, `action` (`invite`, `join`, `leave`, `remove`), `identity?` (invite and remove) | `{participants:[{identity, name\|null, role:"driver"\|"watcher"\|"invited", since}]}` |
+| `session_handover` | `session_id`, `action` (`offer`, `accept`, `decline`, `cancel`, `take_over`), `identity?` (offer) | `{driver, participants, offer:{to,by,expires_at}\|null}` |
+| `escalation` | `action` (`open`, `list`, `claim`, `close`), `session_id?` or `device_id?` and `note?` (open), `status?` (list), `id` and `note?` (claim, close) | `{escalation:E}` for open, claim and close, `{escalations:[E]}` for list, each with `untrusted_text`. A claim of a live session adds `session_id`, `driver`, `participants`; a claim of a ticket adds `device_id` and `device_name`, or `one_off:true` |
 
 The tools above are in every connection, with the screen tools below. `?ui=0`
 hides `ui_tree` and `ui_act` (`?ui=1` is the default); any other value gets 400
@@ -1721,7 +1859,7 @@ parameter no longer exists: a request that carries it, with any value, gets 400
 `{"error":"the shape parameter was removed; ..."}` rather than a silently
 different tool list. A tool that the connection does not list is `unknown tool`.
 Every tool except `session_create`, `session_list`, `device_list`,
-`device_connect` and the three agent tools requires `session_id`. When
+`device_connect`, the three agent tools, `people_list` and `escalation` requires `session_id`. When
 it is missing, empty or not a string, `tools/call` returns a tool error
 `session_id is required; call session_list to find it` and nothing reaches the
 backend. There is no default session.
@@ -2039,7 +2177,7 @@ never update themselves.
    `initialize` → `tools/list` returns the 7 session tools and the two device
    tools (`device_list`, `device_connect`) plus the nine screen tools, `ui_tree`,
    `ui_act`, `block_input`, `send_sas`, `type_secret` and `request_full_control`,
-   and the three agent tools (27), `?ui=0` drops `ui_tree` and `ui_act`, and `?shape=...` is a 400 (curl).
+   the three agent tools and the four team tools (31), `?ui=0` drops `ui_tree` and `ui_act`, and `?shape=...` is a 400 (curl).
 3. `/mcp` without the JWT on a non-localhost host → 403 (unit test with a fake
    host + a test for bad aud / expired / wrong sig using a locally generated
    RSA key).
@@ -2090,8 +2228,14 @@ never update themselves.
     as the app does (a public client, `http://127.0.0.1/callback`, port 53122, resource
     `/app/w/default`), uses the token on `/app/w/default/api/devices` and
     `/app/w/default/mcp`, and finds it a 401 on `/mcp` and an MCP token a 401 on `/app`.
-    `test/notify.test.js` covers the six events, the feed and the settings, and
+    `test/notify.test.js` covers the events, the feed and the settings, and
     `test/agent-frame.test.js` the picture, including that no storage holds image bytes.
+
+14. People on a session: `test/participants.test.js` (invites, the roster, the picture and its route),
+    `test/handover.test.js` (the access rule on every side, the offer, the three steps and their faults),
+    `test/link-handover.test.js` (one-off drivers and the built-in agent), `test/escalations.test.js` (the
+    queue, claims and the agent's items) and `test/team-tools.test.js` (the agent-mode gate and the agent's
+    tool list) run against the real Worker, Session objects and D1 stand-in.
 
 ## Must keep
 
@@ -2148,6 +2292,13 @@ never update themselves.
 - The agent's last picture is held in the task object's memory only, read by the task's
   starter or its session's driver with `sessions.control` and the second factor, and dropped
   when the task ends.
+- A session's last picture, for the people watching it, is held in the Session object's memory only,
+  never replaced by a zoom, never kept for `type_secret`, read only by the driver and a person who
+  joined and passed the access rule, and dropped when the session ends.
+- Nobody gains access by being invited, offered control or claiming an item: watching and driving take
+  `sessions.control` with its second factor, a saved PC that was never asked also takes
+  `sessions.unattended` with its factor, and control moves only while the session is attached.
+- A one-off PC is never told who drives its session: its poll answers and its welcome carry no `driver`.
 - Notifications are written with the event that causes them, go only to members who are
   people, are never part of the team log, and are deleted after 30 days.
 - No secrets in the repo: `.dev.vars` gitignored; attach keys stored hashed.

@@ -5,6 +5,58 @@ All notable changes to Support-MCP are listed here. The format follows
 [Semantic Versioning](https://semver.org). It stays at 0.x until Stage 1 is safe
 to run on unattended customer PCs.
 
+## [Unreleased]
+
+Invites, handover and the escalation queue (relay).
+
+### Added
+
+- A driver can invite a colleague into a live session, on a saved PC or a one-off link. The colleague gets
+  a notification, joins, and watches the last full screenshot the driver or the agent took. A watcher sends no
+  commands. Who is on a session, a pending offer and the last handover live in the session's own storage and end with
+  it; at most 20 people besides the driver.
+- The driver offers control to a watcher for 2 minutes. They accept, and become the driver once the PC has let the
+  session in (`not_attached` before that). The old driver watches. Control moves in three steps (the session marks the
+  accept, one guarded database change moves the PC's pointer, the session follows with a step that can be repeated), so a
+  take-over that lands in between wins and nothing loops. A saved PC's corner window shows the new driver.
+- One rule for watching and driving: `sessions.control` with its second factor; on a saved PC that was connected
+  without asking, also `sessions.unattended` with its factor (`needs_unattended`). An invite checks the target's role
+  only; their factor is checked when they join, see the picture or accept.
+- Four MCP tools, for members only, each needing `sessions.control`: `people_list`, `session_participants`
+  (`invite`, `join`, `leave`, `remove`), `session_handover` (`offer`, `accept`, `decline`, `cancel`, `take_over` for
+  one-off links) and `escalation` (`open`, `list`, `claim`, `close`). `tools/list` now has 31 tools; the 27 old ones keep
+  their names and inputs. Their errors are plain text with the code first (`<code>: <message>`).
+  `session_status` gains `participants`, `offer`, `frame_rev` and `frame_at`, and `driver` for one-off sessions.
+- `GET /api/v1/w/<slug>/sessions/<sid>/frame`, also on `/app/w/<slug>/api/...`: the last full screenshot of a live session,
+  held in the session's memory only, for its driver and for people who joined it. A zoom never replaces it, `type_secret`
+  never feeds it, and it goes when the session ends.
+- The escalation queue (migration `0008_escalations.sql`): a technician puts a session or a PC in it with a note; whoever
+  is free claims it. A live session that the person who escalated still drives moves to the claimer under the
+  rule above, with the claim in the same database change; anything else is a claimed ticket that names the PC. Two people
+  claiming at once cannot both win. A built-in agent task that finishes with "needs a person" opens an item with its
+  summary in the same batch as its end.
+- Notifications `session_invited` and `control_offered`, always delivered to the named person and not switchable, and
+  `escalation_opened` and `escalation_claimed`, switchable and on by default.
+
+### Changed
+
+- A one-off link session now has a driver: the team member who made it. A command from anyone else is refused with the
+  driver's name and a pointer to `session_handover`, and an admin (anyone with `sessions.unattended`) can take it over.
+  The driver is never sent to the PC, so the person at it still sees the generic notice. Sessions made before this release
+  have no driver key and stay open to anyone who may control sessions until they end, at most 24 hours, and so do sessions
+  made in open mode.
+- The built-in agent applies the driver rule to a one-off session that has a driver. When its starter hands the session
+  over, the task stops quietly (`handed over to <person>`, no "needs attention"); a take-over by anyone else ends it with
+  the notice, as before. A task cannot be started on a one-off session someone else drives.
+- In a team on "built-in agent only" the four new tools are refused (`mode:`), except `escalation` `list`, `close` and a claim
+  that moves no session.
+
+### Security
+
+- The built-in agent's tool list is unchanged: the four tools are not in it, and a test pins it.
+- A watcher who holds `sessions.end` can still end the session through MCP or the API, as any member with that permission
+  can. The app shows Leave, not End session, to a watcher. This gap is accepted and written down in the security model.
+
 ## [0.8.0] - 2026-11-09
 
 The technician app for Windows, and the relay routes it uses.

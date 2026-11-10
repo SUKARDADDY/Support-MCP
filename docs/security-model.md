@@ -693,14 +693,75 @@ apply to only one client say which.
     resume are team API calls only, never MCP tools, so text on a customer's
     screen cannot make an agent resume a workspace.
   - *The log names ids, not secrets.* `device_session_started`,
-    `device_session_taken_over` and `device_session_ended` (with the reason) hold
+    `device_session_taken_over`, `device_session_handed_over` and `device_session_ended` (with the reason) hold
     a PC's id and name, the first 8 characters of the session id and identities.
     They never hold a code, a key, typed text or a screenshot. A session's own log
     keeps what a session's log always kept.
-  - *What is still open.* Invites, handover, the escalation queue, notifications,
-    the built-in agent, owner messages and screenshot storage are later releases.
+  - *What is still open.* Owner messages and screenshot storage are later releases.
     Stage 1 stays off real customers' unattended PCs until the release that
     enforces rules about who may connect and when.
+- **Who is on a session, and who drives it.** A driver can invite a colleague to watch a live
+  session, offer them control, and send the session to the team's queue. None of this widens
+  anyone's access, and these rules hold:
+  - *One rule decides, for every way in.* To watch a session (a join, the picture) or to become
+    its driver (an accept, a claim), a person must be a member (open mode never counts) holding
+    `sessions.control`, with the second factor that brings; the session must be live in their
+    team; if it is a saved PC's session whose pointer says `ask:false` (the person at the PC
+    was never asked), they must also hold `sessions.unattended` with its second factor, else
+    `needs_unattended`; and to become the driver the session must be `attached`, else
+    `not_attached`. Seeing a PC's screen is a lesser right than driving it, but on a session
+    started without asking it is exactly what "connect without asking" protects, so a watcher
+    needs the same permission as a driver there. A one-off session counts as approved once
+    attached, because the person at the PC ran the link themselves. An invite checks only the
+    target's role, because the second factor belongs to the invited person's own sign-in: it is
+    checked when they join, read the picture or accept. Tests cover every side: a technician
+    without the permission on a session that asked and on one that did not, an admin, a
+    missing factor, a Viewer, open mode, a waiting session, and a session of another team.
+  - *Control moves only after the PC has let the session in, and the PC's record and the
+    Session cannot disagree for good.* An accept or a claim marks the Session, then one guarded
+    database change moves the PC's pointer (and, for a claim, claims the queue item and writes
+    the log row in the same batch), then the Session follows with a step that can be repeated.
+    The change holds only while the old driver is still named and the new driver still holds
+    what the rule asks, so a take-over that landed first wins and the call says `not_driver`; a
+    take-over that lands after the change wins too, because the Session's step stops when
+    someone else drives. A Session step that fails is retried at once and, if it keeps failing,
+    reported, and repeating the call runs only that step. Fault tests cover each of these.
+  - *Invites and watchers stay with the session.* Who is invited or watching, a pending offer
+    (2 minutes) and the last handover are in the Session's own storage and end with it. There
+    is no table. At most 20 people besides the driver. The team log holds `device_session_handed_over`
+    (a saved PC), `session_handed_over` and `session_taken_over` (a one-off session), with ids and
+    names only.
+  - *A one-off session has a driver, and the PC is never told it.* A member who makes a link
+    drives its session, and a command from anyone else is refused with the driver's name; an
+    admin (anyone with `sessions.unattended`) can take it over with `session_handover`, and the driver
+    can hand it over. The driver is never in a poll answer or the welcome, so the person at a
+    one-off PC keeps seeing the generic notice and never a technician's name. A session whose storage
+    has no driver (made before 0.8.1, or in open mode) keeps the old behaviour until it ends, at most
+    24 hours: there is no fallback to its creator, which would lock every old session.
+  - *The watcher's picture is memory only.* The Session holds the last full screenshot in a
+    field of the object, never in its storage, D1 or KV, replaced by no zoom, never kept for
+    `type_secret`, and dropped when the session ends or the object is evicted. It is read through
+    `GET .../sessions/<sid>/frame`, only by the driver and by a person who joined and passes the
+    rule, on the terms a screenshot is read, and not while the workspace or the relay is stopped.
+    The storage scan in the tests covers Session storage.
+  - *The queue holds ids, names and text from people and an agent.* An item has the PC and the
+    session, who opened it, who claimed and closed it, and a note, a summary or a close note.
+    Those texts are untrusted: they may repeat a customer's screen, and a reader shows them as text.
+    The log names the item's id and the PC, never the text. A built-in agent task that finishes with
+    `needs_human` opens an item with its summary in the same batch as its end, and nothing else that
+    ends a task does. A claim moves control only from the
+    person who escalated and only while they still drive the session; after a take-over it is
+    a claim of a ticket, which moves nothing. Two people claiming at once cannot both win: the claim is one
+    guarded update. A team on "built-in agent only" refuses the four tools, except listing, closing and
+    claiming a ticket; a live claim is refused with `mode`. The four tools are not in the built-in
+    agent's tool list, and a test pins it.
+  - *Notifications.* An invite and an offer of control are addressed to one named person, reach them
+    whatever their settings say, and cannot be switched off, so a colleague who is waiting on someone
+    is never lost to a setting. The queue's two events (opened, claimed) can be switched off.
+  - *Accepted gap: a watcher can still end the session.* A person holding `sessions.end` can end
+    any session through MCP or the API, as any member with that permission can today, and a watcher is
+    such a member. The app shows a watcher Leave, never End session, and the driver can remove
+    watchers, but this is not an enforced boundary: it matches how `sessions.end` has always worked.
 - **Each session belongs to its workspace.** A session stores the workspace that
   created it, and operator calls name their workspace. A call from another
   workspace gets the same answer as a session that does not exist. A session
@@ -1012,10 +1073,11 @@ apply to only one client say which.
   who is a person; service tokens get none), the event, a time, the ids of the PC, task or
   session, a title and a body of a few words. The body can repeat a PC's name or a task's
   first line, which come from people and from the PC, so the app shows them as text. A row
-  is written in the same batch as the change that causes it, is never part of the team log,
+  is written in the same batch as the change that causes it (an invite and an offer of control are
+  written alone, after the Session recorded them), is never part of the team log,
   and is deleted after 30 days by an hourly Cron Trigger. Another team's members never see it:
   every read filters by workspace and recipient. A member's switches and watched PCs are in
-  `members.notify`.
+  `members.notify`. Eight events can be switched off; an invite and an offer of control cannot.
 - **The free plan's allowances, for the app.** The feed holds each call open up to 25 seconds,
   so one person with the app open around the clock makes about 3,500 feed calls a day, and
   each open session tab you drive makes about 1,800 requests an hour (a picture every 3 seconds, plus the task check and the feed). The
@@ -1128,7 +1190,8 @@ apply to only one client say which.
   commands and write files, like an MCP client, so the limits bound spend and time, not
   the harm of one bad command: 120 tool calls, 2 hours, a cap per task and a cap per
   month reserved in the database before each model call, and it ends at once when
-  someone else takes over its session, when the person at the PC ends it, when the
+  someone else takes over its session (when its starter hands the session over, it stops
+  quietly instead, with no "needs attention"), when the person at the PC ends it, when the
   starter, the workspace or the operator stops it, or when the starter stops watching
   (unless the task was started with `keep_working`). There are no approvals by default.
   This stays Stage 1: not on real customers' unattended PCs until the release that
