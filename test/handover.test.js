@@ -466,6 +466,22 @@ test('a handover by the starter stops their task quietly and leaves the session 
   assert.equal(w.sql('SELECT COUNT(*) AS n FROM escalations')[0].n, 0);
 });
 
+test('the quiet stop names the new driver the way the team knows them', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  await addTech2(w);
+  w.db.sqlite.prepare("UPDATE members SET name = 'Tamar Two' WHERE identity = ?").run(TECH2);
+  const a = await w.startOnPc(TECH, { keep_working: true });
+  const sid = a.joined.sid;
+  const people = sessionPeople(w.env);
+  await part(people, sid, TECH, 'invite', TECH2);
+  await part(people, sid, TECH2, 'join');
+  await hand(people, sid, TECH, 'offer', TECH2);
+  await hand(people, sid, TECH2, 'accept');
+  await w.drive(a.id);
+  assert.equal(w.taskRow(a.id).end_reason, 'handed over to Tamar Two');
+});
+
 test('a take-over by someone else still ends the task with the notice, even when the starter had offered control', async (t) => {
   const w = await agentWorld(t);
   await w.ready();

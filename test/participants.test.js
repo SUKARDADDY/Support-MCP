@@ -43,6 +43,9 @@ test('tools/list has 31 tools, the four new ones with the code-first contract in
   assert.deepEqual(by.people_list.inputSchema.properties, {});
   for (const name of ['session_participants', 'session_handover', 'escalation']) assert.match(by[name].description, /Errors start with a code/, name);
   assert.match(by.escalation.description, /untrusted data/);
+  // A caller who is not a team member (open mode) is no driver, and the description says so.
+  assert.match(by.session_create.description, /The caller becomes the driver when they are a team member \(not in open mode\)/);
+  for (const name of ['session_participants', 'session_handover', 'escalation']) assert.match(by[name].description, /second_factor/, name);
   // The other 27 keep their names and the 27 old inputs.
   assert.equal(tools.filter((x) => !NEW_TOOLS.includes(x.name)).length, 27);
 });
@@ -149,6 +152,20 @@ test('session_status shows the people, the offer and the picture\'s rev and time
   assert.deepEqual(s.offer, { to: TECH2, by: TECH, expires_at: w.now() + 120_000 });
   assert.deepEqual([s.frame_rev, s.frame_at], [null, null]);
   assert.ok(!JSON.stringify(s).includes(JPEG), 'status never carries the picture');
+});
+
+test('an ended session shows no people and no offer in its status', async (t) => {
+  const w = await agentWorld(t);
+  await addTech2(w);
+  const { sid } = await attached(w, TECH);
+  await w.tool(TECH, 'session_participants', { session_id: sid, action: 'invite', identity: TECH2 });
+  await w.tool(TECH2, 'session_participants', { session_id: sid, action: 'join' });
+  await w.tool(TECH, 'session_handover', { session_id: sid, action: 'offer', identity: TECH2 });
+  assert.equal((await w.tool(VIEW, 'session_status', { session_id: sid })).participants.length, 2);
+  await w.tool(TECH, 'session_end', { session_id: sid });
+  const ended = await w.tool(VIEW, 'session_status', { session_id: sid });
+  assert.equal(ended.state, 'ended');
+  assert.deepEqual([ended.participants, ended.offer, ended.frame_rev], [[], null, null]);
 });
 
 // ---- the picture ----------------------------------------------------------------------------------

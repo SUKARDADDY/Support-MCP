@@ -128,7 +128,7 @@ export function fakeCore(initial = {}) {
       log('request', method, path, body);
       const [p, q] = path.split('?');
       if (state.requestError?.(method, p)) throw state.requestError(method, p);
-      if (p === '/api') return { workspace: { slug: 'default', open: false }, me: { identity: 'tech@example.com', role_id: 'technician', permissions: state.permissions } };
+      if (p === '/api') return { workspace: { slug: 'default', open: false }, me: { identity: 'tech@example.com', role_id: 'technician', permissions: state.permissions, ...(state.meFor?.(account) ?? {}) } };
       if (p === '/api/sites') return { sites: state.sites, next: null };
       if (p === '/api/customers') return { customers: state.customers, next: null };
       if (p === '/api/devices' && method === 'GET') return { devices: state.devices.map(({ online, ...d }) => d), next: null };

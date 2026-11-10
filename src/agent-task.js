@@ -663,7 +663,12 @@ export class AgentTask {
       if (driver !== starter) {
         const handed = watch.handed_over;
         if (handed && normalizeIdentity(handed.from) === starter && normalizeIdentity(handed.to) === driver) {
-          return { end: ['stopped', `handed over to ${driver}`, null, true, { actor: starter }] };
+          // Named the way the team knows them, else by identity; a name that cannot be read is not worth failing the end for.
+          let who = driver;
+          try {
+            who = (await teamFromEnv(this.env).getMember(cfg.workspace, driver))?.name || driver;
+          } catch (_) { /* the identity will do */ }
+          return { end: ['stopped', `handed over to ${who}`, null, true, { actor: starter }] };
         }
         return { end: ['stopped', 'someone else took over the session', null, true] };
       }

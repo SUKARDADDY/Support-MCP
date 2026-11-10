@@ -67,6 +67,17 @@ Invites, handover and the escalation queue (relay and technician app).
   the notice, as before. A task cannot be started on a one-off session someone else drives.
 - In a team on "built-in agent only" the four new tools are refused (`mode:`), except `escalation` `list`, `close` and a claim
   that moves no session.
+- The four tools keep their refusals apart: `second_factor` (the role allows it, the sign-in lacks the authenticator code),
+  `offer_pending` (an offer to someone else is open) and `busy` (control is being handed over right now) are no longer
+  `cannot_control`, `needs_unattended` or `already_claimed`, and an unknown `action` is `bad_request`.
+- A repeated accept finishes a handover whose session step failed even after the offer has lapsed, so the PC's record and the
+  session cannot disagree for good.
+- The status of an ended session lists no people and no offer. The agent's quiet stop names the new driver by name when the
+  team knows it.
+- Technician app: a tab ends a session only when a fresh status read says its person drives it (or the session has no
+  driver and the tab is not a guest's); otherwise closing the tab just closes it. A one-off link's tab survives a restart
+  while its session is pending or consumed. Each tab reads its person from its own team, also while another team is shown.
+  The screenshot loop stops the moment the relay says `agent busy`.
 
 ### Security
 

@@ -493,8 +493,10 @@ export class Session {
     const attached = s.get('transport') === 'https-poll'
       ? s.get('state') === 'attached' && Date.now() - (s.get('http_seen_at') || 0) < HTTP_SEEN_MS
       : !!(await this.currentSocket());
+    // An ended session has no people: its roster, offer and picture go with it.
+    const over = s.get('state') === 'ended';
     return Response.json(statusBody(s, rows, attached, {
-      participants: this.roster(), offer: this.offerView(), frame_rev: this.frame ? this.frame.rev : null, frame_at: this.frame ? this.frame.at : null,
+      participants: over ? [] : this.roster(), offer: over ? null : this.offerView(), frame_rev: this.frame ? this.frame.rev : null, frame_at: this.frame ? this.frame.at : null,
     }));
   }
 

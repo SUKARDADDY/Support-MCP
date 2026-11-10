@@ -371,3 +371,20 @@ describe('the Queue with answers held while the team is switched', () => {
     expect(screen.queryByText('Someone else claimed that item first.')).not.toBeInTheDocument();
   });
 });
+
+describe('a tab of a team that is not on screen', () => {
+  test('is the person of its own team: with another team on screen, a hidden tab you drive still looks for its agent task', async () => {
+    const fake = fakeCore({ accounts: [ACCOUNT, SECOND] });
+    // Tess drives in the first team; in the second team the person shown is Lee, who only watches this session.
+    fake.state.meFor = (account) => (account === 'acc2' ? { identity: LEAD } : { identity: ME });
+    fake.state.sessions[SID] = { state: 'attached', driver: ME, machine: 'FRONT', log: [], participants: [person(ME, 'driver', 'Tess Tech'), person(LEAD, 'watcher', 'Lee Lead')] };
+    localStorage.setItem('support.active', JSON.stringify('acc2'));
+    localStorage.setItem('support.tabs', JSON.stringify([{ key: SID, account: 'acc1', deviceId: ID('a'), deviceName: 'Front counter', sessionId: SID, taskId: null }]));
+    renderApp(fake);
+    await screen.findByRole('heading', { name: /Devices/ });
+    const asked = (account) => fake.core.request.mock.calls.filter((c) => c[0] === account && c[1] === 'GET' && c[2] === '/api/agent/tasks');
+    // The hidden tab is read as Tess (a driver, who may follow tasks), not as Lee (a watcher, who may not).
+    await waitFor(() => expect(asked('acc1').length).toBeGreaterThanOrEqual(1));
+    expect(fake.core.request.mock.calls.some((c) => c[0] === 'acc1' && c[2] === '/api')).toBe(true);
+  });
+});
