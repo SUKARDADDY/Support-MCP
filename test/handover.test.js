@@ -283,6 +283,30 @@ test('a session step that keeps failing is reported, and repeating the call fini
   assert.equal((await w.log()).filter((r) => r.kind === 'device_session_handed_over').length, 1);
 });
 
+test('a session step that kept failing until the offer lapsed is finished by a repeated accept, and later handovers work', async (t) => {
+  const w = await agentWorld(t);
+  const { sid, pc, people } = await asked(w);
+  await part(people, sid, TECH, 'invite', TECH2);
+  await part(people, sid, TECH2, 'join');
+  await hand(people, sid, TECH, 'offer', TECH2);
+  around(w, { op: 'complete', times: 3 });
+  assert.equal(await code(hand(people, sid, TECH2, 'accept')), 'busy');
+  assert.equal(w.pointer(pc.id).by, TECH2);
+  // The offer and the hold lapse; the Session still names TECH.
+  w.advance(180_000);
+  assert.equal((await call(w, sid, '/watch?workspace=default', undefined, { method: 'GET' })).driver, TECH);
+  assert.equal((await w.tool(TECH2, 'session_status', { session_id: sid })).offer, null);
+  const again = await hand(people, sid, TECH2, 'accept');
+  assert.equal(again.driver, TECH2);
+  assert.equal(w.pointer(pc.id).by, TECH2);
+  assert.equal((await call(w, sid, '/watch?workspace=default', undefined, { method: 'GET' })).driver, TECH2);
+  assert.equal((await w.log()).filter((r) => r.kind === 'device_session_handed_over').length, 1, 'the PC did not move again');
+  // The new driver can hand over again.
+  await hand(people, sid, TECH2, 'offer', TECH);
+  assert.equal((await hand(people, sid, TECH, 'accept')).driver, TECH);
+  assert.equal(w.pointer(pc.id).by, TECH);
+});
+
 test('a cancel between the steps leaves one driver, whichever way it lands', async (t) => {
   const w = await agentWorld(t);
   const { sid, pc, people } = await asked(w);

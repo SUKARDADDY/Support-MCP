@@ -16,7 +16,8 @@
 //      already the new one, and it stops with not_driver when someone else drives, because a
 //      take-over that landed between steps 2 and 3 is the later decision and stands.
 // A step 3 that fails is retried at once; if it keeps failing the call says so and the caller repeats
-// it: step 2 sees that the pointer already names them, and only step 3 runs again.
+// it: step 2 sees that the pointer already names them, and only step 3 runs again. An accept finds the same
+// state after the offer has lapsed, and finishes step 3 without an offer: the pointer is the proof.
 import { TeamError, normalizeIdentity, teamFromEnv } from './workspace.js';
 import { devicesFromEnv } from './devices.js';
 import { deviceHooks } from './device-sessions.js';
@@ -195,7 +196,11 @@ export function sessionPeople(env, { devTtlMs = 0 } = {}) {
     }
     if (action === 'accept') {
       if (driverIs(watch, me)) return out(slug, { driver: watch.driver, participants: watch.participants, offer: watch.offer });
-      await devs.sessionRule(slug, me, sid, watch, caps, { driving: true });
+      const { pointer } = await devs.sessionRule(slug, me, sid, watch, caps, { driving: true });
+      // A saved PC's pointer already names the caller while the Session still has someone else: an earlier accept
+      // moved the pointer and its session step failed, and the offer has lapsed since. The pointer moved under the
+      // full guard, so that is the proof; only the session step is left.
+      if (pointer && watch.driver && pointer.by === me) return out(slug, await complete(slug, sid, me, watch.driver, 'accept'));
       return out(slug, await moveControl(slug, me, sid, watch, 'accept', caps));
     }
     // take_over: a one-off session only. A saved PC's is device_connect with take_over.
