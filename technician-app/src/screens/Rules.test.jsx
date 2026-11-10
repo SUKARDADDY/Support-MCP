@@ -433,6 +433,15 @@ describe('Rules on this PC', () => {
     expect(requestsOf(fake, 'GET', new RegExp(`^/api/rules/${CUSTOMER}$`))).toHaveLength(1);
   });
 
+  test('a PC under a customer with no rules of its own says the team\'s rules apply and names no customer', async () => {
+    const fake = fakeWith(READER);
+    const section = await open(fake, 'Back office');
+    await within(section).findByText('Restart the PC');
+    expect(within(section).getByText(/The team's rules\. Only people who manage rules change them\./)).toBeInTheDocument();
+    expect(within(section).queryByText(/Hadar Bakery Ltd/)).not.toBeInTheDocument();
+    expect(within(section).queryByText(/changes made for/)).not.toBeInTheDocument();
+  });
+
   test('its link opens the Rules screen', async () => {
     const fake = fakeWith(READER);
     const section = await open(fake, 'Front counter');

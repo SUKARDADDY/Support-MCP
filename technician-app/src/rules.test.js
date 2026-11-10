@@ -73,4 +73,16 @@ describe('the rules the screens work with', () => {
     expect(hoursSummary({ mon: ['08:00', '18:00'], wed: ['08:00', '18:00'] })).toBe('Monday 08:00 to 18:00, Wednesday 08:00 to 18:00');
     expect(hoursSummary({ sun: ['09:00', '24:00'] })).toBe('Sunday 09:00 to 24:00');
   });
+
+  test('the week is a circle: Sunday groups with Monday and with Saturday', () => {
+    const long = ['07:30', '20:00'];
+    const sunThu = { sun: long, mon: long, tue: long, wed: long, thu: long, fri: ['08:00', '13:00'] };
+    expect(hoursSummary(sunThu)).toBe('Sunday to Thursday 07:30 to 20:00, Friday 08:00 to 13:00');
+    expect(hoursSummary({ sun: long, mon: long })).toBe('Sunday to Monday 07:30 to 20:00');
+    expect(hoursSummary({ fri: long, sat: long, sun: long, mon: long, wed: ['09:00', '10:00'] })).toBe('Friday to Monday 07:30 to 20:00, Wednesday 09:00 to 10:00');
+    expect(hoursSummary({ mon: long, sat: long })).toBe('Monday 07:30 to 20:00, Saturday 07:30 to 20:00');
+    expect(hoursSummary({ sat: long, sun: ['09:00', '12:00'] })).toBe('Saturday 07:30 to 20:00, Sunday 09:00 to 12:00');
+    expect(hoursSummary(Object.fromEntries(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'].map((d) => [d, long])))).toBe('Monday to Sunday 07:30 to 20:00');
+    expect(hoursSummary({ mon: long, tue: long, sun: ['09:00', '12:00'] })).toBe('Monday to Tuesday 07:30 to 20:00, Sunday 09:00 to 12:00');
+  });
 });

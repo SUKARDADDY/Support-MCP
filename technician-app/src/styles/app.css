@@ -252,7 +252,7 @@ dialog::backdrop { background: rgb(0 0 0 / .45); }
 .queue .q-acts { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
 
 /* ---------- rules and approvals ---------- */
-.code-in { font: 500 20px var(--mono); letter-spacing: .15em; width: 9ch; border: 1px solid var(--field-border); border-radius: 8px; padding: 8px 10px; background: var(--card); }
+.code-in { font: 500 20px var(--mono); letter-spacing: .15em; width: calc(6ch + .9em + 32px); border: 1px solid var(--field-border); border-radius: 8px; padding: 8px 10px; background: var(--card); }
 .rules-form { border: 0; padding: 0; margin: 0 0 8px; min-width: 0; }
 .rfield { min-width: 0; }
 .rfield > legend { float: left; width: 100%; padding: 0; margin: 0 0 4px; font-size: 16px; font-weight: 700; }
@@ -270,7 +270,7 @@ dialog::backdrop { background: rgb(0 0 0 / .45); }
 .hours-row { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; min-height: 36px; }
 .hours-day { width: 92px; font-weight: 600; }
 .hours-closed { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; color: var(--ink-2); width: 88px; }
-.hours-row input[type="text"] { width: 7ch; text-align: center; font-family: var(--mono); }
+.hours-row input[type="text"] { width: calc(5ch + 32px); text-align: center; font-family: var(--mono); }
 .rlist ul { list-style: none; margin: 0 0 8px; padding: 0; }
 .rlist li { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-top: 1px solid var(--rule-2); }
 .rlist li:first-child { border-top: 0; }

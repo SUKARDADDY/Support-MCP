@@ -102,17 +102,26 @@ export function problemWith(doc, merged) {
   return null;
 }
 
-// Business hours in a line: "Mon to Fri 08:00 to 18:00, Sun 08:00 to 13:00". Days with the same times are grouped when they follow each other.
+// Business hours in a line: "Monday to Friday 08:00 to 18:00, Saturday 08:00 to 13:00". Days with the same times are grouped when they
+// follow each other, and the week is a circle: Sunday sits next to Monday and to Saturday, so a Sunday-to-Thursday week reads as one run.
 export function hoursSummary(hours) {
   if (!hours) return t('rules.no_hours');
+  const n = DAYS.length;
+  const label = (i) => (hours[DAYS[i]] ? `${hours[DAYS[i]][0]} ${t('rules.to')} ${hours[DAYS[i]][1]}` : null);
+  const open = DAYS.map((_, i) => label(i));
+  if (open.every((l) => l === null)) return '';
+  // Start where a run begins: a day whose times differ from the day before it. With the same times all week there is no such day.
+  let start = open.findIndex((l, i) => l !== null && l !== open[(i + n - 1) % n]);
+  if (start < 0) start = 0;
   const runs = [];
-  for (const day of DAYS) {
-    const span = hours[day];
-    if (!span) continue;
-    const label = `${span[0]} ${t('rules.to')} ${span[1]}`;
+  for (let k = 0; k < n; k++) {
+    const i = (start + k) % n;
+    if (open[i] === null) continue;
     const last = runs[runs.length - 1];
-    if (last && last.label === label && DAYS.indexOf(last.to) === DAYS.indexOf(day) - 1) last.to = day;
-    else runs.push({ from: day, to: day, label });
+    if (last && last.label === open[i] && last.end === (i + n - 1) % n) { last.end = i; last.to = DAYS[i]; } else runs.push({ from: DAYS[i], to: DAYS[i], end: i, label: open[i] });
   }
+  // At most one run crosses the Sunday to Monday line. It reads first (Sunday to Thursday), the others from Monday on.
+  const wraps = (r) => DAYS.indexOf(r.to) < DAYS.indexOf(r.from);
+  runs.sort((a, b) => (wraps(b) ? 1 : 0) - (wraps(a) ? 1 : 0) || DAYS.indexOf(a.from) - DAYS.indexOf(b.from));
   return runs.map((r) => `${r.from === r.to ? t(`day.${r.from}`) : t('rules.days_range', { from: t(`day.${r.from}`), to: t(`day.${r.to}`) })} ${r.label}`).join(', ');
 }
