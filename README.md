@@ -708,10 +708,11 @@ A new `scheduled` handler runs hourly (a Cron Trigger in `wrangler.toml`); see
 ## The technician app
 
 A small Windows app for your technicians: it signs in to the relay, lists saved PCs, pairs and
-approves them, shows a PC's screen and the built-in agent's work in a tab, and raises Windows
-notifications for the six events that need a person. It is a Tauri 2 app (a Rust core and React
-screens) in `technician-app/`, installs per user, updates itself from signed releases, and is
-view only until a later release. Install, sign-in, what each screen does, updates, the
+approves them, shows a PC's screen and the built-in agent's work in a tab, lets a driver invite
+colleagues to watch a session, hand control over and send a session to a shared queue, and raises Windows
+notifications for what needs a person. It is a Tauri 2 app (a Rust core and React
+screens) in `technician-app/`, installs per user, updates itself from signed releases, and never clicks or
+types on a PC itself (that comes in a later release). Install, sign-in, what each screen does, updates, the
 notification click limitation, SmartScreen and the free-plan ceilings are in
 [docs/technician-app.md](docs/technician-app.md).
 
