@@ -5,9 +5,9 @@ All notable changes to Support-MCP are listed here. The format follows
 [Semantic Versioning](https://semver.org). It stays at 0.x until Stage 1 is safe
 to run on unattended customer PCs.
 
-## [Unreleased]
+## [0.8.1] - 2026-11-10
 
-Invites, handover and the escalation queue (relay).
+Invites, handover and the escalation queue (relay and technician app).
 
 ### Added
 
@@ -37,6 +37,23 @@ Invites, handover and the escalation queue (relay).
   summary in the same batch as its end.
 - Notifications `session_invited` and `control_offered`, always delivered to the named person and not switchable, and
   `escalation_opened` and `escalation_claimed`, switchable and on by default.
+- Technician app: the session tab shows who is in the session (driving, watching, invited), and the driver can
+  **Invite** a colleague (from `people_list`), **Hand over** to someone watching, **Remove** a person and
+  **Escalate** with a note. A person offered control sees **Take control** and **Not now**; the driver can cancel the
+  offer. A watcher sees **Leave** instead of **End session**, and closing the tab of a session you only watch or
+  were invited to never ends it. A watcher sees the last picture the driver or the agent took, with its age
+  ("Picture from 12 s ago"), fetched from the new frame route only when `frame_rev` changes. Refusals are told in the
+  app's words for their code (`needs_unattended`, `not_attached`, `not_driver` and the rest).
+- Technician app: a **Queue** screen in the rail, with Open, Mine and Closed, **Claim** (a live item makes you the driver and
+  opens its session; a ticket opens the PC) and **Close** with a note, and a badge of the open items. It is read when
+  shown and when a queue notification arrives, never by a timer.
+- Technician app: making a one-off link opens a tab for its session that waits for the person and then works like a saved
+  PC's tab, with you as the driver. Tabs work without a PC id.
+- Technician app: an invite notification opens the session and joins it, even with no tab yet; an offer opens it with the
+  banner; queue notices open the Queue. A Windows notification click now carries the event's name. The two queue events are in
+  the settings; invites and offers have no switch.
+- Technician app core: the four new tools and the picture route are in its allow-lists (a test pins both), and a tool
+  error that starts with a code (`<code>: <message>`) is read into a code, with plain text kept for errors without one.
 
 ### Changed
 
