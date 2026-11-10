@@ -30,13 +30,18 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm test
 
-  # Runs on a GitHub-hosted Windows runner with the .NET Framework v4 compiler.
+  # Runs on our self-hosted Windows VM runner with the .NET Framework v4 compiler.
   # It builds the app from source against the pinned .NET Framework 4.5.2 reference
   # assemblies, runs the native tests, and checks that the exe committed in
   # src/app-bundle.json is the build of the committed source.
   windows-app:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: windows-latest
+    # Pull requests from this repository only, pushes to main and release tags only (a branch
+    # with an open pull request is covered by the pull request run), and manual runs.
+    if: >-
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+      || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')))
+      || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, Windows, X64, laptop-win]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -71,18 +76,51 @@ jobs:
           if-no-files-found: error
 
   # The technician app (technician-app/, a Tauri 2 shell with a Rust core and React screens).
-  # On a GitHub-hosted Windows runner it runs the Rust tests and the screens' tests, builds the
+  # On our self-hosted Windows VM runner it runs the Rust tests and the screens' tests, builds the
   # NSIS installer with `tauri build` and checks it is under 25 MB, then installs an end-to-end
   # build silently and drives it against a real local relay (technician-app/e2e/run.mjs,
   # docs/technician-app.md, "How it is tested"). The installer is uploaded as an artifact.
   technician-app:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: windows-latest
+    # Pull requests from this repository only, pushes to main and release tags only (a branch
+    # with an open pull request is covered by the pull request run), and manual runs.
+    if: >-
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+      || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')))
+      || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, Windows, X64, laptop-win]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The VM mounts a per-repo cache volume labeled ci-cache as D:. The Rust target folder and
+      # cargo's registry and git caches become junctions into it, so every path the later steps
+      # use stays the same. Only CARGO_HOME's registry and git folders move: its bin folder holds
+      # the rustup proxies on PATH. With no such volume the step does nothing and the build is cold.
+      - name: Use the local Rust build cache
+        shell: pwsh
+        run: |
+          $vol = Get-Volume -DriveLetter D -ErrorAction SilentlyContinue
+          if ($vol -and $vol.FileSystemLabel -eq 'ci-cache') {
+            function Use-Junction([string]$Link, [string]$Target) {
+              New-Item -ItemType Directory -Force -Path $Target | Out-Null
+              New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Link) | Out-Null
+              $item = Get-Item -LiteralPath $Link -Force -ErrorAction SilentlyContinue
+              if ($item) {
+                # Deleting a junction removes the link only. A real folder is removed with its contents.
+                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { $item.Delete() }
+                else { Remove-Item -LiteralPath $Link -Recurse -Force }
+              }
+              New-Item -ItemType Junction -Path $Link -Target $Target | Out-Null
+              "$Link -> $Target"
+            }
+            $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+            Use-Junction (Join-Path $PWD 'technician-app/src-tauri/target') 'D:\support-mcp\target'
+            Use-Junction (Join-Path $cargoHome 'registry') 'D:\cargo\registry'
+            Use-Junction (Join-Path $cargoHome 'git') 'D:\cargo\git'
+          } else {
+            'No ci-cache volume on D:, so the Rust build starts cold.'
+          }
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
@@ -97,17 +135,6 @@ jobs:
           rustup default stable
           rustc --version
           cargo --version
-      # The repository allows only GitHub's own actions, so the Rust cache is actions/cache.
-      - name: Cache the Rust build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            technician-app/src-tauri/target
-          key: rust-${{ runner.os }}-${{ hashFiles('technician-app/src-tauri/Cargo.lock') }}
-          restore-keys: rust-${{ runner.os }}-
       # The relay's one npm package, which `wrangler dev` bundles for the end-to-end run.
       - run: npm ci --ignore-scripts
       - name: Install the screens' packages
