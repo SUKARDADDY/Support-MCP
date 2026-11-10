@@ -159,8 +159,8 @@ export function sessionPeople(env, { devTtlMs = 0 } = {}) {
     return complete(slug, sid, me, watch.driver, kind, { fromGen, gen });
   }
 
-  // Steps 1 to 3 for an accept, a claim or a take-over. For a claim, `claim` is { expectDriver, extra, recorded } and the
-  // queue's pieces (extra) ride in the same guarded change; recorded says an earlier try already wrote them.
+  // Steps 1 to 3 for an accept, a claim or a take-over. For a claim, `claim` is { expectDriver, extra } and the
+  // queue's pieces (extra) ride in the same guarded change.
   async function moveControl(slug, me, sid, watch, kind, caps, claim = null) {
     let from = null;
     let fromGen = watch.gen ?? 0;
@@ -178,8 +178,7 @@ export function sessionPeople(env, { devTtlMs = 0 } = {}) {
     let changed = false;
     let moved = null;
     try {
-      // A claim that an earlier try already recorded (a one-off session has no pointer to show it) skips the record.
-      if (!claim?.recorded) moved = await devs.handOver(slug, me, { sid, deviceId: watch.device_id, from, fromGen, kind, extra: claim?.extra ?? null }, caps);
+      moved = await devs.handOver(slug, me, { sid, deviceId: watch.device_id, from, fromGen, kind, extra: claim?.extra ?? null }, caps);
       changed = true;
     } finally {
       // Nothing changed in the database: let the session go again at once, not after its 30 seconds.

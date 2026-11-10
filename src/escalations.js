@@ -153,7 +153,7 @@ export function escalationStore(db, team) {
   // The pieces of a live claim that ride in the handover's guarded change (src/devices.js handOver): the log row,
   // the rule that the item is still free (or already this person's, on a repeat), the claim, and the opener's notice.
   // A repeat (`resume`) claims nothing again: the earlier try already did, in the same batch that moved the PC.
-  async function claimPieces(slug, row, actorIdentity, { resume }) {
+  async function claimPieces(slug, row, actorIdentity, { resume = false } = {}) {
     const actor = normalizeIdentity(actorIdentity);
     const now = Date.now();
     const heard = resume ? [] : await notify.rows(slug, 'escalation_claimed', { to: [row.opened_by], except: [actor] }, {
@@ -246,7 +246,37 @@ export function escalationService(env, { devTtlMs = 0, agentMode = async () => f
   async function list(slug, actor, args) {
     const status = args.status === undefined || args.status === null ? 'open' : args.status;
     if (!STATUSES.includes(status)) throw bad('status must be open, mine or closed');
-    return { escalations: await store.list(slug, actor, status), untrusted_text: UNTRUSTED };
+    const items = await store.list(slug, actor, status);
+    // On Mine, an item whose live claim is half done (see `unfinished`) says so, so the app can offer to finish it.
+    if (status === 'mine') {
+      const me = normalizeIdentity(actor);
+      await Promise.all(items.map(async (e) => {
+        if (e.claimed_by !== me || e.closed_at !== null || !e.session_id || !SID_RE.test(e.session_id)) return;
+        try {
+          if (await unfinished(slug, e, me, await hooks.watch(slug, e.session_id))) e.finish_pending = true;
+        } catch (_) { /* no mark; the claim itself says what is wrong */ }
+      }));
+    }
+    return { escalations: items, untrusted_text: UNTRUSTED };
+  }
+
+  // Is this item's live session the opener's to give (still theirs, not over, and not the claimer's own)?
+  const liveFor = (row, watch, me) => !!watch && LIVE.has(watch.state) && !!watch.driver && normalizeIdentity(watch.driver) === row.opened_by && row.opened_by !== me;
+
+  // Is a claim the person already holds half done: control was to move to them, and the part on the PC (or the
+  // Session's reservation) happened, but the Session still has the sender? Repeating the claim finishes it. Nothing
+  // else counts, because finishing moves control and so needs the consent the first claim gave:
+  //   - a saved PC: the PC's pointer already names the claimer, at a generation not below the Session's (an older move is
+  //     a take-over or a handover since, not this claim);
+  //   - a one-off session: the Session still holds the reservation this claim made (it lapses after 30 seconds).
+  // After the claimer handed control back, after the sender took it back, or for a ticket claim, the answer is no.
+  async function unfinished(slug, row, me, watch) {
+    if (row.claimed_by !== me || row.closed_at !== null || !liveFor(row, watch, me)) return false;
+    if (watch.device_id) {
+      const p = await devs.liveSession(slug, watch.device_id);
+      return !!p && p.id === row.session_id && p.by === me && (p.gen ?? 0) >= (watch.gen ?? 0);
+    }
+    return !!watch.accepting && watch.accepting.to === me && watch.accepting.claim === true;
   }
 
   // The result of a ticket claim: the item and where to go.
@@ -275,17 +305,18 @@ export function escalationService(env, { devTtlMs = 0, agentMode = async () => f
         throw new TeamError(503, 'unavailable', 'could not reach that session; try again');
       }
     }
-    const live = !!watch && LIVE.has(watch.state) && !!watch.driver && normalizeIdentity(watch.driver) === row.opened_by && row.opened_by !== me;
+    const live = liveFor(row, watch, me);
     if (!live) {
       if (resume) return ticket(slug, escalationOut(row));
       return ticket(slug, await store.claimTicket(slug, me, id));
     }
     if (await agentModeOn(slug)) throw new TeamError(409, 'mode', 'this team uses the built-in agent; a live session cannot be claimed here, only a ticket');
+    // A claim already held moves control only when it is half done; otherwise it is the ticket it was.
+    if (resume && !(await unfinished(slug, row, me, watch))) return ticket(slug, escalationOut(row));
     await devs.sessionRule(slug, me, row.session_id, watch, caps, { driving: true });
-    const extra = await store.claimPieces(slug, row, me, { resume });
-    // A repeat on a one-off session has no pointer to show the earlier try: the item says it was claimed.
-    const recorded = resume && !watch.device_id;
-    const moved = await people.moveControl(slug, me, row.session_id, watch, 'claim', caps, { expectDriver: row.opened_by, extra, recorded });
+    const moved = resume
+      ? await people.finishMove(slug, me, row.session_id, watch, 'claim', caps)
+      : await people.moveControl(slug, me, row.session_id, watch, 'claim', caps, { expectDriver: row.opened_by, extra: await store.claimPieces(slug, row, me) });
     return {
       escalation: escalationOut(await store.get(slug, id)),
       session_id: row.session_id, driver: moved.driver, ...(row.device_id ? { device_id: row.device_id, device_name: row.device_name } : { one_off: true }),

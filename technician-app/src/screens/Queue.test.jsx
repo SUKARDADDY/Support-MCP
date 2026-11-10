@@ -324,19 +324,20 @@ describe('a live claim whose session step did not finish', () => {
     expect(await screen.findByText('You are driving')).toBeInTheDocument();
   });
 
-  test('on Mine, an item claimed by you whose session is live and still driven by the sender has the action; one you drive does not', async () => {
+  test('on Mine, only an item the relay marks finish_pending has the action; a claimed item with a live session but no mark does not', async () => {
     const fake = halfDone();
     const claimed = (over) => item({ opened_by: LEAD, claimed_by: ME, claimed_at: Date.now() - 1000, ...over });
-    const done = claimed({ id: ID('f'), session_id: 'z'.repeat(64), note: 'Already mine' });
-    fake.state.sessions['z'.repeat(64)] = { state: 'attached', driver: ME, log: [] };
-    const { user } = await openQueue([claimed({ session_id: SID, note: 'Half done' }), done], fake);
+    // Both sessions are live and driven by the sender; only the first is the half-finished state the relay marks.
+    fake.state.sessions['z'.repeat(64)] = { state: 'attached', driver: LEAD, log: [] };
+    const half = claimed({ session_id: SID, note: 'Half done', finish_pending: true });
+    const handedBack = claimed({ id: ID('f'), session_id: 'z'.repeat(64), note: 'Handed back' });
+    const { user } = await openQueue([half, handedBack], fake);
     await user.click(await screen.findByRole('tab', { name: 'Mine' }));
-    const half = (await screen.findByText('Half done')).closest('li');
-    expect(within(half).getByRole('button', { name: 'Finish taking control' })).toBeInTheDocument();
-    expect(within((await screen.findByText('Already mine')).closest('li')).queryByRole('button', { name: 'Finish taking control' })).not.toBeInTheDocument();
-    // Claim is not offered for a claimed item; Finish repeats the claim.
-    expect(within(half).queryByRole('button', { name: 'Claim' })).not.toBeInTheDocument();
-    await user.click(within(half).getByRole('button', { name: 'Finish taking control' }));
+    const li = (await screen.findByText('Half done')).closest('li');
+    expect(within(li).getByRole('button', { name: 'Finish taking control' })).toBeInTheDocument();
+    expect(within((await screen.findByText('Handed back')).closest('li')).queryByRole('button', { name: 'Finish taking control' })).not.toBeInTheDocument();
+    expect(within(li).queryByRole('button', { name: 'Claim' })).not.toBeInTheDocument();
+    await user.click(within(li).getByRole('button', { name: 'Finish taking control' }));
     await waitFor(() => expect(queueCalls(fake, 'claim')[0]?.args[1]).toEqual({ action: 'claim', id: ID('e') }));
   });
 });

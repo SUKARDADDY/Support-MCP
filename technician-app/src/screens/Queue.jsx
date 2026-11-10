@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { claimEscalation, closeEscalation, listQueue, refusalText, sessionStatus } from '../api.js';
+import { claimEscalation, closeEscalation, listQueue, refusalText } from '../api.js';
 import { useApp } from '../context.jsx';
 import { formatAgo } from '../format.js';
 import { tabKeyDown, useDialog, useInterval, useLoad } from '../hooks.js';
@@ -21,23 +21,10 @@ export function Queue() {
   const [error, setError] = useState(null);
   const [closing, setClosing] = useState(null);
   const [finishItem, setFinishItem] = useState(null); // an item whose claim committed but whose session step did not (busy)
-  // On the Mine list, an item you claimed whose session is still live and still driven by the person who sent it has
-  // not finished moving control to you: it is marked `unfinished`, and its action repeats the claim.
-  const { data, error: loadError, loading, reload } = useLoad(async () => {
-    const items = await listQueue(core, account.id, status);
-    if (status !== 'mine') return { status, items };
-    const marked = await Promise.all(items.map(async (e) => {
-      if (!e.session_id || e.closed_at || !same(e.claimed_by, me.identity) || same(e.opened_by, me.identity)) return e;
-      try {
-        const st = await sessionStatus(core, account.id, e.session_id, 0);
-        const live = ['pending', 'consumed', 'waiting', 'attached'].includes(st?.state);
-        return live && st.driver && same(st.driver, e.opened_by) ? { ...e, unfinished: true } : e;
-      } catch (_) {
-        return e;
-      }
-    }));
-    return { status, items: marked };
-  }, [core, account.id, status, me.identity]);
+  // On the Mine list the relay marks (finish_pending) an item you claimed whose move of control is half done: the PC
+  // already names you but the session still has the sender. Only then does repeating the claim move control; for any
+  // other claimed item it moves nothing, so no other item gets the action.
+  const { data, error: loadError, loading, reload } = useLoad(async () => ({ status, items: await listQueue(core, account.id, status) }), [core, account.id, status]);
   const shown = data && data.status === status ? data.items : null;
 
   // The list is read when the screen is shown and after a change, and again when the window is shown or focused again,
@@ -146,7 +133,7 @@ export function Queue() {
                         {!e.claimed_by && !e.closed_at && can('sessions.control') ? (
                           <button type="button" className="btn btn-pri btn-sm" disabled={busy === e.id} onClick={() => claim(e)}>{t('queue.claim')}</button>
                         ) : null}
-                        {e.unfinished && can('sessions.control') ? (
+                        {e.finish_pending && can('sessions.control') ? (
                           <button type="button" className="btn btn-pri btn-sm" disabled={busy === e.id} onClick={() => claim(e)}>{t('queue.finish')}</button>
                         ) : null}
                         {mayClose(e) ? <button type="button" className="btn btn-sec btn-sm" onClick={() => setClosing(e)}>{t('queue.close')}</button> : null}

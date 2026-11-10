@@ -7,6 +7,7 @@ import { TECH2, addTech2, attached, attachedLink, call } from './people-world.js
 import { oai } from './agent-fakes.js';
 import { escalationService } from '../src/escalations.js';
 import { teamStore } from '../src/workspace.js';
+import { sessionPeople } from '../src/session-people.js';
 
 const code = async (promise) => {
   try {
@@ -350,6 +351,113 @@ test('a claim whose last step did not go through is finished by repeating it, wi
   assert.equal((await w.log()).filter((r) => r.kind === 'escalation_claimed').length, 1);
   assert.equal((await w.log()).filter((r) => r.kind === 'session_handed_over').length, 1, 'the one-off record was not written twice');
   assert.equal(notes(w, 'escalation_claimed').length, 1);
+});
+
+// The session step of a claim fails `times` times, so the claim is recorded and the PC (or the reservation) is ahead.
+function failComplete(w, times = 3) {
+  const real = w.env.SESSION.get;
+  let down = times;
+  w.env.SESSION.get = (id) => ({ fetch: async (u, init) => {
+    let body = null;
+    try { body = JSON.parse(init?.body); } catch (_) { /* not JSON */ }
+    if (down > 0 && body?.op === 'complete') { down -= 1; throw new Error('out of reach'); }
+    return real(id).fetch(u, init);
+  } });
+}
+const handoverTo = (people, sid, from, to) => people.handover('default', from, { session_id: sid, action: 'offer', identity: to })
+  .then(() => people.handover('default', to, { session_id: sid, action: 'accept' }));
+const drivers = async (w, sid, pc) => [pc ? w.pointer(pc.id).by : null, (await watchOf(w, sid)).driver];
+
+test('repeating a claim moves control only while it is half done: not after the claimer handed back, not after the sender took back, not for a ticket claim', async (t) => {
+  const w = await agentWorld(t);
+  await addTech2(w);
+  const svc = service(w);
+  const people = sessionPeople(w.env);
+  const moves = async () => (await w.log()).filter((r) => r.kind === 'device_session_handed_over' || r.kind === 'device_session_taken_over').length;
+
+  // The claimer handed control back to the sender.
+  const a = await attached(w, LEAD);
+  const itemA = (await svc.open('default', LEAD, { session_id: a.sid })).escalation;
+  assert.equal((await svc.claim('default', BOSS, { id: itemA.id })).driver, BOSS);
+  await handoverTo(people, a.sid, BOSS, LEAD);
+  const countA = await moves();
+  const againA = await svc.claim('default', BOSS, { id: itemA.id });
+  assert.equal(againA.driver, undefined, 'a ticket: no control moved');
+  assert.deepEqual(await drivers(w, a.sid, a.pc), [LEAD, LEAD]);
+  assert.equal(await moves(), countA);
+
+  // The sender took control back (a take-over).
+  const b = await attached(w, LEAD);
+  const itemB = (await svc.open('default', LEAD, { session_id: b.sid })).escalation;
+  assert.equal((await svc.claim('default', BOSS, { id: itemB.id })).driver, BOSS);
+  await w.tool(LEAD, 'device_connect', { device_id: b.pc.id, take_over: true });
+  const countB = await moves();
+  assert.equal((await svc.claim('default', BOSS, { id: itemB.id })).driver, undefined);
+  assert.deepEqual(await drivers(w, b.sid, b.pc), [LEAD, LEAD]);
+  assert.equal(await moves(), countB);
+
+  // A ticket claim (someone else drove when it was made); the sender drives again later.
+  const c = await attached(w, TECH);
+  const itemC = (await svc.open('default', TECH, { session_id: c.sid })).escalation;
+  await people.participants('default', TECH, { session_id: c.sid, action: 'invite', identity: TECH2 });
+  await people.participants('default', TECH2, { session_id: c.sid, action: 'join' });
+  await handoverTo(people, c.sid, TECH, TECH2);
+  assert.equal((await svc.claim('default', BOSS, { id: itemC.id })).driver, undefined, 'a ticket while TECH2 drives');
+  await handoverTo(people, c.sid, TECH2, TECH);
+  const countC = await moves();
+  assert.equal((await svc.claim('default', BOSS, { id: itemC.id })).driver, undefined);
+  assert.deepEqual(await drivers(w, c.sid, c.pc), [TECH, TECH]);
+  assert.equal(await moves(), countC);
+  // None of these is offered as unfinished on Mine.
+  const mine = (await svc.list('default', BOSS, { status: 'mine' })).escalations;
+  assert.deepEqual(mine.filter((e) => e.finish_pending), []);
+});
+
+test('the same on a one-off session: a repeated claim after a hand back is a ticket, and only a claim whose reservation is still there is finished', async (t) => {
+  const w = await agentWorld(t);
+  await addTech2(w);
+  const svc = service(w);
+  const people = sessionPeople(w.env);
+  const { sid } = await attachedLink(w, TECH);
+  const item = (await svc.open('default', TECH, { session_id: sid })).escalation;
+  assert.equal((await svc.claim('default', TECH2, { id: item.id })).driver, TECH2);
+  await handoverTo(people, sid, TECH2, TECH);
+  assert.equal((await svc.claim('default', TECH2, { id: item.id })).driver, undefined);
+  assert.equal((await watchOf(w, sid)).driver, TECH);
+
+  // A half-done claim: the reservation is there, the list marks it, and repeating it moves control.
+  const link2 = await attachedLink(w, TECH);
+  const item2 = (await svc.open('default', TECH, { session_id: link2.sid })).escalation;
+  failComplete(w);
+  assert.equal(await code(svc.claim('default', TECH2, { id: item2.id })), 'busy');
+  assert.equal((await watchOf(w, link2.sid)).driver, TECH);
+  assert.deepEqual((await svc.list('default', TECH2, { status: 'mine' })).escalations.filter((e) => e.finish_pending).map((e) => e.id), [item2.id]);
+  assert.equal((await svc.claim('default', TECH2, { id: item2.id })).driver, TECH2);
+  // Once the reservation has lapsed, the same half-done state is only a ticket.
+  const link3 = await attachedLink(w, TECH);
+  const item3 = (await svc.open('default', TECH, { session_id: link3.sid })).escalation;
+  failComplete(w);
+  assert.equal(await code(svc.claim('default', TECH2, { id: item3.id })), 'busy');
+  w.advance(60_000);
+  assert.equal((await svc.claim('default', TECH2, { id: item3.id })).driver, undefined);
+  assert.equal((await watchOf(w, link3.sid)).driver, TECH);
+});
+
+test('a saved PC\'s half-done claim is marked on Mine and finished by repeating it, in one generation step with the pointer', async (t) => {
+  const w = await agentWorld(t);
+  const svc = service(w);
+  const { sid, pc } = await attached(w, LEAD);
+  const item = (await svc.open('default', LEAD, { session_id: sid })).escalation;
+  failComplete(w);
+  assert.equal(await code(svc.claim('default', BOSS, { id: item.id })), 'busy');
+  assert.deepEqual(await drivers(w, sid, pc), [BOSS, LEAD], 'the PC is ahead of the session');
+  assert.deepEqual((await svc.list('default', BOSS, { status: 'mine' })).escalations.filter((e) => e.finish_pending).map((e) => e.id), [item.id]);
+  const done = await svc.claim('default', BOSS, { id: item.id });
+  assert.equal(done.driver, BOSS);
+  const watch = await watchOf(w, sid);
+  assert.deepEqual([w.pointer(pc.id).by, watch.driver, w.pointer(pc.id).gen === watch.gen], [BOSS, BOSS, true]);
+  assert.equal((await w.log()).filter((r) => r.kind === 'device_session_handed_over').length, 1, 'one move, however often it was tried');
+  assert.deepEqual((await svc.list('default', BOSS, { status: 'mine' })).escalations.filter((e) => e.finish_pending), []);
 });
 
 test('a team on the built-in agent only may claim a ticket, but a live claim gets mode', async (t) => {
