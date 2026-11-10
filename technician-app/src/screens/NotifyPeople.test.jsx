@@ -78,7 +78,7 @@ describe('clicking an offer of control', () => {
     expect(toolCalls(fake, 'session_handover')).toHaveLength(0);
     expect(toolCalls(fake, 'session_participants')).toHaveLength(0);
     // Closing that tab leaves the session and never ends it: it is the other person's session.
-    await userEvent.setup().click(screen.getByRole('button', { name: 'Leave the session with Front counter' }));
+    await userEvent.setup().click(await screen.findByRole('button', { name: 'Leave the session with Front counter' }));
     await waitFor(() => expect(toolCalls(fake, 'session_participants')).toHaveLength(1));
     expect(toolCalls(fake, 'session_end')).toHaveLength(0);
   });

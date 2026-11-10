@@ -25,7 +25,7 @@ export class ToolFail extends Error {
 // The default answers of the people, handover and queue tools: they change what the stand-in's relay holds.
 const ME = 'tech@example.com';
 const roomOf = (state, sid) => (state.sessions[sid] ??= { state: 'attached', driver: ME, log: [] });
-function peopleCall(state, args) {
+export function peopleCall(state, args) {
   const room = roomOf(state, args.session_id);
   const list = (room.participants ??= [{ identity: room.driver ?? ME, name: 'Tess Tech', role: 'driver', since: Date.now() - 60000 }]);
   const name = (identity) => state.people.find((p) => p.identity === identity)?.name ?? null;
@@ -35,7 +35,7 @@ function peopleCall(state, args) {
   if (args.action === 'remove') room.participants = list.filter((p) => p.identity !== args.identity);
   return { participants: structuredClone(room.participants) };
 }
-function handoverCall(state, args) {
+export function handoverCall(state, args) {
   const room = roomOf(state, args.session_id);
   const list = (room.participants ??= [{ identity: room.driver ?? ME, name: 'Tess Tech', role: 'driver', since: Date.now() - 60000 }]);
   if (args.action === 'offer') room.offer = { to: args.identity, by: room.driver, expires_at: Date.now() + 120000 };
@@ -48,7 +48,7 @@ function handoverCall(state, args) {
   }
   return { driver: room.driver, participants: structuredClone(room.participants), offer: room.offer ?? null };
 }
-function escalationCall(state, args) {
+export function escalationCall(state, args) {
   const q = state.queue;
   if (args.action === 'list') {
     const keep = args.status === 'closed' ? (e) => e.closed_at : args.status === 'mine' ? (e) => !e.closed_at && (e.opened_by === ME || e.claimed_by === ME) : (e) => !e.closed_at && !e.claimed_by;

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { claimEscalation, closeEscalation, listQueue, refusalText } from '../api.js';
 import { useApp } from '../context.jsx';
 import { formatAgo } from '../format.js';
@@ -15,13 +15,11 @@ const STATUSES = ['open', 'mine', 'closed'];
 // claim opens the PC. Notes, summaries and PC names were written by people and by an agent that
 // read a customer's PC, so they are shown as text and labelled as such.
 export function Queue() {
-  const { core, account, me, can, now, toast, openTarget, openSessionTab, tabForSession, showTab, refreshQueue } = useApp();
+  const { core, account, me, can, now, toast, openTarget, openSessionTab, tabForSession, showTab, refreshQueue, isShown } = useApp();
   const [status, setStatus] = useState('open');
   const [busy, setBusy] = useState(null); // the id of the item a claim is on its way for
   const [error, setError] = useState(null);
   const [closing, setClosing] = useState(null);
-  const accountRef = useRef(account.id);
-  accountRef.current = account.id;
   const { data, error: loadError, loading, reload } = useLoad(async () => ({ status, items: await listQueue(core, account.id, status) }), [core, account.id, status]);
   const shown = data && data.status === status ? data.items : null;
 
@@ -37,8 +35,8 @@ export function Queue() {
       // The claim stands whichever team is shown now; what it opens depends on that.
       if (out.session_id) {
         openSessionTab({ deviceId: out.device_id ?? null, deviceName: out.device_name ?? (out.device_id ? '' : t('session.one_off_name')), sessionId: out.session_id, accountOf: owner });
-        if (accountRef.current === owner) toast(t('queue.claimed_live'));
-      } else if (accountRef.current === owner) {
+        if (isShown(owner)) toast(t('queue.claimed_live'));
+      } else if (isShown(owner)) {
         if (out.device_id) {
           toast(t('queue.claimed_ticket', { name: out.device_name || t('queue.a_pc') }));
           openTarget({ account: owner, device_id: out.device_id });
@@ -47,11 +45,11 @@ export function Queue() {
         }
       }
     } catch (e) {
-      if (accountRef.current === owner) setError(refusalText(e, t('queue.claim_failed')));
+      if (isShown(owner)) setError(refusalText(e, t('queue.claim_failed')));
     } finally {
       setBusy(null);
       refreshQueue(owner);
-      if (accountRef.current === owner) reload();
+      if (isShown(owner)) reload();
     }
   }
 
@@ -59,7 +57,7 @@ export function Queue() {
     const owner = account.id;
     await closeEscalation(core, owner, item.id, note);
     refreshQueue(owner);
-    if (accountRef.current === owner) {
+    if (isShown(owner)) {
       toast(t('queue.closed_toast'));
       reload();
     }
