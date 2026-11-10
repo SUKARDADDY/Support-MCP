@@ -337,21 +337,37 @@ release signed long before its deploy would skip them.
    ```sh
    cloudflared access curl -X POST https://<relay>/api/v1/deployment/ring-updates \
      -H 'content-type: application/json' -d '{}'
-   # {"rung":12,"teams_left":0}
+   # {"rung":12,"teams_left":30,"next":"team-17"}
+   cloudflared access curl -X POST https://<relay>/api/v1/deployment/ring-updates \
+     -H 'content-type: application/json' -d '{"after":"team-17"}'
+   # {"rung":9,"teams_left":0,"next":null}
    ```
 
-   `rung` is how many doorbells were rung. While `teams_left` is above 0, call
-   it again: a PC that was rung checks in, so the next call goes on to the
-   teams it did not reach. It rings only connected, active PCs below the
-   release that the rollout reaches, at most 100 per team a call, and leaves
-   PCs that checked in during the last 2 minutes alone (the check-in already
-   offered them the release). It rings nothing under `EMERGENCY_STOP` or without
+   `rung` is how many doorbells were rung. A call takes about 20 teams in name
+   order. While `next` is not `null`, call again with `{"after": <next>}`: the
+   round goes on from where the last call stopped and never returns to a team it
+   passed, so it ends even when some PCs cannot update (an old app, a PC that is
+   not connected, a PC that checks in and stays on the old version). `teams_left`
+   is how many teams after the cursor still have a PC below the release. It rings
+   only connected, active PCs below the release that the rollout reaches, at most
+   100 per team a call, and leaves PCs seen in the last 5 minutes alone (the
+   check-in already offered them the release, and a PC seen that recently does
+   not rewrite its last-seen time, so a shorter span would ring it again). It rings nothing under `EMERGENCY_STOP` or without
    a signed release. The hourly run does the same for the PCs it finds, about
    four teams an hour and only PCs not seen for an hour, so a missed ring costs
    at most that wait. A pinned rollout (`UPDATE_ROLLOUT:100`) rings every due PC; a
    staged rollout rings only the day's share.
 5. Attach the three files from `release-files` to the GitHub release, so anyone
    can check a PC's app against the signed note.
+
+   **Sessions that were live before the deploy are not enforced on the PC.** A
+   saved-PC session that started on a PC below 1.0.0 keeps running the old app,
+   which has no rules, until it ends; the relay checks the rules for its commands,
+   but the PC does not check them again. A PC updates only between sessions, and
+   `device_connect` needs 1.0.0, so a new session on it waits for the update. After
+   the deploy, check `session_list` against `device_list` (it shows each PC's
+   `app_version`) and end the sessions on a PC below 1.0.0 if the team's rules
+   matter for them, or let them end on their own.
 
 `UPDATE_ROLLOUT` controls who is offered the release: empty follows the stages,
 `pause` (or `0`) offers nothing at once, also in the 426 answer, and a whole

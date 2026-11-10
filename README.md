@@ -467,9 +467,12 @@ override them for its own PCs. The rules cover:
   technician approves during business hours; outside them the action is allowed),
   `outside_hours` (refused during business hours, allowed outside) or `never`:
   `restart`, `shutdown`, `install`, `uninstall` and `close_program`.
-- **Protected programs and folders.** A protected program is never closed or
-  uninstalled. A protected folder is never read, written to, or installed from.
-  Each list holds at most 50 entries.
+- **Protected programs and folders.** The tools never close or uninstall a protected
+  program, and the file tools and `install_program` never read from, write to, or install
+  from a protected folder. A raw `run` command is only screened for them (see below), so
+  they are not a wall. Each list holds at most 50 entries, and a folder must be a
+  folder, not a whole drive such as `C:\`. The Support app itself, its processes and its
+  install folder are protected from the tools whatever the lists say.
 
 With no rules saved, `restart`, `shutdown`, `install` and `uninstall` are `approve`,
 `close_program` is `allow`, and nothing is protected. A customer's override holds only
@@ -489,6 +492,8 @@ cloudflared access curl "$api/rules/<customer id>" -X DELETE -H 'content-type: a
   -d '{"code":"123456"}'                              # the customer has the team's rules again
 ```
 
+Moving an active PC to a site under another customer, or off any site, changes which override
+applies to it, so it takes the same: `rules.manage` and a fresh code in the `PATCH .../devices/<id>` body.
 `rev` is the revision you read (0 when nothing was saved); a save for any other
 revision is a 409 `stale`. The technician app has a **Rules** screen for the same: anyone who can see PCs reads
 the team's rules and each customer's overrides, and an admin edits them and types the
@@ -503,7 +508,8 @@ database, before anything reaches it. The answer is one of three:
 - **Refused**, with a code: `rule_never`, `business_hours`, `protected_program`,
   `protected_folder` or `needs_full_control` (a restart, shutdown, install and uninstall
   need a PC set to full control).
-- **Allowed.**
+- **Allowed.** A restart or shutdown with a delay is judged over the whole wait, so one
+  decided just before business hours cannot land inside them when the rule forbids it.
 - **Held for approval.** The call waits, up to 5 minutes, for a technician to approve it in
   the technician app. A technician with `sessions.unattended` is told with a notification
   (`approval_requested`, which cannot be switched off) and approves with a fresh code from
@@ -517,6 +523,9 @@ database, before anything reaches it. The answer is one of three:
 
 The built-in agent has the same six tools, follows the same rules, and waits for approval
 the same way. `put_file` and `get_file` are checked against the protected folders only.
+`install_program` runs only installers (`.msi`, `.msu` or `.exe`, not in the Windows folder, never
+a Windows tool such as `shutdown.exe` or `msiexec.exe`) and refuses arguments that restart or uninstall,
+so it is not a way round the restart and uninstall rules.
 
 **The PC enforces them too.** Every check-in answer carries the rules in force for that
 PC. The PC keeps them on disk, checks every action itself, and refuses what they forbid
@@ -530,7 +539,8 @@ short names (`PROGRA~1`) and follows links.
 
 - A raw `run` command is not limited by the rules beyond that screen. The screen is a
   guardrail: anyone writing a different command gets past it, and `run` as SYSTEM can do
-  anything the five actions can. Give `sessions.control` only to people you trust with that.
+  anything the five actions can, to a protected program or folder and to the Support app too.
+  Give `sessions.control` only to people you trust with that.
 - The screen tools (`click`, `type_text`, `press_key`, UAC prompts and the rest) are not
   checked against the rules. Someone who can click can open Windows Settings and uninstall a program.
 - The rules are not signed. The PC trusts the relay for them, unlike a release: a relay
@@ -538,6 +548,9 @@ short names (`PROGRA~1`) and follows links.
 - Business hours follow the team's time zone and the relay's clock.
 - An approval is checked by the relay. The PC sees that a technician is named on the
   command, not who approved it or whether they did.
+- A session that was live before the 1.0.0 deploy, on a PC still running an older app, is
+  not enforced on the PC; the relay checks the tools, and the release steps say to end such
+  sessions.
 
 The full design is in the [security model](docs/security-model.md#rules-and-approvals) and
 the [spec](docs/relay-v1-spec.md#rules-and-approvals).

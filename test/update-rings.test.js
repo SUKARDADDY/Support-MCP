@@ -27,9 +27,9 @@ async function ringWorld(t, { rollout = '100', env = {} } = {}) {
     return { id, bell: bell ? w.ringSocket(id, slug) : null };
   };
   const team = (slug) => w.db.sqlite.prepare("INSERT INTO workspaces(slug, name, created_by, created_at) VALUES (?, ?, ?, 1)").run(slug, slug, BOSS);
-  const route = async (who = BOSS, { method = 'POST', json = true, headers = {} } = {}) => {
+  const route = async (who = BOSS, { method = 'POST', json = true, headers = {}, body = {} } = {}) => {
     const r = await handler.fetch(new Request('https://support.example.com/api/v1/deployment/ring-updates', {
-      method, headers: { ...(json ? { 'content-type': 'application/json' } : {}), 'cf-access-jwt-assertion': await accessToken(who), ...headers }, body: method === 'POST' ? '{}' : undefined,
+      method, headers: { ...(json ? { 'content-type': 'application/json' } : {}), 'cf-access-jwt-assertion': await accessToken(who), ...headers }, body: method === 'POST' ? JSON.stringify(body) : undefined,
     }), w.env);
     return { status: r.status, body: await r.json() };
   };
@@ -139,7 +139,7 @@ test('POST /api/v1/deployment/ring-updates: a deployment admin rings the due PCs
   const b = pc('acme', 1, { prefix: 'b' });
   const fresh = pc('default', 2, { seen: w.now() - 30_000 });
   const ok = await route(BOSS);
-  assert.deepEqual([ok.status, ok.body], [200, { rung: 2, teams_left: 0 }]);
+  assert.deepEqual([ok.status, ok.body], [200, { rung: 2, teams_left: 0, next: null }]);
   assert.deepEqual(rungOf([a, b, fresh]).sort(), [a.id, b.id].sort(), 'a PC that checked in seconds ago was offered the release then');
   for (const who of [TECH, 'someone@example.com']) {
     const r = await route(who);
@@ -152,31 +152,65 @@ test('POST /api/v1/deployment/ring-updates: a deployment admin rings the due PCs
   assert.equal(anonymous.status, 403);
 });
 
-test('the route says how many teams are left, and each call goes on from the PCs the last one rang, which have checked in since', async (t) => {
+test('the route goes on from a cursor and ends even when PCs stay below the release: stuck, not connected, or checked in but not updated', async (t) => {
   const { w, pc, team, route } = await ringWorld(t);
   const slugs = Array.from({ length: 45 }, (_, i) => `team-${String(i).padStart(2, '0')}`);
-  const pcs = slugs.map((slug, i) => { team(slug); return pc(slug, i); });
-  let left = null;
+  // Every third PC cannot update: it checks in when rung (last_seen moves) and stays on the old version.
+  // Every fifth team has a due PC with no doorbell connected, so it is never rung and never changes.
+  const pcs = slugs.map((slug, i) => { team(slug); return pc(slug, i, { bell: i % 5 !== 4 }); });
+  const stuck = (i) => i % 3 === 0;
+  let after = '';
+  let calls = 0;
   let total = 0;
-  for (let call = 0; call < 5 && left !== 0; call++) {
-    const r = await route(BOSS);
+  const cursors = [];
+  while (after !== null) {
+    assert.ok(calls++ < 6, 'the calls end');
+    const r = await route(BOSS, { body: { after } });
     assert.equal(r.status, 200);
     total += r.body.rung;
-    left = r.body.teams_left;
-    // The PCs that were rung check in, so they are not due again.
-    for (const p of pcs.filter((x) => x.bell.sent.length)) w.db.sqlite.prepare('UPDATE devices SET last_seen = ?, app_version = ? WHERE id = ?').run(w.now(), VERSION, p.id);
-    if (call === 0) assert.ok(left > 0 && left < 45, `a first call leaves teams: ${left}`);
+    cursors.push(r.body.next);
+    // Each call moves the cursor on, and teams_left is what lies after it.
+    if (r.body.next !== null) {
+      assert.ok(after === '' || r.body.next > after, 'the cursor only moves forward');
+      assert.equal(r.body.teams_left, slugs.filter((s) => s > r.body.next).length, 'what is left lies after the cursor');
+    } else assert.equal(r.body.teams_left, 0);
+    pcs.forEach((p, i) => {
+      if (!p.bell || p.bell.sent.length === 0) return;
+      w.db.sqlite.prepare('UPDATE devices SET last_seen = ?, app_version = ? WHERE id = ?').run(w.now(), stuck(i) ? OLD : VERSION, p.id);
+    });
+    after = r.body.next;
   }
-  assert.equal(left, 0);
-  assert.equal(total, 45, 'every team\'s PC was rung once');
-  assert.deepEqual(pcs.map((p) => p.bell.sent.length), pcs.map(() => 1));
-  assert.ok(RING_ROUTE_SUBREQUESTS <= 45);
+  assert.ok(cursors.length > 1, 'it took more than one call');
+  const connected = pcs.filter((p) => p.bell);
+  assert.equal(total, connected.length, 'every connected PC was rung');
+  assert.deepEqual(connected.map((p) => p.bell.sent.length), connected.map(() => 1), 'and rung once, the stuck ones too');
+  // A second round from the start rings no one: the ones rung have just checked in, and the rest are not connected.
+  const again = await route(BOSS, { body: { after: '' } });
+  assert.equal(again.body.rung, 0);
+});
+
+test('the route leaves PCs seen in the last 5 minutes alone, the span in which a check-in does not rewrite last_seen', async (t) => {
+  const { w, pc, route } = await ringWorld(t);
+  const lately = pc('default', 1, { seen: w.now() - 4 * 60_000 });
+  const earlier = pc('default', 2, { seen: w.now() - 6 * 60_000 });
+  const out = await route(BOSS);
+  assert.equal(out.body.rung, 1);
+  assert.deepEqual(rungOf([lately, earlier]), [earlier.id]);
+});
+
+test('the route refuses an after that is not a team name, and takes none, null or an empty one as the start', async (t) => {
+  const { route } = await ringWorld(t);
+  for (const body of [{ after: 5 }, { after: 'Bad Name' }, { after: 'x'.repeat(41) }, [], 'text']) {
+    const r = await route(BOSS, { body });
+    assert.deepEqual([r.status, r.body.error.code], [400, 'bad_request'], JSON.stringify(body));
+  }
+  for (const body of [{}, { after: null }, { after: '' }, { after: 'a-team' }]) assert.equal((await route(BOSS, { body })).status, 200, JSON.stringify(body));
 });
 
 test('the route and the hourly run ring nothing under EMERGENCY_STOP', async (t) => {
   const { w, pc, route } = await ringWorld(t, { env: { EMERGENCY_STOP: '1' } });
   const a = pc('default', 1);
-  assert.deepEqual((await route(BOSS)).body, { rung: 0, teams_left: 0 });
+  assert.deepEqual((await route(BOSS)).body, { rung: 0, teams_left: 0, next: null });
   await sweep(w.env, w.now(), bundle);
   assert.equal(a.bell.sent.length, 0);
 });

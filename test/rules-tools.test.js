@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { agentWorld, BOSS, TECH, VIEW } from './agent-world.js';
 import { attachedLink } from './people-world.js';
-import { HOURS, savedPc, setRules } from './rules-world.js';
+import { HOURS, asking, enrol, fresh, savedPc, setRules } from './rules-world.js';
 import { REFUSAL_CODES, listTools } from '../src/mcp.js';
 import { permissionForTool } from '../src/permissions.js';
 
@@ -138,7 +138,9 @@ test('the rules are read on every command: a change takes effect on the next cal
   // A customer's override changes the rules of that customer's PCs only.
   const customer = (await w.api(BOSS, 'POST', '/customers', { name: 'Acme Ltd' })).body.customer.id;
   const site = (await w.api(BOSS, 'POST', '/sites', { name: 'Main', customer_id: customer })).body.site.id;
-  await w.api(BOSS, 'PATCH', `/devices/${pc.id}`, { site_id: site });
+  // The move changes the rules that apply to the PC, so it takes rules.manage and a fresh code.
+  await enrol(w, BOSS);
+  assert.equal((await w.api(BOSS, 'PATCH', `/devices/${pc.id}`, { site_id: site, code: await fresh(w) })).status, 200);
   await setRules(w, { restart: 'never' }, customer);
   assert.match((await w.tool(TECH, 'restart_pc', { session_id: sid })).error, /^rule_never/);
   assert.equal(frames.filter((f) => f.type === 'power').length, 2);
@@ -202,6 +204,116 @@ test('protected folders: put_file, get_file and an installer inside one are refu
   // A raw run is not screened by the relay: the PC screens it.
   assert.equal((await w.tool(TECH, 'run', { session_id: sid, command: 'type C:\\Data\\notes.txt' })).exit_code, 0);
   assert.deepEqual(frames.map((f) => f.type), ['put_file', 'get_file', 'run']);
+});
+
+// ---- one tool is not a way round another (PR 9 review) ------------------------------------------------------
+test('install_program runs only installers: other files, the Windows folder, system tools, and arguments that restart or uninstall are refused before anyone is asked', async (t) => {
+  const w = await agentWorld(t);
+  const { sid, frames, session } = await savedPc(w, t);
+  await setRules(w, { ...ALLOW, install: 'approve' });
+  for (const [args, match] of [
+    [{ path: 'C:\\Temp\\run.bat' }, /only \.msi, \.msu or \.exe/],
+    [{ path: 'C:\\Temp\\notes' }, /only \.msi, \.msu or \.exe/],
+    [{ path: 'C:\\Windows\\Temp\\setup.exe' }, /Windows folder/],
+    [{ path: 'D:/windows/system32/setup.exe' }, /Windows folder/],
+    [{ path: 'C:\\Temp\\shutdown.exe', args: '/r /t 0' }, /Windows tool/],
+    [{ path: 'C:\\Temp\\MSIEXEC.EXE', args: '/x {11111111-2222-3333-4444-555555555555}' }, /Windows tool/],
+    [{ path: 'C:\\Temp\\wusa.exe.', args: '/uninstall /kb:1' }, /Windows tool/],
+    [{ path: 'C:\\Temp\\cmd.exe', args: '/c shutdown /r' }, /Windows tool/],
+    [{ path: 'C:\\Temp\\a.msi', args: '/x{11111111-2222-3333-4444-555555555555} /qn' }, /must not uninstall/],
+    [{ path: 'C:\\Temp\\a.msi', args: '/qn /forcerestart' }, /must not restart/],
+    [{ path: 'C:\\Temp\\a.msi', args: 'REBOOT=Force' }, /must not restart/],
+    [{ path: 'C:\\Temp\\a.exe', args: '/S /restart' }, /must not restart/],
+    [{ path: 'relative\\setup.exe' }, /absolute path/],
+    [{ path: '\\\\server\\share\\setup.exe' }, /absolute path/],
+    [{ path: 'C:\\Temp\\setup.exe:stream' }, /absolute path/],
+  ]) {
+    const r = await w.tool(TECH, 'install_program', { session_id: sid, ...args });
+    assert.match(r.error, match, JSON.stringify(args));
+    assert.equal(session().approval ?? null, null, `no approval was asked for ${JSON.stringify(args)}`);
+  }
+  assert.equal(frames.length, 0);
+  // Real installers, and the installer's own flags, are left alone.
+  await setRules(w, ALLOW);
+  for (const args of [{ path: 'C:\\Temp\\Setup.EXE', args: '/S /D=C:\\Apps' }, { path: 'C:\\Temp\\a.msi', args: '/qn /norestart ALLUSERS=1' }, { path: 'C:\\Temp\\update.msu' }]) {
+    assert.equal((await w.tool(TECH, 'install_program', { session_id: sid, ...args })).ok, true, JSON.stringify(args));
+  }
+});
+
+test('the Support app cannot be closed, uninstalled or written to through its own tools, whatever the rules say', async (t) => {
+  const w = await agentWorld(t);
+  const { sid, frames } = await savedPc(w, t);
+  await setRules(w, ALLOW);
+  for (const [name, args, code] of [
+    ['close_program', { name: 'support.exe' }, 'protected_program'],
+    ['close_program', { name: 'SUPPORT' }, 'protected_program'],
+    ['close_program', { name: 'support-1.0.0-0a1b2c3d.exe' }, 'protected_program'],
+    ['close_program', { name: 'C:\\Program Files\\SupportMCP\\support.exe' }, 'protected_program'],
+    ['uninstall_program', { program_id: '64:SupportMcpDevice' }, 'protected_program'],
+    ['uninstall_program', { program_id: '32:supportmcpdevice' }, 'protected_program'],
+    ['put_file', { path: 'C:\\Program Files\\SupportMCP\\support.exe', data_b64: 'eA==' }, 'protected_folder'],
+    ['put_file', { path: 'c:/program files/supportmcp/../SupportMCP/device.json', data_b64: 'eA==' }, 'protected_folder'],
+    ['get_file', { path: 'D:\\Program Files (x86)\\SupportMCP\\device.json' }, 'protected_folder'],
+    ['get_file', { path: 'C:\\Program Files\\SupportMCP-1a2b3c4d\\device.json' }, 'protected_folder'],
+    ['install_program', { path: 'C:\\Program Files\\SupportMCP\\setup.exe' }, 'protected_folder'],
+  ]) {
+    assert.match((await w.tool(TECH, name, { session_id: sid, ...args })).error, new RegExp(`^${code}: `), `${name} ${JSON.stringify(args)}`);
+  }
+  assert.equal(frames.length, 0, 'nothing reached the PC');
+  // A program that only starts with the word, and a folder that only looks alike, are not the app.
+  await w.tool(TECH, 'list_programs', { session_id: sid });
+  assert.equal((await w.tool(TECH, 'close_program', { session_id: sid, name: 'supportassist.exe' })).closed, 1);
+  assert.equal((await w.tool(TECH, 'put_file', { session_id: sid, path: 'C:\\Program Files\\SupportMCP Tools\\a.txt', data_b64: 'eA==' })).bytes, 3);
+});
+
+test('the relay reads names the way the PC does: a folder, a trailing dot or space and the .exe suffix change nothing for close', async (t) => {
+  const w = await agentWorld(t);
+  const { sid, frames } = await savedPc(w, t);
+  await setRules(w, { ...ALLOW, protected_programs: ['Outlook.exe'] });
+  for (const name of ['C:\\Office\\outlook.exe', 'D:/x/OUTLOOK', 'outlook.exe.', 'outlook. ', '  Outlook.EXE  ']) {
+    assert.match((await w.tool(TECH, 'close_program', { session_id: sid, name })).error, /^protected_program: /, name);
+  }
+  assert.equal(frames.length, 0);
+  assert.equal((await w.tool(TECH, 'close_program', { session_id: sid, name: 'C:\\Office\\outlook2.exe' })).closed, 1);
+});
+
+test('a restart or shutdown with a delay is judged over the whole wait: decided before the hours, it is refused or asks when it would land inside them', async (t) => {
+  const w = await agentWorld(t);
+  const { sid, frames, session } = await savedPc(w, t);
+  // The clock is Friday 08:00 UTC; hours are 07:00 to 18:00 UTC on weekdays. Move to 06:59:00.
+  w.advance(-61 * 60_000);
+  await setRules(w, { time_zone: 'UTC', hours: HOURS, restart: 'outside_hours', shutdown: 'approve_in_hours', install: 'allow', uninstall: 'allow', close_program: 'allow' });
+  assert.match((await w.tool(TECH, 'restart_pc', { session_id: sid, delay_s: 120 })).error, /^business_hours: /, 'lands at 07:01, inside');
+  assert.equal(frames.length, 0);
+  assert.equal((await w.tool(TECH, 'restart_pc', { session_id: sid, delay_s: 30 })).ok, true, 'lands at 06:59:30, outside');
+  // A shutdown that lands inside the hours needs approval; one that stays outside does not.
+  assert.equal((await w.tool(TECH, 'shutdown_pc', { session_id: sid, delay_s: 30 })).ok, true);
+  assert.equal(ofType(frames, 'power').at(-1).approved_by, undefined);
+  const asked = await asking(w, session, TECH, 'shutdown_pc', { session_id: sid, delay_s: 120 });
+  assert.match(asked.approval.summary, /Shut down the PC in 120 seconds/);
+  session().cancelApproval('the test is over');
+  await asked.call;
+});
+
+test('frames that carry a rules tag are waited for 15 s longer, for the PC\'s own check-in; frames that carry none are not', async (t) => {
+  const w = await agentWorld(t);
+  const { sid, session } = await savedPc(w, t);
+  await setRules(w, ALLOW);
+  const waits = [];
+  const real = session().awaitResult.bind(session());
+  session().awaitResult = (id, ws, tag, frame, waitMs, extra) => { waits.push([frame.type, waitMs]); return real(id, ws, tag, frame, waitMs, extra); };
+  await w.tool(TECH, 'restart_pc', { session_id: sid });
+  await w.tool(TECH, 'run', { session_id: sid, command: 'whoami', timeout_s: 20 });
+  await w.tool(TECH, 'close_program', { session_id: sid, name: 'OUTLOOK.EXE' });
+  await w.tool(TECH, 'list_programs', { session_id: sid });
+  await w.tool(TECH, 'screenshot', { session_id: sid });
+  const [power, run, close, list, screen] = waits;
+  assert.deepEqual(power, ['power', 60_000 + 15_000 + 15_000]);
+  assert.deepEqual(run, ['run', 20_000 + 15_000 + 15_000]);
+  assert.deepEqual(close, ['programs', 60_000 + 15_000 + 15_000]);
+  assert.deepEqual(list, ['programs', 60_000 + 15_000], 'a list reads no rules: no catch-up');
+  assert.equal(screen[0], 'screen');
+  assert.equal(screen[1], 30_000 + 15_000, 'a screenshot carries no tag: its own wait only');
 });
 
 test('limited control: restart, shutdown, install and uninstall need full control, and closing a program does not', async (t) => {

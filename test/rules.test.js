@@ -4,14 +4,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
-  DEFAULT_RULES, REFUSALS, RulesError, decide, effectiveRules, hoursUtc, isTimeZone, parseRules, parseStored, pathInside, resolveTimeZone, rulesTag,
+  DEFAULT_RULES, REFUSALS, RulesError, decide, effectiveRules, hoursUtc, installArgsProblem, installerProblem, isTimeZone, parseRules, parseStored, pathInside, resolveTimeZone, rulesTag,
 } from '../src/rules.js';
 
 const cases = JSON.parse(readFileSync(new URL('./fixtures/rules-cases.json', import.meta.url), 'utf8'));
 
 test('the shared file has the cases the plan names', () => {
   assert.ok(cases.decide.length >= 60);
-  for (const k of ['decide', 'hours', 'effective', 'validate']) assert.ok(cases[k].length > 5, k);
+  for (const k of ['decide', 'hours', 'effective', 'validate', 'installers']) assert.ok(cases[k].length > 5, k);
   assert.equal(new Set(Object.values(cases).filter(Array.isArray).flat().map((c) => c.name)).size, Object.values(cases).filter(Array.isArray).flat().length, 'case names are unique');
 });
 
@@ -23,6 +23,12 @@ for (const c of cases.decide) {
     else assert.deepEqual(got, { [c.expect.outcome]: true });
     // The spans in the case are the ones the relay works out for its answer, 8 days ending at hours_until.
     assert.deepEqual(hoursUtc(c.rules, (c.hours_until - 8 * 86400) * 1000), { hours_utc: c.hours_utc, hours_until: c.hours_until });
+  });
+}
+
+for (const c of cases.installers) {
+  test(`installer: ${c.name}`, () => {
+    assert.equal((installerProblem(c.path) ?? installArgsProblem(c.path, c.args)) !== null, c.problem);
   });
 }
 

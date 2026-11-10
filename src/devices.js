@@ -514,7 +514,13 @@ export function deviceStore(db, team, { authSecret = '', hooks = null, defaultTi
   // mode, its owner's contact (the owner's control level and name stay the
   // owner's), or approval of a waiting PC with the six-digit number its owner
   // reads out. Approval is its own request: it is not mixed with other changes.
-  async function updateDevice(slug, actorIdentity, id, body) {
+  //
+  // A change of site that changes the PC's customer swaps the customer override of the rules that apply to it,
+  // so on an active PC it is a change of rules: the caller (src/api.js) checks rules.manage and a fresh
+  // authenticator code first (siteMoveChangesRules says when) and passes { rulesCleared: true }. A store call that
+  // would make such a move without it is refused, so no path moves a PC between customers on devices.manage alone.
+  // The move is logged as device_changed and rules_changed, and the PC is rung.
+  async function updateDevice(slug, actorIdentity, id, body, { rulesCleared = false } = {}) {
     const actor = normalizeIdentity(actorIdentity);
     const hasSite = Object.hasOwn(body, 'site_id');
     const hasFields = Object.hasOwn(body, 'fields');
@@ -574,6 +580,10 @@ export function deviceStore(db, team, { authSecret = '', hooks = null, defaultTi
       const sets = [];
       const values = [];
       const siteChanges = hasSite && siteId !== cur.site_id;
+      const rulesChange = siteChanges && cur.status === 'active' && (await customerOf(slug, cur.site_id)) !== (await customerOf(slug, siteId));
+      if (rulesChange && !rulesCleared) {
+        throw new TeamError(409, 'rules_change', 'moving an active PC to another customer, or to no site, changes the rules that apply to it: it needs rules.manage and a fresh authenticator code');
+      }
       if (siteChanges) { changed.push(`site ${cur.site_id ?? 'none'} to ${siteId ?? 'none'}`); sets.push('site_id = ?'); values.push(siteId); }
       const accessChanges = hasAccess && access !== cur.access;
       if (accessChanges) { changed.push(`access ${cur.access} to ${access}`); sets.push('access = ?'); values.push(access); }
@@ -583,11 +593,17 @@ export function deviceStore(db, team, { authSecret = '', hooks = null, defaultTi
       if (merge.ids.length) { changed.push(...merge.ids.map((f) => `field ${f}`)); sets.push('fields = json_patch(fields, ?)'); values.push(merge.patch); }
       if (!changed.length) return { noop: true, result: deviceOut(cur) };
       // A changed access mode is something the PC acts on, so it is rung.
-      ring = accessChanges;
+      ring = accessChanges || rulesChange;
       return {
-        entries: [{ kind: 'device_changed', detail: `${id} ${changed.join(', ')}` }],
+        entries: [
+          { kind: 'device_changed', detail: `${id} ${changed.join(', ')}` },
+          ...(rulesChange ? [{ kind: 'rules_changed', detail: `device ${id}: site ${cur.site_id ?? 'none'} to ${siteId ?? 'none'}, customer ${(await customerOf(slug, cur.site_id)) ?? 'none'} to ${(await customerOf(slug, siteId)) ?? 'none'}` }] : []),
+        ],
         guard: and(
           base,
+          // The customer's rules follow the PC, so the permission is held at commit and the PC is still approved.
+          rulesChange ? actorHas(slug, actor, 'rules.manage') : lit(true),
+          rulesChange ? ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND status = 'active')", [slug, id]] : lit(true),
           // The permission is held at commit too, not only when it was read.
           accessChanges && access === 'any' ? actorHas(slug, actor, UNATTENDED_PERMISSION) : lit(true),
           siteId ? rowExists('sites', slug, siteId) : lit(true),
@@ -606,6 +622,29 @@ export function deviceStore(db, team, { authSecret = '', hooks = null, defaultTi
     });
     if (ring) await hooks?.ring(slug, id);
     return out;
+  }
+
+  // The customer a site belongs to, or null (no site, or a site that is gone). A site never changes customer.
+  async function customerOf(slug, siteId) {
+    if (!siteId) return null;
+    return (await q('SELECT customer_id FROM sites WHERE workspace = ? AND id = ?', slug, siteId).first())?.customer_id ?? null;
+  }
+
+  // Whether the site change in a PATCH of a PC would change the rules that apply to it: the PC is active and the
+  // new site is under another customer than the old one (or either is no site). The caller then asks for
+  // rules.manage and a fresh code before updateDevice. Anything that is not a plain site change answers false
+  // and is left to updateDevice to refuse. A site that does not exist is refused here, before a code is spent.
+  async function siteMoveChangesRules(slug, id, body) {
+    if (!Object.hasOwn(body, 'site_id') || Object.hasOwn(body, 'approve')) return false;
+    let siteId = null;
+    if (body.site_id !== null) {
+      if (typeof body.site_id !== 'string' || !ID_RE.test(body.site_id)) return false;
+      siteId = body.site_id;
+    }
+    const cur = await q('SELECT status, site_id FROM devices WHERE workspace = ? AND id = ?', slug, id).first();
+    if (!cur || cur.status !== 'active' || cur.site_id === siteId) return false;
+    if (siteId && !(await count('sites', slug, ' AND id = ?', siteId))) throw new TeamError(400, 'unknown_site', 'no such site');
+    return (await customerOf(slug, cur.site_id)) !== (await customerOf(slug, siteId));
   }
 
   // A technician removes a saved PC, waiting or not. Its key ends with its row.
@@ -1274,7 +1313,7 @@ export function deviceStore(db, team, { authSecret = '', hooks = null, defaultTi
     connect, sessionEnded, pinSessionEnd,
     listRecords, getRecord, addRecord, updateRecord, removeRecord,
     listFields, addField, updateField, removeField,
-    listDevices, getDevice, liveSession, updateDevice, removeDevice,
+    listDevices, getDevice, liveSession, updateDevice, siteMoveChangesRules, removeDevice,
     createPairingCode, listPairingCodes, revokePairingCode,
     redeemCode, requestJoin, authenticate, checkIn, checkInFull, rulesFor, updateOwn, leave,
   };

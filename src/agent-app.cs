@@ -1534,9 +1534,13 @@ namespace SupportMcp {
         public readonly List<long> Starts = new List<long>(), Ends = new List<long>();
         public long Until;
         // Past the horizon every moment counts as business hours: the stricter side, as in src/rules.js.
-        public bool Inside(long nowS) {
-            if (nowS >= Until) return true;
-            for (int i = 0; i < Starts.Count; i++) if (nowS >= Starts[i] && nowS < Ends[i]) return true;
+        public bool Inside(long nowS) { return Inside(nowS, 0); }
+        // Whether any moment from nowS to nowS + delayS (both included) is inside business hours: a restart or shutdown
+        // that waits lands at the end of its window, so an hour rule holds for all of it. A span is [start, end).
+        public bool Inside(long nowS, long delayS) {
+            long last = nowS + delayS;
+            if (last >= Until) return true;
+            for (int i = 0; i < Starts.Count; i++) if (nowS < Ends[i] && last >= Starts[i]) return true;
             return false;
         }
     }
@@ -1717,10 +1721,16 @@ namespace SupportMcp {
         }
 
         // ---- names and paths (the same as src/rules.js) --------------------------------------------------------------
-        // A program name for comparison: trimmed, lower case, without a trailing .exe.
+        // A program name for comparison: trimmed, lower case, the trailing dots and spaces Windows drops from a name dropped,
+        // and without a trailing .exe.
         public static string ProgramKey(string name) {
-            string k = (name ?? "").Trim().ToLowerInvariant();
+            string k = (name ?? "").Trim().ToLowerInvariant().TrimEnd(new char[] { '.', ' ' });
             return k.EndsWith(".exe", StringComparison.Ordinal) ? k.Substring(0, k.Length - 4) : k;
+        }
+        // The same for the name of a running program to close: a folder in front of it is dropped first (the relay does the same).
+        public static string ProcessKey(string name) {
+            string t = (name ?? "").Trim();
+            return ProgramKey(t.Substring(t.LastIndexOfAny(new char[] { '\\', '/' }) + 1));
         }
         // A path as lower-case components: / the same as \, repeated and trailing separators dropped, . and .. resolved
         // (never above the drive), the \\?\ prefix dropped, and the trailing dots and spaces Windows drops dropped too.
@@ -1744,11 +1754,63 @@ namespace SupportMcp {
             return true;
         }
 
+        // ---- the Support app itself, and installers (the same as src/rules.js) ----------------------------------------------
+        // The app is never closed, uninstalled or written to through its own tools. Its program is support.exe, or
+        // support-<version>-<8 hex>.exe after an update; its folder is SupportMCP under Program Files (SupportMCP-<id> while
+        // an install is staged). These are the names; AppGuard adds this PC's real processes and folder.
+        static readonly System.Text.RegularExpressions.Regex AppProgram = new System.Text.RegularExpressions.Regex(@"^support(?:-.+-[0-9a-f]{8})?\z",
+            System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+        public static bool IsAppProgram(string name) { return AppProgram.IsMatch(ProcessKey(name)); }
+        public static bool IsAppPath(string path) {
+            var p = PathParts(path);
+            return p.Count >= 3 && p[1].StartsWith("program files", StringComparison.Ordinal) && (p[2] == "supportmcp" || p[2].StartsWith("supportmcp-", StringComparison.Ordinal));
+        }
+        // Tools that are Windows itself: install_program runs an installer, never one of these, wherever the file sits.
+        static readonly string[] SystemTools = new string[] {
+            "msiexec", "wusa", "shutdown", "cmd", "powershell", "powershell_ise", "pwsh", "wscript", "cscript", "mshta", "rundll32", "regsvr32",
+            "reg", "regedit", "sc", "net", "net1", "taskkill", "tskill", "schtasks", "at", "bcdedit", "diskpart", "format", "dism", "pnputil",
+            "wmic", "certutil", "bitsadmin", "cmstp", "msbuild", "installutil", "forfiles", "runas", "takeown", "icacls", "cacls", "vssadmin",
+            "wevtutil", "wsl", "bash", "logoff", "tsdiscon", "psexec", "psexec64" };
+        // Why a file may not be run by install_program, or null: only .msi, .msu and .exe installers, none in the Windows
+        // folder (on any drive) and none named as a system tool.
+        public static string InstallerProblem(string path) {
+            var parts = PathParts(path);
+            string name = parts.Count > 0 ? parts[parts.Count - 1] : "";
+            if (!(name.EndsWith(".msi", StringComparison.Ordinal) || name.EndsWith(".msu", StringComparison.Ordinal) || name.EndsWith(".exe", StringComparison.Ordinal))) return "install_program runs only .msi, .msu or .exe installers";
+            if (parts.Count > 1 && parts[1] == "windows") return "install_program does not run files from the Windows folder";
+            if (name.EndsWith(".exe", StringComparison.Ordinal) && Array.IndexOf(SystemTools, name.Substring(0, name.Length - 4)) >= 0) return "install_program does not run " + name + ": it is a Windows tool, not an installer";
+            return null;
+        }
+        // Why these installer arguments are refused, or null: they ask the installer to uninstall or to restart the PC, which
+        // other rules govern.
+        public static string InstallArgsProblem(string path, string args) {
+            var parts = PathParts(path);
+            string name = parts.Count > 0 ? parts[parts.Count - 1] : "";
+            bool windows = name.EndsWith(".msi", StringComparison.Ordinal) || name.EndsWith(".msu", StringComparison.Ordinal);
+            var token = new StringBuilder();
+            string text = (args ?? "").ToLowerInvariant() + " ";
+            foreach (char ch in text) {
+                if (!(char.IsWhiteSpace(ch) || "\"'`;&|,()".IndexOf(ch) >= 0)) { token.Append(ch); continue; }
+                if (token.Length == 0) continue;
+                string t = token.ToString(); token.Length = 0;
+                if (t.Contains("forcerestart") || t.Contains("promptrestart") || t.Contains("warnrestart") || t.Contains("reboot=force")
+                    || ((t[0] == '/' || t[0] == '-') && (t.Substring(1) == "restart" || t.Substring(1) == "reboot"))) return "installer arguments must not restart the PC: use restart_pc";
+                if (windows && (t[0] == '/' || t[0] == '-')) {
+                    if (t.Substring(1).StartsWith("uninstall", StringComparison.Ordinal)) return "installer arguments must not uninstall a program: use uninstall_program";
+                    if (t.Length >= 2 && t[1] == 'x' && (t.Length == 2 || !(t[2] >= 'a' && t[2] <= 'z'))) return "installer arguments must not uninstall a program: use uninstall_program";
+                }
+            }
+            return null;
+        }
+
         // ---- the decision (src/rules.js decide, in the same order) ---------------------------------------------------
         // action: restart, shutdown, install, uninstall, close_program, put_file or get_file. control: "full" or "limited".
         // program and path may be null. The order is fixed because both sides run the same cases: the rule's own never, full
         // control, protected programs and folders, and last the value (allow, approve, or an hour rule).
-        public static Verdict Decide(RulesDoc r, string action, long nowS, Hours hours, string control, string program, string path) {
+        public static Verdict Decide(RulesDoc r, string action, long nowS, Hours hours, string control, string program, string path) { return Decide(r, action, nowS, hours, control, program, path, 0); }
+        // delayS: for a restart or shutdown, the seconds before it happens. An hour rule is judged over the whole window from
+        // nowS to nowS + delayS, not at the moment of the decision.
+        public static Verdict Decide(RulesDoc r, string action, long nowS, Hours hours, string control, string program, string path, long delayS) {
             bool file = action == "put_file" || action == "get_file";
             bool guarded = action == "restart" || action == "shutdown" || action == "install" || action == "uninstall" || action == "close_program";
             if (!guarded && !file) return Refuse("rule_never");
@@ -1757,15 +1819,19 @@ namespace SupportMcp {
             if (!known || value == "never") return Refuse("rule_never");
             if (guarded && action != "close_program" && control == "limited") return Refuse("needs_full_control");
             if ((action == "close_program" || action == "uninstall") && program != null) {
-                string key = ProgramKey(program);
+                // A close names a running program, maybe with a folder; an uninstall names an installed program (no folder).
+                string key = action == "close_program" ? ProcessKey(program) : ProgramKey(program);
                 foreach (string p in r.Programs) if (ProgramKey(p) == key) return Refuse("protected_program");
+                if (action == "close_program" && IsAppProgram(program)) return Refuse("protected_program");
             }
             if ((file || action == "install") && path != null) {
                 foreach (string f in r.Folders) if (PathInside(f, path)) return Refuse("protected_folder");
+                if (IsAppPath(path)) return Refuse("protected_folder");
             }
             if (value == "allow") return new Verdict();
             if (value == "approve") return new Verdict { Approve = true };
-            bool inside = (hours ?? new Hours()).Inside(nowS);
+            long window = (action == "restart" || action == "shutdown") && delayS > 0 ? delayS : 0;
+            bool inside = (hours ?? new Hours()).Inside(nowS, window);
             if (value == "approve_in_hours") return inside ? new Verdict { Approve = true } : new Verdict();
             return inside ? Refuse("business_hours") : new Verdict(); // outside_hours
         }
@@ -1798,12 +1864,13 @@ namespace SupportMcp {
                 return RunScreen.Check(Wire.Text(frame, "command"), current.Doc);
             }
             string action, program = null, path = null, sub = Wire.Text(frame, "action");
+            long delayS = 0; Programs.Installed found = null;
             if (type == "put_file" || type == "get_file") {
                 action = type;
                 try { path = Client.AbsolutePath(Wire.Text(frame, "path")); } catch (Exception) { return null; } // the file code answers a bad path itself
             } else if (type == "power") {
                 if (sub != "restart" && sub != "shutdown") return "power needs action restart or shutdown";
-                action = sub;
+                action = sub; delayS = PowerAction.DelayOf(frame);
             } else if (type == "programs") {
                 if (sub == "list") return null;
                 if (sub == "install") {
@@ -1811,7 +1878,7 @@ namespace SupportMcp {
                     try { path = Client.AbsolutePath(Wire.Text(frame, "path")); } catch (Exception) { return "install needs the absolute path of an installer that is on this PC"; }
                 } else if (sub == "uninstall") {
                     action = "uninstall";
-                    var found = Programs.Find(Wire.Text(frame, "program_id"));
+                    found = Programs.Find(Wire.Text(frame, "program_id"));
                     if (found == null) return Err("not_found", "no installed program has that id; take it from list_programs");
                     program = found.Name;
                 } else if (sub == "close") {
@@ -1827,16 +1894,25 @@ namespace SupportMcp {
             string tag = Wire.Text(frame, "rules_tag");
             long at = JudgeTime(frame, view);
             bool behind = tag.Length > 0 && tag != view.Tag;
-            if (behind || (guarded && view.Stale) || (guarded && HourValue(view.Doc.Of(action)) && at >= view.Hours.Until)) {
+            if (behind || (guarded && view.Stale) || (guarded && HourValue(view.Doc.Of(action)) && at + delayS >= view.Hours.Until)) {
                 ruled.CatchUp(CatchUpMs, stop);
                 view = ruled.State.Now(); at = JudgeTime(frame, view);
                 if (behind && tag != view.Tag) return Err("rules_stale", "this PC could not get the team's current rules in time; try again");
             }
             if (guarded && view.Stale) return Err("rules_stale", "this PC could not read the team's rules from its last check-in; try again in a minute");
-            Verdict v = Decide(view.Doc, action, at, view.Hours, limited ? "limited" : "full", program, path);
+            Verdict v = Decide(view.Doc, action, at, view.Hours, limited ? "limited" : "full", program, path, delayS);
             if (v.Refused) return v.Error;
-            // The relay's cases compare the path as written. This PC also expands short names and follows links first.
-            if (path != null && PathCheck.Inside(view.Doc.Folders, path)) return Refuse("protected_folder").Error;
+            // The relay's cases compare the path as written. This PC also expands short names and follows links first, and
+            // adds the folders of the Support app itself to the protected ones.
+            if (path != null) {
+                var folders = new List<string>(view.Doc.Folders); folders.AddRange(AppGuard.Folders());
+                if (PathCheck.Inside(folders, path)) return Refuse("protected_folder").Error;
+            }
+            // One tool is not a way round another: an installer is an installer, an uninstall is not the app itself.
+            string problem = null;
+            if (action == "install") problem = Programs.InstallProblem(path, Wire.Clean(Wire.Text(frame, "args"), 1000), view.Doc);
+            else if (action == "uninstall") problem = Programs.UninstallProblem(found, view.Doc);
+            if (problem != null) return problem;
             if (v.Approve && Wire.Clean(Wire.Text(frame, "approved_by"), 320).Length == 0)
                 return Err("approval_unavailable", "this action needs a technician's approval in the technician app, and the request carries none");
             return null;
@@ -1847,19 +1923,30 @@ namespace SupportMcp {
     // determined one gets round any text check. It refuses the obvious: a verb of a guarded action whose rule is not allow
     // (use_tool, pointing at the tool), and any mention of a protected program or folder. Simple tokens, any case.
     public static class RunScreen {
-        public static string Check(string command, RulesDoc r) {
+        public static string Check(string command, RulesDoc r) { return Check(command, r, null); }
+        // own: the action of the tool whose own text this is (install for an installer's path and arguments, uninstall for a
+        // program's uninstall command), whose verbs are that tool's business and are not sent back to it. The Support app is
+        // protected whatever the rules say: its program names, its service and Run key names, and its install folder.
+        public static string Check(string command, RulesDoc r, string own) {
             string c = (command ?? "").ToLowerInvariant();
             foreach (string p in r.Programs) if (Mentions(c, Rules.ProgramKey(p), false)) return Rules.Refuse("protected_program").Error;
+            foreach (string app in AppWords) if (Mentions(c, app, false)) return Rules.Refuse("protected_program").Error;
             string flat = Flat(c);
             foreach (string f in r.Folders) if (Mentions(flat, Flat(f.ToLowerInvariant()).TrimEnd(new char[] { '\\' }), true)) return Rules.Refuse("protected_folder").Error;
+            foreach (string f in AppGuard.Folders()) if (Mentions(flat, Flat(f.ToLowerInvariant()).TrimEnd(new char[] { '\\' }), true)) return Rules.Refuse("protected_folder").Error;
             foreach (var statement in Statements(c)) {
                 for (int i = 0; i < statement.Count; i++) {
+                    if (statement[i].EndsWith(".exe", StringComparison.Ordinal) && Rules.IsAppProgram(Verb(statement[i]) + ".exe")) return Rules.Refuse("protected_program").Error;
                     string action = VerbAction(Verb(statement[i]), statement, i + 1);
-                    if (action != null && r.Of(action) != "allow") return UseTool(action);
+                    // A command that ends programs must not name the app (taskkill /im support.exe, Stop-Process -Name support).
+                    if (action == "close_program") for (int j = i + 1; j < statement.Count; j++) if (Rules.IsAppProgram(statement[j])) return Rules.Refuse("protected_program").Error;
+                    if (action != null && action != own && r.Of(action) != "allow") return UseTool(action);
                 }
             }
             return null;
         }
+        // The Support app's own names: its install folder's name, its service and its tray's Run value.
+        static readonly string[] AppWords = new string[] { "supportmcp", "supportmcpdevice", "supportmcptray" };
         static string UseTool(string action) {
             string what = "", tool = "";
             if (action == "restart") { what = "restarts the PC"; tool = "restart_pc"; }
@@ -1939,6 +2026,35 @@ namespace SupportMcp {
         }
     }
 
+    // The Support app's own files and processes on this PC, which its tools never touch whatever the rules say: close_program
+    // skips its processes, the file tools and installers refuse its folder, and the raw-command screen refuses to name them.
+    // This is the real list (the install folder, the folder the service's exe runs from, and any SupportMCP* folder beside
+    // the install folder, such as a staged install); src/rules.js and Rules.IsAppProgram / IsAppPath hold the names.
+    public static class AppGuard {
+        public static List<string> Folders() {
+            var list = new List<string>();
+            try {
+                string root = FullInstall.Root;
+                list.Add(Path.Combine(root, "SupportMCP"));
+                foreach (string dir in Directory.GetDirectories(root, "SupportMCP*")) if (!list.Contains(dir)) list.Add(dir);
+            } catch (Exception) { }
+            try {
+                string dir = Path.GetDirectoryName(DeviceSetup.InstalledExe());
+                if (!String.IsNullOrEmpty(dir) && !list.Contains(dir)) list.Add(dir);
+            } catch (Exception) { }
+            return list;
+        }
+        // The process is this one, or runs a file from the app's folders (the helper, the tray and the corner windows run the
+        // same exe). A process whose file cannot be read counts when it is named like the app.
+        public static bool OwnsProcess(Process p) {
+            try { if (p.Id == Process.GetCurrentProcess().Id) return true; } catch (Exception) { }
+            string image = null;
+            try { image = p.MainModule.FileName; } catch (Exception) { }
+            if (String.IsNullOrEmpty(image)) { try { return Rules.IsAppProgram(p.ProcessName); } catch (Exception) { return false; } }
+            return PathCheck.Inside(Folders(), image);
+        }
+    }
+
     // File paths against the protected folders. The relay compares whole components of the path as written; this PC
     // first expands short names (PROGRA~1) and follows links and junctions on the deepest folder that exists, and
     // refuses when the path, as written or resolved, is inside a folder, as written or resolved.
@@ -1992,6 +2108,16 @@ namespace SupportMcp {
     public static class PowerAction {
         public const int DefaultDelayS = 30, MaxDelayS = 600;
         internal static int MinDelayS = 5;
+        // After the action went (or was blocked, or aborted with shutdown /a), the PC is not told which: the one-at-a-time latch
+        // frees itself this long after the delay ends, so a request that never came to anything cannot block power actions
+        // until the service restarts. The tests shorten it.
+        internal static int LatchMs = 120000;
+        // The delay a frame asks for, brought into MinDelayS to MaxDelayS (30 when none is given): what Start waits, and what
+        // the rules judge their hours over.
+        public static long DelayOf(Dictionary<string, object> frame) {
+            object given; long asked = frame.TryGetValue("delay_s", out given) && given != null ? Wire.Number(frame, "delay_s") : DefaultDelayS;
+            return Math.Max(MinDelayS, Math.Min(MaxDelayS, asked));
+        }
         // The tests replace this: it restarts or shuts down, and returns an error text or null.
         internal static Func<bool, string> Perform = Live;
         static int pending, generation;
@@ -2004,8 +2130,7 @@ namespace SupportMcp {
         [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
         public static Dictionary<string, object> Start(Dictionary<string, object> frame, long serverOffsetMs) {
             bool reboot = Wire.Text(frame, "action") == "restart";
-            object given; long asked = frame.TryGetValue("delay_s", out given) && given != null ? Wire.Number(frame, "delay_s") : DefaultDelayS;
-            long delay = Math.Max(MinDelayS, Math.Min(MaxDelayS, asked));
+            long delay = DelayOf(frame);
             if (Interlocked.CompareExchange(ref pending, 1, 0) != 0) return Wire.Map("ok", false, "error", "busy: a restart or shutdown is already waiting on this PC; do not repeat it");
             int mine = Interlocked.Increment(ref generation);
             long at = (Client.UnixNow() + serverOffsetMs) / 1000 + delay;
@@ -2014,7 +2139,11 @@ namespace SupportMcp {
                 if (Thread.VolatileRead(ref generation) != mine) return;
                 string error;
                 try { error = Perform(reboot); } catch (Exception e) { error = e.Message; }
-                if (error != null) Interlocked.Exchange(ref pending, 0); // it did not go: a new request may try again
+                if (error != null) { Interlocked.Exchange(ref pending, 0); return; } // it did not go: a new request may try again
+                // It was started. A shutdown that was aborted or blocked afterwards is not reported to this service, so the latch is
+                // freed after a grace period instead of staying set for good.
+                Thread.Sleep(LatchMs);
+                if (Thread.VolatileRead(ref generation) == mine) Interlocked.Exchange(ref pending, 0);
             });
             t.IsBackground = true; t.Start();
             return Wire.Map("ok", true, "at", at);
@@ -2106,10 +2235,12 @@ namespace SupportMcp {
             if (name.Length > 0) list.AddRange(Process.GetProcessesByName(name));
             return list;
         }
-        // Why a process is never closed from here, or null: it runs in session 0 or it is a critical Windows process.
+        // Why a process is never closed from here, or null: it is the Support app (any of its processes, by the file it runs
+        // from), it runs in session 0 or it is a critical Windows process.
         static string Untouchable(Process p) {
             int session;
             try { session = p.SessionId; } catch (Exception) { return "cannot be inspected"; }
+            if (AppGuard.OwnsProcess(p)) return "is the Support app";
             if (p.Id == 0 || p.Id == 4 || p.Id == Process.GetCurrentProcess().Id || session == 0) return "runs as part of Windows, outside any user session";
             string n = p.ProcessName.ToLowerInvariant();
             foreach (string c in Critical) if (n == c) return "is a critical Windows process";
@@ -2171,11 +2302,16 @@ namespace SupportMcp {
             int timeoutS = (int)Math.Max(10, Math.Min(600, t));
             if (action == "install") {
                 string path = Client.AbsolutePath(Wire.Text(frame, "path"));
-                if (!File.Exists(path)) return Wire.Map("ok", false, "error", Rules.Err("not_found", "there is no installer at " + path));
                 string args = Wire.Clean(Wire.Text(frame, "args"), 1000);
-                bool msi = path.EndsWith(".msi", StringComparison.OrdinalIgnoreCase);
-                if (!msi) return RunInstaller(path, args, timeoutS, work, stop);
-                return RunInstaller(Path.Combine(Environment.SystemDirectory, "msiexec.exe"), "/i \"" + path + "\" /qn /norestart" + (args.Length > 0 ? " " + args : ""), timeoutS, work, stop);
+                // The rules' check has judged this already; it is not left to it alone, since an installer runs as SYSTEM.
+                string notInstaller = Rules.InstallerProblem(path) ?? Rules.InstallArgsProblem(path, args) ?? WindowsFolderProblem(path);
+                if (notInstaller != null) return Wire.Map("ok", false, "error", notInstaller);
+                if (!File.Exists(path)) return Wire.Map("ok", false, "error", Rules.Err("not_found", "there is no installer at " + path));
+                string tail = args.Length > 0 ? " " + args : "";
+                if (path.EndsWith(".msi", StringComparison.OrdinalIgnoreCase)) return RunInstaller(Path.Combine(Environment.SystemDirectory, "msiexec.exe"), "/i \"" + path + "\" /qn /norestart" + tail, timeoutS, work, stop);
+                // An update package goes to Windows Update Standalone Installer, never straight to the shell.
+                if (path.EndsWith(".msu", StringComparison.OrdinalIgnoreCase)) return RunInstaller(Path.Combine(Environment.SystemDirectory, "wusa.exe"), "\"" + path + "\" /quiet /norestart" + tail, timeoutS, work, stop);
+                return RunInstaller(path, args, timeoutS, work, stop);
             }
             Installed p = Find(Wire.Text(frame, "program_id"));
             if (p == null) return Wire.Map("ok", false, "error", Rules.Err("not_found", "no installed program has that id; take it from list_programs"));
@@ -2183,6 +2319,33 @@ namespace SupportMcp {
             if (guid != null) return RunInstaller(Path.Combine(Environment.SystemDirectory, "msiexec.exe"), "/x " + guid + " /qn /norestart", timeoutS, work, stop);
             if (p.Quiet.Length > 0) return RunInstaller(Path.Combine(Environment.SystemDirectory, "cmd.exe"), "/c \"" + p.Quiet + "\"", timeoutS, work, stop);
             return Wire.Map("ok", false, "error", "this program has no silent uninstall command, so it cannot be removed from here");
+        }
+        // Why a path is not run as an installer on this PC, or null: it is in this PC's Windows folder (links and short names
+        // resolved), wherever the drive.
+        static string WindowsFolderProblem(string path) {
+            string windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            if (windows.Length == 0) return null;
+            string real = PathCheck.Resolve(path);
+            if (Rules.PathInside(windows, real) || Rules.PathInside(PathCheck.Resolve(windows), real)) return "install_program does not run files from the Windows folder";
+            return null;
+        }
+        // What stops an installer from being run, or null: the shared checks of the relay (type, Windows folder, system tools,
+        // arguments that restart or uninstall), this PC's real Windows folder, and the raw-command screen over the path and
+        // the arguments (a protected program or folder named, the app itself, a restart or shutdown verb). The install verbs
+        // themselves are the tool's own and are not screened.
+        public static string InstallProblem(string path, string args, RulesDoc doc) {
+            string problem = Rules.InstallerProblem(path) ?? Rules.InstallArgsProblem(path, args) ?? WindowsFolderProblem(path);
+            if (problem != null) return problem;
+            return RunScreen.Check(path + " " + args, doc, "install");
+        }
+        // What stops an uninstall, or null: the Support app is never uninstalled from here (by its registry key, whatever it
+        // is called), and a program with no Windows Installer code is removed by the command its own entry holds, which gets
+        // the raw-command screen like anything else that runs as SYSTEM.
+        public static string UninstallProblem(Installed p, RulesDoc doc) {
+            if (p == null) return null;
+            if (String.Equals(p.Key, DeviceSetup.ServiceName, StringComparison.OrdinalIgnoreCase)) return Rules.Err("protected_program", "the Support app is never uninstalled through its own tools");
+            if (MsiCode(p) == null && p.Quiet.Length > 0) return RunScreen.Check(p.Quiet, doc, "uninstall");
+            return null;
         }
         // The product code of a Windows Installer program: its key name, or the {code} in its uninstall string.
         static string MsiCode(Installed p) {

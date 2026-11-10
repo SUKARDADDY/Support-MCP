@@ -850,7 +850,9 @@ async function handleApp(request, env, url, origin, devTtlMs, workspace, rest, o
 // POST /api/v1/deployment/ring-updates: ring the connected PCs that the release this relay serves is due for,
 // across every team, right after a deploy (the hourly run does the same for what it reaches). Only a person whose
 // Access login is in DEPLOYMENT_ADMINS may: a service token is refused whatever it is named, as is every
-// other login. Answers { rung, teams_left }; with teams_left above 0, call it again.
+// other login. Body { after } (a team name, from the last answer's next; none for the first call). Answers
+// { rung, teams_left, next }; while next is not null, call again with after set to it. The teams are taken in
+// name order from the one after the cursor, so the calls end even when some PCs cannot update.
 const RING_UPDATES_PATH = '/api/v1/deployment/ring-updates';
 async function handleRingUpdates(request, env, url, appBundle) {
   if (request.headers.has('origin')) return fail(403, 'forbidden', 'cross-site requests are refused');
@@ -862,8 +864,20 @@ async function handleRingUpdates(request, env, url, appBundle) {
   if (identityKind(who) !== 'person' || !parseDeploymentAdmins(env.DEPLOYMENT_ADMINS).has(who)) {
     return fail(403, 'forbidden', 'only a deployment admin may ring PCs for an update');
   }
+  let after = '';
   try {
-    return json(await ringUpdates(env, Date.now(), appBundle, { budget: RING_ROUTE_SUBREQUESTS, idleMs: RING_ROUTE_IDLE_MS }), 200, noStore);
+    const text = await request.text();
+    const body = text.trim() ? JSON.parse(text) : {};
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new Error('not an object');
+    if (Object.hasOwn(body, 'after') && body.after !== null) {
+      if (typeof body.after !== 'string' || (body.after !== '' && !/^[a-z0-9-]{1,40}$/.test(body.after))) throw new Error('bad after');
+      after = body.after;
+    }
+  } catch (_) {
+    return fail(400, 'bad_request', 'send {} or { "after": <the next of the last answer> }');
+  }
+  try {
+    return json(await ringUpdates(env, Date.now(), appBundle, { budget: RING_ROUTE_SUBREQUESTS, idleMs: RING_ROUTE_IDLE_MS, after }), 200, noStore);
   } catch (_) {
     return fail(503, 'unavailable', 'could not ring the PCs; try again', { 'retry-after': '1' });
   }

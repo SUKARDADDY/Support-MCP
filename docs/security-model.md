@@ -1257,7 +1257,7 @@ apply to only one client say which.
 - **The window shows, and the rules enforce part of it.** The window shows that support is
   connected and working, and the consent dialog says what access is granted. The window
   itself stops nothing. On a saved PC the team's rules do stop five actions and
-  protected folders, as [Rules and approvals](#rules-and-approvals) says. They do not stop
+  protected folders when they go through the tools, as [Rules and approvals](#rules-and-approvals) says. They do not stop
   an operator acting in bad faith with a raw `run` or the screen tools: under full
   control commands run as SYSTEM or as the signed-in user with administrator rights, and
   what they change stays changed. The PowerShell agent's
@@ -1293,7 +1293,9 @@ the restart and program tools (`not_saved_pc`). Bullets say what holds, and what
   install or uninstall needs a PC set to full control (`needs_full_control`), because an
   installer and a restart act as the system. A close works under limited support, but only
   on the signed-in user's own programs. A protected program is checked for a close and an
-  uninstall, a protected folder for `put_file`, `get_file` and an installer's path.
+  uninstall, a protected folder for `put_file`, `get_file` and an installer's path. A protected
+  folder cannot be a whole drive (refused when saved). Closing a program by name judges the name
+  without its folder, trailing dots and spaces and `.exe`, on both sides.
   `test/fixtures/rules-cases.json` holds the cases, and both the Worker's tests and the app's
   native tests run them, so the two cannot drift apart unseen.
 - **Where each check runs.** The relay's Session object reads the rules in force for the PC
@@ -1309,10 +1311,35 @@ the restart and program tools (`not_saved_pc`). Bullets say what holds, and what
 - **What the PC adds.** It expands Windows short names (`PROGRA~1`) and follows links and
   junctions before it compares a folder, so a protected folder is not reached by another name
   for it. It never closes a process of session 0 or a critical Windows process whatever the
-  rules say. It screens a raw `run` command (below). A restart starts with the rules on
+  rules say. It never closes a process of the Support app itself (any process that runs a file
+  from the app's folders, so the helper, the tray and the corner windows are covered), never
+  uninstalls the app's own entry, and adds the app's install folder to the protected folders
+  for the file tools and installers, and the app's names to what its raw-command screen refuses.
+  So a tool cannot end or tamper with the support app that enforces the rules. It screens a raw
+  `run` command (below). A restart starts with the rules on
   disk, and a PC that never had an answer uses the defaults. An answer it cannot read keeps the last good rules and marks them stale, and a
   guarded action is then refused (`rules_stale`) until a good answer comes. The relay does the
   same when it cannot read the rules for a restart, a shutdown, a program tool or a file.
+- **One tool is not a way round another.** `install_program` runs as SYSTEM with free
+  arguments, so it would defeat the restart and uninstall rules if it ran anything. It accepts
+  only a `.msi`, `.msu` or `.exe` on a local drive that is not in a `Windows` folder and is not named
+  as a Windows tool (`shutdown.exe`, `msiexec.exe`, `wusa.exe`, `cmd.exe`, `powershell.exe` and the
+  like, by file name, wherever it sits), and refuses arguments that ask for a restart or, for an
+  `.msi` or `.msu`, an uninstall. It refuses before an approval is asked, on the relay, and again on the
+  PC, where the raw-command screen also reads the path and the arguments. What a vendor's `.exe`
+  does with its own other arguments is its own: the checks are a guardrail there, like the screen.
+  An uninstall by a program's own `QuietUninstallString` is screened the same way, and the Support
+  app's entry is never uninstalled. `put_file` into the app's folder, and `get_file` of its
+  record, are refused. `close_program` skips the app's processes.
+- **A change of the rules that apply to a PC is guarded like a change of rules.** Moving an active
+  PC to a site under another customer, or off its site, swaps the customer override that applies to
+  it, which `devices.manage` alone must not do. So that move needs `rules.manage`, a person and a
+  fresh authenticator code, writes `rules_changed` next to `device_changed` (the PC and the two
+  customers' ids, never a value), and rings the PC. A move inside a customer changes nothing that
+  applies, and a PC still waiting for approval has no rules yet, so those need only `devices.manage`.
+  No other path changes it: a site cannot change customer, a customer or site that still has PCs
+  cannot be removed, a pairing code only places a new PC, and the technician app has no way to
+  change a PC's site. Removing a customer's override is already a rules save.
 - **What is not enforced.** These stay open, and the rules are no substitute for trusting the
   people who hold `sessions.control`:
   - *Raw `run` commands.* They are not limited by the rules beyond a screen on the PC. The
@@ -1327,13 +1354,16 @@ the restart and program tools (`not_saved_pc`). Bullets say what holds, and what
     are not checked against the rules. Someone who can see and click can open Windows Settings
     and uninstall a program, or press Restart.
   - *A protected name as the rules write it.* A protected program matches by name, trimmed,
-    lower case and without `.exe`. A close is judged by the process name and an uninstall by the
+    lower case, without trailing dots and spaces and without `.exe`. A close is judged by the process name and an uninstall by the
     name `list_programs` shows, so list both forms when they differ. A close by `pid` or an
     uninstall by `program_id` is judged by the name the PC finds, but a program may have more
     than one name.
   - *Files outside the file tools.* The protected folders limit `put_file`, `get_file` and an
-    installer's path. A command that reads or writes one without naming it, or the screen, is not
-    stopped.
+    installer's path, and nothing else. A raw command that reads or writes one without naming
+    it in a way the screen reads, or the screen tools, is not stopped. The same holds for the
+    Support app's folder and processes: the tools and the screen refuse them, a raw command that
+    avoids the screen can still end the app (as SYSTEM it can do anything), and the app
+    then no longer enforces anything.
   - *Force.* A restart or shutdown closes running programs without asking, so unsaved work is
     lost, and a forced close ends a program at once. The rules say whether the action may happen,
     not how much it costs the person at the PC.
@@ -1349,7 +1379,12 @@ the restart and program tools (`not_saved_pc`). Bullets say what holds, and what
   no time zone data. It keeps the relay's time (`server_time` plus the seconds since, on its own
   stopwatch), not its wall clock, so setting the PC's clock changes nothing. A frame's
   `decided_at` is the time hour rules are judged at, but only when it is within 60 seconds of
-  the PC's own reckoning. Past the 8 days every moment counts as business hours, the stricter
+  the PC's own reckoning. A restart or shutdown with a delay is judged over the whole wait, from
+  `decided_at` to `decided_at + delay_s`: a rule that refuses it during business hours refuses it
+  when any part of the wait is inside them, and one that asks for approval during business hours
+  asks when any part is, so an action decided outside the hours cannot land inside them. A
+  relay that withholds the delay from a frame cannot loosen it: the PC reads `delay_s` from the
+  frame it runs. Past the 8 days every moment counts as business hours, the stricter
   side, until the PC gets a fresh answer. The zone is the team's, else `DEFAULT_TIME_ZONE`,
   else UTC, so a customer in another time zone has the team's hours unless its override names
   its own.
@@ -1374,7 +1409,9 @@ the restart and program tools (`not_saved_pc`). Bullets say what holds, and what
   - *What an approval covers.* It is bound by a hash to that exact action on that PC in that
     session. When it is given the command starts again from the top: the session, the driver,
     the PC's attachment and the rules are all read again, so a rule that changed during the wait
-    applies, and an approval for another action is refused (`declined`).
+    applies, and an approval for another action is refused (`declined`). If the command lane is
+    taken at that moment, the approved command waits for it, up to 60 seconds, instead of losing
+    the approval; if the lane stays busy the call ends `busy` and says the approval was used.
   - *When it ends without an answer.* One approval waits at a time in a session, and a second
     is `busy`. It is cancelled by a handover or take-over (it was asked for the old driver), the
     end of the session, and Stop or Pause of the built-in agent that asked. An object restart
@@ -1392,10 +1429,12 @@ the restart and program tools (`not_saved_pc`). Bullets say what holds, and what
   session's own log holds the refusal code and the action's detail, which can include an
   installer path or a program name.
 - **Releases and update rings.** An older PC cannot enforce any of this, so a saved-PC session
-  needs a PC on 1.0.0 or later and an older one updates itself first. A deploy does not make a
+  needs a PC on 1.0.0 or later and an older one updates itself first. A session that was already
+  live on an older PC when 1.0.0 was deployed keeps the old app, which has no rules: the relay
+  checks its tools, the PC does not, until it ends. The release steps say to end those sessions. A deploy does not make a
   connected PC check in, so the relay rings the PCs that are due an update: the hourly run does
   it, and a deployment admin can call `POST /api/v1/deployment/ring-updates` right after a
-  deploy. The route takes an Access login that is a person listed in `DEPLOYMENT_ADMINS`. A
+  deploy (it goes through the teams with a cursor, so a loop that follows it ends). The route takes an Access login that is a person listed in `DEPLOYMENT_ADMINS`. A
   ring is only the existing doorbell, which carries no authority (above): a forged one only
   makes a PC check in.
 

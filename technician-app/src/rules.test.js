@@ -62,6 +62,8 @@ describe('the rules the screens work with', () => {
     expect(problemWith({ restart: 'outside_hours' }, { ...ok, hours: HOURS, restart: 'outside_hours' })).toBeNull();
     expect(problemWith({ ...ok, protected_folders: ['Customer Data'] }, ok)).toMatchObject({ key: 'rules.err_folder' });
     expect(problemWith({ ...ok, protected_folders: ['C:\\Data', 'D:/Other'] }, ok)).toBeNull();
+    // A whole drive would refuse every file and installer of the PC.
+    for (const root of ['C:\\', 'c:/', 'D:\\\\']) expect(problemWith({ ...ok, protected_folders: [root] }, ok)).toMatchObject({ key: 'rules.err_folder_root' });
     expect(problemWith({ ...ok, protected_programs: Array.from({ length: 51 }, (_, i) => `p${i}`) }, ok)).toMatchObject({ key: 'rules.err_list_long' });
   });
 

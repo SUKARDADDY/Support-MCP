@@ -14,6 +14,8 @@ export const DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
 export const LIST_MAX = 50;
 export const PROGRAM_MAX = 100;
 export const FOLDER_MAX = 260;
+// A whole drive (C:\, c:/) is not a folder to protect: it would refuse every file and installer of the PC. The relay refuses it too.
+export const isDriveRoot = (path) => /^[A-Za-z]:[\\/]*$/.test(String(path).trim());
 export const FIELDS = ['time_zone', 'hours', ...ACTIONS, 'protected_programs', 'protected_folders'];
 
 // What a team with no saved rules has (the relay uses the same).
@@ -95,6 +97,7 @@ export function problemWith(doc, merged) {
   }
   for (const folder of doc.protected_folders ?? []) {
     if (!/^[A-Za-z]:[\\/]/.test(folder)) return { key: 'rules.err_folder', vars: { path: folder } };
+    if (isDriveRoot(folder)) return { key: 'rules.err_folder_root', vars: { path: folder } };
   }
   return null;
 }

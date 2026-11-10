@@ -3052,14 +3052,24 @@ public static class AppTests {
             foreach (object span in (System.Collections.ArrayList)c["hours_utc"]) { var pair = (System.Collections.ArrayList)span; hours.Starts.Add(Convert.ToInt64(pair[0])); hours.Ends.Add(Convert.ToInt64(pair[1])); }
             var args = (Dictionary<string, object>)c["args"];
             string control = args.ContainsKey("control") ? Wire.Text(args, "control") : null, program = args.ContainsKey("program") ? Wire.Text(args, "program") : null, path = args.ContainsKey("path") ? Wire.Text(args, "path") : null;
-            var verdict = Rules.Decide(doc, Wire.Text(c, "action"), Wire.Number(c, "now"), hours, control, program, path);
+            long delay = args.ContainsKey("delay_s") ? Wire.Number(args, "delay_s") : 0;
+            var verdict = Rules.Decide(doc, Wire.Text(c, "action"), Wire.Number(c, "now"), hours, control, program, path, delay);
             var expect = (Dictionary<string, object>)c["expect"]; string outcome = Wire.Text(expect, "outcome");
             string got = verdict.Refused ? "refuse" : verdict.Approve ? "approve" : "allow";
             Assert(got == outcome && (outcome != "refuse" || verdict.Code == Wire.Text(expect, "code")), "case '" + name + "' wants " + outcome + " " + Wire.Text(expect, "code") + ", got " + got + " " + verdict.Code);
             ran++;
         }
-        Assert(ran >= 60, "the shared file holds the cases: " + ran);
-        Console.WriteLine("PASS rules vectors: " + ran + " shared cases decided as the relay does (" + skipped + " relay-only skipped)");
+        Assert(ran >= 100, "the shared file holds the cases: " + ran);
+        // The installers the relay and this PC both refuse before anyone is asked (type, Windows folder, system tools, arguments).
+        int installers = 0;
+        foreach (object o in (System.Collections.ArrayList)all["installers"]) {
+            var c = (Dictionary<string, object>)o; string path = Wire.Text(c, "path"), args = Wire.Text(c, "args");
+            string problem = Rules.InstallerProblem(path) ?? Rules.InstallArgsProblem(path, args);
+            Assert((problem != null) == Wire.Flag(c, "problem"), "installer case '" + Wire.Text(c, "name") + "' wants " + (Wire.Flag(c, "problem") ? "a problem" : "none") + ", got: " + problem);
+            installers++;
+        }
+        Assert(installers >= 20, "the shared file holds the installer cases: " + installers);
+        Console.WriteLine("PASS rules vectors: " + ran + " shared cases decided as the relay does (" + skipped + " relay-only skipped), " + installers + " installer cases");
     }
 
     // The answer is read strictly, the last good rules survive a bad one, time runs from the relay's clock, and device.json
@@ -3207,6 +3217,22 @@ public static class AppTests {
         var inHours = new FakeRuled(); Give(inHours, "h3", RulesMap("approve_in_hours", "allow", "allow", "allow", "allow", NoNames, NoNames), now, now + 691200, a, b);
         Assert((check(inHours, Wire.Map("type", "power", "action", "restart", "rules_tag", "h3")) ?? "").StartsWith("approval_unavailable:") && check(inHours, Wire.Map("type", "power", "action", "restart", "rules_tag", "h3", "approved_by", "t@example.com")) == null, "approve_in_hours inside the hours needs approval");
 
+        // A restart or shutdown that waits is judged over its whole wait: decided before the hours, it is refused (or asks) when it lands inside them.
+        var window = new FakeRuled(); Give(window, "w1", RulesMap("outside_hours", "approve_in_hours", "allow", "allow", "allow", NoNames, NoNames), now, now + 691200, now + 300, now + 7200);
+        Func<string, long, string, string> power = delegate(string action, long delay, string approvedBy) {
+            var frame = Wire.Map("type", "power", "action", action, "delay_s", delay, "rules_tag", "w1", "decided_at", now); if (approvedBy != null) frame["approved_by"] = approvedBy;
+            return check(window, frame);
+        };
+        Assert((power("restart", 600, null) ?? "").StartsWith("business_hours:"), "decided 5 minutes before the hours, a restart in 10 minutes lands inside them: refused");
+        Assert((power("restart", 300, null) ?? "").StartsWith("business_hours:"), "one that lands exactly when the hours start is inside");
+        Assert(power("restart", 295, null) == null && power("restart", 5, null) == null, "one that lands before them goes ahead");
+        Assert((power("shutdown", 600, null) ?? "").StartsWith("approval_unavailable:") && power("shutdown", 600, "t@example.com") == null, "approve_in_hours: a shutdown that lands inside the hours needs approval");
+        Assert(power("shutdown", 30, null) == null, "and one that stays outside does not");
+        Assert(window.CatchUps == 0, "none of that needed a check-in");
+        // The wait runs past the horizon: the PC checks in first, as it does for a decision past it.
+        var pastEdge = new FakeRuled(); Give(pastEdge, "w2", RulesMap("outside_hours", "allow", "allow", "allow", "allow", NoNames, NoNames), now, now + 100, now + 5000, now + 6000);
+        Assert((check(pastEdge, Wire.Map("type", "power", "action", "restart", "delay_s", 600, "rules_tag", "w2", "decided_at", now)) ?? "").StartsWith("business_hours:") && pastEdge.CatchUps == 1, "a delay that reaches past hours_until counts as inside the hours, after a check-in");
+
         // A rules_tag the PC has not seen: a check-in it waits on, then the new rules decide, or rules_stale.
         var behind = make();
         behind.OnCatchUp = delegate { Give(behind, "t9", RulesMap("allow", "never", "allow", "allow", "allow", NoNames, NoNames), now, now + 691200); return true; };
@@ -3257,6 +3283,18 @@ public static class AppTests {
         Assert(RunScreen.Check("shutdown /r /t 5", free) == null && RunScreen.Check("Restart-Computer", free) == null && (RunScreen.Check("shutdown /s", free) ?? "").StartsWith("use_tool:"), "restart allowed lets restart through, not shutdown");
         Assert(RunScreen.Check("taskkill /im notepad.exe", new RulesDoc()) == null, "closing programs is allowed by default");
         foreach (string value in new string[] { "approve", "never", "approve_in_hours", "outside_hours", "banana" }) Assert((RunScreen.Check("taskkill /im notepad.exe", new RulesDoc { Close = value }) ?? "").StartsWith("use_tool:"), "close_program " + value + " sends taskkill to the tool");
+        // The Support app is protected whatever the rules say: its processes, its service and Run value, and its folder.
+        var noRules = new RulesDoc();
+        foreach (string app in new string[] { "taskkill /im support.exe /f", "taskkill /f /im Support-1.0.0-0a1b2c3d.exe", "Stop-Process -Name support -Force", "sc stop SupportMcpDevice", "net stop SupportMcpDevice", "reg delete HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v SupportMcpTray /f", "C:\\x\\support-1.0.0-0a1b2c3d.exe --helper", "& 'support.exe' --uninstall" })
+            Assert((RunScreen.Check(app, noRules) ?? "").StartsWith("protected_program:"), "the app is not named in a raw command: " + app);
+        foreach (string folder in new string[] { "del \"C:\\Program Files\\SupportMCP\\device.json\"", "type C:/Program Files/SupportMCP/device.json", "Remove-Item -Recurse 'C:\\Program Files\\SupportMCP'" })
+            Assert((RunScreen.Check(folder, noRules) ?? "").StartsWith("protected_"), "the app's folder is not named in a raw command: " + folder);
+        foreach (string fine in new string[] { "echo contact support for help", "taskkill /im notepad.exe /f", "Get-Service Spooler", "C:\\tools\\supportassist.exe" })
+            Assert(RunScreen.Check(fine, noRules) == null, "left alone: " + fine);
+        // A tool's own verbs are its business: an installer's arguments may say msiexec /i, but not restart or shut the PC down.
+        var guarded = new RulesDoc { Install = "approve", Restart = "approve" };
+        Assert((RunScreen.Check("C:\\x\\setup.exe msiexec /i y.msi /qn", guarded) ?? "").StartsWith("use_tool:") && RunScreen.Check("C:\\x\\setup.exe msiexec /i y.msi /qn", guarded, "install") == null && RunScreen.Check("wusa z.msu /quiet", guarded, "install") == null, "install's own verbs are not sent back to install_program");
+        Assert((RunScreen.Check("C:\\x\\setup.exe & shutdown /r", guarded, "install") ?? "").StartsWith("use_tool:"), "but a restart in the same text is");
         // Protected names and folders: any mention, in any case.
         foreach (string mention in new string[] { "taskkill /im OUTLOOK.EXE", "Get-Process outlook | Stop-Process", "start outlook", "echo 'Microsoft Office'", "\"C:\\Program Files\\Microsoft Office\\x.exe\"" })
             Assert((RunScreen.Check(mention, doc) ?? "").StartsWith("protected_program:"), "a protected program is mentioned: " + mention);
@@ -3337,6 +3375,17 @@ public static class AppTests {
                 PowerAction.Cancel();
                 r = relay.Call(Wire.Map("type", "power", "action", "shutdown", "delay_s", 1, "rules_tag", "p1"));
                 Assert(Wire.Flag(r, "ok") && Until(delegate { lock (calls) return calls.Count == 2; }, 6000) && !calls[1], "a shutdown is not a restart");
+                // A shutdown that was aborted (shutdown /a) or blocked after it started is not reported: the one-at-a-time latch frees
+                // itself a grace period after the action, so power actions are not refused as busy for good. Shortened here.
+                PowerAction.Cancel(); PowerAction.MinDelayS = 1; PowerAction.LatchMs = 600;
+                r = relay.Call(Wire.Map("type", "power", "action", "shutdown", "delay_s", 1, "rules_tag", "p1"));
+                Assert(Wire.Flag(r, "ok") && Until(delegate { lock (calls) return calls.Count == 3; }, 6000), "a third action goes");
+                r = relay.Call(Wire.Map("type", "power", "action", "shutdown", "delay_s", 1, "rules_tag", "p1"));
+                Assert(Refusal(r).StartsWith("busy:"), "busy right after it went: " + Refusal(r));
+                Thread.Sleep(1300);
+                r = relay.Call(Wire.Map("type", "power", "action", "shutdown", "delay_s", 1, "rules_tag", "p1"));
+                Assert(Wire.Flag(r, "ok") && Until(delegate { lock (calls) return calls.Count == 4; }, 6000), "the latch freed itself, so an aborted shutdown does not block the next one for good: " + Refusal(r));
+                PowerAction.LatchMs = 120000;
                 PowerAction.Cancel(); PowerAction.MinDelayS = 5;
                 // The rules refuse before anything is scheduled.
                 Give(full, "p2", RulesMap("allow", "never", "allow", "allow", "allow", NoNames, NoNames), now, now + 691200);
@@ -3345,7 +3394,7 @@ public static class AppTests {
                 full.IsLimited = true;
                 r = relay.Call(Wire.Map("type", "power", "action", "restart", "rules_tag", "p2"));
                 Assert(Refusal(r).StartsWith("needs_full_control:"), "limited control: " + Refusal(r));
-                Assert(calls.Count == 2, "none of those scheduled anything");
+                Assert(calls.Count == 4, "none of those scheduled anything");
             }
             using (var relay = new FakeRelay()) {
                 relay.Lifetime = 300000; relay.Start(); // a one-off session
@@ -3354,7 +3403,7 @@ public static class AppTests {
                 r = relay.Call(Wire.Map("type", "programs", "action", "list"));
                 Assert(Refusal(r).StartsWith("not_saved_pc:"), "nor programs: " + Refusal(r));
             }
-        } finally { PowerAction.MinDelayS = 5; PowerAction.Cancel(); PowerAction.Perform = delegate(bool reboot) { return null; }; }
+        } finally { PowerAction.MinDelayS = 5; PowerAction.LatchMs = 120000; PowerAction.Cancel(); PowerAction.Perform = delegate(bool reboot) { return null; }; }
         Console.WriteLine("PASS power: answered first, 5 to 600 s on this PC's own clock, one at a time, refused by approval, never and limited control");
     }
 
@@ -3399,24 +3448,61 @@ public static class AppTests {
             } else Console.WriteLine("NOTE this PC lists no installed programs; the uninstall rule cases were not run");
             r = relay.Call(Wire.Map("type", "programs", "action", "uninstall", "program_id", "64:{00000000-0000-0000-0000-000000000000}", "rules_tag", "g1"));
             Assert(Refusal(r).StartsWith("not_found:"), "an id no program has: " + Refusal(r));
-            // install: an .exe runs as this process's own account here (SYSTEM in a service) and answers its exit code
-            string cmd = Path.Combine(Environment.SystemDirectory, "cmd.exe");
-            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", cmd, "args", "/c exit 7", "timeout_s", 60, "rules_tag", "g1"));
+            // install: an .exe runs as this process's own account here (SYSTEM in a service) and answers its exit code. The stand-in
+            // installer is a copy of this test exe, which exits with the code it is given.
+            string setup = Path.Combine(dir, "setup-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".exe");
+            File.Copy(System.Reflection.Assembly.GetExecutingAssembly().Location, setup);
+            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", setup, "args", "--exit 7", "timeout_s", 60, "rules_tag", "g1"));
             Assert(Wire.Flag(r, "ok") && Wire.Number(r, "exit_code") == 7, "install runs the installer and answers its exit code: " + Refusal(r) + " " + Wire.Text(r, "detail"));
-            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", cmd, "args", "/c exit 0", "rules_tag", "g1"));
+            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", setup, "args", "--exit 0", "rules_tag", "g1"));
             Assert(Wire.Flag(r, "ok") && Wire.Number(r, "exit_code") == 0, "and 0 for a good one");
             r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", Path.Combine(dir, "no-such-setup.msi"), "rules_tag", "g1"));
             Assert(Refusal(r).StartsWith("not_found:"), "an installer that is not there: " + Refusal(r));
             r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", "setup.exe", "rules_tag", "g1"));
             Assert(!Wire.Flag(r, "ok") && Refusal(r).Contains("absolute path"), "a relative installer path: " + Refusal(r));
+            // One tool is not a way round another: only installers, never Windows' own tools, arguments that restart or uninstall, or a raw command's verbs.
+            string cmd = Path.Combine(Environment.SystemDirectory, "cmd.exe");
+            Func<string, string, string> install = delegate(string path, string args) { return Refusal(relay.Call(Wire.Map("type", "programs", "action", "install", "path", path, "args", args, "rules_tag", "g1"))); };
+            Assert(install(cmd, "/c exit 7").Contains("Windows folder"), "cmd.exe in the Windows folder is not an installer");
+            Assert(install(Path.Combine(dir, "shutdown.exe"), "/r /t 0").Contains("Windows tool"), "shutdown.exe is not an installer wherever it sits");
+            Assert(install(Path.Combine(dir, "MsiExec.EXE"), "/x {11111111-2222-3333-4444-555555555555}").Contains("Windows tool"), "nor is msiexec.exe, in any case");
+            Assert(install(Path.Combine(dir, "run.bat"), "").Contains("only .msi, .msu or .exe"), "a script is not an installer");
+            Assert(install(Path.Combine(dir, "a.msi"), "/x{11111111-2222-3333-4444-555555555555} /qn").Contains("must not uninstall"), "an .msi may not be told to uninstall");
+            Assert(install(setup, "--exit 0 /forcerestart").Contains("must not restart"), "an installer may not be told to restart the PC");
             full.IsLimited = true;
-            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", cmd, "args", "/c exit 7", "rules_tag", "g1"));
+            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", setup, "args", "--exit 7", "rules_tag", "g1"));
             Assert(Refusal(r).StartsWith("needs_full_control:"), "install under limited control is refused: " + Refusal(r));
             full.IsLimited = false;
-            Give(full, "g5", RulesMap("allow", "allow", "allow", "allow", "allow", NoNames, new string[] { Environment.SystemDirectory }), now, now + 691200);
-            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", cmd, "args", "/c exit 7", "rules_tag", "g5"));
+            Give(full, "g5", RulesMap("allow", "allow", "allow", "allow", "allow", NoNames, new string[] { dir }), now, now + 691200);
+            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", setup, "args", "--exit 7", "rules_tag", "g5"));
             Assert(Refusal(r).StartsWith("protected_folder:"), "an installer in a protected folder: " + Refusal(r));
             Give(full, "g1", RulesMap("allow", "allow", "allow", "allow", "allow", NoNames, NoNames), now, now + 691200);
+            // The raw screen reads the installer's path and arguments: a restart verb (install's own verbs excepted) and a protected name.
+            Give(full, "g6", RulesMap("allow", "approve", "allow", "allow", "allow", new string[] { "Outlook.exe" }, NoNames), now, now + 691200);
+            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", setup, "args", "--exit 0 & shutdown /s", "rules_tag", "g6"));
+            Assert(Refusal(r).StartsWith("use_tool:"), "a shutdown verb in the arguments is sent to the tool: " + Refusal(r));
+            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", setup, "args", "--exit 0 /plugin=outlook.exe", "rules_tag", "g6"));
+            Assert(Refusal(r).StartsWith("protected_program:"), "a protected program named in the arguments: " + Refusal(r));
+            Give(full, "g1", RulesMap("allow", "allow", "allow", "allow", "allow", NoNames, NoNames), now, now + 691200);
+            // The Support app is never uninstalled, closed or written to through its own tools.
+            Assert((Programs.UninstallProblem(new Programs.Installed { Key = DeviceSetup.ServiceName, Name = "Support" }, new RulesDoc()) ?? "").StartsWith("protected_program:"), "the app's own registry entry is never uninstalled");
+            var restartGuard = new RulesDoc { Restart = "approve" };
+            Assert((Programs.UninstallProblem(new Programs.Installed { Key = "x", Quiet = "shutdown /r" }, restartGuard) ?? "").StartsWith("use_tool:"), "a quiet uninstall string is screened like a raw command");
+            Assert(Programs.UninstallProblem(new Programs.Installed { Key = "x", Quiet = "\"C:\\Foo\\unins000.exe\" /SILENT" }, restartGuard) == null, "an ordinary one passes");
+            Assert(Programs.UninstallProblem(new Programs.Installed { Key = "{11111111-2222-3333-4444-555555555555}", Msi = true, Quiet = "shutdown /r" }, restartGuard) == null, "a Windows Installer program is removed by product code, so its text is not run");
+            Assert(Programs.UninstallProblem(null, restartGuard) == null, "nothing to judge for a program that is not there");
+            r = relay.Call(Wire.Map("type", "programs", "action", "close", "name", "support.exe", "rules_tag", "g1"));
+            Assert(Refusal(r).StartsWith("protected_program:"), "the app is not closed by name: " + Refusal(r));
+            r = relay.Call(Wire.Map("type", "programs", "action", "close", "name", Path.Combine(DeviceSetup.Folder, "support-1.0.0-0a1b2c3d.exe"), "rules_tag", "g1"));
+            Assert(Refusal(r).StartsWith("protected_program:"), "nor a version file, with its folder: " + Refusal(r));
+            r = relay.Call(Wire.Map("type", "programs", "action", "close", "pid", mine, "force", true, "rules_tag", "g1"));
+            Assert(Refusal(r).StartsWith("protected_program:") && Refusal(r).Contains("Support app") && !Process.GetCurrentProcess().HasExited, "this process, the app, is not closed by pid: " + Refusal(r));
+            Assert(AppGuard.OwnsProcess(Process.GetCurrentProcess()), "a process of the app is recognised");
+            Assert(PathCheck.Inside(AppGuard.Folders(), Path.Combine(DeviceSetup.Folder, "device.json")) && PathCheck.Inside(AppGuard.Folders(), Path.Combine(DeviceSetup.Folder, "..", "SupportMCP", "x.txt")) && !PathCheck.Inside(AppGuard.Folders(), Path.Combine(dir, "x.txt")), "the app's folder is protected, a test folder is not");
+            r = relay.Call(Wire.Map("type", "put_file", "path", Path.Combine(DeviceSetup.Folder, "support.exe"), "data_b64", "eA==", "rules_tag", "g1"));
+            Assert(Refusal(r).StartsWith("protected_folder:"), "no file is written into the app's folder: " + Refusal(r));
+            r = relay.Call(Wire.Map("type", "get_file", "path", Path.Combine(DeviceSetup.Folder, "device.json"), "rules_tag", "g1"));
+            Assert(Refusal(r).StartsWith("protected_folder:"), "nor read from it: " + Refusal(r));
 
             // close
             var started = new List<Process>();
@@ -3580,6 +3666,7 @@ public static class AppTests {
     public static int Main(string[] args) {
         if (args.Length == 2 && args[0] == "--peer") { Screen.Dpi(); return PeerWindow(int.Parse(args[1])); }
         if (args.Length == 2 && args[0] == "--sleep") { Thread.Sleep(int.Parse(args[1])); return 0; } // a stand-in program for the close tests
+        if (args.Length == 2 && args[0] == "--exit") return int.Parse(args[1]); // a stand-in installer for the install tests
         if (args.Length == 2 && args[0] == "--settle") { Thread.Sleep(250); File.WriteAllText(args[1], "done"); return 0; }
         string dir = Path.Combine(Path.GetTempPath(), "support-mcp-native-test-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
         try {

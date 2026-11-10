@@ -14,6 +14,8 @@ const BOSS = 'boss@example.com';
 const TECH = 'tech@example.com';
 const VIEW = 'view@example.com';
 const HOUR = 3_600_000;
+// The caller has already asked for rules.manage and a fresh code, as src/api.js does before a move between customers.
+const CLEARED = { rulesCleared: true };
 
 // A relay database with an admin, a technician and a viewer in default.
 async function setup({ secret = SECRET } = {}) {
@@ -132,7 +134,7 @@ test('a scripted run of every kind of change writes exactly the expected log kin
   const leaving = await devs.requestJoin({ protocol: 1, workspace: W, name: 'Spare' });
   await devs.leave(keyOf(leaving));
   await devs.updateField(W, BOSS, field.id, { label: 'Renewal' });
-  await devs.updateDevice(W, TECH, waiting.device_id, { site_id: site.id });
+  await devs.updateDevice(W, BOSS, waiting.device_id, { site_id: site.id }, CLEARED);
   await devs.removeDevice(W, TECH, waiting.device_id);
   await devs.removeField(W, BOSS, field.id);
   await devs.removeRecord('site', W, TECH, site.id);
@@ -142,7 +144,7 @@ test('a scripted run of every kind of change writes exactly the expected log kin
     'pairing_code_created', 'pairing_code_created', 'pairing_code_revoked',
     'device_paired', 'device_requested', 'device_approved', 'device_changed', 'device_changed',
     'device_removed', 'device_requested', 'device_left',
-    'field_changed', 'device_changed', 'device_removed', 'field_removed', 'site_removed', 'customer_removed',
+    'field_changed', 'device_changed', 'rules_changed', 'device_removed', 'field_removed', 'site_removed', 'customer_removed',
   ]);
   const log = await team.readAudit(W, { limit: 500 });
   assert.equal((await team.verifyAudit(W)).ok, true);
@@ -155,7 +157,8 @@ test('a scripted run of every kind of change writes exactly the expected log kin
   assert.deepEqual(by('device_requested'), [`pc ${waiting.device_id}`, `pc ${leaving.device_id}`]);
   assert.deepEqual(by('device_approved'), [TECH]);
   assert.deepEqual(by('device_left'), [`pc ${leaving.device_id}`]);
-  assert.deepEqual(by('device_changed'), [BOSS, `pc ${waiting.device_id}`, TECH]);
+  assert.deepEqual(by('device_changed'), [BOSS, `pc ${waiting.device_id}`, BOSS]);
+  assert.deepEqual(by('rules_changed'), [BOSS]);
   // The admin's access change (it needs sessions.unattended) names the old and the new mode.
   assert.match(log.rows.find((r) => r.kind === 'device_changed').detail, /access ask to any/);
 });
@@ -710,7 +713,7 @@ test('devices list filters by site and status', async () => {
   // Moving a PC to another site, and off any site.
   const site2 = await devs.addRecord('site', W, TECH, { name: 'Branch', customer_id: customer.id });
   assert.equal((await devs.updateDevice(W, TECH, out.device_id, { site_id: site2.id })).site_id, site2.id);
-  assert.equal((await devs.updateDevice(W, TECH, out.device_id, { site_id: null })).site_id, null);
+  assert.equal((await devs.updateDevice(W, BOSS, out.device_id, { site_id: null }, CLEARED)).site_id, null);
   await assert.rejects(devs.updateDevice(W, TECH, out.device_id, { site_id: newId() }), refused(400, 'unknown_site'));
   await assert.rejects(devs.updateDevice(W, TECH, out.device_id, {}), refused(400, 'bad_request'));
 });
@@ -965,9 +968,9 @@ test('a mode or site changed between the plan and the batch is never logged as a
   const sa = await devs.addRecord('site', W, TECH, { name: 'A', customer_id: customer.id });
   const sb = await devs.addRecord('site', W, TECH, { name: 'B', customer_id: customer.id });
   const sc = await devs.addRecord('site', W, TECH, { name: 'C', customer_id: customer.id });
-  await devs.updateDevice(W, TECH, a.device_id, { site_id: sa.id });
+  await devs.updateDevice(W, BOSS, a.device_id, { site_id: sa.id }, CLEARED);
   sneakBeforeBatch(db, () => db.sqlite.prepare('UPDATE devices SET site_id = ? WHERE id = ?').run(sb.id, a.device_id));
-  await devs.updateDevice(W, TECH, a.device_id, { site_id: sc.id });
+  await devs.updateDevice(W, BOSS, a.device_id, { site_id: sc.id }, CLEARED);
   assert.deepEqual((await details()).slice(-2), [`site none to ${sa.id}`, `site ${sb.id} to ${sc.id}`]);
   // The PC changes both its modes while control was already changed.
   const { key } = await pair(devs, TECH, { access: 'ask', control: 'limited' });
@@ -1090,4 +1093,59 @@ test('two check-ins that saw the old version write one new version: the second f
 test('the check-in query names every devices column, so a join cannot shadow one', async () => {
   const { db } = await setup();
   assert.deepEqual([...DEVICE_COLUMNS].sort(), rows(db, 'PRAGMA table_info(devices)').map((c) => c.name).sort());
+});
+
+// ---- a move between customers is a change of rules (PR 9 review) ---------------------------------------
+test('moving an active PC to another customer, or to no site, is refused without the rules clearance, and logs rules_changed with it', async () => {
+  const { team, devs } = await setup();
+  const a = await devs.addRecord('customer', W, TECH, { name: 'A' });
+  const b = await devs.addRecord('customer', W, TECH, { name: 'B' });
+  const sa = await devs.addRecord('site', W, TECH, { name: 'A1', customer_id: a.id });
+  const sa2 = await devs.addRecord('site', W, TECH, { name: 'A2', customer_id: a.id });
+  const sb = await devs.addRecord('site', W, TECH, { name: 'B1', customer_id: b.id });
+  const { out } = await pair(devs, TECH, {}, { site_id: sa.id });
+  const id = out.device_id;
+  // The check the API makes first.
+  assert.equal(await devs.siteMoveChangesRules(W, id, { site_id: sa2.id }), false, 'same customer');
+  assert.equal(await devs.siteMoveChangesRules(W, id, { site_id: sa.id }), false, 'no change');
+  assert.equal(await devs.siteMoveChangesRules(W, id, { site_id: sb.id }), true, 'another customer');
+  assert.equal(await devs.siteMoveChangesRules(W, id, { site_id: null }), true, 'no site');
+  assert.equal(await devs.siteMoveChangesRules(W, id, { fields: {} }), false);
+  assert.equal(await devs.siteMoveChangesRules(W, id, { site_id: 'nope' }), false, 'a bad id is updateDevice\'s to refuse');
+  await assert.rejects(devs.siteMoveChangesRules(W, id, { site_id: newId() }), refused(400, 'unknown_site'));
+  // The store refuses what the API did not clear.
+  await assert.rejects(devs.updateDevice(W, TECH, id, { site_id: sb.id }), refused(409, 'rules_change'));
+  await assert.rejects(devs.updateDevice(W, TECH, id, { site_id: null }), refused(409, 'rules_change'));
+  assert.equal((await devs.getDevice(W, id)).site_id, sa.id);
+  // Within a customer there is nothing to clear, and nothing but device_changed is logged.
+  const before = (await kinds(team)).length;
+  await devs.updateDevice(W, TECH, id, { site_id: sa2.id });
+  assert.deepEqual((await kinds(team)).slice(before), ['device_changed']);
+  // Cleared, it moves and logs both, never a value of the rules.
+  await devs.updateDevice(W, BOSS, id, { site_id: sb.id }, CLEARED);
+  const rows2 = (await team.readAudit(W, { limit: 500 })).rows.slice(-2);
+  assert.deepEqual(rows2.map((r) => r.kind).sort(), ['device_changed', 'rules_changed']);
+  assert.match(rows2.find((r) => r.kind === 'rules_changed').detail, new RegExp(`device ${id}: site ${sa2.id} to ${sb.id}, customer ${a.id} to ${b.id}`));
+});
+
+test('a PC that is still waiting for approval is placed on a site freely: no rules applied to it yet', async () => {
+  const { devs } = await setup();
+  const a = await devs.addRecord('customer', W, TECH, { name: 'A' });
+  const sa = await devs.addRecord('site', W, TECH, { name: 'A1', customer_id: a.id });
+  const waiting = await devs.requestJoin({ protocol: 1, workspace: W, name: 'W' });
+  assert.equal(await devs.siteMoveChangesRules(W, waiting.device_id, { site_id: sa.id }), false);
+  assert.equal((await devs.updateDevice(W, TECH, waiting.device_id, { site_id: sa.id })).site_id, sa.id);
+});
+
+test('a site cannot be moved to another customer, and one with PCs cannot be removed, so no other path changes a PC\'s customer', async () => {
+  const { devs } = await setup();
+  const a = await devs.addRecord('customer', W, TECH, { name: 'A' });
+  const b = await devs.addRecord('customer', W, TECH, { name: 'B' });
+  const sa = await devs.addRecord('site', W, TECH, { name: 'A1', customer_id: a.id });
+  await pair(devs, TECH, {}, { site_id: sa.id });
+  const moved = await devs.updateRecord('site', W, TECH, sa.id, { name: 'A1 renamed', customer_id: b.id });
+  assert.equal(moved.customer_id, a.id, 'customer_id is not an editable column');
+  await assert.rejects(devs.updateRecord('site', W, TECH, sa.id, { customer_id: b.id }), refused(400, 'bad_request'));
+  await assert.rejects(devs.removeRecord('site', W, TECH, sa.id), refused(409, 'in_use'));
+  await assert.rejects(devs.removeRecord('customer', W, TECH, a.id), refused(409, 'in_use'));
 });

@@ -35,14 +35,26 @@ technician approval for actions the rules hold. This ends Stage 1.
   for the action: the "connected" notice stays. An approval is for one action on one PC, and is dropped, never carried
   out later, when the session ends, control moves, the relay restarts, or the agent that asked is stopped or paused.
   Routes: `GET /app/w/<slug>/api/sessions/<sid>/approvals` and `POST .../approvals/<id>`, on the app's address only.
+- A change of the rules that apply to a PC is guarded like a save of rules. Moving an active PC to a site under another
+  customer, or off any site, swaps which customer override applies, so `PATCH .../devices/<id>` with a `site_id` that changes
+  the customer needs `rules.manage`, a person and a fresh authenticator code, writes `rules_changed` as well as
+  `device_changed`, and rings the PC. A move within a customer, and a site for a PC still waiting for approval, need only
+  `devices.manage`. A site cannot change customer, and a site or customer with PCs cannot be removed, so no other path moves
+  a PC between customers.
 - The PC enforces the rules itself. Each check-in answer carries the effective rules (`rules`, `rules_tag`, `hours_utc`,
   `hours_until`, `server_time`). The PC keeps them on disk, checks every action, and catches up with a check-in when a
   command carries a newer tag. It screens raw `run` commands for guarded actions (`use_tool`) and protected names, and
   guards protected folders for `put_file`, `get_file` and installs after it expands short names and follows links. Install
-  and uninstall need full control, and installers run as SYSTEM.
+  and uninstall need full control, and installers run as SYSTEM. One tool is not a way round another: `install_program` runs
+  only `.msi`, `.msu` and `.exe` installers outside the Windows folder, never a Windows tool such as `shutdown.exe` or
+  `msiexec.exe`, and refuses arguments that restart or uninstall; the PC screens its path and arguments like a raw command.
+  The Support app is never closed, uninstalled or written to through its own tools. A restart or shutdown with a delay is
+  judged over its whole wait, so one decided before business hours cannot land inside them. A protected folder cannot be a
+  whole drive.
 - Update fixes. A changed app version is saved at once (2 seconds), not after a minute. The hourly run rings connected PCs
   that are due an update. A deployment admin can call `POST /api/v1/deployment/ring-updates` right after a deploy, and the
-  release steps in `docs/development.md` now say so. The PC's tray has **Check now**.
+  release steps in `docs/development.md` now say so. The route goes through the teams with a cursor (`after` in, `next`
+  out), so a loop that follows it ends. The PC's tray has **Check now**.
 - Technician app: a **Rules** screen where anyone who can see PCs reads the team's rules and each customer's overrides and
   an admin edits them, saved with a fresh authenticator code; a PC's page shows the rules in force for it; and a dialog
   to approve (with a fresh code) or deny a held action, which shows the action, the PC, who asked and the time left.
@@ -59,12 +71,16 @@ technician approval for actions the rules hold. This ends Stage 1.
 
 ### Security
 
+- Sessions that were live before the deploy on a PC below 1.0.0 are not enforced on the PC (the relay still checks the
+  tools). The release steps say to end them. A PC updates between sessions, and `device_connect` needs 1.0.0.
 - Limits, as the security model says plainly. A raw `run` command is not limited by the rules beyond the PC's text screen,
   which is a guardrail that anyone writing a different command gets past. The screen tools (click, keys, UAC prompts) are
   not checked against the rules. The rules are not signed, so the PC trusts the relay for them, unlike a release. Business
   hours follow the team's time zone and the relay's clock.
 - The PC checks that an action which needs approval carries an approver's name, not who the approver is. A compromised relay
   can name one.
+- The tools hold the rules; the PC's screen is a guardrail. Protected programs and folders limit the six tools and the file
+  tools. A raw command that avoids the screen is not stopped, so the lists are not a boundary.
 - Saving rules and approving an action each take a fresh authenticator code, even for an Access login, through the same record
   of used steps as sign-in.
 

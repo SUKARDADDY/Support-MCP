@@ -838,7 +838,7 @@ test('ring-updates admits a person in DEPLOYMENT_ADMINS and no one else, a servi
     return { status: res.status, body: await res.json() };
   };
   // No bundle and no release here, so a pass has nothing to ring: the answer is the admission.
-  assert.deepEqual(await send(BOSS), { status: 200, body: { rung: 0, teams_left: 0 } });
+  assert.deepEqual(await send(BOSS), { status: 200, body: { rung: 0, teams_left: 0, next: null } });
   for (const who of [BOT, 'outsider@example.com']) assert.deepEqual([(await send(who)).status, (await send(who)).body.error.code], [403, 'forbidden'], who);
   assert.equal((await send(null)).status, 403, 'no Access login');
   assert.equal((await send(BOSS, { method: 'GET' })).status, 405);

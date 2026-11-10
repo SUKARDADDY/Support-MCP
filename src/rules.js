@@ -169,6 +169,8 @@ function checkFolder(text) {
   if (!FOLDER_RE.test(text)) throw bad('protected_folders entries must be absolute local paths such as C:\\Data');
   if (/[<>"|?*]/.test(text)) throw bad('protected_folders entries must not contain < > " | ? *');
   if (text.split(/[\\/]/).some((part) => part === '.' || part === '..')) throw bad('protected_folders entries must not contain . or .. parts');
+  // A whole drive would refuse every file, installer and program of the PC, and nothing could be done with it.
+  if (pathParts(text).length < 2) throw bad('protected_folders entries must be a folder, not a whole drive such as C:\\; name the folder to protect, such as C:\\Customer Data');
 }
 
 // The problem with an effective document, or null: an hour rule needs business hours to be about.
@@ -284,18 +286,27 @@ export function hoursUtc(rules, nowMs) {
   return { hours_utc: spans, hours_until: until };
 }
 
-// Whether a moment is inside business hours. Past the horizon every moment counts as business hours:
-// the stricter side, so rules never loosen when the answer is old.
-function inHours(nowS, { hours_utc: spans, hours_until: until }) {
-  if (nowS >= until) return true;
-  return spans.some(([start, end]) => nowS >= start && nowS < end);
+// Whether any moment from nowS to nowS + delayS (both ends included) is inside business hours. A restart or
+// shutdown with a delay lands at the end of the window, so a rule about hours holds for all of it: decided
+// outside the hours, a restart that lands inside them is judged as inside. Past the horizon every moment counts
+// as business hours: the stricter side, so rules never loosen when the answer is old. A span is [start, end).
+function inHours(nowS, { hours_utc: spans, hours_until: until }, delayS = 0) {
+  const lastS = nowS + delayS;
+  if (lastS >= until) return true;
+  return spans.some(([start, end]) => nowS < end && lastS >= start);
 }
 
 // ---- names and paths ----------------------------------------------------------------
 
-// A program name for comparison: trimmed, lower case, without a trailing .exe, so a protected
-// "Outlook.exe" also covers "outlook".
-const programKey = (name) => String(name).trim().toLowerCase().replace(/\.exe$/, '');
+// A program name for comparison: trimmed, lower case, the trailing dots and spaces Windows drops from a name
+// dropped, and without a trailing .exe, so a protected "Outlook.exe" also covers "outlook" and "OUTLOOK.EXE. ".
+const programKey = (name) => String(name).trim().toLowerCase().replace(/[. ]+$/, '').replace(/\.exe$/, '');
+// The same for the name of a running program to close: a folder in front of it is dropped first (the PC does
+// the same), so "C:\Office\outlook.exe" is "outlook".
+const processKey = (name) => {
+  const text = String(name).trim();
+  return programKey(text.slice(Math.max(text.lastIndexOf('\\'), text.lastIndexOf('/')) + 1));
+};
 
 // A path as lower-case components: / the same as \, repeated and trailing separators dropped, . and ..
 // resolved (never above the drive), the \\?\ prefix dropped, and the trailing dots and spaces Windows
@@ -322,6 +333,63 @@ export function pathInside(folder, path) {
   return f.length > 0 && p.length >= f.length && f.every((part, i) => part === p[i]);
 }
 
+// ---- the Support app itself, and installers ----------------------------------------------
+// The Support app is never closed, uninstalled or written to through its own tools, whatever the rules say. Its
+// program is support.exe, or support-<version>-<8 hex>.exe after an update; its folder is SupportMCP under
+// Program Files (SupportMCP-<id> while an install is staged). The PC protects the real processes and folder
+// (by image path, with links and short names resolved); these checks are the names the relay can know.
+const APP_PROGRAM = /^support(?:-.+-[0-9a-f]{8})?$/;
+export const isAppProgram = (name) => APP_PROGRAM.test(processKey(name));
+export function isAppPath(path) {
+  const p = pathParts(path);
+  return p.length >= 3 && p[1].startsWith('program files') && (p[2] === 'supportmcp' || p[2].startsWith('supportmcp-'));
+}
+// The registry key of the Support app in the list of installed programs (list_programs ids are 64:<key> or 32:<key>).
+export const isAppProgramId = (id) => /^(?:32|64):supportmcpdevice$/i.test(String(id).trim());
+
+// Tools that are Windows itself. install_program runs an installer, never one of these: through it
+// shutdown.exe /r would restart the PC and msiexec.exe /x would uninstall a program, round the rules of
+// those actions. Compared by file name wherever the file sits, since a copy does the same.
+export const SYSTEM_TOOLS = Object.freeze([
+  'msiexec', 'wusa', 'shutdown', 'cmd', 'powershell', 'powershell_ise', 'pwsh', 'wscript', 'cscript', 'mshta', 'rundll32', 'regsvr32',
+  'reg', 'regedit', 'sc', 'net', 'net1', 'taskkill', 'tskill', 'schtasks', 'at', 'bcdedit', 'diskpart', 'format', 'dism', 'pnputil',
+  'wmic', 'certutil', 'bitsadmin', 'cmstp', 'msbuild', 'installutil', 'forfiles', 'runas', 'takeown', 'icacls', 'cacls', 'vssadmin',
+  'wevtutil', 'wsl', 'bash', 'logoff', 'tsdiscon', 'psexec', 'psexec64',
+]);
+
+// The local absolute path of a file as the PC accepts it (a drive letter and a separator, no stream or device
+// name): the text, or null. The PC refuses anything else.
+export function localAbsolutePath(path) {
+  const text = typeof path === 'string' ? path.trim() : '';
+  return /^[A-Za-z]:[\\/]/.test(text) && text.indexOf(':', 2) < 0 ? text : null;
+}
+
+// Why a file may not be run by install_program, or null. Only .msi, .msu and .exe installers, and none in the
+// Windows folder (on any drive) or named as a system tool. The PC checks the same, and its own Windows folder
+// with links resolved besides.
+export function installerProblem(path) {
+  const parts = pathParts(path);
+  const name = parts.at(-1) ?? '';
+  if (!/\.(?:msi|msu|exe)$/.test(name)) return 'install_program runs only .msi, .msu or .exe installers';
+  if (parts.length > 1 && parts[1] === 'windows') return 'install_program does not run files from the Windows folder';
+  if (name.endsWith('.exe') && SYSTEM_TOOLS.includes(name.slice(0, -4))) return `install_program does not run ${name}: it is a Windows tool, not an installer`;
+  return null;
+}
+
+// Why these installer arguments are refused, or null: they ask the installer to uninstall, or to restart the
+// PC, which other rules govern. What an installer does with its other arguments is its own; the PC also
+// screens the text like a raw command (RunScreen).
+export function installArgsProblem(path, args) {
+  const name = pathParts(path).at(-1) ?? '';
+  const windows = name.endsWith('.msi') || name.endsWith('.msu');
+  for (const raw of String(args ?? '').toLowerCase().split(/[\s"'`;&|,()]+/)) {
+    if (!raw) continue;
+    if (/forcerestart|promptrestart|warnrestart|reboot=force/.test(raw) || /^[/-](?:restart|reboot)$/.test(raw)) return 'installer arguments must not restart the PC: use restart_pc';
+    if (windows && (/^[/-]uninstall/.test(raw) || /^[/-]x(?![a-z])/.test(raw))) return 'installer arguments must not uninstall a program: use uninstall_program';
+  }
+  return null;
+}
+
 // ---- the decision -------------------------------------------------------------------
 
 const refuse = (code) => ({ refuse: code, text: REFUSALS[code] });
@@ -331,7 +399,9 @@ const NEEDS_FULL = Object.freeze(['restart', 'shutdown', 'install', 'uninstall']
 // approve it in the app) or { refuse: code, text }.
 //   action  one of ACTIONS or FILE_ACTIONS
 //   ctx     { nowMs, hours?: { hours_utc, hours_until } (worked out from the rules when left out),
-//             control?: 'full' | 'limited', program?: a program name, path?: an absolute path }
+//             control?: 'full' | 'limited', program?: a program name, path?: an absolute path,
+//             delay_s?: for a restart or shutdown, the seconds before it happens: an hour rule is judged over the
+//             whole window from nowMs to nowMs + delay_s, not at the moment of the decision }
 // The order is fixed because the PC runs the same cases: the rule's own never, full control, protected
 // programs and folders, and last the value (allow, approve, or an hour rule).
 export function decide(rules, action, ctx = {}) {
@@ -342,16 +412,19 @@ export function decide(rules, action, ctx = {}) {
   if (value === 'never') return refuse('rule_never');
   if (NEEDS_FULL.includes(action) && ctx.control === 'limited') return refuse('needs_full_control');
   if ((action === 'close_program' || action === 'uninstall') && typeof ctx.program === 'string') {
-    const key = programKey(ctx.program);
+    // A close names a running program, maybe with a folder; an uninstall names an installed program (no folder).
+    const key = action === 'close_program' ? processKey(ctx.program) : programKey(ctx.program);
     if ((rules.protected_programs ?? []).some((p) => programKey(p) === key)) return refuse('protected_program');
+    if (action === 'close_program' && isAppProgram(ctx.program)) return refuse('protected_program');
   }
   if ((action === 'put_file' || action === 'get_file' || action === 'install') && typeof ctx.path === 'string') {
-    if ((rules.protected_folders ?? []).some((f) => pathInside(f, ctx.path))) return refuse('protected_folder');
+    if ((rules.protected_folders ?? []).some((f) => pathInside(f, ctx.path)) || isAppPath(ctx.path)) return refuse('protected_folder');
   }
   if (value === 'allow') return { allow: true };
   if (value === 'approve') return { approve: true };
   const nowS = Math.floor((ctx.nowMs ?? Date.now()) / 1000);
-  const inside = inHours(nowS, ctx.hours ?? hoursUtc(rules, nowS * 1000));
+  const delayS = (action === 'restart' || action === 'shutdown') && Number.isFinite(ctx.delay_s) && ctx.delay_s > 0 ? Math.floor(ctx.delay_s) : 0;
+  const inside = inHours(nowS, ctx.hours ?? hoursUtc(rules, nowS * 1000), delayS);
   if (value === 'approve_in_hours') return inside ? { approve: true } : { allow: true };
   return inside ? refuse('business_hours') : { allow: true };
 }

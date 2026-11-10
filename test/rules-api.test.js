@@ -45,7 +45,7 @@ async function customerWithPc(w, name = 'Acme Ltd') {
   const customer = (await w.api(BOSS, 'POST', '/customers', { name })).body.customer.id;
   const site = (await w.api(BOSS, 'POST', '/sites', { name: 'Main', customer_id: customer })).body.site.id;
   const pc = await w.addPc({ name: `${name} till` });
-  assert.equal((await w.api(BOSS, 'PATCH', `/devices/${pc.id}`, { site_id: site })).status, 200);
+  assert.equal((await w.api(BOSS, 'PATCH', `/devices/${pc.id}`, { site_id: site, code: await fresh(w) })).status, 200);
   const bell = w.ringSocket(pc.id);
   return { customer, site, pc, bell };
 }
@@ -152,6 +152,8 @@ test('a document that cannot be saved is refused before the code is spent, and a
     [{ hours: { mon: ['18:00', '08:00'] } }, /end after/],
     [{ unknown: 1 }, /unknown rules field/],
     [{ protected_folders: ['relative'] }, /absolute/],
+    [{ protected_folders: ['C:\\'] }, /not a whole drive/],
+    [{ protected_folders: ['C:\\Customer Data', 'd:/'] }, /not a whole drive/],
   ]) {
     const r = await bad(doc);
     assert.deepEqual([r.status, r.body.error.code], [400, 'bad_request'], JSON.stringify(doc));
@@ -197,7 +199,7 @@ test('a save stores the whole document, bumps the revision, logs only field name
   assert.deepEqual(r.body.rules, { rev: 1, doc: { ...DEFAULTS, ...doc }, updated_at: w.now(), updated_by: BOSS });
   assert.deepEqual((await w.api(BOSS, 'GET', '/rules')).body.rules, r.body.rules);
   // Logged by the names of what changed.
-  const row = (await w.log()).find((x) => x.kind === 'rules_changed');
+  const row = (await w.log()).filter((x) => x.kind === 'rules_changed').at(-1);
   assert.equal(row.actor, BOSS);
   assert.equal(row.detail, 'team: time_zone, hours, restart, protected_programs, protected_folders');
   const everything = JSON.stringify(await w.log());
@@ -216,6 +218,56 @@ test('a save stores the whole document, bumps the revision, logs only field name
   assert.equal((await w.log()).filter((x) => x.kind === 'rules_changed').at(-1).detail, 'team: shutdown');
   // A role that loses rules.manage between the read and the write cannot save.
   assert.equal((await w.api(BOSS, 'GET', '/rules')).body.rules.rev, 2);
+});
+
+// ---- moving a PC between customers changes its rules (PR 9 review) --------------------------------------
+test('moving an active PC to another customer, or to no site, needs rules.manage and a fresh code, logs rules_changed and rings the PC', async (t) => {
+  const w = await ready(t);
+  const a = await customerWithPc(w, 'Acme Ltd');
+  const otherCustomer = (await w.api(BOSS, 'POST', '/customers', { name: 'Bravo Ltd' })).body.customer.id;
+  const bravo = (await w.api(BOSS, 'POST', '/sites', { name: 'B1', customer_id: otherCustomer })).body.site.id;
+  const second = (await w.api(BOSS, 'POST', '/sites', { name: 'Second', customer_id: a.customer })).body.site.id;
+  const siteOf = async () => (await w.api(BOSS, 'GET', `/devices/${a.pc.id}`)).body.device.site_id;
+  const rung = a.bell.sent.length;
+  // devices.manage alone is not enough: a technician is refused, and the PC stays put.
+  const tech = await w.api(TECH, 'PATCH', `/devices/${a.pc.id}`, { site_id: bravo, code: '123456' });
+  assert.deepEqual([tech.status, tech.body.error.code], [403, 'permission_denied']);
+  // The admin needs a code, and a wrong or missing one moves nothing.
+  const none = await w.api(BOSS, 'PATCH', `/devices/${a.pc.id}`, { site_id: bravo });
+  assert.deepEqual([none.status, none.body.error.code], [400, 'bad_request']);
+  const wrong = await w.api(BOSS, 'PATCH', `/devices/${a.pc.id}`, { site_id: bravo, code: '000000' });
+  assert.deepEqual([wrong.status, wrong.body.error.code], [403, 'second_factor']);
+  assert.equal(await siteOf(), a.site);
+  // A site that is not there is refused before a code is spent.
+  const unknown = await w.api(BOSS, 'PATCH', `/devices/${a.pc.id}`, { site_id: 'a'.repeat(20), code: await fresh(w) });
+  assert.deepEqual([unknown.status, unknown.body.error.code], [400, 'unknown_site']);
+  // Within the customer, devices.manage is enough and there is no ring.
+  assert.equal((await w.api(TECH, 'PATCH', `/devices/${a.pc.id}`, { site_id: second })).status, 200);
+  assert.equal(a.bell.sent.length, rung);
+  // To another customer, with a code: moved, logged both ways, rung once.
+  const ok = await w.api(BOSS, 'PATCH', `/devices/${a.pc.id}`, { site_id: bravo, code: await fresh(w) });
+  assert.equal(ok.status, 200, JSON.stringify(ok.body));
+  assert.equal(await siteOf(), bravo);
+  const kinds = (await w.log()).map((x) => x.kind);
+  assert.deepEqual(kinds.slice(-2).sort(), ['device_changed', 'rules_changed']);
+  assert.equal(a.bell.sent.length, rung + 1);
+  // The code was spent: the same one does not move it again.
+  const reuse = await w.api(BOSS, 'PATCH', `/devices/${a.pc.id}`, { site_id: null, code: await totp(KEY, w.now()) });
+  assert.deepEqual([reuse.status, reuse.body.error.code], [403, 'second_factor']);
+  // To no site, also with a code.
+  assert.equal((await w.api(BOSS, 'PATCH', `/devices/${a.pc.id}`, { site_id: null, code: await fresh(w) })).status, 200);
+  assert.equal(await siteOf(), null);
+  assert.equal(a.bell.sent.length, rung + 2);
+  // The code is not part of the PC's record, and a field change needs none.
+  assert.equal((await w.api(TECH, 'PATCH', `/devices/${a.pc.id}`, { owner_contact: 'x@example.com' })).status, 200);
+});
+
+test('a PC waiting for approval takes a site with devices.manage alone, since no rules apply to it yet', async (t) => {
+  const w = await ready(t);
+  const customer = (await w.api(BOSS, 'POST', '/customers', { name: 'Acme Ltd' })).body.customer.id;
+  const site = (await w.api(BOSS, 'POST', '/sites', { name: 'Main', customer_id: customer })).body.site.id;
+  const pending = await w.addPc({ status: 'pending' });
+  assert.equal((await w.api(TECH, 'PATCH', `/devices/${pending.id}`, { site_id: site })).status, 200);
 });
 
 test('the PC\'s hello carries the effective rules, hours and clock, and a team change moves the tag', async (t) => {
@@ -333,7 +385,7 @@ test('an override is judged with the team\'s rules, may not name a customer that
   assert.equal((await save(w, BOSS, a.customer, { restart: 'outside_hours', hours: HOURS }, 1)).body.override.rev, 1);
   assert.equal((await w.log()).length, logged);
   // Removing the customer removes its rules.
-  await w.api(BOSS, 'PATCH', `/devices/${a.pc.id}`, { site_id: null });
+  assert.equal((await w.api(BOSS, 'PATCH', `/devices/${a.pc.id}`, { site_id: null, code: await fresh(w) })).status, 200);
   assert.equal((await w.api(BOSS, 'DELETE', `/sites/${a.site}`)).status, 200);
   assert.equal(w.sql("SELECT COUNT(*) AS n FROM rules WHERE customer_id = ?", a.customer)[0].n, 1);
   assert.equal((await w.api(BOSS, 'DELETE', `/customers/${a.customer}`)).status, 200);

@@ -60,6 +60,9 @@ export function readNotify(text) {
 export function notifyStore(db, team) {
   const q = (sql, ...params) => db.prepare(sql).bind(...params);
   const COLUMNS = 'workspace, recipient, event, created_at, device_id, task_id, session_id, title, body, dedupe';
+  // A person whose sign-in account is disabled (users.disabled_at, set by hand to lock someone out) hears nothing
+  // and cannot be asked to approve. A member with no account row, such as an Access login, is active.
+  const ACTIVE = 'NOT EXISTS (SELECT 1 FROM users u WHERE u.email = members.identity AND u.disabled_at IS NOT NULL)';
   const values = (slug, r) => [slug, r.recipient, r.event, r.created_at, r.device_id, r.task_id, r.session_id, r.title, r.body, r.dedupe];
 
   // The people an event goes to, as identities. `to` names people (the starter, the
@@ -71,7 +74,7 @@ export function notifyStore(db, team) {
     const named = new Set(to.map(normalizeIdentity));
     const skip = new Set(except.map(normalizeIdentity));
     if (!named.size && !watching && !holding) return [];
-    const { results } = await q("SELECT identity, role_id, notify FROM members WHERE workspace = ? AND kind = 'person'", slug).all();
+    const { results } = await q(`SELECT identity, role_id, notify FROM members WHERE workspace = ? AND kind = 'person' AND ${ACTIVE}`, slug).all();
     const roles = holding ? new Map((await team.listRoles(slug)).map((r) => [r.id, r.permissions])) : null;
     const out = [];
     for (const m of results) {
@@ -84,9 +87,9 @@ export function notifyStore(db, team) {
     return out;
   }
 
-  // The people (never service tokens) whose role holds `permission`, as identities. Admins hold every one.
+  // The people (never service tokens, never a disabled account) whose role holds `permission`, as identities. Admins hold every one.
   async function holders(slug, permission) {
-    const { results } = await q("SELECT identity, role_id FROM members WHERE workspace = ? AND kind = 'person'", slug).all();
+    const { results } = await q(`SELECT identity, role_id FROM members WHERE workspace = ? AND kind = 'person' AND ${ACTIVE}`, slug).all();
     const roles = new Map((await team.listRoles(slug)).map((r) => [r.id, r.permissions]));
     return results.filter((m) => m.role_id === ADMIN_ROLE || (roles.get(m.role_id) ?? []).includes(permission)).map((m) => m.identity);
   }
@@ -107,7 +110,7 @@ export function notifyStore(db, team) {
   async function direct(slug, event, to, what) {
     if (!DIRECT_EVENTS.includes(event)) throw new TypeError('unknown direct notification event');
     const who = normalizeIdentity(to);
-    const found = await q("SELECT identity FROM members WHERE workspace = ? AND identity = ? AND kind = 'person'", slug, who).first('identity');
+    const found = await q(`SELECT identity FROM members WHERE workspace = ? AND identity = ? AND kind = 'person' AND ${ACTIVE}`, slug, who).first('identity');
     if (!found) return [];
     return [{
       recipient: who, event, created_at: Date.now(),

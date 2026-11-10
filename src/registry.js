@@ -175,9 +175,12 @@ export class Registry {
 
   // Ring one PC ({device_id}), a list of PCs ({device_ids}, up to RING_LIST_MAX, each rung if its doorbell
   // is connected, and at most `max` of them when given) or every PC ({all: true}). close: true closes the doorbell after the ring, for a PC that
-  // was just removed. Best effort. A list also answers `count`, how many doorbells were rung.
+  // was just removed. Best effort. A list also answers `count`, how many PCs were rung (a PC with two doorbells
+  // open, an old connection not yet noticed gone, counts once).
   ring({ device_id: id, device_ids: ids, max, all, close }) {
     let rang = 0;
+    const rungPcs = new Set();
+    const owner = new Map(); // socket -> the PC it belongs to, for the list
     let sockets = [];
     if (all === true) sockets = this.ctx.getWebSockets();
     else if (Array.isArray(ids)) {
@@ -187,6 +190,7 @@ export class Registry {
         if (Number.isInteger(max) && pcs >= max) break;
         const open = this.ctx.getWebSockets(DOORBELL_TAG + x);
         if (open.length) pcs++;
+        for (const ws of open) owner.set(ws, x);
         sockets.push(...open);
       }
     } else if (DEVICE_ID.test(String(id))) sockets = this.ctx.getWebSockets(DOORBELL_TAG + id);
@@ -194,10 +198,11 @@ export class Registry {
       try {
         ws.send(RING);
         rang++;
+        if (owner.has(ws)) rungPcs.add(owner.get(ws));
         if (close === true) ws.close(1000, 'removed');
       } catch (_) { /* a dead socket is simply not rung */ }
     }
-    return Response.json({ rang: rang > 0, ...(Array.isArray(ids) ? { count: rang } : {}) });
+    return Response.json({ rang: rang > 0, ...(Array.isArray(ids) ? { count: rungPcs.size } : {}) });
   }
 
   async webSocketMessage(ws, data) {

@@ -192,12 +192,15 @@ in a session on a saved PC. A one-off link refuses them with `not_saved_pc`.
 - `list_programs` returns `installed` (`id`, `name`, `version`, `publisher`) and `running`
   (`name`, `pid`, `session`). Take the ids from it.
 - `install_program` takes `{session_id, path, args?, timeout_s?}`: `path` is an installer
-  that is already on the PC (send it with `put_file`), `.msi` or `.exe`. `uninstall_program`
+  that is already on the PC (send it with `put_file`), `.msi`, `.msu` or `.exe`, not in the Windows
+  folder and never a Windows tool such as `shutdown.exe` or `msiexec.exe`; `args` is at most 1,000
+  characters with no line breaks, and arguments that restart the PC or uninstall are refused (use
+  `restart_pc` and `uninstall_program`). `uninstall_program`
   takes `{session_id, program_id, timeout_s?}`. `timeout_s` is 10 to 600, default 300. Both
   return `{ok, exit_code}` and run as SYSTEM, so the PC must be set to full control.
 - `close_program` takes `{session_id, name | pid, force?}` and returns `{ok, closed}`. Without
   `force` it asks the program to close. With it, the program ends at once and unsaved work is
-  lost.
+  lost. The Support app's own processes are never closed (`protected_program`).
 
 The relay checks each action against the rules in force for that PC before anything reaches
 it, and the PC checks again. The result is one of three. The action runs. It is refused. Or it
@@ -210,7 +213,8 @@ timeout to cover it (for Codex, `tool_timeout_sec`, above).
 **Errors start with a code,** then a sentence: `<code>: <sentence>`. A refusal is the team's
 decision or a technician's, not a fault. Do not retry it, and do not work round it with a raw
 `run`: a `run` is not limited by the rules beyond a screen, but that is not permission, and
-the screen refuses the obvious command with `use_tool`.
+the screen refuses the obvious command with `use_tool`. The same goes for the other tools:
+`install_program` is for installers, so it is not a way to restart the PC or uninstall a program.
 
 | Code | Means |
 |---|---|
@@ -221,7 +225,7 @@ the screen refuses the obvious command with `use_tool`.
 | `declined` | a technician declined, or the approval was cancelled |
 | `approval_timeout` | no technician answered in 5 minutes |
 | `approval_unavailable` | nobody can approve for this caller: a service token, or a team where no member holds `sessions.unattended` (open mode included) |
-| `busy` | another action waits for approval on this session, or a restart or shutdown already waits on the PC |
+| `busy` | another action waits for approval on this session, or a restart or shutdown already waits on the PC. After an approval, if the PC stays busy for a minute the error says the approval was used |
 | `rules_stale` | the relay or the PC could not get the team's current rules; try again in a minute |
 | `not_found` | no such program, or no installer at that path |
 | `not_saved_pc` | the session is a one-off link |

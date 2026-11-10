@@ -181,6 +181,10 @@ describe('editing the team\'s rules', () => {
     await user.clear(screen.getByLabelText('Time zone'));
     await user.type(screen.getByLabelText('Add a protected folder'), 'Customer Data{Enter}');
     expect(await screen.findByText('Customer Data is not a full path. Write it like C:\\Customer Data.')).toBeInTheDocument();
+    // A whole drive is refused too: it would stop every file and installer on the PC.
+    await user.clear(screen.getByLabelText('Add a protected folder'));
+    await user.type(screen.getByLabelText('Add a protected folder'), 'C:\\{Enter}');
+    expect(await screen.findByText('C:\\ is a whole drive. Protect a folder on it, like C:\\Customer Data.')).toBeInTheDocument();
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(savesOf(fake)).toEqual([]);
   });

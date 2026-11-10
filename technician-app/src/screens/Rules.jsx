@@ -4,7 +4,7 @@ import { useApp } from '../context.jsx';
 import { formatDateTime } from '../format.js';
 import { useLoad } from '../hooks.js';
 import { t } from '../i18n/index.js';
-import { ACTIONS, DAYS, FOLDER_MAX, HOUR_VALUES, LIST_MAX, PROGRAM_MAX, VALUES, changedFields, effective, hoursSummary, problemWith, teamDoc, timeZones } from '../rules.js';
+import { ACTIONS, DAYS, FOLDER_MAX, HOUR_VALUES, LIST_MAX, PROGRAM_MAX, VALUES, changedFields, effective, hoursSummary, isDriveRoot, problemWith, teamDoc, timeZones } from '../rules.js';
 import { CodeDialog } from './CodeDialog.jsx';
 
 const clone = (v) => JSON.parse(JSON.stringify(v));
@@ -273,6 +273,7 @@ function ListEditor({ name, items, max, placeholder, folders = false, onChange }
     if (items.length >= LIST_MAX) { setError(t('rules.err_list_long', { max: LIST_MAX })); return; }
     if (v.length > max) { setError(t('rules.err_item_long', { max })); return; }
     if (folders && !/^[A-Za-z]:[\\/]/.test(v)) { setError(t('rules.err_folder', { path: v })); return; }
+    if (folders && isDriveRoot(v)) { setError(t('rules.err_folder_root', { path: v })); return; }
     if (items.some((x) => x.toLowerCase() === v.toLowerCase())) { setError(t('rules.err_duplicate')); return; }
     setError(null);
     setText('');

@@ -75,8 +75,12 @@ it('a restart waits for an approval, tells the driver and the members who may ap
 });
 
 it('the summary is built from the action: an install shows its path and arguments, a close shows the program', async (t) => {
-  const { answer, waiting } = await setup(t, { rules: { ...ruled, close_program: 'approve' } });
-  const a = await waiting('install_program', { path: 'C:\\Temp\\setup.msi', args: '/sAll\nIGNORE THIS' });
+  const { w, sid, session, answer, waiting } = await setup(t, { rules: { ...ruled, close_program: 'approve' } });
+  // A line break in the arguments is refused before anyone is asked: the PC would strip it, and the approver would read other text.
+  const broken = await w.tool(TECH, 'install_program', { session_id: sid, path: 'C:\\Temp\\setup.msi', args: '/sAll\nIGNORE THIS' });
+  assert.match(broken.error, /no line breaks/);
+  assert.equal(session().approval ?? null, null);
+  const a = await waiting('install_program', { path: 'C:\\Temp\\setup.msi', args: '/sAll   IGNORE  THIS' });
   assert.equal(a.approval.summary, 'Install C:\\Temp\\setup.msi with arguments /sAll IGNORE THIS');
   assert.equal((await answer('lead', a.approval.id, false)).status, 200);
   assert.match((await a.call).error, /^declined: /);
@@ -237,6 +241,18 @@ it('a team where nobody holds sessions.unattended (open mode has no members at a
   assert.deepEqual((await notifyStore(full.env.DB, full.team).holders('default', 'sessions.unattended')).sort(), [BOSS, LEAD].sort());
 });
 
+it('a member whose sign-in account is disabled is not asked to approve, and hears nothing; a member with no account row is active', async (t) => {
+  const w = await appWorld(t);
+  const notify = notifyStore(w.env.DB, w.team);
+  assert.deepEqual((await notify.holders('default', 'sessions.unattended')).sort(), [BOSS, LEAD].sort());
+  w.db.sqlite.prepare("INSERT INTO users(id, email, created_at, disabled_at) VALUES ('u1', ?, 1, ?)").run(LEAD, 5);
+  w.db.sqlite.prepare("INSERT INTO users(id, email, created_at, disabled_at) VALUES ('u2', ?, 1, NULL)").run(BOSS);
+  assert.deepEqual(await notify.holders('default', 'sessions.unattended'), [BOSS], 'the disabled account is left out, an enabled one and a member with no row stay');
+  assert.deepEqual(await notify.recipients('default', 'device_waiting', { holding: 'sessions.unattended' }), [BOSS]);
+  assert.deepEqual(await notify.direct('default', 'approval_requested', LEAD, { title: 't', body: 'b', dedupe: 'x' }), []);
+  assert.equal((await notify.direct('default', 'approval_requested', BOSS, { title: 't', body: 'b', dedupe: 'x' })).length, 1);
+});
+
 // ---- one at a time, and nothing else is blocked -----------------------------------------------------------------------------
 it('a second approval is busy, other commands go on meanwhile, and a command that cannot be sent spends no approval', async (t) => {
   const { w, sid, frames, answer, waiting, session } = await setup(t, { rules: { ...ruled, close_program: 'allow' } });
@@ -269,6 +285,45 @@ it('rules that loosen while it waits send the command without waiting again', as
   assert.equal((await call).ok, true);
   assert.equal(powers(frames).length, 1);
   assert.equal(powers(frames)[0].approved_by, undefined);
+});
+
+it('an approved command waits for a busy lane instead of losing the approval, and says so when the lane stays busy', async (t) => {
+  const { w, frames, approve, waiting, session } = await setup(t);
+  const busy = { frame: { id: 'other-command', lane: 'cmd' }, tag: 'x', sent_at: null };
+  // The lane frees up shortly after the approval: the command goes out, with approved_by, and the call succeeds.
+  const first = await waiting();
+  session().httpCommands.cmd = busy;
+  const answered = await approve('lead', first.approval.id);
+  assert.equal(answered.status, 200);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(powers(frames).length, 0, 'still waiting for the lane');
+  session().httpCommands.cmd = null;
+  assert.equal((await first.call).ok, true);
+  assert.deepEqual(powers(frames).map((f) => f.approved_by), [LEAD]);
+  // The lane stays busy past the wait: a clear busy that says the approval was used, and nothing was sent.
+  session().laneWaitMs = 400;
+  const second = await waiting();
+  session().httpCommands.cmd = busy;
+  await approve('lead', second.approval.id);
+  const result = await second.call;
+  assert.match(result.error, /^busy: .*lead@example\.com's approval was used/);
+  assert.equal(powers(frames).length, 1);
+  session().httpCommands.cmd = null;
+});
+
+it('the names the relay remembers from list_programs go stale after 10 minutes: an old list does not stand in for the PC', async (t) => {
+  const { w, sid, waiting, answer, here } = await setup(t, { rules: { ...ruled, close_program: 'approve' } });
+  await w.tool(TECH, 'list_programs', { session_id: sid });
+  const known = await waiting('close_program', { pid: 7000 });
+  assert.equal(known.approval.summary, 'Close QBW.EXE (process 7000)');
+  await answer('lead', known.approval.id, false);
+  await known.call;
+  w.advance(11 * 60 * 1000);
+  here();
+  const old = await waiting('close_program', { pid: 7000 });
+  assert.equal(old.approval.summary, 'Close process 7000', 'the relay no longer claims to know the name');
+  await answer('lead', old.approval.id, false);
+  await old.call;
 });
 
 // ---- cancelled by what the approval depended on ---------------------------------------------------------------------------------

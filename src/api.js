@@ -376,7 +376,16 @@ export async function handleApi(request, env, url, { accessCaller, isJsonContent
       }
       if (method === 'PATCH') {
         await need(team, slug, caller, ['devices.manage'], 'first_member');
-        return json({ device: await devs.updateDevice(slug, caller, id, await readBody(request, RECORD_BODY_MAX)) });
+        const body = await readBody(request, RECORD_BODY_MAX);
+        // A move to another customer (or to no site) changes the rules that apply to the PC, so it is guarded like a
+        // save of rules: rules.manage, a person and a fresh authenticator code, and the PC is rung afterwards.
+        const rulesCleared = await devs.siteMoveChangesRules(slug, id, body);
+        if (rulesCleared) {
+          await need(team, slug, caller, ['rules.manage'], 'first_member');
+          if (identityKind(normalizeIdentity(caller)) !== 'person') throw new TeamError(403, 'forbidden', 'moving a PC to another customer changes its rules: a person with their authenticator does it, not a service token');
+          await needFreshCode(env, caller, app, body.code);
+        }
+        return json({ device: await devs.updateDevice(slug, caller, id, body, { rulesCleared }) });
       }
       if (method === 'DELETE') {
         await need(team, slug, caller, ['devices.manage'], 'first_member');

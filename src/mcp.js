@@ -37,11 +37,11 @@ const ANSWERS_FIRST =
 const DELAY = 'delay_s is the wait before the action, 5 to 600 seconds, default 30.';
 const DELAY_S = { type: 'integer', description: '5..600, default 30', minimum: 5, maximum: 600 };
 const INSTALL_FACTS =
-  'path is an absolute path to an installer (.msi or .exe) that is already on the PC; use put_file to send it first. A .msi runs silent. args is optional installer command-line text, for example /sAll. timeout_s is 10 to 600 seconds, default 300. Returns { ok: true, exit_code }.';
+  'path is an absolute path to an installer (.msi, .msu or .exe) that is already on the PC; use put_file to send it first. It must not be in the Windows folder or a Windows tool such as shutdown.exe or msiexec.exe. A .msi runs silent. args is optional installer command-line text of at most 1000 characters, for example /sAll; arguments that restart the PC or uninstall are refused (use restart_pc and uninstall_program). timeout_s is 10 to 600 seconds, default 300. Returns { ok: true, exit_code }.';
 const UNINSTALL_FACTS =
   'program_id comes from list_programs; never guess it. timeout_s is 10 to 600 seconds, default 300. Returns { ok: true, exit_code }.';
 const CLOSE_FACTS =
-  'Give name (for example OUTLOOK.EXE) or pid from the running list. force false asks the program to close; force true ends it at once and unsaved work is lost. Default false. Returns { ok: true, closed } with the number of programs closed.';
+  'The Support app itself is never closed. Give name (for example OUTLOOK.EXE) or pid from the running list. force false asks the program to close; force true ends it at once and unsaved work is lost. Default false. Returns { ok: true, closed } with the number of programs closed.';
 const LIST_FACTS =
   'Returns installed (id, name, version, publisher) and running (name, pid, session).';
 

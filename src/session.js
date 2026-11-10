@@ -64,7 +64,7 @@ import { ID_RE, MIN_SESSION_VERSION, devicesFromEnv } from './devices.js';
 import { notifyStore } from './notify.js';
 import { UNATTENDED_PERMISSION } from './permissions.js';
 import { compareVersions, validVersion } from './release.js';
-import { REFUSALS, decide } from './rules.js';
+import { REFUSALS, decide, installArgsProblem, installerProblem, isAppProgramId, localAbsolutePath } from './rules.js';
 import { OPERATOR_END_REASONS } from './device-sessions.js';
 import { VERSION_PATTERN } from './version.js';
 import {
@@ -95,7 +95,12 @@ const SCREEN_WAIT_MS = 30 * 1000; // screen frame: base wait for the app's resul
 const CONTROL_WAIT_MS = 120 * 1000; // request_full_control: UAC and the customer's dialogs
 const LANE_OF = { run: 'cmd', put_file: 'cmd', get_file: 'cmd', power: 'cmd', programs: 'cmd', screen: 'screen', control: 'screen' };
 const APPROVAL_MS = 5 * 60 * 1000; // a technician has this long to answer an approval
+const CATCH_UP_MS = 15 * 1000; // the PC may spend this long on a check-in before it decides a frame that carries a rules tag (Rules.CatchUpMs)
+const LANE_STEP_MS = 100; // how often a waiting approved command looks at its lane
+const LANE_WAIT_MS = 60 * 1000; // an approved command waits this long for a busy lane before it gives the approval up
 const PROGRAM_NAME_MAX = 260;
+const PROGRAMS_TTL_MS = 10 * 60 * 1000; // how long a list_programs result stands in for the PC's programs
+const CONTROL_TEXT = /[\u0000-\u001f\u007f]/;
 // Refusals the rules do not make: the codes of the other checks of the tools (src/mcp.js REFUSAL_CODES).
 const EXTRA_REFUSALS = {
   declined: 'a technician declined this action',
@@ -146,6 +151,7 @@ export class Session {
     this.env = env;
     this.sql = ctx.storage.sql;
     this.pending = new Map(); // uuid -> {resolve, tag}
+    this.laneWaitMs = LANE_WAIT_MS; // how long an approved command waits for a busy lane (a test may shorten it)
     this.httpCommands = { cmd: null, screen: null }; // app mode: per lane, {frame, tag, sent_at} waiting for its result
     this.httpPoll = null; // app mode: the parked long poll, if any, {resolve, timer, busy}
     this.gen = 0; // the driver generation (see applyDriver); read with the driver
@@ -156,7 +162,7 @@ export class Session {
     this.frameRev = 0;
     this.over = false; // the session ended: no picture is kept after that
     this.approval = undefined; // the waiting approval { rec, resolve, timer } (undefined: not read yet, null: none); memory only, see loadDriver
-    this.programs = { byId: new Map(), byPid: new Map() }; // names from the last list_programs result: for the rules' name checks and the approval summary
+    this.programs = { byId: new Map(), byPid: new Map(), at: 0 }; // names from the last list_programs result: for the rules' name checks and the approval summary
     this.stopCheckedAt = 0; // when a poll last read whether the workspace is stopped
     this.sql.exec(`CREATE TABLE IF NOT EXISTS log(ts INTEGER, kind TEXT, detail TEXT)`);
   }
@@ -587,6 +593,10 @@ export class Session {
       if (!validVersion(version) || compareVersions(version, MIN_SESSION_VERSION) < 0) return codedRefusal('needs_update', EXTRA_REFUSALS.needs_update);
       prepared = await this.prepareRuled(b);
       if (prepared.error) return Response.json({ ok: false, error: prepared.error });
+      if (prepared.refuse) {
+        this.logRow('rules', `refused ${b.op === 'power' ? b.action : `programs ${b.action}`}: ${prepared.refuse}`, who);
+        return codedRefusal(prepared.refuse, prepared.text);
+      }
     }
     if (this.device && (ruled || ['run', 'put_file', 'get_file'].includes(b.op))) {
       const g = await this.guardCommand(b, prepared, { control, lane, isHttp, who, approved });
@@ -596,7 +606,17 @@ export class Session {
     }
     // From this check to the reservation below there is no await, so two
     // concurrent calls can't both take the same lane.
-    if (isHttp && this.httpCommands[lane]) return ruled ? codedRefusal('busy', 'agent busy; wait for the current operation') : Response.json({ ok: false, error: 'agent busy; wait for the current operation' });
+    if (isHttp && this.httpCommands[lane]) {
+      // A command a technician has approved waits for its lane, up to laneWaitMs, instead of throwing the approval
+      // away. It then starts over (the state, the rules and the lane are all read again), with the wait spent.
+      if (approved && !approved.waited) {
+        if (await this.laneFree(lane, this.laneWaitMs)) return this.command(b, { ...approved, waited: true });
+      }
+      if (approved) {
+        return codedRefusal('busy', `${approved.by}'s approval was used: the PC stayed busy with another command for ${Math.round(this.laneWaitMs / 1000)} seconds, so this one did not run. Ask again, and a technician must approve it again`);
+      }
+      return ruled ? codedRefusal('busy', 'agent busy; wait for the current operation') : Response.json({ ok: false, error: 'agent busy; wait for the current operation' });
+    }
 
     const id = crypto.randomUUID();
     let frame;
@@ -661,6 +681,8 @@ export class Session {
 
     // What the PC needs to hold the relay's decision against its own rules (src/agent-app.cs).
     if (guard?.tag) {
+      // The PC may spend up to CATCH_UP_MS on a check-in before it decides this frame, so the relay waits that much longer.
+      waitMs += CATCH_UP_MS;
       frame.rules_tag = guard.tag;
       frame.decided_at = Math.floor(guard.at / 1000);
       if (guard.approvedBy) frame.approved_by = guard.approvedBy;
@@ -706,10 +728,14 @@ export class Session {
       out.fields = { action: 'list' };
       out.log = 'list';
     } else if (b.action === 'install') {
-      const path = typeof b.path === 'string' ? b.path.trim() : '';
-      if (!path || path.length > 1000) return { error: 'path is required: the absolute path of the installer on the PC' };
-      if (b.args !== undefined && b.args !== null && (typeof b.args !== 'string' || b.args.length > 2000)) return { error: 'args must be text of at most 2000 characters' };
+      // The same checks as the PC's, before a technician is asked: a path it would refuse, a file that is not an
+      // installer, or arguments that restart or uninstall are refused here and spend no approval.
+      const path = localAbsolutePath(b.path) ?? '';
+      if (!path || path.length > 1000 || CONTROL_TEXT.test(path)) return { error: 'path is required: the absolute path of the installer on the PC, such as C:\\Temp\\setup.exe' };
+      if (b.args !== undefined && b.args !== null && (typeof b.args !== 'string' || b.args.length > 1000 || CONTROL_TEXT.test(b.args))) return { error: 'args must be text of at most 1000 characters, with no line breaks' };
       const args = typeof b.args === 'string' ? b.args.trim() : '';
+      const installer = installerProblem(path) ?? installArgsProblem(path, args);
+      if (installer) return { error: installer };
       const timeout = num(b.timeout_s, 300, 10, 600);
       out.fields = { action: 'install', path, ...(args ? { args } : {}), timeout_s: timeout };
       out.ruleAction = 'install';
@@ -720,8 +746,9 @@ export class Session {
     } else if (b.action === 'uninstall') {
       const id = typeof b.program_id === 'string' ? b.program_id.trim() : '';
       if (!id || id.length > 200) return { error: 'program_id is required: an id from list_programs' };
+      if (isAppProgramId(id)) return { refuse: 'protected_program', text: 'the Support app is never uninstalled through its own tools' };
       const timeout = num(b.timeout_s, 300, 10, 600);
-      const name = this.programs.byId.get(id);
+      const name = this.knownProgram('byId', id);
       out.fields = { action: 'uninstall', program_id: id, timeout_s: timeout };
       out.ruleAction = 'uninstall';
       out.program = name ?? id;
@@ -736,7 +763,7 @@ export class Session {
       if (hasPid && (!Number.isSafeInteger(b.pid) || b.pid <= 0)) return { error: 'pid must be a process id from list_programs' };
       if (b.force !== undefined && b.force !== null && typeof b.force !== 'boolean') return { error: 'force must be true or false' };
       const force = b.force === true;
-      const known = hasPid ? this.programs.byPid.get(b.pid) : undefined;
+      const known = hasPid ? this.knownProgram('byPid', b.pid) : undefined;
       out.fields = { action: 'close', ...(hasName ? { name: b.name.trim() } : { pid: b.pid }), force };
       out.ruleAction = 'close_program';
       out.program = hasName ? b.name.trim() : known;
@@ -770,6 +797,8 @@ export class Session {
     const verdict = decide(read.rules, ruleAction, {
       nowMs: at, hours: read.hours, control: control === 'full' ? 'full' : 'limited', program: prepared?.program,
       path: prepared ? prepared.path : String(b.path ?? ''),
+      // A restart or shutdown that waits is judged over the whole wait, not only at this moment.
+      delay_s: b.op === 'power' ? prepared.fields.delay_s : undefined,
     });
     if (verdict.refuse) {
       this.logRow('rules', `refused ${prepared ? prepared.log : b.op}: ${verdict.refuse}`, who);
@@ -843,6 +872,16 @@ export class Session {
     return { response: codedRefusal(outcome.refuse, outcome.text ?? EXTRA_REFUSALS[outcome.refuse]) };
   }
 
+  // Wait until the lane has no command waiting for its result, up to about ms. True when it is free. The wait is
+  // counted in steps, not timed, so a test with a frozen clock still ends.
+  async laneFree(lane, ms) {
+    for (let left = Math.ceil(ms / LANE_STEP_MS); this.httpCommands[lane]; left--) {
+      if (left <= 0) return false;
+      await new Promise((resolve) => setTimeout(resolve, LANE_STEP_MS));
+    }
+    return true;
+  }
+
   // The waiting approval is over, one way: { approved, approver } or { refuse, text } or { ended }. Nothing happens
   // for an approval that is not the one waiting, so an answer that comes twice, or after a timeout, is a no-op.
   finishApproval(id, outcome) {
@@ -891,13 +930,19 @@ export class Session {
     return refusal('bad_request', 'op must be list, answer or cancel');
   }
 
+  // A name from the last list_programs result, or undefined when the list is older than PROGRAMS_TTL_MS: a pid is reused
+  // and a program is removed, so an old list must not stand in for what is on the PC now. The PC decides again by what it finds.
+  knownProgram(kind, key) {
+    return Date.now() - this.programs.at < PROGRAMS_TTL_MS ? this.programs[kind].get(key) : undefined;
+  }
+
   // The names in a list_programs result, kept in memory for the rules' name checks and the approval summary.
   rememberPrograms(result) {
     const byId = new Map();
     const byPid = new Map();
     for (const p of result.installed ?? []) byId.set(p.id, p.name);
     for (const r of result.running ?? []) byPid.set(r.pid, r.name);
-    this.programs = { byId, byPid };
+    this.programs = { byId, byPid, at: Date.now() };
   }
 
   // The rules in force for this saved PC, as session_status shows them, or null when they cannot be read.
