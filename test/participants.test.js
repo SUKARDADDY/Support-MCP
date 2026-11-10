@@ -128,10 +128,10 @@ test('only the driver invites or removes, the target must be a member who can co
   assert.deepEqual(rows((await w.tool(TECH2, 'session_participants', { session_id: sid, action: 'leave' })).participants), [`${TECH}:driver`]);
 });
 
-test('people_list and an invite agree for a member whose identity is not an email', async (t) => {
+test('people_list and an invite read the same stored kind, also for a hand-made row whose name is not an email', async (t) => {
   const w = await agentWorld(t);
   const { sid } = await attached(w, TECH);
-  // The dev identity: an admin the team stored as a person, with no "@" in its name.
+  // Rows made by hand (the API would store both of these as services): a person-kind admin with no "@" in its name, and a service.
   w.db.sqlite.prepare("INSERT INTO members(workspace, identity, kind, name, role_id, added_at, added_by) VALUES ('default', 'local-dev', 'person', NULL, 'admin', 1, ?)").run(BOSS);
   w.db.sqlite.prepare("INSERT INTO members(workspace, identity, kind, name, role_id, added_at, added_by) VALUES ('default', 'a-service-client', 'service', NULL, 'admin', 1, ?)").run(BOSS);
   const list = (await w.tool(TECH, 'people_list')).people;

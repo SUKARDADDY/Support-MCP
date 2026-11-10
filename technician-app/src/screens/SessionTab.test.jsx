@@ -80,7 +80,9 @@ describe('Session tab: watching the screen yourself', () => {
     let n = 0;
     fake.state.screenshot = () => { if (++n >= 2) throw new ToolFail('lead@example.com is driving this session; use device_connect with take_over'); return { data: {}, image: { mime: 'image/png', data: 'QUJD' } }; };
     await openTab(fake);
-    expect(await screen.findByText(/is driving this PC now, so this tab stopped taking pictures/)).toBeInTheDocument();
+    // The status still names this person (it is not refreshed here), so the caption does not name them as the other driver.
+    expect(await screen.findByText(/Someone else may be driving now, so this tab stopped taking pictures/)).toBeInTheDocument();
+    expect(screen.queryByText(/is driving this PC now/)).not.toBeInTheDocument();
     const calls = toolCalls(fake, 'screenshot').length;
     await sleep(120);
     expect(toolCalls(fake, 'screenshot').length).toBe(calls);
@@ -117,6 +119,23 @@ describe('Session tab: watching the screen yourself', () => {
     expect(screen.getByRole('button', { name: 'Close tab' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'End session' })).not.toBeInTheDocument();
     expect(toolCalls(fake, 'screenshot')).toHaveLength(1);
+  });
+
+  test('text from the PC that only contains the relay\'s words in another sentence is a passing failure, not a stop', async () => {
+    const fake = fakeCore();
+    const texts = [
+      'The printer said: session ended unexpectedly',
+      'Spooler: agent busy; try later',
+      'Chrome title: lead@example.com is driving this session; use device_connect',
+      'Error: no such live session was found for that window',
+    ];
+    let n = 0;
+    fake.state.screenshot = () => { throw new ToolFail(texts[n++ % texts.length]); };
+    await openTab(fake);
+    // Three in a row stop the loop as a failure; a stop for the words themselves would have come after one.
+    expect(await screen.findByText(/Taking pictures failed several times in a row/)).toBeInTheDocument();
+    expect(toolCalls(fake, 'screenshot')).toHaveLength(3);
+    expect(screen.queryByText(/Checking…/)).not.toBeInTheDocument();
   });
 
   test('stops at once on "agent busy", and Try again starts the pictures again', async () => {

@@ -15,7 +15,7 @@ const STATUSES = ['open', 'mine', 'closed'];
 // claim opens the PC. Notes, summaries and PC names were written by people and by an agent that
 // read a customer's PC, so they are shown as text and labelled as such.
 export function Queue() {
-  const { core, account, me, can, now, toast, openTarget, openSessionTab, tabForSession, showTab, refreshQueue, queueTick, tuning, visible, isShown } = useApp();
+  const { core, account, me, can, now, toast, openTarget, openSessionTab, tabForSession, showTab, refreshQueue, reportOpen, queueTick, tuning, visible, isShown } = useApp();
   const [status, setStatus] = useState('open');
   const [busy, setBusy] = useState(null); // the id of the item a claim is on its way for
   const [error, setError] = useState(null);
@@ -26,8 +26,9 @@ export function Queue() {
   // The list is read when the screen is shown and after a change, and again when the window is shown or focused again,
   // when a queue notice arrives, and every 30 seconds while the screen is on show: another person may have claimed or
   // closed an item meanwhile. A hidden window reads nothing.
-  useEffect(() => { refreshQueue(); }, [account.id]); // eslint-disable-line react-hooks/exhaustive-deps
-  const again = useCallback(() => { reload(); refreshQueue(); }, [reload, refreshQueue]);
+  // The Open list is also the badge's count; another list needs the badge asked for apart.
+  useEffect(() => { if (data && data.status === 'open') reportOpen(account.id, data.items.length); }, [data]); // eslint-disable-line react-hooks/exhaustive-deps
+  const again = useCallback(() => { reload(); if (status !== 'open') refreshQueue(); }, [reload, refreshQueue, status]);
   const againRef = useRef(again);
   againRef.current = again;
   useInterval(() => againRef.current(), tuning.queueMs, visible, { immediate: false });
@@ -64,7 +65,7 @@ export function Queue() {
       if (isShown(owner)) setError(refusalText(e, t('queue.claim_failed')));
     } finally {
       setBusy(null);
-      refreshQueue(owner);
+      refreshQueue(owner); // the screen may be left before its own list is read again
       if (isShown(owner)) reload();
     }
   }

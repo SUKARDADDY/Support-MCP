@@ -271,6 +271,18 @@ describe('the Queue screen reads again when someone else changes an item', () =>
     await waitFor(() => expect(screen.queryByText('Printer jams')).not.toBeInTheDocument());
   });
 
+  test('on the Open tab the badge takes its count from the list that is read, with no second request', async () => {
+    const { fake } = await openQueue([item()], fakeCore(), SLOW);
+    await screen.findByLabelText('1 open');
+    await sleep(40);
+    const before = queueCalls(fake, 'list').length;
+    fake.state.queue.push(item({ id: ID('f') }));
+    act(() => { window.dispatchEvent(new Event('focus')); });
+    expect(await screen.findByLabelText('2 open')).toBeInTheDocument();
+    await sleep(60);
+    expect(queueCalls(fake, 'list').length - before).toBe(1);
+  });
+
   test('with a slow timer and no event, nothing is read again', async () => {
     const { fake } = await openMine(SLOW);
     const before = queueCalls(fake, 'list').length;

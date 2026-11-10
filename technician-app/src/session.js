@@ -42,9 +42,11 @@ export const same = (a, b) => !!a && !!b && String(a).trim().toLowerCase() === S
 // Why the screenshot loop stopped, from the relay's words, or null for a failure that passes.
 export function stopReason(message) {
   const m = String(message ?? '');
-  if (/is driving/i.test(m)) return 'driving';
-  if (/agent busy/i.test(m)) return 'busy';
-  if (/session ended|no such live session/i.test(m)) return 'ended';
+  // The relay's own sentences, whole: text a PC supplies (a command's error, a window title) that merely contains
+  // these words in another sentence is a passing failure, not a stop.
+  if (/^\S+ is driving this session(;|$)/.test(m)) return 'driving';
+  if (/^agent busy(;|$)/.test(m)) return 'busy';
+  if (/^(not_found: )?no such live session$|^session ended( by .+)?$/.test(m)) return 'ended';
   return null;
 }
 

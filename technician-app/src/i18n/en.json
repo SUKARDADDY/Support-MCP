@@ -337,6 +337,8 @@
  "session.cap_task_paused": "The task is paused. This is the last picture it took.",
  "session.cap_not_driver": "{who} is driving this PC, so this tab does not take pictures. Take over to watch it.",
  "session.cap_driving": "{who} is driving this PC now, so this tab stopped taking pictures.",
+ "session.cap_driving_unsure": "Someone else may be driving now, so this tab stopped taking pictures. Checking…",
+ "session.cap_ending": "The relay says this session ended. Checking…",
  "session.cap_busy": "The PC is busy with the agent, so this tab stopped taking pictures. It switches to the agent's picture when a task runs.",
  "session.cap_failed": "Taking pictures failed several times in a row, so this tab stopped.",
  "session.cap_ended": "The session ended.",

@@ -109,9 +109,10 @@ export function SessionTab({ tab, active = true }) {
   else if (s.role === 'invited') caption = t('session.cap_invited', { who: driver ? nameOf(driver) : '' });
   else if (s.isWatcher) caption = s.frameProblem ? refusalText(s.frameProblem, t('session.cap_watch_failed')) : t('session.cap_watching', { who: driver ? nameOf(driver) : '' });
   else if (!s.attached) caption = t('session.cap_not_attached');
-  else if (s.stopped === 'driving') caption = t('session.cap_driving', { who: driver ?? '' });
+  else if (s.stopped === 'driving') caption = s.isDriver ? t('session.cap_driving_unsure') : t('session.cap_driving', { who: driver ?? '' });
   else if (s.stopped === 'busy') caption = t('session.cap_busy');
-  else if (s.stopped === 'failed' || s.stopped === 'ended') caption = t('session.cap_failed');
+  else if (s.stopped === 'ended') caption = t('session.cap_ending');
+  else if (s.stopped === 'failed') caption = t('session.cap_failed');
   else if (!s.isDriver) caption = t('session.cap_not_driver', { who: driver ?? '' });
   else caption = t('session.cap_view_only');
 

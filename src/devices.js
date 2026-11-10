@@ -1102,8 +1102,9 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
   async function mayInvite(slug, targetIdentity, sid, watch) {
     const target = normalizeIdentity(targetIdentity);
     if (!LIVE_STATES.includes(watch.state)) throw new TeamError(404, 'not_found', 'no such live session');
-    // A person is whom the team stored as a person, as people_list says it: the name's shape (an email) is not the test,
-    // since a member such as the local dev identity has none.
+    // A person is whom the team stored as a person, the same field people_list reads, so the two cannot disagree.
+    // (addMember and the first-admin bootstrap store the kind from the name's shape, so a name with no "@" such as
+    // local-dev is a service when added through the API; only a hand-made row can say otherwise.)
     const member = await team.getMember(slug, target);
     if (member?.kind !== 'person' || !(await holds(slug, target, 'sessions.control'))) {
       throw new TeamError(403, 'cannot_control', `${target} is not a member who can control sessions`);

@@ -120,9 +120,10 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   const can = useCallback((permission) => me.permissions.includes(permission), [me]);
 
   // ---- the queue's badge: the items nobody has claimed ----------------------------------
-  // Read when the app starts, when the Queue screen is shown or changes something, and when the relay
-  // says the queue changed (a notification): never by a timer. Its answer counts only if its team is
-  // still the one on screen and no newer read has begun.
+  // Read when the app starts and when the relay says the queue changed (a notification). While the Queue screen
+  // is on show it reads its own list (on a timer, on focus and on a notice), and the badge takes the count from
+  // the Open list instead of asking again (reportOpen). An answer counts only if its team is still the one on
+  // screen and no newer read has begun.
   const queueSeq = useRef(0);
   const canQueue = me.permissions.includes('sessions.control');
   const refreshQueue = useCallback(async (owner = accountId) => {
@@ -136,6 +137,12 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
       // the badge stays as it was
     }
   }, [core, accountId, guard, canQueue]);
+  // The Queue screen's Open list is the badge's count: no second request.
+  const reportOpen = useCallback((owner, count) => {
+    if (!guard.isShown(owner)) return;
+    queueSeq.current += 1;
+    setQueueCount(count);
+  }, [guard]);
   const refreshQueueRef = useRef(refreshQueue);
   refreshQueueRef.current = refreshQueue;
   useEffect(() => {
@@ -417,9 +424,9 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     core, appInfo, accounts: accounts ?? [], account, setActive, reloadAccounts: loadAccounts, can, me,
     devices: deviceData.devices, places: deviceData.places, devicesState: deviceData, reloadDevices,
     selectedId, select, conns, connect, cancelConnect, dismissConnect,
-    sessionTabFor, tabForSession, isShown: guard.isShown, showTab, endTab, closeTab, leaveTab, markStance, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true), queueCount, queueTick, refreshQueue,
+    sessionTabFor, tabForSession, isShown: guard.isShown, showTab, endTab, closeTab, leaveTab, markStance, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true), queueCount, queueTick, refreshQueue, reportOpen,
     toast, copyText, notifications, openTarget, now, theme, setTheme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded,
-  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, tabForSession, showTab, endTab, closeTab, leaveTab, markStance, updateTab, openSessionTab, go, queueCount, queueTick, refreshQueue, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded]); // eslint-disable-line react-hooks/exhaustive-deps
+  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, tabForSession, showTab, endTab, closeTab, leaveTab, markStance, updateTab, openSessionTab, go, queueCount, queueTick, refreshQueue, reportOpen, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (accounts === null) return <div className="app" role="status"><p className="hint">{t('common.loading')}</p></div>;
 
