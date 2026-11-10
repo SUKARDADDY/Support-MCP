@@ -145,9 +145,10 @@ export function useSession({ core, account, tab, active, me, canControl, tuning,
           if (stopped_ || !alive.current) return;
           failures = 0;
           setTask(t);
-          // The task runs on a session this tab is not on (a task started on a PC makes its own session,
-          // and the tab's old one may have ended): the tab adopts it, and App saves it with the tab.
-          if (t.session_id && t.session_id !== sessionRef.current) {
+          // A task that is working runs on a session this tab is not on (a task started on a PC makes its own
+          // session, and the tab's old one may have ended): the tab adopts it, and App saves it with the tab.
+          // A task that is over has nothing to adopt.
+          if (t.session_id && t.session_id !== sessionRef.current && isLiveTask(t)) {
             sessionRef.current = t.session_id;
             setSessionId(t.session_id);
             setStatus(null);

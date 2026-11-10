@@ -79,7 +79,7 @@ export function fakeCore(initial = {}) {
       if (p === '/api/sites') return { sites: state.sites, next: null };
       if (p === '/api/customers') return { customers: state.customers, next: null };
       if (p === '/api/devices' && method === 'GET') return { devices: state.devices.map(({ online, ...d }) => d), next: null };
-      if (p === '/api/pairing' && method === 'POST') return { pairing: state.pairing };
+      if (p === '/api/pairing' && method === 'POST') { if (state.pairingGate) await state.pairingGate; return { pairing: state.pairing }; }
       if (p === '/api/pairing' && method === 'GET') return state.pairingList ? state.pairingList() : { pairings: state.pairingUsed ? [] : [{ id: state.pairing.id, expires_at: state.pairing.expires_at }], next: null };
       const approve = /^\/api\/devices\/(\w+)$/.exec(p);
       if (approve && method === 'PATCH') {
@@ -127,8 +127,12 @@ export function fakeCore(initial = {}) {
           if (out instanceof Error) throw out;
           return { data: out, image: null };
         }
-        case 'session_status': return { data: state.sessionStatus ? state.sessionStatus(args) : { state: 'attached', driver: 'tech@example.com', log: [], ...(state.sessions[args.session_id] ?? {}) }, image: null };
-        case 'session_end': state.ended = [...(state.ended ?? []), args.session_id]; return { data: { ended: true }, image: null };
+        case 'session_status': return { data: state.sessionStatus ? await state.sessionStatus(args) : { state: 'attached', driver: 'tech@example.com', log: [], ...(state.sessions[args.session_id] ?? {}) }, image: null };
+        case 'session_end':
+          if (state.endGate) await state.endGate;
+          if (state.endError) throw state.endError;
+          state.ended = [...(state.ended ?? []), args.session_id];
+          return { data: { ended: true }, image: null };
         case 'session_create': if (state.oneOffGate) await state.oneOffGate; return { data: { session_id: 'o'.repeat(64), windows_mode: 'app', download_url: 'https://relay.example/j/abcdefghijklmnop?client=app', code_expires_at: Date.now() + 600000 }, image: null };
         case 'screenshot': {
           if (state.screenshot) return state.screenshot(args);

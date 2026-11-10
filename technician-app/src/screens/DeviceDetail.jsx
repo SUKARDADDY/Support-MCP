@@ -55,7 +55,7 @@ export function DeviceDetail({ device }) {
         <dt>{t('facts.device_id')}</dt><dd className="mono">{device.id}</dd>
       </dl>
       <p className="fine">{t('device.owner_changes')}</p>
-      {agentOpen ? <AgentStartDialog device={device} onClose={() => setAgentOpen(false)} onStarted={(started) => { const open = sessionTabFor(device.id); if (open) showTab(open.key); else openSessionTab({ device, taskId: started.task_id }); }} /> : null}
+      {agentOpen ? <AgentStartDialog device={device} onClose={() => setAgentOpen(false)} onStarted={(started) => { const key = started.followedBy?.[0] ?? sessionTabFor(device.id)?.key; if (key) showTab(key); else openSessionTab({ device, taskId: started.task_id }); }} /> : null}
     </div>
   );
 }

@@ -14,6 +14,8 @@ export function OneOffLink({ onClose }) {
   const [error, setError] = useState(null);
   const accountRef = useRef(account.id);
   accountRef.current = account.id;
+  // A link belongs to the team that made it.
+  useEffect(() => { setLink(null); setError(null); setBusy(false); }, [account.id]);
 
   useEffect(() => {
     const d = ref.current;

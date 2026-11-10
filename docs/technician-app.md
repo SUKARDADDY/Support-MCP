@@ -129,7 +129,9 @@ the app's core has no tool for them.
 - Everything a tab asks of the relay uses the account the tab was opened under, not the one on
   screen. A connection that finishes after you switched teams opens its tab under its own team and
   leaves it hidden until you use that team again. Cancelling a connection before the relay has
-  answered ends the session the relay makes afterwards. An answer that comes back for an account,
+  answered ends the session the relay makes afterwards. A session end that fails is tried once more,
+  and if the session may still be there the app names the PC in a message, because its user may still be
+  asked to click Allow. A new connection to the PC waits for that cleanup. An answer that comes back for an account,
   session or task the screen has since left is dropped.
 - A task started on a PC whose session has ended gets a new tab; the ended tab keeps saying so. When a
   task turns out to run on another session than its tab's (a start by PC that had to connect again),

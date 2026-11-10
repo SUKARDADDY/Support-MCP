@@ -14,7 +14,7 @@ const KNOWN_KINDS = ['created', 'consumed', 'attached', 'hello', 'detached', 'de
 // or take it over. There are no click or type controls: this tab only watches. Everything
 // from the PC (the picture, step details, notes, log text) is untrusted and shown as text.
 export function SessionTab({ tab, active = true }) {
-  const { core, tuning, me, can, endTab, closeTab, toast, updateTab, devices, visible, titleOf, registerTab } = useApp();
+  const { core, tuning, me, can, endTab, closeTab, toast, updateTab, devices, visible, titleOf, registerTab, markEnded } = useApp();
   const [showActivity, setShowActivity] = useState(true);
   const [agentOpen, setAgentOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
@@ -27,6 +27,7 @@ export function SessionTab({ tab, active = true }) {
   const latest = useRef(null);
   latest.current = { tab, s };
   useEffect(() => registerTab(tab.key, {
+    key: tab.key,
     account: tab.account,
     deviceId: () => latest.current.tab.deviceId ?? null,
     sessionId: () => latest.current.s.sessionId ?? null,
@@ -37,6 +38,9 @@ export function SessionTab({ tab, active = true }) {
     release: () => latest.current.s.releaseScreenshots(),
     follow: (taskId) => { try { latest.current.s.watchTask(taskId); } finally { latest.current.s.releaseScreenshots(); } },
   }), [registerTab, tab.key, tab.account]);
+
+  // Tells App whether this tab's session has ended, so a screen that looks for the tab on a PC redraws.
+  useEffect(() => { markEnded(tab.key, s.ended); }, [tab.key, s.ended, markEnded]);
 
   // The task this tab follows is saved with the tab, so a restart follows it again (the relay stops
   // a task nobody watches for two minutes), and cleared when the task is over.
@@ -126,7 +130,7 @@ export function SessionTab({ tab, active = true }) {
             <span className="state">{stateWord}</span>
             {!s.ended ? <><span aria-hidden="true">·</span><span>{formatDuration(now - opened)}</span></> : null}
             {s.status?.machine ? <><span aria-hidden="true">·</span><span>{s.status.machine}</span></> : null}
-            {driver ? <><span aria-hidden="true">·</span><span>{s.isDriver ? t('session.you_drive') : t('session.driver_is', { who: driver })}</span></> : null}
+            {driver && !s.ended ? <><span aria-hidden="true">·</span><span>{s.isDriver ? t('session.you_drive') : t('session.driver_is', { who: driver })}</span></> : null}
           </p>
         </div>
         <div className="sess-tools">
@@ -157,7 +161,7 @@ export function SessionTab({ tab, active = true }) {
           {s.stopped && !s.taskLive && !s.ended ? (
             <button type="button" className="btn btn-sec btn-sm" onClick={s.resumeShots}>{t('session.try_again')}</button>
           ) : null}
-          {s.stopped && s.stoppedMessage ? <p className="vp-cap">{s.stoppedMessage}</p> : null}
+          {s.stopped && s.stoppedMessage && !s.ended ? <p className="vp-cap">{s.stoppedMessage}</p> : null}
         </div>
         {showActivity ? (
           <aside className="act" aria-label={t('session.activity_label')}>

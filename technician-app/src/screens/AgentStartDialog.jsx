@@ -11,6 +11,10 @@ export function AgentStartDialog({ device = null, sessionId = null, accountId = 
   // The account the session or PC belongs to: a session tab passes its own, which need not be the one shown.
   const account = { id: accountId ?? shown.id };
   const ref = useRef(null);
+  // The start takes a while and the screens change under it: its end uses the callbacks of the latest
+  // render, not the ones from the render in which Start was pressed.
+  const latest = useRef({ onStarted, onClose });
+  latest.current = { onStarted, onClose };
   const [text, setText] = useState('');
   const [keep, setKeep] = useState(false);
   const [model, setModel] = useState('');
@@ -45,8 +49,8 @@ export function AgentStartDialog({ device = null, sessionId = null, accountId = 
       const started = await startAgentTask(body, account.id);
       rememberTask(started.task_id, body.instructions);
       toast(t('agent.started'));
-      onStarted?.(started);
-      onClose();
+      latest.current.onStarted?.(started);
+      latest.current.onClose();
     } catch (err) {
       setError(messageOf(err, t('agent.start_failed')));
     } finally {

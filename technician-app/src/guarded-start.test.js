@@ -3,7 +3,7 @@ import { guardedStart, guardsFor } from './guarded-start.js';
 
 // A tab's guard that counts what is done to it.
 function guard(over = {}) {
-  const g = { holds: 0, releases: 0, followed: [], account: 'acc', ended: () => false, deviceId: () => 'dev', sessionId: () => 'sid', liveSession: () => null, ...over };
+  const g = { holds: 0, releases: 0, followed: [], key: 'tab', account: 'acc', ended: () => false, deviceId: () => 'dev', sessionId: () => 'sid', liveSession: () => null, ...over };
   g.hold = over.hold ?? (async () => { g.holds += 1; });
   g.release = () => { g.releases += 1; };
   g.follow = over.follow ?? ((id) => { g.followed.push(id); g.releases += 1; });
@@ -28,7 +28,7 @@ describe('guardedStart', () => {
     const g = guard({ liveSession: () => 'sid' });
     const sent = [];
     const out = await guardedStart({ guards: [g], body, send: async (b) => { sent.push({ b, holds: g.holds, releases: g.releases }); if (b.session_id) throw refuse('session_ended'); return { task_id: 't1' }; } });
-    expect(out).toEqual({ task_id: 't1' });
+    expect(out).toEqual({ task_id: 't1', followedBy: ['tab'] });
     expect(sent.map((s) => s.b)).toEqual([{ instructions: 'Fix it', keep_working: false, session_id: 'sid' }, body]);
     expect(sent.map((s) => [s.holds, s.releases])).toEqual([[1, 0], [1, 0]]); // held for both, released by neither
     expect(g.followed).toEqual(['t1']);
@@ -60,10 +60,10 @@ describe('guardedStart', () => {
   });
 
   test('a follow that throws is not released twice, does not stop the other tabs, and does not undo the start', async () => {
-    const bad = guard({ follow: () => { throw new Error('cannot follow'); } });
+    const bad = guard({ key: 'bad', follow: () => { throw new Error('cannot follow'); } });
     const good = guard();
     const out = await guardedStart({ guards: [bad, good], body, send: async () => ({ task_id: 't3' }) });
-    expect(out).toEqual({ task_id: 't3' });
+    expect(out).toEqual({ task_id: 't3', followedBy: ['tab'] }); // only the tab that followed
     expect(bad.releases).toBe(0); // its follow owns the release; the failed start's release does not run for it
     expect(good.followed).toEqual(['t3']);
     expect(good.releases).toBe(1);

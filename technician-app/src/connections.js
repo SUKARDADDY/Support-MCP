@@ -23,9 +23,9 @@ export function declinedKey(reason) {
   }
 }
 
-export function useConnections({ core, account, onLive, pollMs = POLL_MS }) {
+export function useConnections({ core, account, onLive, onEndFailed, pollMs = POLL_MS }) {
   const [conns, setConns] = useState({});
-  // deviceId -> one attempt: { cancelled, account, sessionId, ended, done }. `account` is the
+  // deviceId -> one attempt: { device, cancelled, account, sessionId, ending, done }. `account` is the
   // account that made it: everything the attempt does, ending its session included, goes through
   // that account whatever the app shows now. An attempt stays here until its cleanup is finished.
   const active = useRef(new Map());
@@ -45,26 +45,41 @@ export function useConnections({ core, account, onLive, pollMs = POLL_MS }) {
     });
   }, []);
 
-  // Ends the attempt's session once, with the account that made it. It may have ended already.
-  const endAttempt = useCallback(async (attempt) => {
-    if (!attempt.sessionId || attempt.ended) return;
-    attempt.ended = true;
-    try {
-      await endSession(core, attempt.account, attempt.sessionId);
-    } catch (_) {
-      // it may have ended already
-    }
-  }, [core]);
+  // Ends the attempt's session once, with the account that made it, and returns the one promise for
+  // it, so anyone who needs the cleanup done can wait for it. A failure is tried once more; if the
+  // session is still there after that, the person is told by name, because the PC may still ask its
+  // user to click Allow.
+  const endAttempt = useCallback((attempt) => {
+    if (!attempt.sessionId) return Promise.resolve();
+    attempt.ending ??= (async () => {
+      for (let tries = 0; tries < 2; tries += 1) {
+        try {
+          await endSession(core, attempt.account, attempt.sessionId);
+          return;
+        } catch (_) {
+          // try once more
+        }
+      }
+      try {
+        const st = await sessionStatus(core, attempt.account, attempt.sessionId, 0);
+        if (st.state === 'ended' || st.state === 'unknown') return; // it had ended already
+      } catch (_) {
+        // not known to be gone
+      }
+      onEndFailed?.(attempt.device);
+    })();
+    return attempt.ending;
+  }, [core, onEndFailed]);
 
   const connect = useCallback(async (device, { takeOver = false } = {}) => {
     const prior = active.current.get(device.id);
     if (prior) {
       if (!prior.cancelled) return;
-      await prior.done; // a cancelled attempt that is still cleaning up finishes first
-      if (active.current.has(device.id)) return;
+      await prior.done; // a cancelled attempt that is still cleaning up finishes first, session end included
+      if (active.current.has(device.id)) return; // another click got there first
     }
     let finish;
-    const mine = { cancelled: false, account, sessionId: null, ended: false, done: new Promise((r) => { finish = r; }) };
+    const mine = { device, cancelled: false, account, sessionId: null, ending: null, done: new Promise((r) => { finish = r; }) };
     active.current.set(device.id, mine);
     set(device.id, { phase: 'connecting', sessionId: null, message: null, asks: false, startedAt: Date.now() });
     try {
@@ -101,7 +116,8 @@ export function useConnections({ core, account, onLive, pollMs = POLL_MS }) {
     } catch (e) {
       if (!mine.cancelled) set(device.id, { phase: 'error', message: messageOf(e, null), code: e?.code ?? null });
     } finally {
-      if (active.current.get(device.id) === mine) active.current.delete(device.id);
+      await mine.ending; // still owned while a session end started by Cancel is on its way
+      active.current.delete(device.id);
       finish();
     }
   }, [core, account, onLive, pollMs, set, endAttempt]);

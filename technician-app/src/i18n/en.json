@@ -144,6 +144,7 @@
  "connect.button": "Connect",
  "connect.connecting": "Connecting",
  "connect.cancel": "Cancel",
+ "connect.cleanup_failed": "Could not cancel the request to {name}. The person at the PC may still be asked to click Allow.",
  "connect.cancel_request": "Cancel request",
  "connect.hint_any": "Connects right away.",
  "connect.hint_ask": "Someone at {name} is asked to click Allow.",

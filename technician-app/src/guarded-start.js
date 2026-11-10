@@ -1,6 +1,6 @@
 // How a task is started (App's startAgentTask): the open session tabs on the same PC or session
 // stop their screenshots first, and each holds exactly once and lets go exactly once. A guard is
-// what a tab registers: { account, deviceId(), sessionId(), ended(), liveSession(), hold(), release(), follow(taskId) }.
+// what a tab registers: { key, account, deviceId(), sessionId(), ended(), liveSession(), hold(), release(), follow(taskId) }.
 
 // The relay's refusals that mean the session we picked is not usable now (the app learns a
 // session's state only every few seconds, so it can be stale).
@@ -30,15 +30,19 @@ export async function guardedStart({ guards, body, send }) {
       if (first === body || !STALE_SESSION.has(e?.code)) throw e;
       started = await send(body);
     }
+    const followedBy = [];
     for (const g of guards) {
       holding.delete(g);
       try {
         g.follow(started.task_id);
+        followedBy.push(g.key);
       } catch (_) {
         // the tab could not follow it; the task is running all the same
       }
     }
-    return started;
+    // `followedBy`: the keys of the tabs that now follow the task, so the caller shows one of those
+    // and does not open another tab for a task that already has one.
+    return { ...started, followedBy };
   } catch (e) {
     for (const g of holding) g.release();
     throw e;
