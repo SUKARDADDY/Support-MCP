@@ -410,6 +410,25 @@ describe('a session with no PC (a one-off link)', () => {
     expect(JSON.stringify(fake.calls)).not.toContain('"device_id":null');
   });
 
+  test.each(['pending', 'consumed', 'waiting', 'attached'])('a link tab whose session is %s is still there after a restart', async (state) => {
+    localStorage.setItem('support.tabs', JSON.stringify([oneOff]));
+    const fake = fakeCore();
+    fake.state.sessions[SID] = { state, driver: ME, log: [], participants: [person(ME, 'driver', 'Tess Tech')] };
+    renderApp(fake);
+    expect(await screen.findByRole('tab', { name: /One-off PC/ })).toBeInTheDocument();
+    await sleep(100);
+    expect(screen.getByRole('tab', { name: /One-off PC/ })).toBeInTheDocument();
+    expect(JSON.parse(localStorage.getItem('support.tabs'))).toHaveLength(1);
+  });
+
+  test('a link tab whose session ended is dropped on a restart', async () => {
+    localStorage.setItem('support.tabs', JSON.stringify([oneOff]));
+    const fake = fakeCore();
+    fake.state.sessions[SID] = { state: 'ended', driver: ME, log: [] };
+    renderApp(fake);
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('support.tabs'))).toEqual([]));
+  });
+
   test('making a link opens a tab that waits for the person, then works like a saved PC\'s tab', async () => {
     const fake = fakeCore();
     fake.state.sessions['o'.repeat(64)] = { state: 'waiting', driver: ME, log: [] };

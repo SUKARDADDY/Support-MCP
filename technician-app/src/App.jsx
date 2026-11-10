@@ -293,7 +293,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
         try {
           if (tab.sessionId) {
             const st = await sessionStatus(core, tab.account, tab.sessionId, 0);
-            if (st.state === 'waiting' || st.state === 'attached') keep.push(tab);
+            if (['pending', 'consumed', 'waiting', 'attached'].includes(st.state)) keep.push(tab);
           } else if (tab.taskId) {
             // A task started on a PC has no session yet: keep its tab while the task works.
             const task = (await listTasks(core, tab.account)).find((x) => x.id === tab.taskId);
