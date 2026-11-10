@@ -29,7 +29,7 @@
 // stored as keyed hashes under AUTH_SECRET, and never appear in clear in a row
 // or a log line.
 import { MIN_SECRET_LENGTH, base32Encode, hmacHex, randomBytes, randomToken, sha256Hex, timingSafeEqual } from './crypto.js';
-import { TeamError, identityKind, normalizeIdentity, teamFromEnv } from './workspace.js';
+import { TeamError, normalizeIdentity, teamFromEnv } from './workspace.js';
 import { UNATTENDED_PERMISSION } from './permissions.js';
 import { compareVersions, validVersion } from './release.js';
 import { deviceHooks } from './device-sessions.js';
@@ -1102,7 +1102,10 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
   async function mayInvite(slug, targetIdentity, sid, watch) {
     const target = normalizeIdentity(targetIdentity);
     if (!LIVE_STATES.includes(watch.state)) throw new TeamError(404, 'not_found', 'no such live session');
-    if (identityKind(target) !== 'person' || !(await holds(slug, target, 'sessions.control'))) {
+    // A person is whom the team stored as a person, as people_list says it: the name's shape (an email) is not the test,
+    // since a member such as the local dev identity has none.
+    const member = await team.getMember(slug, target);
+    if (member?.kind !== 'person' || !(await holds(slug, target, 'sessions.control'))) {
       throw new TeamError(403, 'cannot_control', `${target} is not a member who can control sessions`);
     }
     if (watch.device_id) {

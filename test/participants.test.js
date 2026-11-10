@@ -128,6 +128,22 @@ test('only the driver invites or removes, the target must be a member who can co
   assert.deepEqual(rows((await w.tool(TECH2, 'session_participants', { session_id: sid, action: 'leave' })).participants), [`${TECH}:driver`]);
 });
 
+test('people_list and an invite agree for a member whose identity is not an email', async (t) => {
+  const w = await agentWorld(t);
+  const { sid } = await attached(w, TECH);
+  // The dev identity: an admin the team stored as a person, with no "@" in its name.
+  w.db.sqlite.prepare("INSERT INTO members(workspace, identity, kind, name, role_id, added_at, added_by) VALUES ('default', 'local-dev', 'person', NULL, 'admin', 1, ?)").run(BOSS);
+  w.db.sqlite.prepare("INSERT INTO members(workspace, identity, kind, name, role_id, added_at, added_by) VALUES ('default', 'a-service-client', 'service', NULL, 'admin', 1, ?)").run(BOSS);
+  const list = (await w.tool(TECH, 'people_list')).people;
+  assert.equal(list.find((p) => p.identity === 'local-dev')?.can_control, true);
+  assert.equal(list.find((p) => p.identity === 'a-service-client'), undefined);
+  const invite = (identity) => w.tool(TECH, 'session_participants', { session_id: sid, action: 'invite', identity });
+  assert.deepEqual(rows((await invite('local-dev')).participants), [`${TECH}:driver`, 'local-dev:invited']);
+  // Everyone people_list marks can_control is accepted; the service client, which it leaves out, is not.
+  for (const p of list.filter((x) => x.can_control && x.identity !== TECH)) assert.equal((await invite(p.identity)).error, undefined, p.identity);
+  assert.match((await invite('a-service-client')).error, /^cannot_control: /);
+});
+
 test('an invite never widens access: on a PC the owner was never asked about, the target needs "connect without asking" too', async (t) => {
   const w = await agentWorld(t);
   await addTech2(w);
