@@ -31,6 +31,8 @@ const WORKSPACE_TAG = 'ws:';
 // A PC that was away at least this long raises "came online" when its doorbell returns.
 export const ONLINE_AFTER_MS = 10 * 60 * 1000;
 export const DOORBELL_FRAME_MAX = 1024; // bytes; a larger frame closes the doorbell
+// The most PCs one ring call names.
+export const RING_LIST_MAX = 500;
 const RING = JSON.stringify({ type: 'ring' });
 
 export class Registry {
@@ -171,11 +173,23 @@ export class Registry {
     return [...ids].sort();
   }
 
-  // Ring one PC ({device_id}) or every PC ({all: true}). close: true closes the
-  // doorbell after the ring, for a PC that was just removed. Best effort.
-  ring({ device_id: id, all, close }) {
+  // Ring one PC ({device_id}), a list of PCs ({device_ids}, up to RING_LIST_MAX, each rung if its doorbell
+  // is connected, and at most `max` of them when given) or every PC ({all: true}). close: true closes the doorbell after the ring, for a PC that
+  // was just removed. Best effort. A list also answers `count`, how many doorbells were rung.
+  ring({ device_id: id, device_ids: ids, max, all, close }) {
     let rang = 0;
-    const sockets = all === true ? this.ctx.getWebSockets() : DEVICE_ID.test(String(id)) ? this.ctx.getWebSockets(DOORBELL_TAG + id) : [];
+    let sockets = [];
+    if (all === true) sockets = this.ctx.getWebSockets();
+    else if (Array.isArray(ids)) {
+      // In the order given, until `max` PCs (when given) have a doorbell to ring.
+      let pcs = 0;
+      for (const x of new Set(ids.slice(0, RING_LIST_MAX).filter((v) => DEVICE_ID.test(String(v))))) {
+        if (Number.isInteger(max) && pcs >= max) break;
+        const open = this.ctx.getWebSockets(DOORBELL_TAG + x);
+        if (open.length) pcs++;
+        sockets.push(...open);
+      }
+    } else if (DEVICE_ID.test(String(id))) sockets = this.ctx.getWebSockets(DOORBELL_TAG + id);
     for (const ws of sockets) {
       try {
         ws.send(RING);
@@ -183,7 +197,7 @@ export class Registry {
         if (close === true) ws.close(1000, 'removed');
       } catch (_) { /* a dead socket is simply not rung */ }
     }
-    return Response.json({ rang: rang > 0 });
+    return Response.json({ rang: rang > 0, ...(Array.isArray(ids) ? { count: rang } : {}) });
   }
 
   async webSocketMessage(ws, data) {

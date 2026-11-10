@@ -44,9 +44,9 @@ using Shapes = System.Windows.Shapes;
 // Fully qualified, so no System.Reflection using brings new type names into scope.
 [assembly: System.Reflection.AssemblyTitle("Support-MCP")]
 [assembly: System.Reflection.AssemblyProduct("Support-MCP")]
-[assembly: System.Reflection.AssemblyVersion("0.8.1.0")]
-[assembly: System.Reflection.AssemblyFileVersion("0.8.1.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("0.8.1")]
+[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.0.0")]
 
 namespace SupportMcp {
     public static class SupportAccess {
@@ -106,7 +106,7 @@ namespace SupportMcp {
     public static class Wire {
         public const string Footer = "SUPPORTMCPCFG1";
         // The release version, sent in the hello. The hello's "agent" field stays the protocol generation.
-        public const string Version = "0.8.1";
+        public const string Version = "1.0.0";
         public static Dictionary<string, object> Map(params object[] pairs) {
             var d = new Dictionary<string, object>();
             for (int i = 0; i < pairs.Length; i += 2) d[(string)pairs[i]] = pairs[i + 1];
@@ -526,6 +526,7 @@ namespace SupportMcp {
         [DllImport("user32.dll")] public static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr w, IntPtr l);
         [DllImport("user32.dll")] public static extern int GetMessage(out Msg m, IntPtr window, uint min, uint max);
         [DllImport("user32.dll")] public static extern bool PostThreadMessage(uint thread, uint message, IntPtr w, IntPtr l);
+        [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr window, uint message, IntPtr w, IntPtr l);
         [DllImport("user32.dll")] public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
         [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr desktop);
         [DllImport("user32.dll", SetLastError = true)] public static extern bool SetThreadDesktop(IntPtr desktop);
@@ -1201,7 +1202,7 @@ namespace SupportMcp {
             public Lane(string name) { Name = name; }
             public bool Busy { get { return ActiveId != ""; } }
         }
-        static string LaneOf(string type) { return type == "run" || type == "put_file" || type == "get_file" ? "cmd" : type == "screen" || type == "control" ? "screen" : null; }
+        static string LaneOf(string type) { return type == "run" || type == "put_file" || type == "get_file" || type == "power" || type == "programs" ? "cmd" : type == "screen" || type == "control" ? "screen" : null; }
         public long ServerOffsetMs { get { return Interlocked.Read(ref serverOffsetMs); } }
         // Ends a parked poll, so the next poll carries a fresh report (the full-control service uses it after a change).
         public void Nudge() { Wake(); }
@@ -1274,7 +1275,7 @@ namespace SupportMcp {
             } catch (IOException) { if (Woken(poll)) return null; throw; }
             finally { lock (gate) { if (request == req) { request = null; polling = false; } } }
         }
-        static string AbsolutePath(string path) {
+        internal static string AbsolutePath(string path) {
             // Only normal local absolute paths. Refuse relative, device, UNC,
             // and alternate-stream paths; do not turn a file op into a share login.
             if (!System.Text.RegularExpressions.Regex.IsMatch(path, @"^[A-Za-z]:[\\/]") || path.IndexOf(':', 2) >= 0)
@@ -1285,6 +1286,12 @@ namespace SupportMcp {
             try {
                 if (stop.WaitOne(0)) throw new OperationCanceledException();
                 string type = Wire.Text(frame, "type");
+                // A saved PC's rules come first: a frame they forbid is refused here, whoever sent it (see Rules.Check).
+                var ruled = Full as IRuled;
+                string refusal = Rules.Check(ruled, Full != null && Full.Limited, frame, stop);
+                if (refusal != null) return Wire.Map("ok", false, "error", refusal);
+                if (type == "power") return PowerAction.Start(frame, ServerOffsetMs);
+                if (type == "programs") return Programs.Run(frame, ruled, Full.Limited, work, stop);
                 if (type == "screen" || type == "control") {
                     if (Full != null) return Full.ScreenOp(frame, stop);
                     if (type == "control") { var request = RequestFull; return request == null ? Wire.Map("ok", false, "error", Screen.NoFull) : request(); }
@@ -1465,7 +1472,7 @@ namespace SupportMcp {
                         string laneName = LaneOf(type); Lane target = laneName == null ? null : lanes[laneName == "cmd" ? 0 : 1];
                         if (id == "" || target == null) throw new InvalidDataException("Invalid support operation.");
                         if (target.Busy || id == target.LastId) { stop.WaitOne(1000); continue; }
-                        Print(type == "run" ? "$ " + Wire.Text(frame, "command") : type == "screen" || type == "control" ? type : type + " " + Wire.Text(frame, "path"));
+                        Print(type == "run" ? "$ " + Wire.Text(frame, "command") : type == "screen" || type == "control" ? type : type == "power" || type == "programs" ? type + " " + Wire.Text(frame, "action") : type + " " + Wire.Text(frame, "path"));
                         target.ActiveId = id; target.Done.Reset(); Work(1);
                         var command = frame; var running = target;
                         target.Op = new Thread(delegate() { running.OpResult = Execute(command); running.Done.Set(); Wake(); });
@@ -1495,6 +1502,724 @@ namespace SupportMcp {
             }
         }
         public void Dispose() { Stop(); deadlineTimer.Dispose(); /* callbacks may still hold stop */ }
+    }
+
+    // ---- Enforced rules (PR 9) -----------------------------------------------------------------------------------------
+    // The team's rules for a saved PC, as the relay sends them in a check-in answer (src/rules.js is the relay's side, and
+    // test/fixtures/rules-cases.json is run against both). The PC enforces them itself: a frame the rules forbid is refused
+    // here even when it came straight from the relay. Nothing in this part shows anything to the customer. An action that
+    // needs approval was approved by a technician in the technician app, and its frame says by whom ("approved_by").
+
+    // The rules in force for one PC: the five action values and the two lists of the relay's effective document. The time
+    // zone and the hours text are the relay's business: it turns them into exact UTC spans (Hours).
+    public sealed class RulesDoc {
+        public long Rev;
+        // The same defaults as DEFAULT_RULES in src/rules.js, used before the first answer arrives.
+        public string Restart = "approve", Shutdown = "approve", Install = "approve", Uninstall = "approve", Close = "allow";
+        public List<string> Programs = new List<string>(), Folders = new List<string>();
+        // The value of one guarded action. An action this app does not know counts as never.
+        public string Of(string action) {
+            if (action == "restart") return Restart;
+            if (action == "shutdown") return Shutdown;
+            if (action == "install") return Install;
+            if (action == "uninstall") return Uninstall;
+            if (action == "close_program") return Close;
+            return "never";
+        }
+    }
+
+    // The business-hour spans of a check-in answer in Unix seconds, and the end of the horizon they cover. A fresh Hours
+    // (no spans, no horizon) judges every moment as business hours.
+    public sealed class Hours {
+        public readonly List<long> Starts = new List<long>(), Ends = new List<long>();
+        public long Until;
+        // Past the horizon every moment counts as business hours: the stricter side, as in src/rules.js.
+        public bool Inside(long nowS) {
+            if (nowS >= Until) return true;
+            for (int i = 0; i < Starts.Count; i++) if (nowS >= Starts[i] && nowS < Ends[i]) return true;
+            return false;
+        }
+    }
+
+    // What the rules say of one action: go ahead (Code is empty, Approve false), go ahead only with a technician's
+    // approval, or refuse with a code.
+    public sealed class Verdict {
+        public bool Approve; public string Code = "", Text = "";
+        public bool Refused { get { return Code.Length > 0; } }
+        // The refusal as the wire has it: "<code>: <text>".
+        public string Error { get { return Code + ": " + Text; } }
+    }
+
+    // What the PC knows of its rules: the last good document and its tag, the business-hour spans, and the relay's clock.
+    // Time is the relay's server_time plus the time that passed since the answer, on a Stopwatch, never the PC's wall
+    // clock. An answer that cannot be read keeps the last good rules and marks them stale (a guarded action is then
+    // refused with rules_stale until a good answer comes). device.json keeps the document and the tag, not the hours.
+    public sealed class RulesState {
+        public sealed class View {
+            public RulesDoc Doc; public string Tag = ""; public bool Stale, Timed; public long NowS; public Hours Hours;
+        }
+        readonly object gate = new object();
+        readonly Stopwatch clock = new Stopwatch();
+        RulesDoc doc = Rules.Defaults(); string tag = ""; Hours hours = new Hours();
+        bool stale, known, timed; long serverTime; int generation;
+        // Counts the good answers, so a caller that waited for another's check-in can tell that one came.
+        public int Generation { get { lock (gate) return generation; } }
+        // Takes the rules of an active check-in answer. persist: the document changed, so device.json needs a write.
+        public bool Apply(Dictionary<string, object> body, out bool persist) {
+            persist = false;
+            RulesDoc d; string t; Hours h; long server;
+            bool ok = Rules.ReadAnswer(body, out d, out t, out h, out server);
+            lock (gate) {
+                if (!ok) { stale = true; return false; }
+                persist = !known || t != tag;
+                doc = d; tag = t; hours = h; serverTime = server; stale = false; known = true; timed = true; generation++;
+                clock.Reset(); clock.Start();
+            }
+            return true;
+        }
+        public View Now() {
+            lock (gate) return new View { Doc = doc, Tag = tag, Stale = stale, Timed = timed, Hours = hours, NowS = timed ? serverTime + clock.ElapsedMilliseconds / 1000 : 0 };
+        }
+        // The document and tag of device.json. A damaged or missing one leaves the defaults.
+        public void Load(Dictionary<string, object> saved) {
+            object o; saved.TryGetValue("rules", out o);
+            RulesDoc d = Rules.Parse(o); string t = Wire.Text(saved, "rules_tag");
+            if (d == null || !Rules.ValidTag(t)) return;
+            lock (gate) { doc = d; tag = t; known = true; }
+        }
+        public void Write(Dictionary<string, object> into) {
+            lock (gate) { if (!known) return; into["rules"] = Rules.ToMap(doc); into["rules_tag"] = tag; }
+        }
+    }
+
+    // What a saved PC's session offers the rules: its own state, a check-in it can wait on, who it acts as (limited
+    // support) and the helper in the user's session. Client reaches it through Full; a one-off session has none.
+    public interface IRuled {
+        RulesState State { get; }
+        // Checks in with the relay now, outside the refresh limit, and waits at most waitMs. True when the answer had good rules.
+        bool CatchUp(int waitMs, WaitHandle stop);
+        // Limited support: the signed-in user and their session, the only ones close_program may touch. Null and 0xFFFFFFFF otherwise.
+        SecurityIdentifier User { get; }
+        uint UserSession { get; }
+        // Asks the helper in the user's session to send WM_CLOSE to the windows of these processes: {ok, windows}.
+        Dictionary<string, object> CloseWindows(List<int> pids, WaitHandle stop);
+    }
+
+    public static class Rules {
+        public const int ListMax = 50, ProgramMax = 100, FolderMax = 260, SpansMax = 64, CatchUpMs = 15000;
+        // How far a frame's decided_at may be from this PC's own reckoning before it is ignored, in seconds.
+        public const long DecidedSkewS = 60;
+        static readonly string[] Values = new string[] { "allow", "approve", "approve_in_hours", "outside_hours", "never" };
+
+        public static RulesDoc Defaults() { return new RulesDoc(); }
+        public static string Err(string code, string text) { return code + ": " + text; }
+        // The relay's own refusal texts (src/rules.js REFUSALS).
+        public static Verdict Refuse(string code) {
+            string text = "";
+            if (code == "rule_never") text = "the team's rules never allow this action on this PC";
+            else if (code == "business_hours") text = "the team's rules allow this action only outside business hours";
+            else if (code == "protected_program") text = "the team's rules protect this program";
+            else if (code == "protected_folder") text = "the team's rules protect this folder";
+            else if (code == "needs_full_control") text = "this action needs a PC set to full control";
+            return new Verdict { Code = code, Text = text };
+        }
+
+        // ---- reading the answer, strictly ----------------------------------------------------------------------------
+        static object Get(Dictionary<string, object> m, string key) { object v; return m != null && m.TryGetValue(key, out v) ? v : null; }
+        // A whole number the wire may carry (int, long, decimal or double), 0 to 1e13. Never a bool, a string or a fraction.
+        public static bool Num(object v, out long n) {
+            n = 0;
+            if (v is int) n = (int)v;
+            else if (v is long) n = (long)v;
+            else if (v is decimal || v is double) {
+                double x = Convert.ToDouble(v);
+                if (double.IsNaN(x) || double.IsInfinity(x) || x != Math.Floor(x) || x > 1e13) return false;
+                n = (long)x;
+            } else return false;
+            return n >= 0 && n <= 10000000000000L;
+        }
+        public static bool ValidTag(string t) {
+            if (t == null || t.Length == 0 || t.Length > 64) return false;
+            foreach (char c in t) if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) return false;
+            return true;
+        }
+        static bool HasControl(string s) { foreach (char c in s) if (char.IsControl(c)) return true; return false; }
+        // The value of an action field. The field must be there; a value of any kind that is not one of ours counts as never.
+        static bool ActionValue(Dictionary<string, object> m, string key, out string value) {
+            value = "never";
+            if (!m.ContainsKey(key)) return false;
+            string s = m[key] as string;
+            foreach (string known in Values) if (known == s) value = s;
+            return true;
+        }
+        static List<string> ReadList(Dictionary<string, object> m, string key, int max) {
+            var list = Get(m, key) as System.Collections.IList;
+            if (list == null || list.Count > ListMax) return null;
+            var result = new List<string>();
+            foreach (object item in list) {
+                string text = item as string;
+                if (text == null) return null;
+                text = text.Trim();
+                if (text.Length == 0 || text.Length > max || HasControl(text)) return null;
+                result.Add(text);
+            }
+            return result;
+        }
+        // The effective document of an answer ("rules"), or null when any field has the wrong type or size. Missing
+        // fields are not filled in: the relay always sends them all.
+        public static RulesDoc Parse(object o) {
+            var m = o as Dictionary<string, object>;
+            if (m == null) return null;
+            var d = new RulesDoc(); long rev; string s; object v;
+            if (!Num(Get(m, "rev"), out rev)) return null;
+            d.Rev = rev;
+            if (m.TryGetValue("time_zone", out v) && v != null && !(v is string && ((string)v).Length <= 100)) return null;
+            if (m.TryGetValue("hours", out v) && v != null && !(v is Dictionary<string, object>)) return null;
+            if (!ActionValue(m, "restart", out s)) return null; d.Restart = s;
+            if (!ActionValue(m, "shutdown", out s)) return null; d.Shutdown = s;
+            if (!ActionValue(m, "install", out s)) return null; d.Install = s;
+            if (!ActionValue(m, "uninstall", out s)) return null; d.Uninstall = s;
+            if (!ActionValue(m, "close_program", out s)) return null; d.Close = s;
+            var programs = ReadList(m, "protected_programs", ProgramMax); if (programs == null) return null; d.Programs = programs;
+            var folders = ReadList(m, "protected_folders", FolderMax); if (folders == null) return null; d.Folders = folders;
+            return d;
+        }
+        static Hours ReadHours(Dictionary<string, object> body) {
+            var h = new Hours(); long until;
+            if (!Num(Get(body, "hours_until"), out until)) return null;
+            h.Until = until;
+            var list = Get(body, "hours_utc") as System.Collections.IList;
+            if (list == null || list.Count > SpansMax) return null;
+            foreach (object item in list) {
+                var pair = item as System.Collections.IList; long a = 0, b = 0;
+                if (pair == null || pair.Count != 2 || !Num(pair[0], out a) || !Num(pair[1], out b) || b <= a) return null;
+                h.Starts.Add(a); h.Ends.Add(b);
+            }
+            return h;
+        }
+        // The rules, tag, hours and the relay's clock of a check-in answer. False when any of them is missing or malformed.
+        public static bool ReadAnswer(Dictionary<string, object> body, out RulesDoc doc, out string tag, out Hours hours, out long serverTime) {
+            doc = null; tag = ""; hours = null; serverTime = 0;
+            if (body == null) return false;
+            doc = Parse(Get(body, "rules"));
+            if (doc == null) return false;
+            string t = Get(body, "rules_tag") as string;
+            if (!ValidTag(t)) return false;
+            tag = t;
+            if (!Num(Get(body, "server_time"), out serverTime) || serverTime <= 0 || serverTime > 100000000000L) return false;
+            hours = ReadHours(body);
+            return hours != null;
+        }
+        // The document as device.json keeps it (the same fields Parse reads back).
+        public static Dictionary<string, object> ToMap(RulesDoc d) {
+            return Wire.Map("rev", d.Rev, "time_zone", null, "hours", null, "restart", d.Restart, "shutdown", d.Shutdown, "install", d.Install, "uninstall", d.Uninstall,
+                "close_program", d.Close, "protected_programs", new List<string>(d.Programs), "protected_folders", new List<string>(d.Folders));
+        }
+
+        // ---- names and paths (the same as src/rules.js) --------------------------------------------------------------
+        // A program name for comparison: trimmed, lower case, without a trailing .exe.
+        public static string ProgramKey(string name) {
+            string k = (name ?? "").Trim().ToLowerInvariant();
+            return k.EndsWith(".exe", StringComparison.Ordinal) ? k.Substring(0, k.Length - 4) : k;
+        }
+        // A path as lower-case components: / the same as \, repeated and trailing separators dropped, . and .. resolved
+        // (never above the drive), the \\?\ prefix dropped, and the trailing dots and spaces Windows drops dropped too.
+        public static List<string> PathParts(string path) {
+            var parts = new List<string>();
+            string p = path ?? "";
+            if (p.StartsWith(@"\\?\", StringComparison.Ordinal)) p = p.Substring(4);
+            foreach (string raw in p.Split(new char[] { '\\', '/' })) {
+                if (raw.Length == 0 || raw == ".") continue;
+                if (raw == "..") { if (parts.Count > 1) parts.RemoveAt(parts.Count - 1); continue; }
+                string name = raw.TrimEnd(new char[] { '.', ' ' }).ToLowerInvariant();
+                if (name.Length > 0) parts.Add(name);
+            }
+            return parts;
+        }
+        // The path is the folder or inside it, by whole components: C:\Database is not inside C:\Data.
+        public static bool PathInside(string folder, string path) {
+            var f = PathParts(folder); var p = PathParts(path);
+            if (f.Count == 0 || p.Count < f.Count) return false;
+            for (int i = 0; i < f.Count; i++) if (f[i] != p[i]) return false;
+            return true;
+        }
+
+        // ---- the decision (src/rules.js decide, in the same order) ---------------------------------------------------
+        // action: restart, shutdown, install, uninstall, close_program, put_file or get_file. control: "full" or "limited".
+        // program and path may be null. The order is fixed because both sides run the same cases: the rule's own never, full
+        // control, protected programs and folders, and last the value (allow, approve, or an hour rule).
+        public static Verdict Decide(RulesDoc r, string action, long nowS, Hours hours, string control, string program, string path) {
+            bool file = action == "put_file" || action == "get_file";
+            bool guarded = action == "restart" || action == "shutdown" || action == "install" || action == "uninstall" || action == "close_program";
+            if (!guarded && !file) return Refuse("rule_never");
+            string value = guarded ? r.Of(action) : "allow";
+            bool known = false; foreach (string v in Values) if (v == value) known = true;
+            if (!known || value == "never") return Refuse("rule_never");
+            if (guarded && action != "close_program" && control == "limited") return Refuse("needs_full_control");
+            if ((action == "close_program" || action == "uninstall") && program != null) {
+                string key = ProgramKey(program);
+                foreach (string p in r.Programs) if (ProgramKey(p) == key) return Refuse("protected_program");
+            }
+            if ((file || action == "install") && path != null) {
+                foreach (string f in r.Folders) if (PathInside(f, path)) return Refuse("protected_folder");
+            }
+            if (value == "allow") return new Verdict();
+            if (value == "approve") return new Verdict { Approve = true };
+            bool inside = (hours ?? new Hours()).Inside(nowS);
+            if (value == "approve_in_hours") return inside ? new Verdict { Approve = true } : new Verdict();
+            return inside ? Refuse("business_hours") : new Verdict(); // outside_hours
+        }
+        static bool HourValue(string value) { return value == "approve_in_hours" || value == "outside_hours"; }
+        // The frame's decided_at in Unix seconds (a value in milliseconds is read as such), 0 when it has none.
+        static long DecidedAt(Dictionary<string, object> frame) {
+            long n; if (!Num(Get(frame, "decided_at"), out n)) return 0;
+            return n > 100000000000L ? n / 1000 : n;
+        }
+        // The moment hour rules are judged at: the relay's decided_at when it is within a minute of this PC's own
+        // reckoning (so a slow frame is judged as the relay decided), else this PC's own time.
+        static long JudgeTime(Dictionary<string, object> frame, RulesState.View view) {
+            long decided = DecidedAt(frame);
+            return decided > 0 && view.Timed && Math.Abs(decided - view.NowS) <= DecidedSkewS ? decided : view.NowS;
+        }
+
+        // The one check at the top of Client.Execute for a saved PC's session. Returns null to go ahead, else the refusal
+        // as the result's error. A frame whose rules_tag differs from the stored one first gets a check-in it waits on (at
+        // most CatchUpMs), and is decided with the new rules or refused rules_stale. An action that needs approval must
+        // carry approved_by. Raw run commands get the screen only (RunScreen). A one-off session (ruled null) refuses the
+        // frames that exist for saved PCs only.
+        public static string Check(IRuled ruled, bool limited, Dictionary<string, object> frame, WaitHandle stop) {
+            string type = Wire.Text(frame, "type");
+            if (ruled == null) return type == "power" || type == "programs" ? Err("not_saved_pc", "this works only in a session on a saved PC") : null;
+            if (type == "run") {
+                // The screen reads the protected lists, so a run that carries a newer tag first gets a try at the new ones.
+                // It goes ahead with the last good ones when there is no answer: the screen is a guardrail, not a boundary.
+                RulesState.View current = ruled.State.Now(); string seen = Wire.Text(frame, "rules_tag");
+                if (seen.Length > 0 && seen != current.Tag) { ruled.CatchUp(CatchUpMs, stop); current = ruled.State.Now(); }
+                return RunScreen.Check(Wire.Text(frame, "command"), current.Doc);
+            }
+            string action, program = null, path = null, sub = Wire.Text(frame, "action");
+            if (type == "put_file" || type == "get_file") {
+                action = type;
+                try { path = Client.AbsolutePath(Wire.Text(frame, "path")); } catch (Exception) { return null; } // the file code answers a bad path itself
+            } else if (type == "power") {
+                if (sub != "restart" && sub != "shutdown") return "power needs action restart or shutdown";
+                action = sub;
+            } else if (type == "programs") {
+                if (sub == "list") return null;
+                if (sub == "install") {
+                    action = "install";
+                    try { path = Client.AbsolutePath(Wire.Text(frame, "path")); } catch (Exception) { return "install needs the absolute path of an installer that is on this PC"; }
+                } else if (sub == "uninstall") {
+                    action = "uninstall";
+                    var found = Programs.Find(Wire.Text(frame, "program_id"));
+                    if (found == null) return Err("not_found", "no installed program has that id; take it from list_programs");
+                    program = found.Name;
+                } else if (sub == "close") {
+                    action = "close_program";
+                    if (Wire.Text(frame, "name").Trim().Length == 0 && Wire.Number(frame, "pid") <= 0) return "close needs a name or a pid";
+                    program = Programs.TargetName(frame);
+                    if (program == null) return Err("not_found", "no running program has that name or pid");
+                } else return "unknown programs action";
+            } else return null;
+
+            bool guarded = type != "put_file" && type != "get_file";
+            RulesState.View view = ruled.State.Now();
+            string tag = Wire.Text(frame, "rules_tag");
+            long at = JudgeTime(frame, view);
+            bool behind = tag.Length > 0 && tag != view.Tag;
+            if (behind || (guarded && view.Stale) || (guarded && HourValue(view.Doc.Of(action)) && at >= view.Hours.Until)) {
+                ruled.CatchUp(CatchUpMs, stop);
+                view = ruled.State.Now(); at = JudgeTime(frame, view);
+                if (behind && tag != view.Tag) return Err("rules_stale", "this PC could not get the team's current rules in time; try again");
+            }
+            if (guarded && view.Stale) return Err("rules_stale", "this PC could not read the team's rules from its last check-in; try again in a minute");
+            Verdict v = Decide(view.Doc, action, at, view.Hours, limited ? "limited" : "full", program, path);
+            if (v.Refused) return v.Error;
+            // The relay's cases compare the path as written. This PC also expands short names and follows links first.
+            if (path != null && PathCheck.Inside(view.Doc.Folders, path)) return Refuse("protected_folder").Error;
+            if (v.Approve && Wire.Clean(Wire.Text(frame, "approved_by"), 320).Length == 0)
+                return Err("approval_unavailable", "this action needs a technician's approval in the technician app, and the request carries none");
+            return null;
+        }
+    }
+
+    // The raw run command's screen for a saved PC. A guardrail, not a boundary: a command runs as a script file, so a
+    // determined one gets round any text check. It refuses the obvious: a verb of a guarded action whose rule is not allow
+    // (use_tool, pointing at the tool), and any mention of a protected program or folder. Simple tokens, any case.
+    public static class RunScreen {
+        public static string Check(string command, RulesDoc r) {
+            string c = (command ?? "").ToLowerInvariant();
+            foreach (string p in r.Programs) if (Mentions(c, Rules.ProgramKey(p), false)) return Rules.Refuse("protected_program").Error;
+            string flat = Flat(c);
+            foreach (string f in r.Folders) if (Mentions(flat, Flat(f.ToLowerInvariant()).TrimEnd(new char[] { '\\' }), true)) return Rules.Refuse("protected_folder").Error;
+            foreach (var statement in Statements(c)) {
+                for (int i = 0; i < statement.Count; i++) {
+                    string action = VerbAction(Verb(statement[i]), statement, i + 1);
+                    if (action != null && r.Of(action) != "allow") return UseTool(action);
+                }
+            }
+            return null;
+        }
+        static string UseTool(string action) {
+            string what = "", tool = "";
+            if (action == "restart") { what = "restarts the PC"; tool = "restart_pc"; }
+            else if (action == "shutdown") { what = "shuts the PC down"; tool = "shutdown_pc"; }
+            else if (action == "install") { what = "installs a program"; tool = "install_program"; }
+            else if (action == "uninstall") { what = "uninstalls a program"; tool = "uninstall_program"; }
+            else { what = "closes a program"; tool = "close_program"; }
+            return Rules.Err("use_tool", "this command " + what + ", which the team's rules govern. Use the " + tool + " tool, not a raw command");
+        }
+        // / the same as \, repeated backslashes as one.
+        static string Flat(string s) {
+            var b = new StringBuilder();
+            foreach (char ch in s.Replace('/', '\\')) if (!(ch == '\\' && b.Length > 0 && b[b.Length - 1] == '\\')) b.Append(ch);
+            return b.ToString();
+        }
+        static bool WordChar(char ch) { return char.IsLetterOrDigit(ch) || ch == '_'; }
+        static bool NameChar(char ch) { return WordChar(ch) || ch == '-' || ch == '.' || ch == '~'; }
+        // needle (lower case) appears in hay on its own: not inside a longer word, or, for a folder, a longer name.
+        static bool Mentions(string hay, string needle, bool folder) {
+            if (needle.Length == 0) return false;
+            int from = 0;
+            while (from <= hay.Length - needle.Length) {
+                int at = hay.IndexOf(needle, from, StringComparison.Ordinal);
+                if (at < 0) return false;
+                int end = at + needle.Length;
+                bool before = at == 0 || !WordChar(hay[at - 1]);
+                bool after = end >= hay.Length || !(folder ? NameChar(hay[end]) : WordChar(hay[end]));
+                if (before && after) return true;
+                from = at + 1;
+            }
+            return false;
+        }
+        // The command split into statements at ; & | and line ends, each into tokens at spaces, quotes and brackets.
+        static List<List<string>> Statements(string c) {
+            var all = new List<List<string>>(); var cur = new List<string>(); var tok = new StringBuilder();
+            foreach (char ch in c + "\n") {
+                bool end = ch == ';' || ch == '&' || ch == '|' || ch == '\n' || ch == '\r';
+                bool gap = ch == ' ' || ch == '\t' || ch == '"' || ch == '\'' || ch == '`' || ch == '(' || ch == ')' || ch == ',' || ch == '{' || ch == '}';
+                if (!end && !gap) { tok.Append(ch); continue; }
+                if (tok.Length > 0) { cur.Add(tok.ToString()); tok.Length = 0; }
+                if (end && cur.Count > 0) { all.Add(cur); cur = new List<string>(); }
+            }
+            return all;
+        }
+        // A token as a command name: the part after the last backslash, without .exe.
+        static string Verb(string token) {
+            string t = token.Substring(token.LastIndexOf('\\') + 1);
+            return t.EndsWith(".exe", StringComparison.Ordinal) ? t.Substring(0, t.Length - 4) : t;
+        }
+        // The guarded action a verb stands for, from its own token and the rest of its statement, or null.
+        static string VerbAction(string verb, List<string> statement, int from) {
+            if (verb == "restart-computer") return "restart";
+            if (verb == "stop-computer") return "shutdown";
+            if (verb == "taskkill" || verb == "stop-process" || verb == "kill" || verb == "spps") return "close_program";
+            if (verb == "shutdown") {
+                for (int j = from; j < statement.Count; j++) {
+                    string f = statement[j];
+                    if (f.Length != 2 || (f[0] != '/' && f[0] != '-')) continue;
+                    if (f[1] == 'r' || f[1] == 'g') return "restart";
+                    if (f[1] == 's' || f[1] == 'p') return "shutdown";
+                }
+                return null;
+            }
+            if (verb == "wusa") {
+                for (int j = from; j < statement.Count; j++) if (statement[j] == "/uninstall" || statement[j] == "-uninstall") return "uninstall";
+                return "install";
+            }
+            if (verb == "msiexec") {
+                for (int j = from; j < statement.Count; j++) {
+                    string f = statement[j];
+                    if (f.Length < 2 || (f[0] != '/' && f[0] != '-')) continue;
+                    if (f[1] == 'i' || f.Substring(1).StartsWith("package", StringComparison.Ordinal)) return "install";
+                    if (f[1] == 'x' || f.Substring(1).StartsWith("uninstall", StringComparison.Ordinal)) return "uninstall";
+                }
+            }
+            return null;
+        }
+    }
+
+    // File paths against the protected folders. The relay compares whole components of the path as written; this PC
+    // first expands short names (PROGRA~1) and follows links and junctions on the deepest folder that exists, and
+    // refuses when the path, as written or resolved, is inside a folder, as written or resolved.
+    public static class PathCheck {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern int GetLongPathName(string path, StringBuilder longPath, int size);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr security, uint create, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern int GetFinalPathNameByHandle(IntPtr file, StringBuilder path, int size, uint flags);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+        public static bool Inside(IList<string> folders, string path) {
+            if (folders.Count == 0) return false;
+            string real = Resolve(path);
+            foreach (string f in folders) {
+                string realFolder = Resolve(f);
+                if (Rules.PathInside(f, path) || Rules.PathInside(f, real) || Rules.PathInside(realFolder, path) || Rules.PathInside(realFolder, real)) return true;
+            }
+            return false;
+        }
+        // The path with its deepest existing folder in long form and with links resolved; the part below it, which does
+        // not exist yet, stays as written.
+        public static string Resolve(string path) {
+            string full;
+            try { full = Path.GetFullPath(path); } catch (Exception) { return path; }
+            string rest = "", dir = full;
+            while (!String.IsNullOrEmpty(dir) && !Directory.Exists(dir)) {
+                string name = Path.GetFileName(dir);
+                rest = rest.Length == 0 ? name : name + "\\" + rest;
+                dir = Path.GetDirectoryName(dir);
+            }
+            if (String.IsNullOrEmpty(dir)) return full;
+            string real = Real(dir);
+            return rest.Length == 0 ? real : real.TrimEnd(new char[] { '\\' }) + "\\" + rest;
+        }
+        static string Real(string dir) {
+            string longName = dir;
+            var sb = new StringBuilder(1024);
+            int n = GetLongPathName(dir, sb, sb.Capacity);
+            if (n > 0 && n < sb.Capacity) longName = sb.ToString();
+            IntPtr h = CreateFile(longName, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero); // query only, backup semantics (a folder)
+            if (h == new IntPtr(-1)) return longName;
+            try {
+                var b = new StringBuilder(1024);
+                int m = GetFinalPathNameByHandle(h, b, b.Capacity, 0);
+                return m > 0 && m < b.Capacity ? b.ToString() : longName;
+            } finally { CloseHandle(h); }
+        }
+    }
+
+    // restart_pc and shutdown_pc. The answer goes out first; this PC then waits delay_s (5 to 600, 30 when none is given)
+    // on its own and calls InitiateSystemShutdownEx with a timeout of 0 and no message, so nothing shows on the screen.
+    // A second power action while one waits is refused as busy, so a retry cannot schedule two.
+    public static class PowerAction {
+        public const int DefaultDelayS = 30, MaxDelayS = 600;
+        internal static int MinDelayS = 5;
+        // The tests replace this: it restarts or shuts down, and returns an error text or null.
+        internal static Func<bool, string> Perform = Live;
+        static int pending, generation;
+        [StructLayout(LayoutKind.Sequential, Pack = 1)] struct TokenPrivileges { public uint Count; public long Luid; public uint Attributes; }
+        [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool LookupPrivilegeValue(string system, string name, out long luid);
+        [DllImport("advapi32.dll", SetLastError = true)] static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TokenPrivileges state, int length, IntPtr previous, IntPtr returned);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool InitiateSystemShutdownEx(string machine, string message, uint timeout, bool force, bool reboot, uint reason);
+        [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+        public static Dictionary<string, object> Start(Dictionary<string, object> frame, long serverOffsetMs) {
+            bool reboot = Wire.Text(frame, "action") == "restart";
+            object given; long asked = frame.TryGetValue("delay_s", out given) && given != null ? Wire.Number(frame, "delay_s") : DefaultDelayS;
+            long delay = Math.Max(MinDelayS, Math.Min(MaxDelayS, asked));
+            if (Interlocked.CompareExchange(ref pending, 1, 0) != 0) return Wire.Map("ok", false, "error", "busy: a restart or shutdown is already waiting on this PC; do not repeat it");
+            int mine = Interlocked.Increment(ref generation);
+            long at = (Client.UnixNow() + serverOffsetMs) / 1000 + delay;
+            var t = new Thread(delegate() {
+                Thread.Sleep((int)(delay * 1000));
+                if (Thread.VolatileRead(ref generation) != mine) return;
+                string error;
+                try { error = Perform(reboot); } catch (Exception e) { error = e.Message; }
+                if (error != null) Interlocked.Exchange(ref pending, 0); // it did not go: a new request may try again
+            });
+            t.IsBackground = true; t.Start();
+            return Wire.Map("ok", true, "at", at);
+        }
+        // Forgets a waiting action and lets a pending one not happen (the tests).
+        internal static void Cancel() { Interlocked.Increment(ref generation); Interlocked.Exchange(ref pending, 0); }
+        // SeShutdownPrivilege is held but not enabled in a service's token. Forced: an app with unsaved work must not
+        // hold up an unattended restart (and show a screen).
+        static string Live(bool reboot) {
+            IntPtr token;
+            if (!OpenProcessToken(GetCurrentProcess(), 0x28, out token)) return new Win32Exception(Marshal.GetLastWin32Error()).Message;
+            try {
+                long luid;
+                if (!LookupPrivilegeValue(null, "SeShutdownPrivilege", out luid)) return new Win32Exception(Marshal.GetLastWin32Error()).Message;
+                var tp = new TokenPrivileges { Count = 1, Luid = luid, Attributes = 2 };
+                AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+                if (!InitiateSystemShutdownEx(null, null, 0, true, reboot, 0x80000000)) return new Win32Exception(Marshal.GetLastWin32Error()).Message;
+                return null;
+            } finally { CloseHandle(token); }
+        }
+    }
+
+    // list_programs, install_program, uninstall_program and close_program on a saved PC.
+    public static class Programs {
+        public sealed class Installed { public string Id = "", Name = "", Version = "", Publisher = "", Key = "", Quiet = "", Uninstall = ""; public bool Msi; }
+        const string UninstallKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr process, int information, out int value, int size, out int returned);
+        // Names no one closes from here, whatever the rules say: the parts of Windows a user session cannot lose.
+        static readonly string[] Critical = new string[] { "system", "idle", "registry", "smss", "csrss", "wininit", "winlogon", "services", "lsass", "lsm", "svchost", "dwm", "fontdrvhost", "memory compression" };
+
+        // ---- installed programs: HKLM Uninstall, in both registry views ----------------------------------------------
+        static Microsoft.Win32.RegistryKey Root(string view) {
+            var hklm = Microsoft.Win32.RegistryKey.OpenBaseKey(Microsoft.Win32.RegistryHive.LocalMachine, view == "32" ? Microsoft.Win32.RegistryView.Registry32 : Microsoft.Win32.RegistryView.Registry64);
+            try { return hklm.OpenSubKey(UninstallKey); } finally { hklm.Dispose(); }
+        }
+        static Installed Read(Microsoft.Win32.RegistryKey root, string view, string sub) {
+            using (var k = root.OpenSubKey(sub)) {
+                if (k == null) return null;
+                string name = Wire.Clean(k.GetValue("DisplayName") as string, 200);
+                if (name.Length == 0) return null;
+                object system = k.GetValue("SystemComponent"); // a hidden component, or an update of another program
+                if ((system is int && (int)system == 1) || !String.IsNullOrEmpty(k.GetValue("ParentKeyName") as string)) return null;
+                var p = new Installed { Id = view + ":" + sub, Name = name, Key = sub, Version = Wire.Clean(k.GetValue("DisplayVersion") as string, 60), Publisher = Wire.Clean(k.GetValue("Publisher") as string, 100) };
+                p.Quiet = ((k.GetValue("QuietUninstallString") as string) ?? "").Trim();
+                p.Uninstall = ((k.GetValue("UninstallString") as string) ?? "").Trim();
+                object msi = k.GetValue("WindowsInstaller");
+                p.Msi = (msi is int && (int)msi == 1) || p.Uninstall.ToLowerInvariant().Contains("msiexec");
+                return p;
+            }
+        }
+        public static List<Installed> AllInstalled() {
+            var list = new List<Installed>(); var seen = new Dictionary<string, bool>();
+            foreach (string view in new string[] { "64", "32" }) {
+                using (var root = Root(view)) {
+                    if (root == null) continue;
+                    foreach (string sub in root.GetSubKeyNames()) {
+                        Installed p; try { p = Read(root, view, sub); } catch (Exception) { p = null; }
+                        if (p == null || seen.ContainsKey(sub + "|" + p.Name)) continue; // a 32-bit Windows shows one view twice
+                        seen[sub + "|" + p.Name] = true; list.Add(p);
+                    }
+                }
+            }
+            list.Sort(delegate(Installed a, Installed b) { return String.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase); });
+            return list;
+        }
+        // The program a list_programs id names ("64:<key name>" or "32:<key name>"), or null.
+        public static Installed Find(string id) {
+            if (id == null || id.Length < 4 || id[2] != ':' || (!id.StartsWith("64:", StringComparison.Ordinal) && !id.StartsWith("32:", StringComparison.Ordinal))) return null;
+            string sub = id.Substring(3);
+            if (sub.Length == 0 || sub.IndexOf('\\') >= 0 || sub.IndexOf('/') >= 0) return null;
+            try { using (var root = Root(id.Substring(0, 2))) return root == null ? null : Read(root, id.Substring(0, 2), sub); } catch (Exception) { return null; }
+        }
+
+        // ---- running programs ----------------------------------------------------------------------------------------
+        static bool Gone(Process p) { try { return p.HasExited; } catch (Exception) { return false; } }
+        // The program name the rules judge a close by: the name asked for without a folder, else the name of the pid's process.
+        public static string TargetName(Dictionary<string, object> frame) {
+            string name = Wire.Text(frame, "name").Trim();
+            if (name.Length > 0) return name.Substring(name.LastIndexOfAny(new char[] { '\\', '/' }) + 1);
+            long pid = Wire.Number(frame, "pid");
+            if (pid <= 0 || pid > int.MaxValue) return null;
+            try { using (var p = Process.GetProcessById((int)pid)) return p.ProcessName + ".exe"; } catch (Exception) { return null; }
+        }
+        static List<Process> Targets(Dictionary<string, object> frame) {
+            var list = new List<Process>();
+            long pid = Wire.Number(frame, "pid");
+            if (Wire.Text(frame, "name").Trim().Length == 0 && pid > 0 && pid <= int.MaxValue) { try { list.Add(Process.GetProcessById((int)pid)); } catch (Exception) { } return list; }
+            string name = Rules.ProgramKey(TargetName(frame) ?? "");
+            if (name.Length > 0) list.AddRange(Process.GetProcessesByName(name));
+            return list;
+        }
+        // Why a process is never closed from here, or null: it runs in session 0 or it is a critical Windows process.
+        static string Untouchable(Process p) {
+            int session;
+            try { session = p.SessionId; } catch (Exception) { return "cannot be inspected"; }
+            if (p.Id == 0 || p.Id == 4 || p.Id == Process.GetCurrentProcess().Id || session == 0) return "runs as part of Windows, outside any user session";
+            string n = p.ProcessName.ToLowerInvariant();
+            foreach (string c in Critical) if (n == c) return "is a critical Windows process";
+            try { int breakOnTermination, returned; if (NtQueryInformationProcess(p.Handle, 29, out breakOnTermination, 4, out returned) == 0 && breakOnTermination != 0) return "is a critical Windows process"; } catch (Exception) { }
+            return null;
+        }
+        static bool OwnedBy(Process p, SecurityIdentifier sid) {
+            IntPtr token = IntPtr.Zero;
+            try {
+                if (sid == null || !Win.OpenProcessToken(p.Handle, 8, out token)) return false;
+                using (var identity = new WindowsIdentity(token)) return sid.Equals(identity.User);
+            } catch (Exception) { return false; } finally { if (token != IntPtr.Zero) Win.CloseHandle(token); }
+        }
+        static int Exited(List<Process> list) { int n = 0; foreach (Process p in list) if (Gone(p)) n++; return n; }
+        static void WaitExit(List<Process> list, int ms, WaitHandle stop) {
+            var clock = Stopwatch.StartNew();
+            while (clock.ElapsedMilliseconds < ms && Exited(list) < list.Count && !stop.WaitOne(100)) { }
+        }
+        // close: ask the program's windows to close through the helper in the user's session (WM_CLOSE) and, with force,
+        // end what is left. Never a process of session 0 or a critical one. Limited support: only the signed-in user's own.
+        public static Dictionary<string, object> Close(Dictionary<string, object> frame, IRuled ruled, bool limited, WaitHandle stop) {
+            bool force = Wire.Flag(frame, "force");
+            var found = Targets(frame); var eligible = new List<Process>(); string blocked = null;
+            try {
+                foreach (Process p in found) {
+                    string why = Untouchable(p);
+                    if (why != null) { blocked = p.ProcessName + " " + why; continue; }
+                    if (limited && !(p.SessionId == (int)ruled.UserSession && OwnedBy(p, ruled.User))) continue;
+                    eligible.Add(p);
+                }
+                if (eligible.Count == 0) {
+                    if (blocked != null) return Wire.Map("ok", false, "error", Rules.Err("protected_program", blocked + "; it is never closed from here"));
+                    return Wire.Map("ok", false, "error", Rules.Err("not_found", limited ? "no running program of the signed-in user has that name or pid" : "no running program has that name or pid"));
+                }
+                var pids = new List<int>(); foreach (Process p in eligible) pids.Add(p.Id);
+                var sent = ruled.CloseWindows(pids, stop);
+                if (!Wire.Flag(sent, "ok") && !force) return Wire.Map("ok", false, "error", "the program could not be asked to close: " + Wire.Text(sent, "error"));
+                if (Wire.Flag(sent, "ok") && Wire.Number(sent, "windows") > 0) WaitExit(eligible, 5000, stop);
+                if (force) {
+                    foreach (Process p in eligible) if (!Gone(p)) { try { p.Kill(); } catch (Exception) { } }
+                    WaitExit(eligible, 3000, stop);
+                }
+                int closed = Exited(eligible), remaining = eligible.Count - closed;
+                var result = Wire.Map("ok", true, "closed", closed);
+                if (remaining > 0) result["still_running"] = remaining;
+                return result;
+            } finally { foreach (Process p in found) p.Dispose(); }
+        }
+
+        // ---- the frame ---------------------------------------------------------------------------------------------
+        public static Dictionary<string, object> Run(Dictionary<string, object> frame, IRuled ruled, bool limited, string work, WaitHandle stop) {
+            string action = Wire.Text(frame, "action");
+            if (action == "list") return ListFrame();
+            if (action == "close") return Close(frame, ruled, limited, stop);
+            if (action != "install" && action != "uninstall") return Wire.Map("ok", false, "error", "unknown programs action");
+            // The rules refuse these under limited support already. Installers run as SYSTEM, so this is not left to them alone.
+            if (limited) return Wire.Map("ok", false, "error", Rules.Refuse("needs_full_control").Error);
+            long t = Wire.Number(frame, "timeout_s"); if (t == 0) t = 300;
+            int timeoutS = (int)Math.Max(10, Math.Min(600, t));
+            if (action == "install") {
+                string path = Client.AbsolutePath(Wire.Text(frame, "path"));
+                if (!File.Exists(path)) return Wire.Map("ok", false, "error", Rules.Err("not_found", "there is no installer at " + path));
+                string args = Wire.Clean(Wire.Text(frame, "args"), 1000);
+                bool msi = path.EndsWith(".msi", StringComparison.OrdinalIgnoreCase);
+                if (!msi) return RunInstaller(path, args, timeoutS, work, stop);
+                return RunInstaller(Path.Combine(Environment.SystemDirectory, "msiexec.exe"), "/i \"" + path + "\" /qn /norestart" + (args.Length > 0 ? " " + args : ""), timeoutS, work, stop);
+            }
+            Installed p = Find(Wire.Text(frame, "program_id"));
+            if (p == null) return Wire.Map("ok", false, "error", Rules.Err("not_found", "no installed program has that id; take it from list_programs"));
+            string guid = MsiCode(p);
+            if (guid != null) return RunInstaller(Path.Combine(Environment.SystemDirectory, "msiexec.exe"), "/x " + guid + " /qn /norestart", timeoutS, work, stop);
+            if (p.Quiet.Length > 0) return RunInstaller(Path.Combine(Environment.SystemDirectory, "cmd.exe"), "/c \"" + p.Quiet + "\"", timeoutS, work, stop);
+            return Wire.Map("ok", false, "error", "this program has no silent uninstall command, so it cannot be removed from here");
+        }
+        // The product code of a Windows Installer program: its key name, or the {code} in its uninstall string.
+        static string MsiCode(Installed p) {
+            Guid g;
+            if (p.Msi && Guid.TryParse(p.Key, out g)) return p.Key;
+            int open = p.Uninstall.IndexOf('{'), close = p.Uninstall.IndexOf('}');
+            if (p.Msi && open >= 0 && close > open) { string code = p.Uninstall.Substring(open, close - open + 1); if (Guid.TryParse(code, out g)) return code; }
+            return null;
+        }
+        static Dictionary<string, object> ListFrame() {
+            var installed = new System.Collections.ArrayList();
+            foreach (Installed p in AllInstalled()) { if (installed.Count >= 600) break; installed.Add(Wire.Map("id", p.Id, "name", p.Name, "version", p.Version, "publisher", p.Publisher)); }
+            var running = new List<Dictionary<string, object>>();
+            foreach (Process p in Process.GetProcesses()) {
+                try { if (p.Id != 0) running.Add(Wire.Map("name", p.ProcessName + ".exe", "pid", p.Id, "session", p.SessionId)); } catch (Exception) { } finally { p.Dispose(); }
+            }
+            running.Sort(delegate(Dictionary<string, object> a, Dictionary<string, object> b) { return String.Compare(Wire.Text(a, "name"), Wire.Text(b, "name"), StringComparison.OrdinalIgnoreCase); });
+            if (running.Count > 400) running.RemoveRange(400, running.Count - 400);
+            return Wire.Map("ok", true, "installed", installed, "running", running);
+        }
+        // Runs exe with args as SYSTEM, from a PowerShell script in the work folder, in the same kill-on-close Job as a
+        // command, and answers with its exit code (3010, a restart is needed, is not a failure of this call).
+        static Dictionary<string, object> RunInstaller(string exe, string args, int timeoutS, string work, WaitHandle stop) {
+            string script = "$ProgressPreference = 'SilentlyContinue'\r\n$p = Start-Process -FilePath '" + exe.Replace("'", "''") + "'"
+                + (args.Length > 0 ? " -ArgumentList '" + args.Replace("'", "''") + "'" : "") + " -PassThru -Wait\r\nexit $p.ExitCode\r\n";
+            string file = Path.Combine(work, "program-" + Guid.NewGuid().ToString("N") + ".ps1");
+            try {
+                File.WriteAllText(file, script, new UTF8Encoding(true));
+                Dictionary<string, object> r;
+                using (var job = new CommandJob()) r = job.Run(file, Environment.SystemDirectory, timeoutS, stop);
+                if (Wire.Flag(r, "timed_out")) return Wire.Map("ok", false, "error", "it did not finish in " + timeoutS + " seconds and was stopped");
+                var result = Wire.Map("ok", true, "exit_code", r["exit_code"]);
+                string detail = Wire.Clean(Encoding.UTF8.GetString(Convert.FromBase64String(Wire.Text(r, "stderr_b64"))), 300);
+                if (detail.Length > 0) result["detail"] = detail;
+                return result;
+            } finally { try { File.Delete(file); } catch (Exception) { } }
+        }
     }
 
     public static class RestartResume {
@@ -2922,7 +3647,21 @@ namespace SupportMcp {
             pipe.WaitForConnection(); uint pid;
             if (!Native.GetNamedPipeClientProcessId(pipe.SafePipeHandle, out pid) || pid != service) Environment.Exit(1);
         }
+        // close_program: WM_CLOSE to the visible top-level windows of these processes on this session's desktop. The service
+        // does the waiting and, when asked to force, the ending.
+        static Dictionary<string, object> CloseWindows(Dictionary<string, object> frame) {
+            var wanted = new List<uint>(); object list;
+            if (frame.TryGetValue("pids", out list) && list is System.Collections.ArrayList) foreach (object o in (System.Collections.ArrayList)list) if (o is int && (int)o > 0) wanted.Add((uint)(int)o);
+            int sent = 0;
+            if (wanted.Count > 0) Win.EnumDesktopWindows(Win.GetThreadDesktop(Win.GetCurrentThreadId()), delegate(IntPtr w, IntPtr data) {
+                uint owner; Win.GetWindowThreadProcessId(w, out owner);
+                if (wanted.Contains(owner) && Win.IsWindowVisible(w) && Win.PostMessage(w, 0x10, IntPtr.Zero, IntPtr.Zero)) sent++;
+                return true;
+            }, IntPtr.Zero);
+            return Wire.Map("ok", true, "windows", sent);
+        }
         static Dictionary<string, object> Dispatch(Dictionary<string, object> frame, Screen screen, Blocker blocker, WaitHandle stop) {
+            if (Wire.Text(frame, "type") == "close") return CloseWindows(frame);
             var pids = new List<int>(); object list;
             if (frame.TryGetValue("own_pids", out list) && list is System.Collections.ArrayList) foreach (object o in (System.Collections.ArrayList)list) if (o is int) pids.Add((int)o);
             Screen.OwnPids = pids.ToArray();
@@ -3104,6 +3843,8 @@ namespace SupportMcp {
         }
         public static IntPtr QueryUser(uint s) { IntPtr token; return s != 0xFFFFFFFF && Native.WTSQueryUserToken(s, out token) ? token : IntPtr.Zero; }
         public uint Session() { return pinned ? session : Native.WTSGetActiveConsoleSessionId(); }
+        // Limited support: the user this session belongs to (null otherwise).
+        public SecurityIdentifier User { get { return user; } }
         // The signed-in user's token in s, or IntPtr.Zero. Limited: only while it is still the user the session started for.
         public IntPtr UserIn(uint s) {
             IntPtr token = s == 0xFFFFFFFF ? IntPtr.Zero : queryUser(s);
@@ -4881,6 +5622,9 @@ namespace SupportMcp {
         Doorbell bell;
         // The session of the last check-in answer, and the run that handles it (null: none). Under the gate.
         Session current; bool pointer;
+        // The team's rules for this PC (RulesState), and the lock that lets one catch-up check-in run at a time.
+        readonly RulesState rules = new RulesState();
+        readonly object catchGate = new object();
         // The corner windows' pipe, made at the first session: "SupportMcp-<cornerId>-ui", so --window <cornerId> finds it.
         UiServer cornerUi; string cornerId = "";
         // The tests replace these: where a session runs, the signed-in user's token, and the question.
@@ -4953,6 +5697,7 @@ namespace SupportMcp {
                 string stored = Wire.Text(m, "state");
                 terminal = stored == DeviceState.Removed || stored == DeviceState.Expired;
                 state = terminal ? stored : status;
+                rules.Load(m);
                 if (key.Length == 0 || origin.Length == 0) return false;
             } catch (Exception) { return false; }
             LoadHistory();
@@ -5075,8 +5820,13 @@ namespace SupportMcp {
                     state = newState; backoff = NextBackoff(backoff);
                 }
             }
-            // Sessions: an active PC's answer only (a pending PC never gets one).
-            if (result == DeviceLink.DeviceResult.Ok && bodyStatus == DeviceState.Active) Sessions(ReadSession(a.Body));
+            // The rules and the sessions: an active PC's answer only (a pending PC never gets either). The rules come first, so
+            // a session that starts on this answer is judged by them.
+            if (result == DeviceLink.DeviceResult.Ok && bodyStatus == DeviceState.Active) {
+                bool persist; rules.Apply(a.Body, out persist);
+                if (persist) lock (gate) Save();
+                Sessions(ReadSession(a.Body));
+            }
             if (trial) FinishTrial(result, a.Status);
             else if ((result == DeviceLink.DeviceResult.Ok || result == DeviceLink.DeviceResult.UpdateNeeded) && !HoldUpdates()) MaybeUpdate(a.Body);
         }
@@ -5245,6 +5995,27 @@ namespace SupportMcp {
             lock (gate) { long now = PauseClock.Now(); if (!RefreshDue(lastRefresh, now)) return; lastRefresh = now; }
             wake.Set();
         }
+        // A frame carries rules this PC has not seen, or its hours ran out: check in now, outside the 30-second refresh
+        // limit, and wait for the answer for at most waitMs. It reads only the rules of the answer. One at a time: a caller
+        // that waited for another's check-in uses its answer. True when an answer with good rules arrived.
+        bool RulesCatchUp(int waitMs, WaitHandle stopped) {
+            int seen = rules.Generation; var clock = Stopwatch.StartNew();
+            if (!Monitor.TryEnter(catchGate, waitMs)) return false;
+            try {
+                if (rules.Generation != seen) return true;
+                var l = link; if (l == null) return false;
+                DeviceLink.Answer answer = null; var done = new ManualResetEvent(false); // not disposed: the request may still end after the wait did
+                ThreadPool.QueueUserWorkItem(delegate { try { answer = l.Hello(key, Report()); } catch (Exception) { } finally { done.Set(); } });
+                if (WaitHandle.WaitAny(new WaitHandle[] { done, stopped, stop }, (int)Math.Max(0, waitMs - clock.ElapsedMilliseconds)) != 0) return false;
+                var got = answer;
+                if (got == null || got.Result != DeviceLink.DeviceResult.Ok) return false;
+                var dev = ReadDev(got.Body);
+                if (dev == null || Wire.Text(dev, "status") != DeviceState.Active) return false;
+                bool persist; bool ok = rules.Apply(got.Body, out persist);
+                if (persist) lock (gate) Save();
+                return ok;
+            } finally { Monitor.Exit(catchGate); }
+        }
 
         // history.json beside device.json, newest last, the last HistoryCap kept. The caller holds the gate.
         void AddLine(string text) { history.Add(Wire.Map("at", Client.UnixNow(), "text", text)); Trim(); SaveHistory(); }
@@ -5256,6 +6027,7 @@ namespace SupportMcp {
             if (terminal) m["state"] = state; // removed or expired, so a reboot serves it without checking in
             if (uninstallPart.Length > 0) m["uninstall_event"] = uninstallPart;
             if (accepted.Length > 0) m["accepted_session"] = accepted;
+            rules.Write(m);
             WriteAtomic(Path.Combine(folder, "device.json"), Wire.Json().Serialize(m));
         }
         // A line added to history.json by another process (a rollback), while this service is stopped.
@@ -5441,7 +6213,7 @@ namespace SupportMcp {
         // through a Client on POST /agent?sid=<id> with the device key as a Bearer header. Full control works as SYSTEM
         // on the console session (the sign-in screen too) or the one Remote Desktop session; limited support pins the
         // session and its signed-in user, and every screen operation, command and file is that user's (ScreenHost).
-        sealed class Session : IFullControl {
+        sealed class Session : IFullControl, IRuled {
             public readonly SessionPointer P; readonly DeviceService svc; readonly bool rejoin; readonly string forceDecline;
             readonly ManualResetEvent stopped = new ManualResetEvent(false);
             public volatile bool Hosting, Finished, DeclineSent; public volatile string DeclineReason;
@@ -5530,6 +6302,16 @@ namespace SupportMcp {
             public IntPtr UserToken(out string profile) { return host.UserToken(out profile); }
             public void Report(Dictionary<string, object> poll, long serverOffsetMs) { host.Report(poll, serverOffsetMs); }
             public void Welcomed(long expiresAtMs) { }
+            // IRuled: the PC's rules and what close_program needs of the session.
+            public RulesState State { get { return svc.rules; } }
+            public bool CatchUp(int waitMs, WaitHandle stop) { return svc.RulesCatchUp(waitMs, stop); }
+            public SecurityIdentifier User { get { var h = host; return h == null ? null : h.User; } }
+            public uint UserSession { get { var h = host; return h == null ? 0xFFFFFFFF : h.Session(); } }
+            public Dictionary<string, object> CloseWindows(List<int> pids, WaitHandle stop) {
+                var h = host;
+                if (h == null) return Wire.Map("ok", false, "error", "the session has no screen helper");
+                return h.Helper.Op(Wire.Map("type", "close", "pids", pids));
+            }
         }
 
         // ---- test surface: the native tests drive the real CheckIn, Handle and persistence ----
@@ -5548,6 +6330,8 @@ namespace SupportMcp {
         internal void TestStopSession() { Session c; lock (gate) { c = current; current = null; pointer = false; } if (c != null) { c.Stop(null, true); c.Join(15000); } }
         internal Dictionary<string, object> TestStatus() { return Snapshot(); }
         internal bool TestTerminal { get { return terminal; } }
+        internal RulesState TestRules { get { return rules; } }
+        internal bool TestCatchUp(int waitMs) { return RulesCatchUp(waitMs, new ManualResetEvent(false)); }
         // Updates: the key releases are checked against and what starts a process (null: start nothing), then the start
         // as Run does it, the staged file, and letting it go.
         internal void TestUpdates(string key, Func<string, string, Process> runner) { releaseKey = key; run = runner; }
@@ -6122,6 +6906,8 @@ namespace SupportMcp {
         public const string Uninstall = "Uninstall Support…";
         public const string AdminsCanChange = "Your support team's admins can change this.";
         public const string EndSession = "End session";
+        public const string CheckNow = "Check now";
+        public const string Checking = "Checking…";
         public static readonly string UninstallMissing = DeviceSetup.UninstallText;
         public static string Mode(string access) { return access == "any" ? "Support can connect any time." : "Support asks you before each connection. " + AdminsCanChange; }
         // While a session is live: who is connected (the status frame's session.by).
@@ -6141,11 +6927,16 @@ namespace SupportMcp {
         // live: a session is connected now, so "end_session" shows too.
         public static List<string> Actions(string state, string access, bool live) {
             var list = new List<string>();
+            if (CanCheck(state)) list.Add("check_now");
             if (state == DeviceState.Active && access == "ask") list.Add("allow_any_time");
             if (live) list.Add("end_session");
             list.Add("uninstall");
             return list;
         }
+        // "Check now" asks the service for a check-in (the pipe's "refresh"). It helps a PC that is active, waiting for
+        // approval or cannot reach the team; a removed, unapproved or out-of-date one has nothing to check.
+        public static bool CanCheck(string state) { return state == DeviceState.Active || state == DeviceState.Pending || state == DeviceState.Offline; }
+        public static string CheckLabel(bool checking) { return checking ? Checking : CheckNow; }
         public static bool ShowTeamOnly(string state, string access) { return access == "any" && ShowMode(state); }
         // A removed or unapproved PC has no access left, so it shows no mode line.
         public static bool ShowMode(string state) { return state != DeviceState.Removed && state != DeviceState.Expired; }
@@ -6201,8 +6992,9 @@ namespace SupportMcp {
         readonly Palette p;
         readonly TextBlock nameLine, modeLine, teamOnly, stateLine, noOne, note, versionLine;
         readonly StackPanel historyBox, confirmBox;
-        readonly FlatButton allow, confirmYes, confirmNo, uninstall, endSession;
+        readonly FlatButton allow, confirmYes, confirmNo, uninstall, endSession, checkNow;
         public event Action AllowConfirmed;
+        public event Action CheckNowClicked;
         public event Action UninstallClicked;
         public event Action EndSessionClicked;
 
@@ -6235,6 +7027,8 @@ namespace SupportMcp {
             confirmBox.Children.Add(confirmButtons);
             body.Children.Add(confirmBox);
             stateLine = Line(13, p.Ink, 10); body.Children.Add(stateLine);
+            checkNow = new FlatButton(TrayText.CheckNow, p.Muted, Brushes.Transparent, p.Surface2, p.Work, 28, 0, 8, 6, 12.5, true); checkNow.Margin = new Thickness(-8, 4, 0, 0); checkNow.HorizontalAlignment = HorizontalAlignment.Left;
+            body.Children.Add(checkNow);
             noOne = Line(12.5, p.Muted, 4); noOne.Text = TrayText.NoOne; body.Children.Add(noOne);
             endSession = new FlatButton(TrayText.EndSession, p.Stop, p.StopBg, p.StopBgHover, p.Work, 30, 0, 12, 6, 12.5, true); endSession.Margin = new Thickness(0, 8, 0, 0); endSession.HorizontalAlignment = HorizontalAlignment.Left;
             endSession.Visibility = Visibility.Collapsed; body.Children.Add(endSession);
@@ -6249,6 +7043,7 @@ namespace SupportMcp {
             confirmNo.Click += delegate { confirmBox.Visibility = Visibility.Collapsed; allow.Visibility = Visibility.Visible; };
             confirmYes.Click += delegate { confirmBox.Visibility = Visibility.Collapsed; var a = AllowConfirmed; if (a != null) a(); };
             uninstall.Click += delegate { var u = UninstallClicked; if (u != null) u(); };
+            checkNow.Click += delegate { var c = CheckNowClicked; if (c != null) c(); };
             endSession.Click += delegate { var e = EndSessionClicked; if (e != null) e(); };
             Deactivated += delegate { Hide(); };
             PreviewKeyDown += delegate(object sender, KeyEventArgs e) { if (e.Key == Key.Escape) { e.Handled = true; Hide(); } };
@@ -6264,7 +7059,7 @@ namespace SupportMcp {
                 nameLine.Text = "Support"; modeLine.Text = ""; stateLine.Text = TrayText.NotRunning;
                 teamOnly.Visibility = Visibility.Collapsed; allow.Visibility = Visibility.Collapsed; confirmBox.Visibility = Visibility.Collapsed;
                 noOne.Visibility = Visibility.Collapsed; historyBox.Children.Clear(); versionLine.Visibility = Visibility.Collapsed;
-                endSession.Visibility = Visibility.Collapsed;
+                endSession.Visibility = Visibility.Collapsed; checkNow.Visibility = Visibility.Collapsed;
                 return;
             }
             // An older service sends no version, and then the line stays hidden.
@@ -6276,6 +7071,7 @@ namespace SupportMcp {
             modeLine.Visibility = TrayText.ShowMode(state) ? Visibility.Visible : Visibility.Collapsed;
             stateLine.Text = TrayText.State(state, Wire.Text(status, "confirm"));
             teamOnly.Visibility = TrayText.ShowTeamOnly(state, access) ? Visibility.Visible : Visibility.Collapsed;
+            checkNow.Visibility = TrayText.Actions(state, access).Contains("check_now") ? Visibility.Visible : Visibility.Collapsed;
             bool canAllow = TrayText.Actions(state, access).Contains("allow_any_time");
             if (!canAllow) { allow.Visibility = Visibility.Collapsed; confirmBox.Visibility = Visibility.Collapsed; }
             else if (confirmBox.Visibility != Visibility.Visible) allow.Visibility = Visibility.Visible;
@@ -6291,6 +7087,8 @@ namespace SupportMcp {
                 var t = Ui.Label(line, 11.5, FontWeights.Normal, p.Muted, Ui.TextFont); t.Margin = new Thickness(0, 2, 0, 0); historyBox.Children.Add(t);
             }
         }
+        // While a check is under way the button reads "Checking…" and does nothing.
+        public void Checking(bool on) { checkNow.Content = TrayText.CheckLabel(on); checkNow.IsEnabled = !on; }
         public void Note(string text) { note.Text = text ?? ""; note.Visibility = string.IsNullOrEmpty(text) ? Visibility.Collapsed : Visibility.Visible; }
         // Bottom right of the work area, by the clock.
         public void Place() {
@@ -6380,6 +7178,22 @@ namespace SupportMcp {
                     ThreadPool.QueueUserWorkItem(delegate {
                         var st = Ask("end_session");
                         panel.Dispatcher.BeginInvoke(new Action(delegate { if (st == null) panel.Note(TrayText.NotRunning); else panel.Render(st); }));
+                    });
+                };
+                // Check now: the service is asked to check in (the pipe's "refresh"), the button reads "Checking…", and the
+                // status is read again each second until a check-in newer than the click shows, for at most 8 seconds.
+                panel.CheckNowClicked += delegate {
+                    panel.Checking(true);
+                    ThreadPool.QueueUserWorkItem(delegate {
+                        var st = Ask("refresh");
+                        long was = st == null ? 0 : Wire.Number(st, "last_ok_at");
+                        for (int i = 0; i < 8 && st != null; i++) {
+                            Thread.Sleep(1000);
+                            st = Ask("status");
+                            if (st != null && Wire.Number(st, "last_ok_at") > was) break;
+                        }
+                        var shown = st;
+                        panel.Dispatcher.BeginInvoke(new Action(delegate { panel.Checking(false); if (shown == null) panel.Note(TrayText.NotRunning); else panel.Render(shown); }));
                     });
                 };
                 panel.UninstallClicked += delegate {

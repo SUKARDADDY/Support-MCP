@@ -14,6 +14,11 @@
 // offers (src/release.js). The relay only passes the signature on; the PC checks
 // it. Working out the offer reads nothing more from the database.
 //
+// An active PC's hello answer also carries the team's rules for it (src/rules.js): "rules" (the effective
+// document), "rules_tag" (a hash of it, for the PC to compare), "hours_utc" (the business-hour spans of the
+// next 8 days as Unix seconds), "hours_until" (the end of that horizon) and "server_time". They come from
+// the row the check-in already loads. A waiting PC gets none.
+//
 // A hello's answer may also carry "session": the one live session a technician
 // started for this PC, which it should pick up. It comes from the row the check-in
 // already loads, so it costs no query, and a waiting PC never gets it. It is left
@@ -59,12 +64,17 @@ const ROUTES = Object.freeze({
     return [202, await devs.requestJoin(body)];
   },
   async hello(devs, body, request, { env, appBundle }) {
-    const { device, app_version, session } = await devs.checkInFull(keyOf(request), body);
+    const { device, app_version, session, rules } = await devs.checkInFull(keyOf(request), body);
     const release = await releaseFrom(appBundle, env);
     const offered = release && await offerAtCheckIn(release, { ...device, app_version }, env?.UPDATE_ROLLOUT);
     // While the relay is stopped by its operator a PC is told of no session (it would only be ended on arrival).
     const stopped = String(env?.EMERGENCY_STOP ?? '') !== '';
-    return [200, { device, ...(offered ? { update: updateField(release) } : {}), ...(session && !stopped ? { session } : {}) }];
+    return [200, {
+      device,
+      ...(rules ? { rules: rules.doc, rules_tag: rules.tag, hours_utc: rules.hours_utc, hours_until: rules.hours_until, server_time: rules.server_time } : {}),
+      ...(offered ? { update: updateField(release) } : {}),
+      ...(session && !stopped ? { session } : {}),
+    }];
   },
   async update(devs, body, request) {
     return [200, { device: await devs.updateOwn(keyOf(request), body) }];

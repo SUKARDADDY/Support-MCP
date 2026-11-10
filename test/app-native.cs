@@ -2988,6 +2988,582 @@ public static class AppTests {
         Console.WriteLine("PASS sessions on a saved PC: declines, the question, Allow and rejoin, limited support as the user, the driver, End session, a session gone, full control at the sign-in screen, and updates held");
     }
 
+    // ---- Enforced rules (PR 9) ----------------------------------------------------------------------------------------
+    // A saved PC's session without a service: its rules, a check-in the test controls (OnCatchUp), and who it acts as.
+    sealed class FakeRuled : IFullControl, IRuled {
+        public bool IsLimited; public readonly RulesState Own = new RulesState();
+        public Func<bool> OnCatchUp; public int CatchUps; public readonly List<int> ClosedPids = new List<int>();
+        public SecurityIdentifier Who; public uint SessionId = 0xFFFFFFFF;
+        public bool Limited { get { return IsLimited; } }
+        public string UserName { get { return "tester"; } }
+        public Dictionary<string, object> ScreenOp(Dictionary<string, object> frame, WaitHandle stop) { return Wire.Map("ok", true); }
+        public IntPtr UserToken(out string profile) { profile = ""; throw new NotSupportedException(); }
+        public void Report(Dictionary<string, object> poll, long serverOffsetMs) { poll["desktop"] = "default"; }
+        public void Welcomed(long expiresAtMs) { }
+        public RulesState State { get { return Own; } }
+        public bool CatchUp(int waitMs, WaitHandle stop) { CatchUps++; return OnCatchUp != null && OnCatchUp(); }
+        public SecurityIdentifier User { get { return Who; } }
+        public uint UserSession { get { return SessionId; } }
+        public Dictionary<string, object> CloseWindows(List<int> pids, WaitHandle stop) { lock (ClosedPids) ClosedPids.AddRange(pids); return Wire.Map("ok", true, "windows", 0); }
+    }
+    static readonly string[] NoNames = new string[0];
+    // The relay's effective document, as a check-in answer carries it.
+    static Dictionary<string, object> RulesMap(string restart, string shutdown, string install, string uninstall, string close, string[] programs, string[] folders) {
+        return Wire.Map("rev", 1, "time_zone", "Asia/Jerusalem", "hours", null, "restart", restart, "shutdown", shutdown, "install", install, "uninstall", uninstall,
+            "close_program", close, "protected_programs", new System.Collections.ArrayList(programs), "protected_folders", new System.Collections.ArrayList(folders));
+    }
+    // A check-in answer with rules: spans are start, end pairs in Unix seconds.
+    static Dictionary<string, object> RulesAnswer(string tag, Dictionary<string, object> rules, long server, long until, params long[] spans) {
+        var list = new System.Collections.ArrayList();
+        for (int i = 0; i + 1 < spans.Length; i += 2) { var pair = new System.Collections.ArrayList(); pair.Add(spans[i]); pair.Add(spans[i + 1]); list.Add(pair); }
+        return Wire.Map("device", Wire.Map("id", "d", "workspace", "default", "status", "active", "name", "PC", "access", "any", "control", "limited", "site_id", null),
+            "rules", rules, "rules_tag", tag, "hours_utc", list, "hours_until", until, "server_time", server);
+    }
+    static void Give(FakeRuled f, string tag, Dictionary<string, object> rules, long server, long until, params long[] spans) {
+        bool persist; Assert(f.Own.Apply(RulesAnswer(tag, rules, server, until, spans), out persist), "a good answer is taken");
+    }
+    static string HelloRules(string tag, Dictionary<string, object> rules, Dictionary<string, object> session) {
+        var m = Wire.Json().Deserialize<Dictionary<string, object>>(HelloWith("any", "limited", session, null));
+        long now = Client.UnixNow() / 1000;
+        m["rules"] = rules; m["rules_tag"] = tag; m["hours_utc"] = new System.Collections.ArrayList(); m["hours_until"] = now + 691200; m["server_time"] = now;
+        return Wire.Json().Serialize(m);
+    }
+    static string Refusal(Dictionary<string, object> result) { return Wire.Flag(result, "ok") ? "" : Wire.Text(result, "error"); }
+
+    // The shared cases of src/rules.js, run against this app's own copy of decide. The file sits beside the test exe
+    // (scripts/test-app-native.ps1 copies it) or under test\fixtures when run from the repository.
+    static string FindFixture() {
+        string beside = Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location), "rules-cases.json");
+        if (File.Exists(beside)) return beside;
+        for (string d = Directory.GetCurrentDirectory(); !String.IsNullOrEmpty(d); d = Path.GetDirectoryName(d)) {
+            string f = Path.Combine(d, "test", "fixtures", "rules-cases.json");
+            if (File.Exists(f)) return f;
+        }
+        throw new Exception("rules-cases.json is not beside the test exe or under test\\fixtures");
+    }
+    static void RulesVectorTests() {
+        var all = Wire.Json().Deserialize<Dictionary<string, object>>(File.ReadAllText(FindFixture(), Encoding.UTF8));
+        int ran = 0, skipped = 0;
+        foreach (object o in (System.Collections.ArrayList)all["decide"]) {
+            var c = (Dictionary<string, object>)o; string name = Wire.Text(c, "name");
+            if (Wire.Text(c, "scope") == "relay") { skipped++; continue; } // the relay compares plain strings; this PC resolves paths first
+            var doc = Rules.Parse(c["rules"]); Assert(doc != null, "the case's rules read: " + name);
+            var hours = new Hours { Until = Wire.Number(c, "hours_until") };
+            foreach (object span in (System.Collections.ArrayList)c["hours_utc"]) { var pair = (System.Collections.ArrayList)span; hours.Starts.Add(Convert.ToInt64(pair[0])); hours.Ends.Add(Convert.ToInt64(pair[1])); }
+            var args = (Dictionary<string, object>)c["args"];
+            string control = args.ContainsKey("control") ? Wire.Text(args, "control") : null, program = args.ContainsKey("program") ? Wire.Text(args, "program") : null, path = args.ContainsKey("path") ? Wire.Text(args, "path") : null;
+            var verdict = Rules.Decide(doc, Wire.Text(c, "action"), Wire.Number(c, "now"), hours, control, program, path);
+            var expect = (Dictionary<string, object>)c["expect"]; string outcome = Wire.Text(expect, "outcome");
+            string got = verdict.Refused ? "refuse" : verdict.Approve ? "approve" : "allow";
+            Assert(got == outcome && (outcome != "refuse" || verdict.Code == Wire.Text(expect, "code")), "case '" + name + "' wants " + outcome + " " + Wire.Text(expect, "code") + ", got " + got + " " + verdict.Code);
+            ran++;
+        }
+        Assert(ran >= 60, "the shared file holds the cases: " + ran);
+        Console.WriteLine("PASS rules vectors: " + ran + " shared cases decided as the relay does (" + skipped + " relay-only skipped)");
+    }
+
+    // The answer is read strictly, the last good rules survive a bad one, time runs from the relay's clock, and device.json
+    // keeps the document and the tag but not the hours.
+    static void RulesAnswerTests() {
+        long now = 1794304800;
+        Func<Dictionary<string, object>> rulesGood = delegate { return RulesMap("approve", "allow", "never", "approve_in_hours", "outside_hours", new string[] { "Outlook.exe", "Notepad" }, new string[] { @"C:\Data" }); };
+        RulesDoc doc; string tag; Hours hours; long server;
+        var body = RulesAnswer("0123abcd", rulesGood(), now, now + 691200, now - 100, now + 100, now + 200, now + 300);
+        Assert(Rules.ReadAnswer(body, out doc, out tag, out hours, out server), "a good answer reads");
+        Assert(doc.Rev == 1 && doc.Restart == "approve" && doc.Shutdown == "allow" && doc.Install == "never" && doc.Uninstall == "approve_in_hours" && doc.Close == "outside_hours"
+            && doc.Programs.Count == 2 && doc.Programs[0] == "Outlook.exe" && doc.Folders.Count == 1 && doc.Folders[0] == @"C:\Data" && tag == "0123abcd" && server == now && hours.Until == now + 691200 && hours.Starts.Count == 2, "the fields come through");
+        Assert(hours.Inside(now) && !hours.Inside(now + 150) && hours.Inside(now + 200) && !hours.Inside(now + 300) && hours.Inside(now + 691200) && hours.Inside(now + 691201), "inside a span, outside between, and every moment from hours_until on counts as inside");
+        Assert(new Hours().Inside(0) && new Hours().Inside(now), "no horizon at all judges every moment as inside");
+
+        Func<Action<Dictionary<string, object>>, bool> reads = delegate(Action<Dictionary<string, object>> change) {
+            var b = RulesAnswer("0123abcd", rulesGood(), now, now + 691200, now, now + 100);
+            change(b); RulesDoc d2; string t2; Hours h2; long s2;
+            return Rules.ReadAnswer(b, out d2, out t2, out h2, out s2);
+        };
+        Func<Dictionary<string, object>, Dictionary<string, object>> rulesOf = delegate(Dictionary<string, object> b) { return (Dictionary<string, object>)b["rules"]; };
+        Func<int, int, System.Collections.ArrayList> names = delegate(int count, int length) { var l = new System.Collections.ArrayList(); for (int i = 0; i < count; i++) l.Add(new string((char)('a' + i % 26), length)); return l; };
+        Assert(reads(delegate(Dictionary<string, object> b) { }), "unchanged reads");
+        Assert(!reads(b => b.Remove("rules")) && !reads(b => b["rules"] = "text") && !reads(b => b["rules"] = null), "no rules, or rules that are not an object");
+        Assert(!reads(b => rulesOf(b).Remove("restart")) && !reads(b => rulesOf(b).Remove("close_program")) && !reads(b => rulesOf(b).Remove("protected_folders")), "a missing field");
+        Assert(!reads(b => rulesOf(b)["rev"] = -1) && !reads(b => rulesOf(b)["rev"] = "1") && !reads(b => rulesOf(b).Remove("rev")), "rev is a number");
+        Assert(!reads(b => rulesOf(b)["time_zone"] = 5) && !reads(b => rulesOf(b)["hours"] = "9-5"), "time_zone and hours have their types");
+        Assert(!reads(b => rulesOf(b)["protected_programs"] = "Outlook") && !reads(b => rulesOf(b)["protected_programs"] = names(51, 5)) && reads(b => rulesOf(b)["protected_programs"] = names(50, 5)), "a list holds at most 50 entries");
+        Assert(!reads(b => rulesOf(b)["protected_programs"] = names(1, 101)) && reads(b => rulesOf(b)["protected_programs"] = names(1, 100)), "a program name is at most 100 characters");
+        Assert(!reads(b => rulesOf(b)["protected_folders"] = names(1, 261)) && reads(b => rulesOf(b)["protected_folders"] = names(1, 260)), "a folder is at most 260 characters");
+        Assert(!reads(b => rulesOf(b)["protected_programs"] = new System.Collections.ArrayList(new object[] { 5 })) && !reads(b => rulesOf(b)["protected_programs"] = new System.Collections.ArrayList(new object[] { "a\u0001b" }))
+            && !reads(b => rulesOf(b)["protected_programs"] = new System.Collections.ArrayList(new object[] { "  " })), "an entry is text, without control characters, and not empty");
+        Assert(!reads(b => b.Remove("rules_tag")) && !reads(b => b["rules_tag"] = "bad tag!") && !reads(b => b["rules_tag"] = new string('a', 65)) && !reads(b => b["rules_tag"] = 5) && reads(b => b["rules_tag"] = new string('a', 64)), "the tag is 1 to 64 letters or digits");
+        Assert(!reads(b => b.Remove("server_time")) && !reads(b => b["server_time"] = 0) && !reads(b => b["server_time"] = "now") && !reads(b => b["server_time"] = 100000000001L) && !reads(b => b["server_time"] = true) && !reads(b => b["server_time"] = now + 0.5), "server_time is a whole number of seconds");
+        Assert(reads(b => b["server_time"] = (double)now) && reads(b => b["server_time"] = (decimal)now) && reads(b => b["server_time"] = (long)now), "a whole number may arrive as an int, a long, a decimal or a double");
+        Assert(!reads(b => b.Remove("hours_until")) && !reads(b => b.Remove("hours_utc")) && !reads(b => b["hours_utc"] = "x"), "the hours horizon and the spans are required");
+        Assert(!reads(b => ((System.Collections.ArrayList)b["hours_utc"]).Add(new System.Collections.ArrayList(new object[] { 1, 2, 3 }))) && !reads(b => ((System.Collections.ArrayList)b["hours_utc"]).Add(new System.Collections.ArrayList(new object[] { now + 5, now + 4 })))
+            && !reads(b => ((System.Collections.ArrayList)b["hours_utc"]).Add(new System.Collections.ArrayList(new object[] { "a", "b" }))), "a span is two numbers, the end after the start");
+        Assert(!reads(b => { var l = (System.Collections.ArrayList)b["hours_utc"]; l.Clear(); for (int i = 0; i < 65; i++) l.Add(new System.Collections.ArrayList(new object[] { (long)i * 10, (long)i * 10 + 5 })); })
+            && reads(b => { var l = (System.Collections.ArrayList)b["hours_utc"]; l.Clear(); for (int i = 0; i < 64; i++) l.Add(new System.Collections.ArrayList(new object[] { (long)i * 10, (long)i * 10 + 5 })); }), "at most 64 spans");
+        foreach (object odd in new object[] { "banana", null, 7, true }) {
+            RulesDoc d3; string t3; Hours h3; long s3; var b = RulesAnswer("0123abcd", rulesGood(), now, now + 100); rulesOf(b)["restart"] = odd;
+            Assert(Rules.ReadAnswer(b, out d3, out t3, out h3, out s3) && d3.Restart == "never" && d3.Shutdown == "allow", "an action value this app does not know counts as never: " + odd);
+        }
+
+        // Before any answer: the defaults of src/rules.js, no clock, no tag.
+        var state = new RulesState(); var v0 = state.Now();
+        Assert(v0.Doc.Restart == "approve" && v0.Doc.Shutdown == "approve" && v0.Doc.Install == "approve" && v0.Doc.Uninstall == "approve" && v0.Doc.Close == "allow" && v0.Doc.Programs.Count == 0 && v0.Doc.Folders.Count == 0
+            && v0.Tag == "" && !v0.Stale && !v0.Timed && v0.NowS == 0 && v0.Hours.Until == 0, "before the first answer: the defaults, no tag, no clock");
+        // A good answer, then a bad one that keeps the last good rules and marks them stale, then a good one again.
+        bool persist;
+        Assert(state.Apply(RulesAnswer("aaaa", rulesGood(), now, now + 691200, now, now + 100), out persist) && persist && state.Generation == 1, "the first answer is taken and asks for a write");
+        var v1 = state.Now();
+        Assert(v1.Tag == "aaaa" && v1.Doc.Install == "never" && v1.Timed && !v1.Stale && v1.NowS >= now && v1.NowS <= now + 1, "the rules, the tag and the relay's clock");
+        Assert(state.Apply(RulesAnswer("aaaa", rulesGood(), now + 10, now + 691200, now, now + 100), out persist) && !persist && state.Generation == 2, "the same document again asks for no write");
+        var bad = RulesAnswer("bbbb", rulesGood(), now + 20, now + 691200); ((Dictionary<string, object>)bad["rules"]).Remove("shutdown");
+        Assert(!state.Apply(bad, out persist) && !persist && state.Generation == 2, "an answer that cannot be read is refused");
+        var v2 = state.Now();
+        Assert(v2.Stale && v2.Tag == "aaaa" && v2.Doc.Install == "never", "and the last good rules stay, marked stale");
+        Assert(!state.Apply(null, out persist) && state.Now().Stale, "no body is a bad answer too");
+        Assert(state.Apply(RulesAnswer("cccc", RulesMap("allow", "allow", "allow", "allow", "allow", NoNames, NoNames), now + 30, now + 691200), out persist) && persist && !state.Now().Stale && state.Now().Tag == "cccc" && state.Now().Doc.Install == "allow", "a good answer clears stale and takes the new rules");
+        // Time is the relay's clock plus the time since the answer, on a Stopwatch.
+        Assert(state.Apply(RulesAnswer("cccc", RulesMap("allow", "allow", "allow", "allow", "allow", NoNames, NoNames), now + 1000, now + 691200), out persist), "an answer for the clock");
+        Thread.Sleep(2300);
+        long at = state.Now().NowS;
+        Assert(at >= now + 1002 && at <= now + 1004, "the clock runs from server_time: " + (at - now - 1000) + " s after");
+        // device.json: the document and the tag, never the hours.
+        var saved = new Dictionary<string, object>(); state.Write(saved);
+        Assert(saved.ContainsKey("rules") && Wire.Text(saved, "rules_tag") == "cccc" && !saved.ContainsKey("hours_utc") && !saved.ContainsKey("server_time"), "device.json keeps the document and the tag");
+        var restored = new RulesState(); restored.Load(Wire.Json().Deserialize<Dictionary<string, object>>(Wire.Json().Serialize(saved)));
+        var v3 = restored.Now();
+        Assert(v3.Tag == "cccc" && v3.Doc.Install == "allow" && v3.Doc.Restart == "allow" && !v3.Timed && v3.NowS == 0 && v3.Hours.Until == 0 && !v3.Stale, "a reload brings the document back with no clock, so hour rules ask for a fresh answer");
+        var empty = new Dictionary<string, object>(); new RulesState().Write(empty);
+        Assert(empty.Count == 0, "before an answer nothing is written");
+        var damaged = new RulesState(); damaged.Load(Wire.Map("rules", "junk", "rules_tag", "cccc"));
+        var damaged2 = new RulesState(); damaged2.Load(Wire.Map("rules", saved["rules"], "rules_tag", "no good!"));
+        Assert(damaged.Now().Tag == "" && damaged.Now().Doc.Install == "approve" && damaged2.Now().Tag == "", "a damaged record leaves the defaults");
+        Console.WriteLine("PASS rules answer: read strictly, the last good rules kept on a bad answer, the relay's clock, and device.json's document and tag");
+    }
+
+    // Rules.Check on a saved PC's frames, with a fake session: approval, the hour rules at decided_at and at the PC's own
+    // time, a rules_tag the PC has not seen (a check-in it waits on), stale rules, protected names and folders.
+    static void RulesCheckTests(string dir) {
+        long now = Client.UnixNow() / 1000;
+        var stop = new ManualResetEvent(false);
+        Func<FakeRuled> make = delegate { var f = new FakeRuled(); Give(f, "t1", RulesMap("approve", "allow", "never", "approve", "allow", new string[] { "Outlook.exe" }, new string[] { Path.Combine(dir, "protected") }), now, now + 691200); return f; };
+        Func<FakeRuled, Dictionary<string, object>, string> check = delegate(FakeRuled f, Dictionary<string, object> frame) { return Rules.Check(f, f.IsLimited, frame, stop); };
+        var fake = make();
+        // Approval: an approve action needs approved_by, whoever sent the frame.
+        Assert((check(fake, Wire.Map("type", "power", "action", "restart", "rules_tag", "t1")) ?? "").StartsWith("approval_unavailable:"), "an action that needs approval is refused without approved_by");
+        Assert((check(fake, Wire.Map("type", "power", "action", "restart", "rules_tag", "t1", "approved_by", "   ")) ?? "").StartsWith("approval_unavailable:"), "a blank approved_by does not count");
+        Assert(check(fake, Wire.Map("type", "power", "action", "restart", "rules_tag", "t1", "approved_by", "tech@example.com")) == null, "with approved_by it goes ahead");
+        Assert(check(fake, Wire.Map("type", "power", "action", "shutdown", "rules_tag", "t1")) == null, "an allowed action needs no approval");
+        Assert((check(fake, Wire.Map("type", "power", "action", "restart")) ?? "").StartsWith("approval_unavailable:"), "a frame with no tag is judged by the stored rules");
+        Assert(fake.CatchUps == 0, "no catch-up while the tag is the same or absent");
+        Assert((check(fake, Wire.Map("type", "programs", "action", "install", "path", @"C:\Temp\setup.exe", "approved_by", "tech@example.com", "rules_tag", "t1")) ?? "").StartsWith("rule_never:"), "never refuses, even with an approval");
+        Assert((check(fake, Wire.Map("type", "power", "action", "reboot", "rules_tag", "t1")) ?? "").StartsWith("power needs"), "an unknown power action");
+        Assert((check(fake, Wire.Map("type", "programs", "action", "frobnicate")) ?? "").StartsWith("unknown programs"), "an unknown programs action");
+        Assert(check(fake, Wire.Map("type", "programs", "action", "list")) == null, "list is never judged");
+        Assert((check(fake, Wire.Map("type", "programs", "action", "uninstall", "program_id", "64:{00000000-0000-0000-0000-000000000000}", "rules_tag", "t1")) ?? "").StartsWith("not_found:"), "an unknown program id");
+        Assert((check(fake, Wire.Map("type", "programs", "action", "uninstall", "program_id", "garbage")) ?? "").StartsWith("not_found:"), "a malformed program id");
+        Assert((check(fake, Wire.Map("type", "programs", "action", "close", "name", "OUTLOOK.EXE", "rules_tag", "t1")) ?? "").StartsWith("protected_program:"), "a protected program is never closed, by name in any case");
+        Assert((check(fake, Wire.Map("type", "programs", "action", "close", "name", @"C:\Program Files\Office\outlook", "rules_tag", "t1")) ?? "").StartsWith("protected_program:"), "a folder in the name and no .exe change nothing");
+        Assert(check(fake, Wire.Map("type", "programs", "action", "close", "name", "notepad.exe", "rules_tag", "t1")) == null, "another program may be closed");
+        Assert((check(fake, Wire.Map("type", "programs", "action", "close")) ?? "").StartsWith("close needs"), "close needs a name or a pid");
+        Assert((check(fake, Wire.Map("type", "programs", "action", "close", "pid", 2147483000)) ?? "").StartsWith("not_found:"), "a pid nobody has");
+        // Files and installers against the protected folder.
+        string protectedFile = Path.Combine(dir, "protected", "sub", "x.txt");
+        Assert((check(fake, Wire.Map("type", "put_file", "path", protectedFile)) ?? "").StartsWith("protected_folder:"), "put_file into a protected folder is refused");
+        Assert((check(fake, Wire.Map("type", "get_file", "path", protectedFile)) ?? "").StartsWith("protected_folder:"), "so is get_file");
+        Assert(check(fake, Wire.Map("type", "put_file", "path", Path.Combine(dir, "protected2", "x.txt"))) == null && check(fake, Wire.Map("type", "get_file", "path", Path.Combine(dir, "other.txt"))) == null, "a folder with the same start is not inside");
+        Assert(check(fake, Wire.Map("type", "get_file", "path", "relative.txt")) == null, "a bad path is the file code's to refuse");
+        var freeInstall = make(); Give(freeInstall, "t2", RulesMap("allow", "allow", "allow", "allow", "allow", NoNames, new string[] { Path.Combine(dir, "protected") }), now, now + 691200);
+        Assert((check(freeInstall, Wire.Map("type", "programs", "action", "install", "path", protectedFile, "rules_tag", "t2")) ?? "").StartsWith("protected_folder:") && check(freeInstall, Wire.Map("type", "programs", "action", "install", "path", Path.Combine(dir, "setup.exe"), "rules_tag", "t2")) == null, "an installer inside a protected folder is refused, one elsewhere goes ahead");
+        // A one-off session has no rules and no saved-PC frames.
+        Assert((Rules.Check(null, false, Wire.Map("type", "power", "action", "restart"), stop) ?? "").StartsWith("not_saved_pc:") && (Rules.Check(null, false, Wire.Map("type", "programs", "action", "list"), stop) ?? "").StartsWith("not_saved_pc:"), "a one-off session refuses the saved-PC frames");
+        Assert(Rules.Check(null, false, Wire.Map("type", "run", "command", "shutdown /r"), stop) == null && Rules.Check(null, false, Wire.Map("type", "put_file", "path", protectedFile), stop) == null, "and judges nothing else");
+
+        // Hour rules: judged at the relay's decided_at when it is within a minute of the PC's own time, else at its own time.
+        long a = now - 3600, b = now + 3600; // business hours now, for an hour on each side
+        var hourly = new FakeRuled(); Give(hourly, "h1", RulesMap("allow", "allow", "allow", "allow", "outside_hours", NoNames, NoNames), now, now + 691200, a, b);
+        Func<long, string> closeAt = delegate(long decided) {
+            var frame = Wire.Map("type", "programs", "action", "close", "name", "notepad.exe", "rules_tag", "h1"); if (decided != 0) frame["decided_at"] = decided;
+            return check(hourly, frame);
+        };
+        Assert((closeAt(0) ?? "").StartsWith("business_hours:") && (closeAt(now) ?? "").StartsWith("business_hours:"), "outside_hours refuses during business hours");
+        long edge = b - 30; var nearEnd = new FakeRuled(); Give(nearEnd, "h1", RulesMap("allow", "allow", "allow", "allow", "outside_hours", NoNames, NoNames), edge, now + 691200, a, b);
+        Func<long, string> nearAt = delegate(long decided) {
+            var frame = Wire.Map("type", "programs", "action", "close", "name", "notepad.exe", "rules_tag", "h1", "decided_at", decided);
+            return check(nearEnd, frame);
+        };
+        Assert((nearAt(edge) ?? "").StartsWith("business_hours:"), "the PC's own time is 30 s before the end of the hours: inside");
+        Assert(nearAt(b + 10) == null, "a frame decided 40 s after the PC's own time, after the hours, is judged as decided: outside, allowed");
+        Assert((nearAt(b + 1000) ?? "").StartsWith("business_hours:"), "a decided_at far from the PC's own time is ignored: its own time, inside");
+        Assert(nearAt((b + 10) * 1000) == null, "a decided_at in milliseconds is read as such");
+        Assert(nearEnd.CatchUps == 0, "none of that needed a check-in");
+        // Past the horizon the PC checks in first. A catch-up that brings later hours decides by them; one that fails treats every moment as business hours.
+        var lapsed = new FakeRuled(); Give(lapsed, "h1", RulesMap("allow", "allow", "allow", "allow", "outside_hours", NoNames, NoNames), now, now - 5, now + 10, now + 20);
+        lapsed.OnCatchUp = delegate { Give(lapsed, "h1", RulesMap("allow", "allow", "allow", "allow", "outside_hours", NoNames, NoNames), now, now + 691200, now + 5000, now + 6000); return true; };
+        Assert(check(lapsed, Wire.Map("type", "programs", "action", "close", "name", "notepad.exe", "rules_tag", "h1")) == null && lapsed.CatchUps == 1, "past hours_until the PC checks in, and the fresh hours say outside: allowed");
+        var offline = new FakeRuled(); Give(offline, "h1", RulesMap("allow", "allow", "allow", "allow", "outside_hours", NoNames, NoNames), now, now - 5, now + 5000, now + 6000);
+        Assert((check(offline, Wire.Map("type", "programs", "action", "close", "name", "notepad.exe", "rules_tag", "h1")) ?? "").StartsWith("business_hours:") && offline.CatchUps == 1, "past hours_until with no answer: every moment is business hours");
+        var approveHours = new FakeRuled(); Give(approveHours, "h2", RulesMap("approve_in_hours", "allow", "allow", "allow", "allow", NoNames, NoNames), now, now + 691200, now + 5000, now + 6000);
+        Assert((check(approveHours, Wire.Map("type", "power", "action", "restart", "rules_tag", "h2", "decided_at", now)) == null) && check(approveHours, Wire.Map("type", "power", "action", "restart", "rules_tag", "h2")) == null, "approve_in_hours outside the hours is allowed without approval");
+        var inHours = new FakeRuled(); Give(inHours, "h3", RulesMap("approve_in_hours", "allow", "allow", "allow", "allow", NoNames, NoNames), now, now + 691200, a, b);
+        Assert((check(inHours, Wire.Map("type", "power", "action", "restart", "rules_tag", "h3")) ?? "").StartsWith("approval_unavailable:") && check(inHours, Wire.Map("type", "power", "action", "restart", "rules_tag", "h3", "approved_by", "t@example.com")) == null, "approve_in_hours inside the hours needs approval");
+
+        // A rules_tag the PC has not seen: a check-in it waits on, then the new rules decide, or rules_stale.
+        var behind = make();
+        behind.OnCatchUp = delegate { Give(behind, "t9", RulesMap("allow", "never", "allow", "allow", "allow", NoNames, NoNames), now, now + 691200); return true; };
+        Assert((check(behind, Wire.Map("type", "power", "action", "shutdown", "rules_tag", "t9")) ?? "").StartsWith("rule_never:") && behind.CatchUps == 1, "a new tag: the PC checks in and the new rules decide (shutdown is never now)");
+        Assert(check(behind, Wire.Map("type", "power", "action", "restart", "rules_tag", "t9")) == null && behind.CatchUps == 1, "the next frame with that tag needs no check-in");
+        var cut = make(); cut.OnCatchUp = delegate { return false; };
+        Assert((check(cut, Wire.Map("type", "power", "action", "shutdown", "rules_tag", "t9")) ?? "").StartsWith("rules_stale:") && cut.CatchUps == 1, "no answer in time: rules_stale");
+        var still = make(); still.OnCatchUp = delegate { Give(still, "t8", RulesMap("allow", "allow", "allow", "allow", "allow", NoNames, NoNames), now, now + 691200); return true; };
+        Assert((check(still, Wire.Map("type", "power", "action", "shutdown", "rules_tag", "t9")) ?? "").StartsWith("rules_stale:"), "an answer with some other tag is still stale");
+        Assert((check(cut, Wire.Map("type", "put_file", "path", Path.Combine(dir, "other.txt"), "rules_tag", "t9")) ?? "").StartsWith("rules_stale:"), "a file frame with an unseen tag waits for the same check-in");
+        // Rules that could not be read: guarded actions are refused until a good answer; files and raw commands go on with the last good ones.
+        var stale = make(); bool persist; Assert(!stale.Own.Apply(Wire.Map("device", Wire.Map("status", "active")), out persist), "a bad answer");
+        Assert((check(stale, Wire.Map("type", "power", "action", "shutdown")) ?? "").StartsWith("rules_stale:") && stale.CatchUps == 1, "stale rules refuse a guarded action, after trying a check-in");
+        stale.OnCatchUp = delegate { Give(stale, "t1", RulesMap("allow", "allow", "allow", "allow", "allow", NoNames, NoNames), now, now + 691200); return true; };
+        Assert(check(stale, Wire.Map("type", "power", "action", "shutdown")) == null && stale.CatchUps == 2, "and a good answer from that check-in lets it through");
+        var stale2 = make(); stale2.Own.Apply(Wire.Map("device", Wire.Map("status", "active")), out persist);
+        Assert(check(stale2, Wire.Map("type", "put_file", "path", Path.Combine(dir, "other.txt"))) == null && check(stale2, Wire.Map("type", "run", "command", "echo hi")) == null && stale2.CatchUps == 0, "files and raw commands use the last good rules");
+        // A raw run that carries an unseen tag first gets a try at the new protected lists, and goes ahead with the old ones when there is no answer.
+        var screened = make(); screened.OnCatchUp = delegate { Give(screened, "t7", RulesMap("allow", "allow", "allow", "allow", "allow", new string[] { "notepad.exe" }, NoNames), now, now + 691200); return true; };
+        Assert((check(screened, Wire.Map("type", "run", "command", "start notepad", "rules_tag", "t7")) ?? "").StartsWith("protected_program:") && screened.CatchUps == 1, "a raw run with a newer tag checks in first, and the screen uses the new lists");
+        var screened2 = make(); screened2.OnCatchUp = delegate { return false; };
+        Assert(check(screened2, Wire.Map("type", "run", "command", "Get-Date", "rules_tag", "t7")) == null && screened2.CatchUps == 1, "and with no answer it goes ahead with the last good lists");
+        // Limited support.
+        var limited = make(); limited.IsLimited = true;
+        Assert((check(limited, Wire.Map("type", "power", "action", "shutdown", "rules_tag", "t1")) ?? "").StartsWith("needs_full_control:") && check(limited, Wire.Map("type", "programs", "action", "close", "name", "notepad.exe", "rules_tag", "t1")) == null, "limited control cannot restart, shut down, install or uninstall, but may close a program");
+        Console.WriteLine("PASS rules check: approval, hour rules at decided_at and at the PC's own time, a tag the PC has not seen, stale rules, protected names and folders, and limited control");
+    }
+
+    // The raw run command's screen: verbs of guarded actions, protected names and folders, and what it leaves alone.
+    static void RunScreenTests() {
+        var doc = new RulesDoc { Close = "approve", Programs = new List<string> { "Outlook.exe", "Microsoft Office" }, Folders = new List<string> { @"C:\Data" } };
+        Func<string, string, string> verb = delegate(string command, string tool) {
+            string r = RunScreen.Check(command, doc);
+            Assert(r != null && r.StartsWith("use_tool:") && r.Contains(tool), "a raw '" + command + "' is sent to " + tool + ": " + r);
+            return r;
+        };
+        verb("shutdown /r /t 0", "restart_pc"); verb("SHUTDOWN.EXE -r -t 0", "restart_pc"); verb(@"C:\Windows\System32\shutdown.exe /g", "restart_pc"); verb("cmd /c shutdown /r", "restart_pc");
+        verb("Restart-Computer -Force", "restart_pc"); verb("Write-Output 'x'; restart-computer", "restart_pc"); verb("& shutdown.exe /r", "restart_pc");
+        verb("shutdown /s /t 0", "shutdown_pc"); verb("shutdown /p", "shutdown_pc"); verb("Stop-Computer", "shutdown_pc");
+        verb("msiexec /i C:\\x.msi /qn", "install_program"); verb("msiexec.exe /i\"C:\\x.msi\"", "install_program"); verb("MSIEXEC /package x.msi", "install_program"); verb("wusa C:\\u.msu /quiet", "install_program");
+        verb("msiexec /x {11111111-2222-3333-4444-555555555555} /qn", "uninstall_program"); verb("msiexec /x{11111111-2222-3333-4444-555555555555}", "uninstall_program"); verb("msiexec /uninstall x.msi", "uninstall_program"); verb("wusa /uninstall /kb:123456", "uninstall_program");
+        verb("taskkill /im notepad.exe /f", "close_program"); verb("Get-Process notepad | Stop-Process", "close_program"); verb("kill 1234", "close_program");
+        // Left alone: other flags, other statements, other words.
+        foreach (string fine in new string[] { "Get-Process", "shutdown /a", "shutdown /l", "shutdown /?", "msiexec /?", "echo hello", "shutdown /a; echo -s", "Write-Output 'we do not shutdown'", "dir C:\\Database", "dir C:\\Data2\\x", "notepad outlook2", "[Console]::Write('ok')" })
+            Assert(RunScreen.Check(fine, doc) == null, "left alone: " + fine);
+        // A rule that allows the action lets its verb through, and only its own.
+        var free = new RulesDoc { Restart = "allow" };
+        Assert(RunScreen.Check("shutdown /r /t 5", free) == null && RunScreen.Check("Restart-Computer", free) == null && (RunScreen.Check("shutdown /s", free) ?? "").StartsWith("use_tool:"), "restart allowed lets restart through, not shutdown");
+        Assert(RunScreen.Check("taskkill /im notepad.exe", new RulesDoc()) == null, "closing programs is allowed by default");
+        foreach (string value in new string[] { "approve", "never", "approve_in_hours", "outside_hours", "banana" }) Assert((RunScreen.Check("taskkill /im notepad.exe", new RulesDoc { Close = value }) ?? "").StartsWith("use_tool:"), "close_program " + value + " sends taskkill to the tool");
+        // Protected names and folders: any mention, in any case.
+        foreach (string mention in new string[] { "taskkill /im OUTLOOK.EXE", "Get-Process outlook | Stop-Process", "start outlook", "echo 'Microsoft Office'", "\"C:\\Program Files\\Microsoft Office\\x.exe\"" })
+            Assert((RunScreen.Check(mention, doc) ?? "").StartsWith("protected_program:"), "a protected program is mentioned: " + mention);
+        foreach (string mention in new string[] { "del C:\\Data\\x.txt", "type \"c:/data/x\"", "dir C:\\\\Data", "copy x C:\\DATA", "Get-ChildItem 'C:\\Data\\sub'" })
+            Assert((RunScreen.Check(mention, doc) ?? "").StartsWith("protected_folder:"), "a protected folder is mentioned: " + mention);
+        Assert(RunScreen.Check("dir C:\\Database", doc) == null && RunScreen.Check("dir C:\\Data.old", doc) == null && RunScreen.Check("echo outlook2 microsoft", doc) == null, "a longer name is not the protected one");
+        Assert((RunScreen.Check("Restart-Computer ; echo C:\\Data", doc) ?? "").StartsWith("protected_folder:"), "a protected name is refused before the verb");
+        Assert(RunScreen.Check(null, doc) == null && RunScreen.Check("", doc) == null, "no command is nothing to screen");
+        Console.WriteLine("PASS raw run screen: every guarded verb, the rule that allows it, protected names and folders, and what it leaves alone");
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern int GetShortPathName(string longPath, StringBuilder shortPath, int size);
+    // Protected folders against paths: whole components, short names, links and junctions, a folder that does not exist yet.
+    static void PathCheckTests(string dir) {
+        string root = Path.Combine(dir, "paths-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+        string data = Path.Combine(root, "Data"), sub = Path.Combine(data, "sub"), database = Path.Combine(root, "Database"), longName = Path.Combine(root, "Protected Long Folder Name");
+        Directory.CreateDirectory(sub); Directory.CreateDirectory(database); Directory.CreateDirectory(longName);
+        var folders = new List<string> { data };
+        Assert(PathCheck.Inside(folders, Path.Combine(sub, "new.txt")) && PathCheck.Inside(folders, data) && PathCheck.Inside(folders, data.ToUpperInvariant() + "\\X.TXT"), "a path inside the folder, the folder itself, and any case");
+        Assert(!PathCheck.Inside(folders, Path.Combine(database, "x.txt")) && !PathCheck.Inside(folders, data + "2") && !PathCheck.Inside(new List<string>(), data), "Database is not inside Data, and no folders protect nothing");
+        Assert(PathCheck.Inside(folders, Path.Combine(root, "Other", "..", "Data", "x.txt")) && !PathCheck.Inside(folders, Path.Combine(data, "..", "Database", "x.txt")), ".. is resolved");
+        Assert(PathCheck.Inside(new List<string> { @"Z:\Nope" }, @"Z:\Nope\sub\x.txt") && !PathCheck.Inside(new List<string> { @"Z:\Nope" }, @"Z:\Nopes\x.txt"), "a folder that does not exist is compared as written");
+        // A junction into the folder: reaching it through the link is still inside, and so is protecting the link.
+        string link = Path.Combine(root, "link");
+        var mk = Process.Start(new ProcessStartInfo("cmd.exe", "/c mklink /J \"" + link + "\" \"" + data + "\"") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true });
+        mk.StandardOutput.ReadToEnd(); mk.WaitForExit();
+        Assert(mk.ExitCode == 0 && Directory.Exists(link), "the test could make a junction");
+        Assert(PathCheck.Inside(folders, Path.Combine(link, "x.txt")) && PathCheck.Inside(folders, Path.Combine(link, "not", "yet", "x.txt")), "a path through a junction into the folder is inside it");
+        Assert(PathCheck.Inside(new List<string> { link }, Path.Combine(data, "sub", "x.txt")) && !PathCheck.Inside(new List<string> { link }, Path.Combine(database, "x.txt")), "a folder protected through a junction covers its target");
+        // Short names, when 8.3 names are on for this volume.
+        var sb = new StringBuilder(1024); int n = GetShortPathName(longName, sb, sb.Capacity); string shortName = n > 0 ? sb.ToString() : "";
+        if (shortName.Length > 0 && !String.Equals(shortName, longName, StringComparison.OrdinalIgnoreCase)) {
+            Assert(PathCheck.Inside(new List<string> { longName }, Path.Combine(shortName, "x.txt")) && PathCheck.Inside(new List<string> { shortName }, Path.Combine(longName, "x.txt")), "a short name and the long one are the same folder: " + shortName);
+            Assert(PathCheck.Resolve(Path.Combine(shortName, "x.txt")).EndsWith("Protected Long Folder Name\\x.txt", StringComparison.OrdinalIgnoreCase), "Resolve expands the short name");
+        } else Console.WriteLine("NOTE this volume has no 8.3 short names; the short-name case was not run");
+        Console.WriteLine("PASS protected folders: whole components, .. and case, junctions in both directions, short names, and a folder that does not exist");
+    }
+
+    // restart_pc and shutdown_pc: the answer first, the wait on this PC's own clock, one at a time. Perform is replaced by a
+    // recorder and never put back: a thread left waiting must not restart the test machine.
+    static void PowerTests() {
+        var calls = new List<bool>();
+        PowerAction.Perform = delegate(bool reboot) { lock (calls) calls.Add(reboot); return null; };
+        PowerAction.Cancel();
+        long now = Client.UnixNow() / 1000;
+        try {
+            using (var relay = new FakeRelay()) {
+                var full = new FakeRuled(); relay.Agent.Full = full;
+                Give(full, "p1", RulesMap("approve", "allow", "allow", "allow", "allow", NoNames, NoNames), now, now + 691200);
+                relay.Lifetime = 300000; relay.Start();
+                var r = relay.Call(Wire.Map("type", "power", "action", "restart", "delay_s", 1, "rules_tag", "p1"));
+                Assert(Refusal(r).StartsWith("approval_unavailable:") && calls.Count == 0, "restart needs approval and nothing was scheduled: " + Refusal(r));
+                var before = Client.UnixNow() / 1000;
+                r = relay.Call(Wire.Map("type", "power", "action", "restart", "delay_s", 1, "rules_tag", "p1", "approved_by", "tech@example.com", "decided_at", before));
+                long at = Wire.Number(r, "at");
+                Assert(Wire.Flag(r, "ok") && at >= before + 4 && at <= before + 8, "an approved restart is answered with the time it will happen, a delay of 1 s raised to 5: " + (at - before));
+                Thread.Sleep(1500);
+                Assert(calls.Count == 0, "and it has not happened yet");
+                r = relay.Call(Wire.Map("type", "power", "action", "shutdown", "rules_tag", "p1"));
+                Assert(Refusal(r).StartsWith("busy:"), "a second power action while one waits is busy: " + Refusal(r));
+                PowerAction.Cancel(); Thread.Sleep(100);
+                before = Client.UnixNow() / 1000;
+                r = relay.Call(Wire.Map("type", "power", "action", "shutdown", "rules_tag", "p1"));
+                Assert(Wire.Flag(r, "ok") && Wire.Number(r, "at") >= before + 29 && Wire.Number(r, "at") <= before + 33, "with no delay_s it waits 30 s");
+                PowerAction.Cancel();
+                r = relay.Call(Wire.Map("type", "power", "action", "shutdown", "delay_s", 99999, "rules_tag", "p1"));
+                Assert(Wire.Flag(r, "ok") && Wire.Number(r, "at") >= Client.UnixNow() / 1000 + 596 && Wire.Number(r, "at") <= Client.UnixNow() / 1000 + 603, "a delay over 600 s is cut to 600");
+                PowerAction.Cancel(); Thread.Sleep(100);
+                Assert(calls.Count == 0, "a cancelled wait never acts");
+                // It acts after the delay, once, with the right kind. The minimum is lowered here only to keep the test short.
+                PowerAction.MinDelayS = 1;
+                r = relay.Call(Wire.Map("type", "power", "action", "restart", "delay_s", 1, "rules_tag", "p1", "approved_by", "tech@example.com"));
+                Assert(Wire.Flag(r, "ok") && Until(delegate { lock (calls) return calls.Count == 1; }, 6000), "the restart happens after its delay");
+                Thread.Sleep(1500);
+                Assert(calls.Count == 1 && calls[0], "once, as a restart");
+                r = relay.Call(Wire.Map("type", "power", "action", "shutdown", "delay_s", 1, "rules_tag", "p1"));
+                Assert(Refusal(r).StartsWith("busy:"), "after it acted, the PC is going down: another one is still busy");
+                PowerAction.Cancel();
+                r = relay.Call(Wire.Map("type", "power", "action", "shutdown", "delay_s", 1, "rules_tag", "p1"));
+                Assert(Wire.Flag(r, "ok") && Until(delegate { lock (calls) return calls.Count == 2; }, 6000) && !calls[1], "a shutdown is not a restart");
+                PowerAction.Cancel(); PowerAction.MinDelayS = 5;
+                // The rules refuse before anything is scheduled.
+                Give(full, "p2", RulesMap("allow", "never", "allow", "allow", "allow", NoNames, NoNames), now, now + 691200);
+                r = relay.Call(Wire.Map("type", "power", "action", "shutdown", "rules_tag", "p2"));
+                Assert(Refusal(r).StartsWith("rule_never:"), "never: " + Refusal(r));
+                full.IsLimited = true;
+                r = relay.Call(Wire.Map("type", "power", "action", "restart", "rules_tag", "p2"));
+                Assert(Refusal(r).StartsWith("needs_full_control:"), "limited control: " + Refusal(r));
+                Assert(calls.Count == 2, "none of those scheduled anything");
+            }
+            using (var relay = new FakeRelay()) {
+                relay.Lifetime = 300000; relay.Start(); // a one-off session
+                var r = relay.Call(Wire.Map("type", "power", "action", "restart"));
+                Assert(Refusal(r).StartsWith("not_saved_pc:"), "a one-off session has no power action: " + Refusal(r));
+                r = relay.Call(Wire.Map("type", "programs", "action", "list"));
+                Assert(Refusal(r).StartsWith("not_saved_pc:"), "nor programs: " + Refusal(r));
+            }
+        } finally { PowerAction.MinDelayS = 5; PowerAction.Cancel(); PowerAction.Perform = delegate(bool reboot) { return null; }; }
+        Console.WriteLine("PASS power: answered first, 5 to 600 s on this PC's own clock, one at a time, refused by approval, never and limited control");
+    }
+
+    static Process StartSleeper(string dir, out string exeName) {
+        string copy = Path.Combine(dir, "supportmcp-close-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".exe");
+        File.Copy(System.Reflection.Assembly.GetExecutingAssembly().Location, copy);
+        exeName = Path.GetFileName(copy);
+        return Process.Start(new ProcessStartInfo(copy, "--sleep 120000") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true });
+    }
+    // list_programs, install, uninstall and close_program against a fake saved-PC session. Nothing here uninstalls a real program:
+    // every uninstall is refused before it can run, or runs under limited control, which refuses it again.
+    static void ProgramsTests(string dir) {
+        long now = Client.UnixNow() / 1000; int mine = Process.GetCurrentProcess().Id;
+        using (var relay = new FakeRelay()) {
+            var full = new FakeRuled(); relay.Agent.Full = full;
+            Give(full, "g1", RulesMap("allow", "allow", "allow", "allow", "allow", NoNames, NoNames), now, now + 691200);
+            relay.Lifetime = 300000; relay.Start();
+            // list
+            var r = relay.Call(Wire.Map("type", "programs", "action", "list", "rules_tag", "g1"));
+            Assert(Wire.Flag(r, "ok") && r["installed"] is System.Collections.ArrayList && r["running"] is System.Collections.ArrayList, "list answers installed and running: " + Refusal(r));
+            bool me = false;
+            foreach (object o in (System.Collections.ArrayList)r["running"]) { var e = (Dictionary<string, object>)o; if (Wire.Number(e, "pid") == mine) me = Wire.Text(e, "name").EndsWith(".exe") && Wire.Number(e, "session") == Process.GetCurrentProcess().SessionId; }
+            Assert(me, "the running list holds this process with its name and session");
+            var installed = (System.Collections.ArrayList)r["installed"];
+            if (installed.Count > 0) {
+                var first = (Dictionary<string, object>)installed[0];
+                string id = Wire.Text(first, "id");
+                Assert((id.StartsWith("64:") || id.StartsWith("32:")) && Wire.Text(first, "name").Length > 0 && first.ContainsKey("version") && first.ContainsKey("publisher"), "an installed program has an id, a name, a version and a publisher: " + id);
+                Assert(Programs.Find(id) != null && Programs.Find(id).Name == Wire.Text(first, "name"), "its id finds it again");
+                // What the rules say of it, without running anything.
+                var stop = new ManualResetEvent(false); string name = Wire.Text(first, "name");
+                var guard = new FakeRuled(); Give(guard, "g2", RulesMap("allow", "allow", "allow", "allow", "allow", new string[] { name.ToUpperInvariant() }, NoNames), now, now + 691200);
+                Assert((Rules.Check(guard, false, Wire.Map("type", "programs", "action", "uninstall", "program_id", id, "rules_tag", "g2"), stop) ?? "").StartsWith("protected_program:"), "a protected program, named by its display name, cannot be uninstalled");
+                var never = new FakeRuled(); Give(never, "g3", RulesMap("allow", "allow", "allow", "never", "allow", NoNames, NoNames), now, now + 691200);
+                Assert((Rules.Check(never, false, Wire.Map("type", "programs", "action", "uninstall", "program_id", id, "rules_tag", "g3"), stop) ?? "").StartsWith("rule_never:"), "uninstall never");
+                var ask = new FakeRuled(); Give(ask, "g4", RulesMap("allow", "allow", "allow", "approve", "allow", NoNames, NoNames), now, now + 691200);
+                Assert((Rules.Check(ask, false, Wire.Map("type", "programs", "action", "uninstall", "program_id", id, "rules_tag", "g4"), stop) ?? "").StartsWith("approval_unavailable:") && Rules.Check(ask, false, Wire.Map("type", "programs", "action", "uninstall", "program_id", id, "rules_tag", "g4", "approved_by", "t@example.com"), stop) == null, "uninstall needs approval");
+                full.IsLimited = true;
+                r = relay.Call(Wire.Map("type", "programs", "action", "uninstall", "program_id", id, "timeout_s", 10, "rules_tag", "g1"));
+                Assert(Refusal(r).StartsWith("needs_full_control:"), "uninstall under limited control is refused: " + Refusal(r));
+                full.IsLimited = false;
+            } else Console.WriteLine("NOTE this PC lists no installed programs; the uninstall rule cases were not run");
+            r = relay.Call(Wire.Map("type", "programs", "action", "uninstall", "program_id", "64:{00000000-0000-0000-0000-000000000000}", "rules_tag", "g1"));
+            Assert(Refusal(r).StartsWith("not_found:"), "an id no program has: " + Refusal(r));
+            // install: an .exe runs as this process's own account here (SYSTEM in a service) and answers its exit code
+            string cmd = Path.Combine(Environment.SystemDirectory, "cmd.exe");
+            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", cmd, "args", "/c exit 7", "timeout_s", 60, "rules_tag", "g1"));
+            Assert(Wire.Flag(r, "ok") && Wire.Number(r, "exit_code") == 7, "install runs the installer and answers its exit code: " + Refusal(r) + " " + Wire.Text(r, "detail"));
+            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", cmd, "args", "/c exit 0", "rules_tag", "g1"));
+            Assert(Wire.Flag(r, "ok") && Wire.Number(r, "exit_code") == 0, "and 0 for a good one");
+            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", Path.Combine(dir, "no-such-setup.msi"), "rules_tag", "g1"));
+            Assert(Refusal(r).StartsWith("not_found:"), "an installer that is not there: " + Refusal(r));
+            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", "setup.exe", "rules_tag", "g1"));
+            Assert(!Wire.Flag(r, "ok") && Refusal(r).Contains("absolute path"), "a relative installer path: " + Refusal(r));
+            full.IsLimited = true;
+            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", cmd, "args", "/c exit 7", "rules_tag", "g1"));
+            Assert(Refusal(r).StartsWith("needs_full_control:"), "install under limited control is refused: " + Refusal(r));
+            full.IsLimited = false;
+            Give(full, "g5", RulesMap("allow", "allow", "allow", "allow", "allow", NoNames, new string[] { Environment.SystemDirectory }), now, now + 691200);
+            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", cmd, "args", "/c exit 7", "rules_tag", "g5"));
+            Assert(Refusal(r).StartsWith("protected_folder:"), "an installer in a protected folder: " + Refusal(r));
+            Give(full, "g1", RulesMap("allow", "allow", "allow", "allow", "allow", NoNames, NoNames), now, now + 691200);
+
+            // close
+            var started = new List<Process>();
+            if (Process.GetCurrentProcess().SessionId == 0) Console.WriteLine("NOTE the tests run in session 0, which close never touches; the close cases were not run");
+            else try {
+                string exeName; var proc = StartSleeper(dir, out exeName); started.Add(proc);
+                Assert(Until(delegate { return Process.GetProcessesByName(Path.GetFileNameWithoutExtension(exeName)).Length == 1; }, 5000), "the test program runs");
+                r = relay.Call(Wire.Map("type", "programs", "action", "close", "name", exeName, "force", false, "rules_tag", "g1"));
+                Assert(Wire.Flag(r, "ok") && Wire.Number(r, "closed") == 0 && Wire.Number(r, "still_running") == 1 && !proc.HasExited, "a close without force asks the windows and ends nothing: " + Refusal(r));
+                Assert(full.ClosedPids.Contains(proc.Id), "the windows were asked through the helper");
+                r = relay.Call(Wire.Map("type", "programs", "action", "close", "pid", proc.Id, "force", true, "rules_tag", "g1"));
+                Assert(Wire.Flag(r, "ok") && Wire.Number(r, "closed") == 1 && proc.WaitForExit(5000), "force by pid ends it: " + Refusal(r));
+                string second; var proc2 = StartSleeper(dir, out second); started.Add(proc2);
+                Assert(Until(delegate { return Process.GetProcessesByName(Path.GetFileNameWithoutExtension(second)).Length == 1; }, 5000), "a second one runs");
+                r = relay.Call(Wire.Map("type", "programs", "action", "close", "name", second.ToUpperInvariant(), "force", true, "rules_tag", "g1"));
+                Assert(Wire.Flag(r, "ok") && Wire.Number(r, "closed") == 1 && proc2.WaitForExit(5000), "force by name, in any case: " + Refusal(r));
+                r = relay.Call(Wire.Map("type", "programs", "action", "close", "name", "no-such-program-xyz.exe", "rules_tag", "g1"));
+                Assert(Refusal(r).StartsWith("not_found:"), "no such program: " + Refusal(r));
+                r = relay.Call(Wire.Map("type", "programs", "action", "close", "pid", 4, "force", true, "rules_tag", "g1"));
+                Assert(Refusal(r).StartsWith("protected_program:"), "the System process is never closed: " + Refusal(r));
+                r = relay.Call(Wire.Map("type", "programs", "action", "close", "name", "lsass.exe", "force", true, "rules_tag", "g1"));
+                Assert(Refusal(r).StartsWith("protected_program:"), "a session-0 process is never closed: " + Refusal(r));
+                // Limited support: only the signed-in user's own programs.
+                string third; var proc3 = StartSleeper(dir, out third); started.Add(proc3);
+                Assert(Until(delegate { return Process.GetProcessesByName(Path.GetFileNameWithoutExtension(third)).Length == 1; }, 5000), "a third one runs");
+                full.IsLimited = true; full.SessionId = (uint)Process.GetCurrentProcess().SessionId; full.Who = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+                r = relay.Call(Wire.Map("type", "programs", "action", "close", "pid", proc3.Id, "force", true, "rules_tag", "g1"));
+                Assert(Refusal(r).StartsWith("not_found:") && !proc3.HasExited, "limited support does not touch another user's program: " + Refusal(r));
+                full.Who = WindowsIdentity.GetCurrent().User;
+                r = relay.Call(Wire.Map("type", "programs", "action", "close", "pid", proc3.Id, "force", true, "rules_tag", "g1"));
+                Assert(Wire.Flag(r, "ok") && Wire.Number(r, "closed") == 1 && proc3.WaitForExit(5000), "limited support closes the signed-in user's own: " + Refusal(r));
+                full.IsLimited = false;
+            } finally { foreach (var p in started) { try { if (!p.HasExited) p.Kill(); } catch (Exception) { } p.Dispose(); } }
+        }
+        Console.WriteLine("PASS programs: the installed and running lists, install's exit code, uninstall's rules, and close with force, protected processes and limited support");
+    }
+
+    // The service keeps the rules in device.json through its own check-in and reload, refuses an unreadable answer, and
+    // checks in on demand for a frame that carries a newer tag.
+    static void RulesServiceTests(string dir) {
+        using (var relay = new FakeDevice()) {
+            string folder = NewServiceFolder(dir, relay.Origin);
+            var svc = new DeviceService(Path.Combine(folder, "support.exe")); Assert(svc.TestInit(), "init");
+            long now = Client.UnixNow() / 1000;
+            var one = RulesMap("approve", "approve", "approve", "approve", "allow", new string[] { "Outlook.exe" }, new string[] { @"C:\Data" });
+            Func<Dictionary<string, object>, string> json = delegate(Dictionary<string, object> m) { return Wire.Json().Serialize(m); };
+            Assert(svc.TestRules.Now().Tag == "" && !svc.TestRules.Now().Timed, "no rules before the first answer");
+            relay.Body = json(RulesAnswer("tag1", one, now, now + 691200, now, now + 100));
+            svc.TestCheckInOnce();
+            var v = svc.TestRules.Now();
+            Assert(v.Tag == "tag1" && v.Doc.Folders.Count == 1 && v.Timed && !v.Stale && v.Hours.Starts.Count == 1, "a check-in takes the rules from the answer");
+            var stored = ReadJson(Path.Combine(folder, "device.json"));
+            Assert(Wire.Text(stored, "rules_tag") == "tag1" && stored["rules"] is Dictionary<string, object> && Wire.Text(stored, "key") == "smd1.default.id.secret" && !stored.ContainsKey("hours_utc"), "device.json has them, with the rest of the record");
+            var again = new DeviceService(Path.Combine(folder, "support.exe")); Assert(again.TestInit(), "reload");
+            var v2 = again.TestRules.Now();
+            Assert(v2.Tag == "tag1" && v2.Doc.Programs.Count == 1 && v2.Doc.Programs[0] == "Outlook.exe" && !v2.Timed && v2.Hours.Until == 0, "a restart brings back the document and the tag, with no hours");
+            // An answer that cannot be read: stale, nothing changed on disk.
+            var broken = RulesAnswer("tag2", RulesMap("allow", "allow", "allow", "allow", "allow", NoNames, NoNames), now, now + 691200); ((Dictionary<string, object>)broken["rules"]).Remove("restart");
+            relay.Body = json(broken); svc.TestCheckInOnce();
+            Assert(svc.TestRules.Now().Stale && svc.TestRules.Now().Tag == "tag1" && Wire.Text(ReadJson(Path.Combine(folder, "device.json")), "rules_tag") == "tag1", "an unreadable answer keeps the last good rules, stale, on disk too");
+            relay.Body = json(RulesAnswer("tag2", RulesMap("allow", "allow", "allow", "allow", "allow", NoNames, NoNames), now, now + 691200)); svc.TestCheckInOnce();
+            Assert(!svc.TestRules.Now().Stale && svc.TestRules.Now().Tag == "tag2" && Wire.Text(ReadJson(Path.Combine(folder, "device.json")), "rules_tag") == "tag2", "a good one clears it and is saved");
+            // A body with no rules at all (a relay that does not send them) is unreadable too.
+            relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "device", Wire.Map("id", "d", "workspace", "default", "status", "active", "name", "PC", "access", "ask", "control", "limited", "site_id", null)));
+            svc.TestCheckInOnce();
+            Assert(svc.TestRules.Now().Stale && svc.TestRules.Now().Tag == "tag2", "an active answer with no rules is stale too");
+            // On demand: the catch-up reads only the rules, and is refused for anything but an active answer.
+            relay.Body = json(RulesAnswer("tag3", one, now, now + 691200));
+            Assert(svc.TestCatchUp(5000) && svc.TestRules.Now().Tag == "tag3" && !svc.TestRules.Now().Stale && relay.LastPath == "/device/hello" && Wire.Text(ReadJson(Path.Combine(folder, "device.json")), "rules_tag") == "tag3", "a catch-up check-in takes the new rules and saves them");
+            relay.Body = json(RulesAnswer("tag4", one, now, now + 691200)); relay.Refuse = true;
+            var timer = Stopwatch.StartNew(); Assert(!svc.TestCatchUp(5000) && timer.ElapsedMilliseconds < 4000 && svc.TestRules.Now().Tag == "tag3", "no answer: false, quickly, and nothing changes");
+            relay.Refuse = false; relay.HelloBody = json(RulesAnswer("tag4", one, now, now + 691200)); relay.HelloDelayMs = 3000;
+            timer.Restart(); Assert(!svc.TestCatchUp(600) && timer.ElapsedMilliseconds >= 500 && timer.ElapsedMilliseconds < 2500 && svc.TestRules.Now().Tag == "tag3", "a slow answer is waited for only as long as asked");
+            Thread.Sleep(3500);
+            relay.HelloDelayMs = 800; var results = new bool[2]; var threads = new List<Thread>();
+            for (int i = 0; i < 2; i++) { int k = i; var t = new Thread(delegate() { results[k] = svc.TestCatchUp(8000); }); t.IsBackground = true; threads.Add(t); t.Start(); }
+            foreach (var t in threads) Assert(t.Join(15000), "a catch-up ends");
+            Assert(results[0] && results[1] && svc.TestRules.Now().Tag == "tag4", "two frames waiting at once both get the one answer");
+            relay.HelloBody = null; relay.HelloDelayMs = 0;
+            relay.Body = Wire.Json().Serialize(Wire.Map("protocol", 1, "device", Wire.Map("id", "d", "workspace", "default", "status", "pending", "name", "PC", "access", "ask", "control", "limited", "site_id", null)));
+            Assert(!svc.TestCatchUp(3000), "a waiting PC gets no rules");
+            // The tray's refresh request is answered with the status at once.
+            var reply = svc.TestHandle(Wire.Map("type", "refresh"));
+            Assert(reply != null && Wire.Text(reply, "state").Length > 0, "refresh is answered with the status");
+        }
+        Console.WriteLine("PASS rules in the service: kept in device.json through a check-in and a reload, an unreadable answer refused, and a check-in on demand");
+    }
+
+    // A real saved-PC session (limited support, hosted in this process) judged by the rules of the check-in answer: the wiring
+    // from Session to Rules.Check, and a frame whose tag the PC has not seen, answered by a real check-in.
+    static void RulesSessionTests(string dir) {
+        string folder;
+        var started = new List<DeviceService>();
+        string protectedDir = Path.Combine(dir, "prot-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+        using (var relay = new FakeDevice()) {
+            try {
+                string id = Hex64(); var svc = SessionService(dir, relay.Origin, "any", "limited", DeviceService.Target.Console, out folder); started.Add(svc);
+                var rules1 = RulesMap("approve", "approve", "approve", "approve", "allow", new string[] { "Outlook.exe" }, new string[] { protectedDir });
+                relay.Body = HelloRules("s1", rules1, Pointer(id, false)); svc.TestCheckInOnce();
+                Assert(Until(delegate { return AgentFor(relay, "hello", id).Count == 1; }, 8000), "the session connects");
+                Assert(svc.TestRules.Now().Tag == "s1", "the check-in that started it brought the rules");
+                Func<Dictionary<string, object>, Dictionary<string, object>> send = delegate(Dictionary<string, object> frame) { return relay.AgentResult(relay.AgentQueue(frame), 90); };
+                var r = send(Wire.Map("type", "power", "action", "restart", "delay_s", 5, "rules_tag", "s1", "approved_by", "tech@example.com"));
+                Assert(Refusal(r).StartsWith("needs_full_control:"), "a limited PC does not restart: " + Refusal(r));
+                r = send(Wire.Map("type", "programs", "action", "list", "rules_tag", "s1"));
+                Assert(Wire.Flag(r, "ok") && r["installed"] is System.Collections.ArrayList, "list works under limited support: " + Refusal(r));
+                r = send(Wire.Map("type", "run", "command", "Write-Output 'shutdown /r'", "timeout_s", 30));
+                Assert(Refusal(r).StartsWith("use_tool:") && Refusal(r).Contains("restart_pc"), "a raw restart is sent to the tool: " + Refusal(r));
+                r = send(Wire.Map("type", "run", "command", "[Console]::Write('fine')", "timeout_s", 60));
+                Assert(Wire.Flag(r, "ok") && Decode(r, "stdout_b64") == "fine", "an ordinary command runs: " + Refusal(r));
+                string blocked = Path.Combine(protectedDir, "x.txt");
+                r = send(Wire.Map("type", "put_file", "path", blocked, "data_b64", Convert.ToBase64String(Encoding.UTF8.GetBytes("no"))));
+                Assert(Refusal(r).StartsWith("protected_folder:") && !File.Exists(blocked) && !Directory.Exists(protectedDir), "put_file into a protected folder is refused and writes nothing: " + Refusal(r));
+                Directory.CreateDirectory(protectedDir); File.WriteAllText(blocked, "secret");
+                r = send(Wire.Map("type", "get_file", "path", blocked, "length", 100));
+                Assert(Refusal(r).StartsWith("protected_folder:"), "so is get_file: " + Refusal(r));
+                string open = Path.Combine(dir, "open-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".txt");
+                r = send(Wire.Map("type", "put_file", "path", open, "data_b64", Convert.ToBase64String(Encoding.UTF8.GetBytes("yes"))));
+                Assert(Wire.Flag(r, "ok") && File.ReadAllText(open) == "yes", "a file elsewhere is written: " + Refusal(r));
+                r = send(Wire.Map("type", "programs", "action", "close", "name", "OUTLOOK.EXE", "rules_tag", "s1"));
+                Assert(Refusal(r).StartsWith("protected_program:"), "a protected program: " + Refusal(r));
+                // The team changes the rules; the next frame carries the new tag; the PC checks in for it and decides by them.
+                var rules2 = RulesMap("approve", "approve", "approve", "approve", "never", new string[] { "Outlook.exe" }, new string[] { protectedDir });
+                relay.Body = HelloRules("s2", rules2, Pointer(id, false));
+                r = send(Wire.Map("type", "programs", "action", "close", "name", "notepad.exe", "rules_tag", "s2"));
+                Assert(Refusal(r).StartsWith("rule_never:") && svc.TestRules.Now().Tag == "s2", "a frame with an unseen tag makes the PC check in, and the new rules decide: " + Refusal(r));
+                r = send(Wire.Map("type", "programs", "action", "close", "name", "notepad.exe", "rules_tag", "s3"));
+                Assert(Refusal(r).StartsWith("rules_stale:"), "a tag the relay itself does not send is rules_stale: " + Refusal(r));
+                Assert(Wire.Text(ReadJson(Path.Combine(folder, "device.json")), "rules_tag") == "s2", "and the rules in device.json are the last good ones");
+            } finally { foreach (var x in started) x.TestStopSession(); }
+        }
+        Console.WriteLine("PASS rules in a saved PC's session: limited control, the raw run screen, protected folders and programs, and a check-in for a newer tag");
+    }
+
+    // The tray's Check now: its action, its words, and the pipe request it sends.
+    static void CheckNowTests() {
+        foreach (string state in new string[] { DeviceState.Active, DeviceState.Pending, DeviceState.Offline })
+            foreach (string access in new string[] { "ask", "any" }) Assert(TrayText.Actions(state, access).Contains("check_now") && TrayText.CanCheck(state), "Check now shows for " + state + "/" + access);
+        foreach (string state in new string[] { DeviceState.Removed, DeviceState.Expired, DeviceState.UpdateNeeded })
+            foreach (string access in new string[] { "ask", "any" }) Assert(!TrayText.Actions(state, access).Contains("check_now") && !TrayText.CanCheck(state) && TrayText.Actions(state, access).Contains("uninstall"), "Check now is hidden for " + state + "/" + access);
+        Assert(TrayText.CheckNow == "Check now" && TrayText.Checking == "Checking\u2026" && TrayText.CheckLabel(false) == "Check now" && TrayText.CheckLabel(true) == "Checking\u2026", "its words");
+        foreach (string a in TrayText.Actions(DeviceState.Active, "ask", true)) Assert(a.IndexOf("ask", StringComparison.OrdinalIgnoreCase) < 0, "no action id contains ask: " + a);
+        Assert(TrayText.CheckNow.IndexOf("ask", StringComparison.OrdinalIgnoreCase) < 0 && TrayText.Checking.IndexOf("ask", StringComparison.OrdinalIgnoreCase) < 0, "no label contains ask");
+        Assert(Pipes.DeviceRequest(Wire.Map("type", "refresh")) == "refresh" && Pipes.DeviceRequest(Wire.Map("type", "refresh", "force", true)) == null, "the pipe takes exactly {\"type\":\"refresh\"}");
+        Console.WriteLine("PASS the tray's Check now: its action in each state, its words, and the refresh request");
+    }
+
     static void Press(System.Windows.Controls.Button button) { button.RaiseEvent(new System.Windows.RoutedEventArgs(System.Windows.Controls.Primitives.ButtonBase.ClickEvent)); }
     [DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(int pid);
     // A window of another process: the focus-return test starts this exe again with --peer <parent pid>. It lets the
@@ -3003,6 +3579,7 @@ public static class AppTests {
     }
     public static int Main(string[] args) {
         if (args.Length == 2 && args[0] == "--peer") { Screen.Dpi(); return PeerWindow(int.Parse(args[1])); }
+        if (args.Length == 2 && args[0] == "--sleep") { Thread.Sleep(int.Parse(args[1])); return 0; } // a stand-in program for the close tests
         if (args.Length == 2 && args[0] == "--settle") { Thread.Sleep(250); File.WriteAllText(args[1], "done"); return 0; }
         string dir = Path.Combine(Path.GetTempPath(), "support-mcp-native-test-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
         try {
@@ -3185,6 +3762,16 @@ public static class AppTests {
             TrayPr6Tests();
             DoorbellTests();
             SessionLiveTests(dir);
+            RulesVectorTests();
+            RulesAnswerTests();
+            RulesCheckTests(dir);
+            RunScreenTests();
+            PathCheckTests(dir);
+            PowerTests();
+            ProgramsTests(dir);
+            RulesServiceTests(dir);
+            RulesSessionTests(dir);
+            CheckNowTests();
             // The downloaded PE overlay must be readable by the actual .NET client.
             string overlay = Path.Combine(dir, "overlay.exe"); byte[] cfg = Encoding.UTF8.GetBytes(Wire.Json().Serialize(Wire.Map("sid", new string('a', 64), "key", new string('b', 64), "origin", "https://support.example.com", "startup_expires_at", Client.UnixNow() + 10000)));
             using (var f = File.Create(overlay)) { f.WriteByte(77); f.WriteByte(90); f.Write(cfg, 0, cfg.Length); byte[] n = BitConverter.GetBytes(cfg.Length); f.Write(n, 0, n.Length); byte[] footer = Encoding.ASCII.GetBytes(Wire.Footer); f.Write(footer, 0, footer.Length); }

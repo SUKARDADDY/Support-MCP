@@ -15,8 +15,9 @@
 // team log is not touched. Title and body may repeat text from a customer's PC and
 // are shown as text.
 //
-// Two events are not switchable: session_invited ("you were invited to a session") and
-// control_offered ("someone offered you control"). They are addressed to one named person and
+// Three events are not switchable: session_invited ("you were invited to a session"),
+// control_offered ("someone offered you control") and approval_requested ("an action waits for
+// your approval"). They are addressed to one named person and
 // always reach them, whatever their settings say, so a person cannot miss that a colleague is
 // waiting on them. They have their own write path (direct) and are not in EVENTS. The queue's
 // events (escalation_opened, escalation_claimed) are switchable like the first six.
@@ -27,7 +28,7 @@ export const EVENTS = Object.freeze([
   'task_finished', 'task_problem', 'session_declined', 'device_online', 'device_missing', 'device_waiting', 'escalation_opened', 'escalation_claimed',
 ]);
 // Addressed to one named person and always delivered: no switch, and no recipients() lookup.
-export const DIRECT_EVENTS = Object.freeze(['session_invited', 'control_offered']);
+export const DIRECT_EVENTS = Object.freeze(['session_invited', 'control_offered', 'approval_requested']);
 export const WATCH_MAX = 500;
 export const FEED_LIMIT = 50;
 export const KEEP_MS = 30 * 24 * 60 * 60 * 1000;
@@ -83,6 +84,13 @@ export function notifyStore(db, team) {
     return out;
   }
 
+  // The people (never service tokens) whose role holds `permission`, as identities. Admins hold every one.
+  async function holders(slug, permission) {
+    const { results } = await q("SELECT identity, role_id FROM members WHERE workspace = ? AND kind = 'person'", slug).all();
+    const roles = new Map((await team.listRoles(slug)).map((r) => [r.id, r.permissions]));
+    return results.filter((m) => m.role_id === ADMIN_ROLE || (roles.get(m.role_id) ?? []).includes(permission)).map((m) => m.identity);
+  }
+
   // The rows for one event, one per recipient. what: { device_id, task_id, session_id,
   // title, body, dedupe }. Nothing is written.
   async function rows(slug, event, who, what) {
@@ -94,7 +102,7 @@ export function notifyStore(db, team) {
     }));
   }
 
-  // The row for a direct event (session_invited, control_offered): one named member who is a person,
+  // The row for a direct event (session_invited, control_offered, approval_requested): one named member who is a person,
   // whatever their settings say. Nothing for a name that is not such a member. Nothing is written.
   async function direct(slug, event, to, what) {
     if (!DIRECT_EVENTS.includes(event)) throw new TypeError('unknown direct notification event');
@@ -171,7 +179,7 @@ export function notifyStore(db, team) {
     return r.meta.changes;
   }
 
-  return { recipients, rows, direct, statements, write, feed, settings, patchSettings, prune };
+  return { recipients, holders, rows, direct, statements, write, feed, settings, patchSettings, prune };
 }
 
 // The feed, held open: the rows after `after` if there are any, otherwise a check every

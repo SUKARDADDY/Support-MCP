@@ -13,6 +13,8 @@ $references = Get-AppCompilerReferences $ReferenceDir
 $fx = "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319"
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 $exe = Join-Path $WorkDir 'app-native.exe'
+# The shared rules cases (PASS rules vectors) are read from beside the test exe.
+Copy-Item -LiteralPath (Join-Path $root 'test\fixtures\rules-cases.json') -Destination (Join-Path $WorkDir 'rules-cases.json') -Force
 & "$fx\csc.exe" /nologo $references /target:exe /platform:x86 /main:AppTests /warnaserror+ "/out:$exe" (Join-Path $root 'src\agent-app.cs') (Join-Path $root 'test\app-native.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Native test compilation failed.' }
 $ErrorActionPreference = 'Continue'

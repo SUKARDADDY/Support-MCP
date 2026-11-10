@@ -2,8 +2,71 @@
 
 All notable changes to Support-MCP are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
-[Semantic Versioning](https://semver.org). It stays at 0.x until Stage 1 is safe
-to run on unattended customer PCs.
+[Semantic Versioning](https://semver.org). Version 1.0.0 ended Stage 1: it is the
+first release that enforces a team's rules on saved PCs.
+
+## [1.0.0] - 2026-11-11
+
+Enforced rules: what anyone may do to a saved PC is limited by the team's rules, checked by the relay and by the PC, with
+technician approval for actions the rules hold. This ends Stage 1.
+
+### Added
+
+- Team rules, with per-customer overrides (migration `0009_rules.sql`, one new table: apply it before you deploy). A
+  document holds a time zone (an IANA name; `DEFAULT_TIME_ZONE`, then UTC, when none is set), business hours, protected
+  programs, protected folders (at most 50 entries each) and, for each of restart, shutdown, install, uninstall and
+  closing a program, one of `allow`, `approve`, `approve_in_hours`, `outside_hours` or `never`. With nothing saved the
+  four system actions are `approve`, closing a program is `allow` and nothing is protected. A customer's override
+  replaces whole fields of the team's.
+- Routes `GET` and `PATCH /api/v1/w/<slug>/rules`, and `GET`, `PATCH` and `DELETE /api/v1/w/<slug>/rules/<customer id>`
+  (also under `/app/w/<slug>/api`). Reading needs `devices.view`. Saving needs the new permission `rules.manage` (admins
+  only by default), a person (a service token is refused), the revision that was read (`409 stale` when it moved) and a
+  fresh six-digit code from the person's own authenticator. A recovery code does not count, and a code works once. A
+  save rings the PCs it reaches, and the team log row `rules_changed` names the fields that changed, never a value.
+- Six MCP tools, 37 in all: `restart_pc`, `shutdown_pc`, `list_programs`, `install_program`, `uninstall_program` and
+  `close_program`. They work in a session on a saved PC, need `sessions.control`, and are checked by the relay against
+  the rules before anything reaches the PC. A refusal is an error that starts with a code: `rule_never`,
+  `business_hours`, `declined`, `approval_timeout`, `approval_unavailable`, `busy`, `rules_stale`, `protected_program`,
+  `protected_folder`, `needs_full_control`, `not_found`, `not_saved_pc` or `needs_update`. `session_status` of a saved PC
+  adds `rules` and `approval`. The built-in agent has the same six tools and follows the same rules.
+- Approvals. An action set to `approve` waits up to 5 minutes for a technician holding `sessions.unattended` to approve
+  it in the technician app, with a fresh authenticator code (a denial needs none). The requester and each holder get an
+  `approval_requested` notification, which cannot be switched off. The person at the PC is never asked and sees nothing
+  for the action: the "connected" notice stays. An approval is for one action on one PC, and is dropped, never carried
+  out later, when the session ends, control moves, the relay restarts, or the agent that asked is stopped or paused.
+  Routes: `GET /app/w/<slug>/api/sessions/<sid>/approvals` and `POST .../approvals/<id>`, on the app's address only.
+- The PC enforces the rules itself. Each check-in answer carries the effective rules (`rules`, `rules_tag`, `hours_utc`,
+  `hours_until`, `server_time`). The PC keeps them on disk, checks every action, and catches up with a check-in when a
+  command carries a newer tag. It screens raw `run` commands for guarded actions (`use_tool`) and protected names, and
+  guards protected folders for `put_file`, `get_file` and installs after it expands short names and follows links. Install
+  and uninstall need full control, and installers run as SYSTEM.
+- Update fixes. A changed app version is saved at once (2 seconds), not after a minute. The hourly run rings connected PCs
+  that are due an update. A deployment admin can call `POST /api/v1/deployment/ring-updates` right after a deploy, and the
+  release steps in `docs/development.md` now say so. The PC's tray has **Check now**.
+- Technician app: a **Rules** screen where anyone who can see PCs reads the team's rules and each customer's overrides and
+  an admin edits them, saved with a fresh authenticator code; a PC's page shows the rules in force for it; and a dialog
+  to approve (with a fresh code) or deny a held action, which shows the action, the PC, who asked and the time left.
+
+### Changed
+
+- `device_connect` needs a saved PC on 1.0.0 or later (it was 0.6.0). A PC below that updates itself first, so right
+  after the release ring the PCs, as step 4 of "Sign and deploy a release" says.
+- Version 1.0.0 ends Stage 1. The README, the security model and `docs/development.md` no longer say a saved PC stays off
+  real customers' unattended machines. They say what is enforced and what is not.
+- `rules.manage` needs an authenticator, like the other management permissions.
+- Codex needs `tool_timeout_sec = 930` (was 630): a held action can wait 5 minutes, then a command can run 10 minutes.
+- The hourly run spends 9 of its 50 subrequests on update rings.
+
+### Security
+
+- Limits, as the security model says plainly. A raw `run` command is not limited by the rules beyond the PC's text screen,
+  which is a guardrail that anyone writing a different command gets past. The screen tools (click, keys, UAC prompts) are
+  not checked against the rules. The rules are not signed, so the PC trusts the relay for them, unlike a release. Business
+  hours follow the team's time zone and the relay's clock.
+- The PC checks that an action which needs approval carries an approver's name, not who the approver is. A compromised relay
+  can name one.
+- Saving rules and approving an action each take a fresh authenticator code, even for an Access login, through the same record
+  of used steps as sign-in.
 
 ## [0.8.1] - 2026-11-10
 

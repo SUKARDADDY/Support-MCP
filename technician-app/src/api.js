@@ -48,8 +48,14 @@ export async function fetchPlaces(core, account) {
   const [sites, customers] = await Promise.all([read('/api/sites', 'sites'), read('/api/customers', 'customers')]);
   const customerName = new Map(customers.map((c) => [c.id, String(c.name ?? '')]));
   const out = new Map();
-  for (const s of sites) out.set(s.id, { name: String(s.name ?? ''), customer: customerName.get(s.customer_id) ?? '' });
+  for (const s of sites) out.set(s.id, { name: String(s.name ?? ''), customer: customerName.get(s.customer_id) ?? '', customerId: s.customer_id ?? null });
   return out;
+}
+
+// Every customer of the team, [{ id, name }], for the Rules screen's picker.
+export async function fetchCustomers(core, account) {
+  const rows = await pages((after) => core.request(account, 'GET', `/api/customers?limit=500${after ? `&after=${after}` : ''}`), 'customers');
+  return rows.map((c) => ({ id: c.id, name: String(c.name ?? '') }));
 }
 
 // Who you are on this team and what your role allows.
@@ -165,6 +171,66 @@ export async function claimEscalation(core, account, id) {
 export async function closeEscalation(core, account, id, note) {
   const d = (await core.tool(account, 'escalation', { action: 'close', id, ...(note ? { note } : {}) })).data;
   return d?.escalation ?? null;
+}
+
+// ---- the team's rules and the approvals they ask for (the team API's /rules and the app's
+// sessions/<id>/approvals; text in a rules document is the team's own, and the summary of an approval
+// is built by the relay from the action, so both are shown as text) ----
+
+const normalizeRow = (r) => ({ rev: Number.isSafeInteger(r?.rev) ? r.rev : 0, doc: r?.doc && typeof r.doc === 'object' ? r.doc : {}, updatedAt: r?.updated_at ?? null, updatedBy: r?.updated_by ?? null });
+
+// The team's rules and every customer's override: { team: { rev, doc }, overrides: Map(customer id -> { rev, doc }), defaultTimeZone }.
+// A customer with no override has none in the map: revision 0 and an empty document.
+export async function fetchRules(core, account) {
+  const v = await core.request(account, 'GET', '/api/rules');
+  if (!v?.rules || typeof v.rules !== 'object') throw new Error('the rules are missing from the relay\'s answer');
+  return {
+    team: normalizeRow(v.rules),
+    overrides: new Map((Array.isArray(v.overrides) ? v.overrides : []).map((o) => [o.customer_id, normalizeRow(o)])),
+    defaultTimeZone: typeof v.default_time_zone === 'string' && v.default_time_zone ? v.default_time_zone : 'UTC',
+  };
+}
+
+// One customer's override and the rules in force for that customer, as the relay works them out.
+export async function fetchCustomerRules(core, account, customerId) {
+  const v = await core.request(account, 'GET', `/api/rules/${customerId}`);
+  if (!v?.effective || typeof v.effective !== 'object') throw new Error('the rules are missing from the relay\'s answer');
+  return { ...normalizeRow(v), effective: v.effective };
+}
+
+// Saves the whole team document (customerId null) or a customer's override. `rev` is the revision that was read and `code`
+// a fresh code from the person's authenticator. Answers the saved row.
+export async function saveRules(core, account, customerId, doc, rev, code) {
+  const v = await core.request(account, 'PATCH', customerId ? `/api/rules/${customerId}` : '/api/rules', { doc, rev, code });
+  return normalizeRow(customerId ? v?.override : v?.rules);
+}
+
+// Removes a customer's override, so the customer has the team's rules again.
+export const removeOverride = (core, account, customerId, rev, code) => core.request(account, 'DELETE', `/api/rules/${customerId}`, { rev, code });
+
+// The approval waiting on a session: [] or one { id, summary, actor, via, action, created_at, expires_at, device_id, device_name }.
+export async function listApprovals(core, account, sessionId) {
+  const v = await core.request(account, 'GET', `/api/sessions/${sessionId}/approvals`);
+  return Array.isArray(v?.approvals) ? v.approvals : [];
+}
+
+// Approve (with a fresh authenticator code) or deny (no code) the waiting approval.
+export const answerApproval = (core, account, sessionId, id, approve, code) => core.request(account, 'POST', `/api/sessions/${sessionId}/approvals/${id}`, { approve, ...(approve ? { code } : {}) });
+
+// What to tell the person about a code the relay refused (a wrong or used code, no authenticator, too many tries), or null
+// when the refusal was about something else.
+export function codeProblem(e) {
+  if (e?.code === 'locked') return t('code.locked');
+  if (e?.code !== 'second_factor') return null;
+  return /authenticator on your account/i.test(String(e.message ?? '')) ? t('code.none') : t('code.wrong');
+}
+
+// A tool's refusal as the PC or the rules wrote it, "<code>: <sentence>", in our words for the code when there are some
+// ("refuse.<code>" in en.json). Used for the details of an agent's failed steps and the reasons a task ended. Anything
+// else, or no text, stays as it is.
+export function codedText(text) {
+  const m = /^([a-z][a-z_]{1,39}): /.exec(String(text ?? ''));
+  return m && hasKey(`refuse.${m[1]}`) ? t(`refuse.${m[1]}`) : text;
 }
 
 // The words of a message of the core's own, by the stable `reason` it carries, in en.json

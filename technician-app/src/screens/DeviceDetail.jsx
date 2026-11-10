@@ -7,6 +7,7 @@ import { deviceStatus, placeLabel } from '../devices.js';
 import { formatAgo, formatDate, formatDateTime } from '../format.js';
 import { t } from '../i18n/index.js';
 import { AgentStartDialog } from './AgentStartDialog.jsx';
+import { RulesOnPc } from './RulesOnPc.jsx';
 
 // One saved PC: who it belongs to, how it can be reached, and the way in. Names, sites and
 // the owner's text come from people and from the PC, so they are shown as text only.
@@ -45,6 +46,8 @@ export function DeviceDetail({ device }) {
           ) : null}
         </>
       )}
+
+      {device.status !== 'pending' ? <RulesOnPc device={device} /> : null}
 
       <dl className="facts">
         {device.pairedAt ? <><dt>{t('facts.paired')}</dt><dd>{formatDate(device.pairedAt)}</dd></> : null}

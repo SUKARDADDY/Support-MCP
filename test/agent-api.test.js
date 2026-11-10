@@ -16,7 +16,7 @@ const NOT_MEMBER = 'you are not a member of this team';
 test('agent_start, agent_status and agent_control are tools every connection lists, whatever the team\'s mode', async (t) => {
   const w = await agentWorld(t);
   const names = (await w.rpc(BOSS, 'tools/list')).body.result.tools.map((x) => x.name);
-  assert.equal(names.length, 31);
+  assert.equal(names.length, 37);
   for (const n of ['agent_start', 'agent_status', 'agent_control']) assert.ok(names.includes(n), n);
   await w.api(BOSS, 'PATCH', '/agent', { mode: 'agent' });
   assert.deepEqual((await w.rpc(BOSS, 'tools/list')).body.result.tools.map((x) => x.name), names, 'tools/list is the same for every mode');

@@ -1,4 +1,4 @@
-// The hourly run (a Cron Trigger, `scheduled` in src/app.js). It does two things.
+// The hourly run (a Cron Trigger, `scheduled` in src/app.js). It does three things.
 //
 // It raises "missing" for each saved PC that crossed 7 days without contact: its last
 // contact is older than 7 days and its doorbell is not connected. Last contact is the
@@ -23,6 +23,16 @@
 // no more than the budget can handle: a PC that is connected can never fill the list ahead
 // of a PC that is missing.
 //
+// It rings the saved PCs that are due an update: connected, active, below the release this relay
+// serves, in the share of PCs the rollout offers it to (offerAtCheckIn, src/release.js), and not seen
+// for an hour (a PC that checked in lately was offered the update then). A deploy does not make PCs
+// reconnect, so without a ring a connected PC would hear of a release only at its next check-in, up
+// to 6 hours later. The run finds the teams with such PCs in one query, takes a few in turn like the
+// missing-PC pass does, lists each one's candidates in one query, and rings up to RING_PC_MAX of them
+// in one call to the team's Registry. Nothing is stored: a PC that cannot update is rung once an
+// hour, which costs it one small check-in. No ring is sent under EMERGENCY_STOP or without a release.
+// The same pass runs from POST /api/v1/deployment/ring-updates (ringUpdates, below) right after a deploy.
+//
 // It deletes notifications older than 30 days.
 //
 // A workspace whose Registry cannot be read is skipped this hour: a PC is not called
@@ -30,20 +40,36 @@
 import { teamFromEnv } from './workspace.js';
 import { deviceHooks } from './device-sessions.js';
 import { notifyStore } from './notify.js';
+import { offerAtCheckIn, releaseFrom } from './release.js';
 
 export const MISSING_MS = 7 * 24 * 60 * 60 * 1000;
 // MISSING_MS plus this must stay under KEEP_MS (src/notify.js) by more than a run's gap.
 export const MISSING_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
-// Of the 50: the query for the teams and the prune take two, a team costs two (its
-// doorbells, and its candidates), and a PC costs two (who hears of it, and the write).
+// Of the 50: the query for the teams and the prune take two, and SUBREQUESTS are shared by the two
+// passes. The ring pass keeps RING_SUBREQUESTS (its query for teams, then a team costs one query and,
+// when it has PCs to ring, one Registry call), and the missing-PC pass has the rest. A team costs the
+// missing-PC pass two (its doorbells, and its candidates), and a PC costs two (who hears of it, and the write).
 export const SUBREQUESTS = 46;
+export const RING_SUBREQUESTS = 9;
 const TEAM_COST = 2;
 // Connected ids go to the query as one JSON parameter. D1 allows 100 KB a statement, so a
 // longer list is not sent: the query then reads that many extra rows, which can hold every
 // connected PC, and the run drops them.
 const ONLINE_PARAM_MAX = 60_000;
 const PC_COST = 2;
+
+// At most this many PCs are rung per team per pass, so a release does not start a wave of downloads.
+export const RING_PC_MAX = 100;
+// A team's candidates are read in one query, and are named in one Registry call (RING_LIST_MAX in
+// src/registry.js is the same 500). A PC the rollout does not reach yet is read and dropped.
+const RING_CANDIDATES = 500;
+// The hourly run leaves PCs seen within the hour alone. The deploy-time route leaves only the PCs that
+// just checked in, which were offered the release then.
+export const RING_IDLE_MS = HOUR_MS;
+export const RING_ROUTE_IDLE_MS = 2 * 60 * 1000;
+// The route's own budget, under the 50 a request may make (Access's key fetch and the caller's checks use a few).
+export const RING_ROUTE_SUBREQUESTS = 40;
 
 // The list started at `turn` places along, wrapping round.
 const rotated = (list, turn) => (list.length ? [...list.slice(turn % list.length), ...list.slice(0, turn % list.length)] : list);
@@ -58,7 +84,47 @@ const UNTOLD = `EXISTS (
     AND COALESCE(CASE WHEN json_valid(m.notify) THEN json_type(m.notify, '$.events.device_missing') END, '') <> 'false'
     AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.workspace = d.workspace AND n.recipient = m.identity AND n.dedupe = 'missing:' || d.id || ':' || COALESCE(d.last_seen, d.paired_at)))`;
 
-export async function sweep(env, now = Date.now()) {
+// Ring the PCs due an update. Returns { rung, teams_left }: how many doorbells were rung, and how many
+// teams with candidates this pass did not reach (call again, for the route: a PC that has just been rung
+// checks in, so it drops out of the next pass). budget is the subrequests this pass may make; idleMs the
+// quiet a PC needs; turn where in the rotation of teams to start.
+export async function ringUpdates(env, now, appBundle, { budget = RING_SUBREQUESTS, idleMs = RING_IDLE_MS, turn = 0 } = {}) {
+  if (String(env.EMERGENCY_STOP ?? '') !== '') return { rung: 0, teams_left: 0 };
+  const release = await releaseFrom(appBundle, env);
+  if (!release) return { rung: 0, teams_left: 0 };
+  const quiet = now - idleMs;
+  const teams = (await env.DB.prepare(
+    `SELECT DISTINCT workspace FROM devices WHERE status = 'active' AND app_version <> '' AND app_version <> ? AND COALESCE(last_seen, paired_at) < ? ORDER BY workspace`,
+  ).bind(release.version, quiet).all()).results.map((r) => r.workspace);
+  const hooks = deviceHooks(env);
+  let left = budget - 1;
+  let rung = 0;
+  let reached = 0;
+  for (const workspace of rotated(teams, turn)) {
+    // A team costs its query and, with PCs to ring, one call to its Registry.
+    if (left < 2) break;
+    left -= 1;
+    reached++;
+    try {
+      // Most recently seen first: a PC that is gone for good is last and never crowds out one that answers.
+      const { results } = await env.DB.prepare(
+        `SELECT id, workspace, status, app_version FROM devices WHERE workspace = ? AND status = 'active' AND app_version <> '' AND app_version <> ?
+           AND COALESCE(last_seen, paired_at) < ? ORDER BY COALESCE(last_seen, paired_at) DESC, id LIMIT ?`,
+      ).bind(workspace, release.version, quiet, RING_CANDIDATES).all();
+      const due = [];
+      for (const pc of results) if (await offerAtCheckIn(release, pc, env.UPDATE_ROLLOUT, now)) due.push(pc.id);
+      if (!due.length) continue;
+      left -= 1;
+      // One call names every due PC (up to RING_CANDIDATES) and the Registry rings the first RING_PC_MAX with a
+      // doorbell open, so PCs that are not connected cannot use up the share.
+      rung += await hooks.ringMany(workspace, due, { max: RING_PC_MAX });
+    } catch (_) { /* this team waits for the next pass */ }
+  }
+  return { rung, teams_left: teams.length - reached };
+}
+
+// appBundle is the app this relay serves (null when it serves none: then nothing is rung).
+export async function sweep(env, now = Date.now(), appBundle = null) {
   const notify = notifyStore(env.DB, teamFromEnv(env));
   const turn = Math.floor(now / HOUR_MS);
   const hooks = deviceHooks(env);
@@ -67,7 +133,7 @@ export async function sweep(env, now = Date.now()) {
   const teams = (await env.DB.prepare(
     `SELECT DISTINCT workspace FROM devices d WHERE d.status = 'active' AND COALESCE(d.last_seen, d.paired_at) < ? AND COALESCE(d.last_seen, d.paired_at) >= ? AND ${UNTOLD} ORDER BY workspace`,
   ).bind(crossed, oldest).all()).results.map((r) => r.workspace);
-  let left = SUBREQUESTS;
+  let left = SUBREQUESTS - RING_SUBREQUESTS;
   for (const workspace of rotated(teams, turn)) {
     if (left < TEAM_COST + PC_COST) break;
     left -= 1;
@@ -92,5 +158,8 @@ export async function sweep(env, now = Date.now()) {
       }
     } catch (_) { /* this workspace waits for the next run */ }
   }
+  try {
+    await ringUpdates(env, now, appBundle, { turn });
+  } catch (_) { /* the PCs hear of the release at their next check-in */ }
   await notify.prune(now);
 }

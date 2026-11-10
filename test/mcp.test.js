@@ -16,7 +16,9 @@ const backend = {
 const AGENT = ['agent_control', 'agent_start', 'agent_status'];
 // The team's tools for people: who is on a session, handing it over, and the queue.
 const TEAM = ['escalation', 'people_list', 'session_handover', 'session_participants'];
-const BASE = ['device_connect', 'device_list', 'get_file', 'put_file', 'run', 'session_create', 'session_end', 'session_list', 'session_status', ...AGENT, ...TEAM];
+// The tools the team's rules govern, and list_programs, which only reads.
+const RULED = ['close_program', 'install_program', 'list_programs', 'restart_pc', 'shutdown_pc', 'uninstall_program'];
+const BASE = ['device_connect', 'device_list', 'get_file', 'put_file', 'run', 'session_create', 'session_end', 'session_list', 'session_status', ...AGENT, ...TEAM, ...RULED];
 const EXTRAS = ['block_input', 'request_full_control', 'send_sas', 'type_secret'];
 const SPLIT = ['click', 'drag', 'move_mouse', 'press_key', 'screenshot', 'scroll', 'type_text', 'wait', 'zoom'];
 const names = (options) => listTools(options).map((t) => t.name).sort();
@@ -59,9 +61,9 @@ test('parseToolOptions reads ui and rejects unknown values and the removed shape
 test('tools/list follows the connection options', async () => {
   const { status, body } = await handleRpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, backend);
   assert.equal(status, 200);
-  assert.equal(body.result.tools.length, 16 + 9 + 2 + 4);
+  assert.equal(body.result.tools.length, 22 + 9 + 2 + 4);
   const noUi = await handleRpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, backend, { ui: false });
-  assert.equal(noUi.body.result.tools.length, 16 + 9 + 4);
+  assert.equal(noUi.body.result.tools.length, 22 + 9 + 4);
 });
 
 test('every tool takes a session_id, and the schemas stay JSON', () => {

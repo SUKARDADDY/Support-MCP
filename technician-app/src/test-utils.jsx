@@ -3,6 +3,7 @@
 import { render } from '@testing-library/react';
 import { vi } from 'vitest';
 import { App } from './App.jsx';
+import { DEFAULT_DOC, effective } from './rules.js';
 
 export const ACCOUNT = { id: 'acc1', relay: 'https://relay.example', team: 'default', team_name: 'Default', email: 'tech@example.com', signed_in: true };
 export const ID = (c) => c.repeat(20);
@@ -14,6 +15,12 @@ export const device = (over = {}) => ({
 });
 
 const TECH = ['devices.view', 'devices.manage', 'sessions.create', 'sessions.view', 'sessions.control', 'sessions.end'];
+
+// An error as the core hands one over: { code, message, status }.
+export const relayFail = (status, code, message) => Object.assign(new Error(message), { code, status });
+export const GOOD_CODE = '123456';
+export const SID = (c = 's') => c.repeat(64);
+export const AID = (c = 'a') => c.repeat(32);
 
 export class ToolFail extends Error {
   constructor(message, code = 'tool') {
@@ -73,6 +80,42 @@ export function escalationCall(state, args) {
   return { escalation: e };
 }
 
+// The relay's /rules routes: the team's document at /rules and a customer's override at /rules/<customer id>.
+// A save needs the revision that was read and the good code, and is recorded in state.saves.
+export async function rulesCall(state, account, method, customerId, body) {
+  if (state.rulesGate) await state.rulesGate;
+  if (state.rulesError) { const e = state.rulesError(method, customerId, body); if (e) throw e; }
+  const rules = state.rulesFor?.(account) ?? state.rules; // a test may give each team its own
+  const row = customerId ? rules.overrides[customerId] ?? { rev: 0, doc: {}, updated_at: null, updated_by: null } : rules.team;
+  if (method === 'GET' && !customerId) {
+    return { rules: structuredClone(rules.team), overrides: Object.entries(rules.overrides).map(([id, o]) => ({ customer_id: id, ...structuredClone(o) })), default_time_zone: rules.defaultTimeZone };
+  }
+  if (method === 'GET') return { customer_id: customerId, ...structuredClone(row), effective: { rev: rules.team.rev + row.rev, ...effective(rules.team.doc, row.doc, rules.defaultTimeZone) } };
+  if (state.saveGate) await state.saveGate;
+  if (body.rev !== row.rev) throw relayFail(409, 'stale', 'the rules changed since you read them; read them again');
+  if (body.code !== state.goodCode) throw relayFail(403, 'second_factor', 'that code is wrong or was already used; wait for the next one from your authenticator');
+  state.saves = [...(state.saves ?? []), { method, customerId, ...structuredClone(body) }];
+  if (method === 'DELETE') { delete rules.overrides[customerId]; return { removed: { customer_id: customerId } }; }
+  const saved = { rev: row.rev + 1, doc: structuredClone(body.doc), updated_at: Date.now(), updated_by: 'tech@example.com' };
+  if (customerId) { rules.overrides[customerId] = saved; return { override: { customer_id: customerId, ...saved } }; }
+  rules.team = saved;
+  return { rules: saved };
+}
+
+// The approval waiting on a session, and the answer to it.
+export async function approvalsCall(state, account, method, sid, id, body) {
+  if (state.approvalsGate) await state.approvalsGate;
+  if (state.approvalsError) { const e = state.approvalsError(method, sid, id); if (e) throw e; }
+  const waiting = state.approvals[sid] ?? null;
+  if (method === 'GET') return { approvals: waiting ? [structuredClone(waiting)] : [] };
+  if (state.answerGate) await state.answerGate;
+  if (!waiting || waiting.id !== id) throw relayFail(404, 'not_found', 'that approval is not waiting: it was answered or cancelled, or it timed out');
+  if (body.approve && body.code !== state.goodCode) throw relayFail(403, 'second_factor', 'that code is wrong or was already used; wait for the next one from your authenticator');
+  state.answers = [...(state.answers ?? []), { account, sid, id, ...structuredClone(body) }];
+  delete state.approvals[sid];
+  return { id, approved: body.approve };
+}
+
 // Builds the stand-in. `state` is what the relay holds; tests change it between steps.
 export function fakeCore(initial = {}) {
   const state = {
@@ -92,6 +135,10 @@ export function fakeCore(initial = {}) {
     recent: [],
     models: { models: [{ provider: 'anthropic', id: 'claude-sonnet' }], default_model: 'claude-sonnet', starters_pick_model: true, tasks: [], caps: {} },
     tasks: [],
+    // The team's rules and the customers' overrides, as /rules answers; `goodCode` is the authenticator code the relay accepts once.
+    rules: { team: { rev: 0, doc: structuredClone(DEFAULT_DOC), updated_at: null, updated_by: null }, overrides: {}, defaultTimeZone: 'UTC' },
+    goodCode: GOOD_CODE,
+    approvals: {}, // session id -> the approval waiting on it
     autostart: false,
     update: null,
     ...initial,
@@ -167,6 +214,10 @@ export function fakeCore(initial = {}) {
         if (state.sessionFrame) return state.sessionFrame(frame[1], account);
         throw Object.assign(new Error('this session has no picture yet'), { code: 'no_frame', status: 404 });
       }
+      const rulesRoute = /^\/api\/rules(?:\/(\w+))?$/.exec(p);
+      if (rulesRoute) return rulesCall(state, account, method, rulesRoute[1] ?? null, body);
+      const approvalsRoute = /^\/api\/sessions\/(\w+)\/approvals(?:\/(\w+))?$/.exec(p);
+      if (approvalsRoute) return approvalsCall(state, account, method, approvalsRoute[1], approvalsRoute[2] ?? null, body);
       if (p === '/teams') return { teams: state.teams };
       if (p === '/notifications/settings') {
         if (state.notifySettingsFor) return state.notifySettingsFor(account);

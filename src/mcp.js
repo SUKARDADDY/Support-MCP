@@ -26,6 +26,25 @@ const tool = (name, description, properties = {}, required = []) => ({
   inputSchema: { type: 'object', properties: { session_id: SESSION_ID, ...properties }, required: ['session_id', ...required] },
 });
 
+// What a model must know about the tools the team's rules govern (restart_pc, shutdown_pc, install_program,
+// uninstall_program, close_program; list_programs only reads). Worded from the benchmarked set in plans/bench-pr9.
+export const REFUSAL_CODES = ['rule_never', 'business_hours', 'declined', 'approval_timeout', 'approval_unavailable', 'busy', 'rules_stale', 'protected_program', 'protected_folder', 'needs_full_control', 'not_found', 'not_saved_pc', 'needs_update'];
+const RULES_NOTE =
+  `These actions follow the team's rules. Some need a technician's approval in the technician app, and the call waits up to 5 minutes for it. A refusal is the decision of the team's rules or of the technician, not a fault: the result is an error that starts with a code (${REFUSAL_CODES.join(', ')}), then a sentence. Do not work around a refusal with a raw command through run. They work only in a session on a saved PC; a one-off link session refuses them with not_saved_pc.`;
+const LIST_NOTE = 'It only reads, so the rules never refuse it, but it works only in a session on a saved PC.';
+const ANSWERS_FIRST =
+  'The call answers { ok: true, at } straight away, before the PC acts; at is the time the action will happen, in Unix seconds. Do not call it again to check or to retry: a second call schedules a second action.';
+const DELAY = 'delay_s is the wait before the action, 5 to 600 seconds, default 30.';
+const DELAY_S = { type: 'integer', description: '5..600, default 30', minimum: 5, maximum: 600 };
+const INSTALL_FACTS =
+  'path is an absolute path to an installer (.msi or .exe) that is already on the PC; use put_file to send it first. A .msi runs silent. args is optional installer command-line text, for example /sAll. timeout_s is 10 to 600 seconds, default 300. Returns { ok: true, exit_code }.';
+const UNINSTALL_FACTS =
+  'program_id comes from list_programs; never guess it. timeout_s is 10 to 600 seconds, default 300. Returns { ok: true, exit_code }.';
+const CLOSE_FACTS =
+  'Give name (for example OUTLOOK.EXE) or pid from the running list. force false asks the program to close; force true ends it at once and unsaved work is lost. Default false. Returns { ok: true, closed } with the number of programs closed.';
+const LIST_FACTS =
+  'Returns installed (id, name, version, publisher) and running (name, pid, session).';
+
 // Sessions, commands and files.
 const BASE_TOOLS = [
   {
@@ -53,7 +72,7 @@ const BASE_TOOLS = [
   {
     name: 'session_status',
     description:
-      'State, windows_mode (app or powershell), machine, user, expiry, whether an agent is attached, client_version (the release version the client reports, else its agent string), client_agent (the agent string, which names the protocol generation, or null), and the last log rows. App sessions also report elevated (true for administrator rights, null if unknown), control (full, normal, or null if not reported), caps (what the app can do: screen, uia, lanes, full), and, when the app reports them, desktop (default, secure or unknown), paused_until (the customer is using the PC until then) and input_blocked_until (block_input is on until then), as Unix milliseconds. The audit log shows typed text only as a length and never anything for type_secret.',
+      'State, windows_mode (app or powershell), machine, user, expiry, whether an agent is attached, client_version (the release version the client reports, else its agent string), client_agent (the agent string, which names the protocol generation, or null), and the last log rows. App sessions also report elevated (true for administrator rights, null if unknown), control (full, normal, or null if not reported), caps (what the app can do: screen, uia, lanes, full), and, when the app reports them, desktop (default, secure or unknown), paused_until (the customer is using the PC until then) and input_blocked_until (block_input is on until then), as Unix milliseconds. A saved PC also reports rules (the rules in force for it: restart, shutdown, install, uninstall and close_program each allow, approve, approve_in_hours, outside_hours or never; hours; protected programs and folders) and approval (an action waiting for approval from a technician, or null). The audit log shows typed text only as a length and never anything for type_secret.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -108,6 +127,69 @@ const BASE_TOOLS = [
       required: ['session_id', 'path'],
     },
   },
+  // The saved-PC tools that the team's rules govern (src/rules.js). They are command tools: one frame to the PC
+  // on its command lane, never a screen action.
+  {
+    name: 'restart_pc',
+    description:
+      `Restart the customer's PC. ${DELAY} ${ANSWERS_FIRST} ${RULES_NOTE} Use this tool instead of a raw command through run (Restart-Computer, shutdown) for restarts.`,
+    inputSchema: { type: 'object', properties: { session_id: SESSION_ID, delay_s: DELAY_S }, required: ['session_id'] },
+  },
+  {
+    name: 'shutdown_pc',
+    description:
+      `Shut down the customer's PC. ${DELAY} ${ANSWERS_FIRST} ${RULES_NOTE} Use this tool instead of a raw command through run (shutdown, Stop-Computer) for shutdowns.`,
+    inputSchema: { type: 'object', properties: { session_id: SESSION_ID, delay_s: DELAY_S }, required: ['session_id'] },
+  },
+  {
+    name: 'list_programs',
+    description: `List the programs on the customer's PC. ${LIST_FACTS} ${LIST_NOTE}`,
+    inputSchema: { type: 'object', properties: { session_id: SESSION_ID }, required: ['session_id'] },
+  },
+  {
+    name: 'install_program',
+    description:
+      `Install a program on the customer's PC from an installer file. ${INSTALL_FACTS} ${RULES_NOTE} Use this tool instead of a raw command through run (msiexec) for installing programs.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: SESSION_ID,
+        path: { type: 'string', description: 'absolute path of the installer on the PC' },
+        args: { type: 'string', description: 'optional installer arguments' },
+        timeout_s: { type: 'integer', description: '10..600, default 300' },
+      },
+      required: ['session_id', 'path'],
+    },
+  },
+  {
+    name: 'uninstall_program',
+    description:
+      `Uninstall an installed program from the customer's PC. ${UNINSTALL_FACTS} ${RULES_NOTE} Use this tool instead of a raw command through run (msiexec) for uninstalling programs.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: SESSION_ID,
+        program_id: { type: 'string', description: 'id from list_programs' },
+        timeout_s: { type: 'integer', description: '10..600, default 300' },
+      },
+      required: ['session_id', 'program_id'],
+    },
+  },
+  {
+    name: 'close_program',
+    description:
+      `Close a running program on the customer's PC. ${CLOSE_FACTS} ${RULES_NOTE} Use this tool instead of a raw command through run (taskkill, Stop-Process) for closing programs.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: SESSION_ID,
+        name: { type: 'string', description: 'process name, e.g. OUTLOOK.EXE' },
+        pid: { type: 'integer', description: 'process id' },
+        force: { type: 'boolean', description: 'end the program at once, default false' },
+      },
+      required: ['session_id'],
+    },
+  },
   {
     name: 'device_list',
     description:
@@ -124,7 +206,7 @@ const BASE_TOOLS = [
   {
     name: 'device_connect',
     description:
-      'Connect to a saved PC by its id from device_list. It starts a session in state waiting and returns { session_id, state, asks, rang }. The PC notices within seconds when rang is true (its doorbell was connected), otherwise within about 5 minutes. asks is true when the person at the PC will be asked to allow it, which happens when the PC is set to ask first, when you pass ask:true, or when your role may not connect without asking; the person has 2 minutes, and no answer, nobody signed in, or a refusal ends the session (ended_reason declined or nobody). Poll session_status until state is attached, then use session_id with the session tools; the PC\'s control level (full or limited) decides what they can do, and a limited PC runs everything as the person signed in at it. One technician drives a session at a time: a command from anyone else is refused with the driver\'s name. take_over:true takes the driving seat of a session someone else started, and needs the permission to connect without asking; without it, ask the driver to end the session and connect again. A PC already in a session, a PC waiting for approval, and a PC older than 0.6.0 (it updates itself first) are refused. A session lasts at most 24 hours.',
+      'Connect to a saved PC by its id from device_list. It starts a session in state waiting and returns { session_id, state, asks, rang }. The PC notices within seconds when rang is true (its doorbell was connected), otherwise within about 5 minutes. asks is true when the person at the PC will be asked to allow it, which happens when the PC is set to ask first, when you pass ask:true, or when your role may not connect without asking; the person has 2 minutes, and no answer, nobody signed in, or a refusal ends the session (ended_reason declined or nobody). Poll session_status until state is attached, then use session_id with the session tools; the PC\'s control level (full or limited) decides what they can do, and a limited PC runs everything as the person signed in at it. One technician drives a session at a time: a command from anyone else is refused with the driver\'s name. take_over:true takes the driving seat of a session someone else started, and needs the permission to connect without asking; without it, ask the driver to end the session and connect again. A PC already in a session, a PC waiting for approval, and a PC older than 1.0.0 (it updates itself first) are refused. A session lasts at most 24 hours.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -352,7 +434,8 @@ const screenResult = (out) => {
 const toolError = (msg) => ({ content: [{ type: 'text', text: msg }], isError: true });
 
 // backend: { session_create, session_list, session_status, run, put_file,
-//            get_file, session_end, request_full_control, device_list,
+//            get_file, restart_pc, shutdown_pc, list_programs, install_program,
+//            uninstall_program, close_program, session_end, request_full_control, device_list,
 //            device_connect, people_list, session_participants, session_handover,
 //            escalation, agent_start, agent_status, agent_control } each async
 //            (args) -> object|string, may throw. Every screen tool goes through

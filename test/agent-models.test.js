@@ -119,7 +119,7 @@ test('the month is the calendar month in UTC', () => {
 test('the agent\'s tools are the session tools without session_id and the PC, session and team tools, plus note and finish', () => {
   const tools = agentTools();
   assert.deepEqual(tools.map((t) => t.name), [
-    'session_status', 'run', 'put_file', 'get_file', 'screenshot', 'click', 'move_mouse', 'drag', 'scroll', 'type_text', 'press_key', 'wait', 'zoom',
+    'session_status', 'run', 'put_file', 'get_file', 'restart_pc', 'shutdown_pc', 'list_programs', 'install_program', 'uninstall_program', 'close_program', 'screenshot', 'click', 'move_mouse', 'drag', 'scroll', 'type_text', 'press_key', 'wait', 'zoom',
     'ui_tree', 'ui_act', 'note', 'finish',
   ]);
   for (const gone of ['type_secret', 'block_input', 'send_sas', 'request_full_control', 'session_create', 'session_list', 'session_end', 'device_list', 'device_connect',
@@ -133,7 +133,7 @@ test('the agent\'s tools are the session tools without session_id and the PC, se
     assert.doesNotMatch(JSON.stringify(t.schema), /type_secret/, t.name);
   }
   assert.match(tools.find((t) => t.name === 'screenshot').description, /untrusted/, 'the safety guidance stays');
-  assert.ok(JSON.stringify(tools).length < 20000, 'about 4,000 tokens, step 0 measured');
+  assert.ok(JSON.stringify(tools).length < 24000, 'about 5,000 tokens: 4,000 measured in step 0, and the six rule-governed tools add about 1,000');
 });
 
 test('strict mode: every property required, an optional one also null, no extra properties, and nulls are stripped before the relay sees them', () => {
@@ -158,6 +158,14 @@ test('a step record shows the verb and a short detail, and never typed text', ()
   assert.equal(stepDetail('ui_act', { ref: 3, verb: 'set_value', value: 'VALUE-NOT-SHOWN' }), 'set_value 3');
   assert.equal(stepDetail('put_file', { path: 'C:\\a.txt', data_b64: 'SECRETDATA' }), 'C:\\a.txt');
   assert.equal(stepDetail('screenshot', {}), '');
+  // The tools the team's rules govern show what they act on, and an installer's arguments never.
+  assert.equal(stepDetail('restart_pc', { delay_s: 60 }), 'in 60 s');
+  assert.equal(stepDetail('shutdown_pc', {}), 'in 30 s');
+  assert.equal(stepDetail('list_programs', {}), '');
+  assert.equal(stepDetail('install_program', { path: 'C:\\setup.msi', args: '/password=hunter2' }), 'C:\\setup.msi');
+  assert.equal(stepDetail('uninstall_program', { program_id: 'app-1' }), 'app-1');
+  assert.equal(stepDetail('close_program', { name: 'OUTLOOK.EXE', force: true }), 'OUTLOOK.EXE (force)');
+  assert.equal(stepDetail('close_program', { pid: 4120 }), 'pid 4120');
   assert.ok(!JSON.stringify([stepDetail('type_text', { text: 'hunter2' }), stepDetail('put_file', { path: 'p', data_b64: 'hunter2' })]).includes('hunter2'));
 });
 

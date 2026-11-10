@@ -199,8 +199,11 @@ export function accountStore(db, { secret }) {
   // FACTOR_LOCK_MAX_MS, and even a right code is refused until it ends. A right
   // code clears the count and the lock.
   // Returns { ok: true, via: 'code' | 'recovery' }, or
-  // { ok: false, reason: 'none' | 'locked' | 'wrong', lockedUntil? }.
-  async function verifyFactor(userId, code) {
+  // { ok: false, reason: 'none' | 'locked' | 'wrong', lockedUntil? }. With codeOnly a recovery code is
+  // wrong: an action that asks for a fresh code wants the authenticator, not a saved one-time code.
+  // A six-digit code works once however it is used: last_step moves past its step, so the sign-in
+  // page, the consent page and the rules route share one record of used codes.
+  async function verifyFactor(userId, code, { codeOnly = false } = {}) {
     const f = await getFactor(userId);
     if (!f) return { ok: false, reason: 'none' };
     const now = Date.now();
@@ -226,7 +229,7 @@ export function accountStore(db, { secret }) {
           ok = r.meta.changes === 1;
         }
       }
-    } else {
+    } else if (!codeOnly) {
       const norm = normalizeRecovery(code);
       if (RECOVERY_RE.test(norm)) {
         const want = await hmacHex(secret, 'recovery-code', norm);

@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { openD1 } from './d1-fake.js';
 import { teamStore } from '../src/workspace.js';
-import { CHECK_IN_CHANGE_MS, CHECK_IN_REFRESH_MS, CODE_TTL_MS, LIMITS, PENDING_TTL_MS, deviceStore, newId, normalizeCode, parseDeviceKey } from '../src/devices.js';
+import { CHECK_IN_CHANGE_MS, CHECK_IN_REFRESH_MS, CHECK_IN_VERSION_MS, CODE_TTL_MS, DEVICE_COLUMNS, LIMITS, PENDING_TTL_MS, deviceStore, newId, normalizeCode, parseDeviceKey } from '../src/devices.js';
 
 const W = 'default';
 const SECRET = 'a-deployment-secret-of-at-least-32-characters';
@@ -401,7 +401,7 @@ test('a PC checks in unlogged: unchanged details are written every 5 minutes, ch
   const log = (await kinds(team)).length;
   const seen = () => rows(db, 'SELECT last_seen, app_version, os FROM devices')[0];
   const paired = seen().last_seen;
-  const writes = () => db.seen.filter((s) => /^UPDATE devices SET os/.test(s.sql)).length;
+  const writes = () => db.seen.filter((s) => /^UPDATE devices SET (os|app_version)/.test(s.sql)).length;
   clk.advance(60_000);
   await devs.checkIn(key, { os: 'Windows 10', machine: 'POS-1', app_version: '0.3.0' });
   assert.equal(seen().last_seen, paired, 'a minute on, nothing changed: no write');
@@ -1026,18 +1026,68 @@ test('devices.manage and fields.manage need a second factor at sign-in', async (
   assert.equal(factorRequired([{ permissions: ['devices.view', 'sessions.view'] }], false), false);
 });
 
-test('check-ins that flip a value back and forth write at most once a minute', async (t) => {
+test('check-ins that flip os or machine back and forth write at most once a minute', async (t) => {
   const { db, devs } = await setup();
   const clk = clock(t);
   const { key } = await pair(devs);
   clk.advance(CHECK_IN_CHANGE_MS);
-  const writes = () => db.seen.filter((s) => /^UPDATE devices SET os/.test(s.sql)).length;
+  const writes = () => db.seen.filter((s) => /^UPDATE devices SET (os|app_version)/.test(s.sql)).length;
   for (let i = 0; i < 12; i++) {
-    await devs.checkIn(key, { app_version: i % 2 ? '1.0.0' : '2.0.0' });
+    await devs.checkIn(key, { os: i % 2 ? 'Windows 10' : 'Windows 11' });
     clk.advance(4000);
   }
   assert.equal(writes(), 1, 'twelve flips in 48 seconds: one write');
   clk.advance(CHECK_IN_CHANGE_MS);
-  await devs.checkIn(key, { app_version: '3.0.0' });
+  await devs.checkIn(key, { machine: 'POS-9' });
   assert.equal(writes(), 2);
+});
+
+test('a changed app_version is written after 2 seconds, while os and machine keep the minute', async (t) => {
+  const { db, devs } = await setup();
+  const clk = clock(t);
+  const { key } = await pair(devs);
+  const seen = () => rows(db, 'SELECT last_seen, app_version, os FROM devices')[0];
+  const writes = () => db.seen.filter((s) => /^UPDATE devices SET (os|app_version)/.test(s.sql)).length;
+  clk.advance(CHECK_IN_REFRESH_MS);
+  await devs.checkIn(key, { os: 'Windows 10', app_version: '0.9.0' });
+  assert.deepEqual([seen().app_version, writes()], ['0.9.0', 1]);
+  clk.advance(CHECK_IN_VERSION_MS - 1000);
+  await devs.checkIn(key, { app_version: '1.0.0' });
+  assert.deepEqual([seen().app_version, writes()], ['0.9.0', 1], 'one second after a write: not yet');
+  clk.advance(1000);
+  await devs.checkIn(key, { app_version: '1.0.0' });
+  assert.deepEqual([seen().app_version, seen().last_seen, writes()], ['1.0.0', clk.now(), 2], 'two seconds after a write: saved at once');
+  // A changed os in the same breath still waits for its minute, and a version change beside it does not.
+  clk.advance(CHECK_IN_VERSION_MS);
+  await devs.checkIn(key, { os: 'Windows 11', app_version: '1.0.1' });
+  assert.deepEqual([seen().app_version, seen().os], ['1.0.1', 'Windows 10']);
+  clk.advance(CHECK_IN_CHANGE_MS);
+  await devs.checkIn(key, { os: 'Windows 11' });
+  assert.equal(seen().os, 'Windows 11');
+  // A version that flips back and forth is written at most once every two seconds.
+  const before = writes();
+  for (let i = 0; i < 6; i++) {
+    await devs.checkIn(key, { app_version: i % 2 ? '1.0.1' : '1.0.2' });
+    clk.advance(1000);
+  }
+  assert.equal(writes() - before, 2, 'six check-ins a second apart: written at 2 s and again at 5 s, never within 2 s of a write');
+});
+
+test('two check-ins that saw the old version write one new version: the second finds it changed', async (t) => {
+  const { db, devs } = await setup();
+  const clk = clock(t);
+  const { key } = await pair(devs);
+  clk.advance(CHECK_IN_REFRESH_MS);
+  await devs.checkIn(key, { app_version: '0.9.0' });
+  clk.advance(CHECK_IN_VERSION_MS);
+  const before = db.seen.length;
+  await Promise.all([devs.checkIn(key, { app_version: '1.0.0' }), devs.checkIn(key, { app_version: '1.0.1' })]);
+  const written = db.seen.slice(before).filter((s) => /^UPDATE devices SET app_version/.test(s.sql));
+  assert.equal(written.length, 2, 'both tried');
+  assert.equal(rows(db, 'SELECT app_version FROM devices')[0].app_version, written[0].params[0], 'the first to write won, the other changed nothing');
+});
+
+test('the check-in query names every devices column, so a join cannot shadow one', async () => {
+  const { db } = await setup();
+  assert.deepEqual([...DEVICE_COLUMNS].sort(), rows(db, 'PRAGMA table_info(devices)').map((c) => c.name).sort());
 });

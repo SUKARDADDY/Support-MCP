@@ -87,7 +87,7 @@ describe('the driver: Invite, Hand over, Remove, Escalate', () => {
     ['cannot_control', 'Only people whose role can control sessions can do that.'],
     ['second_factor', 'Sign in again with your authenticator code to do this.'],
     ['offer_pending', 'An offer of control to someone else is still open. Cancel it first, or wait until it runs out.'],
-    ['busy', 'Control is being handed over right now. Try again in a moment.'],
+    ['busy', 'Something else is in progress on this session, such as control being handed over or another action waiting for approval. Try again in a moment.'],
   ])('a %s refusal reads as the app\'s sentence', async (code, text) => {
     const fake = fakeCore();
     fake.state.participantsCall = () => { throw new ToolFail(`${code}: the relay's own words`, code); };

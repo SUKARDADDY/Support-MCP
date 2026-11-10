@@ -62,10 +62,19 @@ test('a technician code pairs a PC; it checks in, changes its own settings, and 
   w.db.sqlite.exec('UPDATE devices SET last_seen = last_seen - 120000');
   const hello = await w.send('hello', { protocol: 1, os: 'Windows 11', machine: 'POS-1', app_version: '0.4.1' }, { headers: w.bearer(paired.body.key) });
   assert.equal(hello.status, 200);
-  assert.deepEqual(hello.body, {
+  const { rules, rules_tag: tag, hours_utc: spans, hours_until: until, server_time: serverTime, ...rest } = hello.body;
+  assert.deepEqual(rest, {
     protocol: 1,
     device: { id: paired.body.device_id, workspace: 'default', status: 'active', name: 'Front desk', access: 'ask', control: 'full', site_id: null },
   });
+  // A team with no rules row: the defaults, in UTC, with no business hours.
+  assert.deepEqual(rules, {
+    rev: 0, time_zone: 'UTC', hours: null, restart: 'approve', shutdown: 'approve', install: 'approve', uninstall: 'approve',
+    close_program: 'allow', protected_programs: [], protected_folders: [],
+  });
+  assert.match(tag, /^[0-9a-f]{16}$/);
+  assert.deepEqual([spans, until - serverTime], [[], 8 * 86400]);
+  assert.ok(Math.abs(serverTime - Date.now() / 1000) < 5, 'the relay\'s clock');
   assert.deepEqual({ ...rows(w.db, 'SELECT os, app_version FROM devices')[0] }, { os: 'Windows 11', app_version: '0.4.1' });
 
   const updated = await w.send('update', { protocol: 1, name: 'Till', access: 'any', control: 'limited' }, { headers: w.bearer(paired.body.key) });
@@ -329,7 +338,7 @@ test('a hello offers the signed release to an active PC on an older version, and
   const paired = await w.send('pair', { protocol: 1, code: await w.code(), name: 'Till', app_version: OLDER });
   const hello = await w.send('hello', { protocol: 1, app_version: OLDER }, { headers: w.bearer(paired.body.key) });
   assert.equal(hello.status, 200);
-  assert.deepEqual(Object.keys(hello.body).sort(), ['device', 'protocol', 'update']);
+  assert.deepEqual(Object.keys(hello.body).sort(), ['device', 'hours_until', 'hours_utc', 'protocol', 'rules', 'rules_tag', 'server_time', 'update']);
   assert.deepEqual(hello.body.update, { version: VERSION, note: w.note, signature: w.env.RELEASE_SIGNATURE });
   assert.ok(verifies(w.key.xy, hello.body.update.note, hello.body.update.signature), 'the PC can verify what it is offered');
   // Without app_version in the request, the stored version decides.
@@ -383,12 +392,12 @@ test('the offer matrix: version, status, rollout, group and the deploy settings'
   }
 });
 
-test('a relay with no app bundle offers nothing, and the hello answer is unchanged', async () => {
+test('a relay with no app bundle offers nothing, and the hello answer has no update', async () => {
   const signature = Buffer.alloc(64, 1).toString('base64');
   const w = await wire({ RELEASE_SIGNATURE: signature, RELEASE_SIGNED_AT: '1794000000', UPDATE_ROLLOUT: '100' });
   const paired = await w.send('pair', { protocol: 1, code: await w.code(), name: 'x' });
   const hello = await w.send('hello', { protocol: 1, app_version: OLDER }, { headers: w.bearer(paired.body.key) });
-  assert.deepEqual(Object.keys(hello.body).sort(), ['device', 'protocol']);
+  assert.deepEqual(Object.keys(hello.body).sort(), ['device', 'hours_until', 'hours_utc', 'protocol', 'rules', 'rules_tag', 'server_time']);
 });
 
 test('working out the offer reads and writes nothing more in the database', async () => {

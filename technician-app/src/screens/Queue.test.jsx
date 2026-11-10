@@ -317,7 +317,7 @@ describe('a live claim whose session step did not finish', () => {
     const fake = halfDone();
     const { user } = await openQueue([item({ session_id: SID, opened_by: LEAD })], fake);
     await user.click(await screen.findByRole('button', { name: 'Claim' }));
-    expect(await screen.findByText('Control is being handed over right now. Try again in a moment.')).toBeInTheDocument();
+    expect(await screen.findByText('Something else is in progress on this session, such as control being handed over or another action waiting for approval. Try again in a moment.')).toBeInTheDocument();
     await user.click(await screen.findByRole('button', { name: 'Finish taking control' }));
     expect(await screen.findByRole('tab', { name: /Front counter/, selected: true })).toBeInTheDocument();
     expect(queueCalls(fake, 'claim')).toHaveLength(2);

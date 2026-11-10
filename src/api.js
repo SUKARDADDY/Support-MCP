@@ -14,16 +14,20 @@
 // There the caller is an OAuth caller, held to the rules MCP gives one: a real
 // member (never open mode), the second factor for a permission that needs one,
 // and only the routes the app uses (APP_ROUTES). Members, roles, the team log,
-// the stop switch and the agent's settings and models are not among them.
+// the stop switch and the agent's settings and models are not among them. The team's rules are:
+// the app reads them and, for an admin, saves them with a fresh authenticator code.
 //
 // One route is not a collection: GET sessions/<64 hex session id>/frame, the last full screenshot of a
 // live session, for the driver and for a person who joined it (src/session-people.js). It is held in the
 // session's memory, so a watcher's app reads it here and an AI client is not sent large images it did not ask for.
-import { TeamError, teamFromEnv } from './workspace.js';
+import { TeamError, identityKind, normalizeIdentity, teamFromEnv } from './workspace.js';
 import { ID_RE, devicesFromEnv } from './devices.js';
 import { deviceHooks } from './device-sessions.js';
 import { handleAgentApi } from './agent-api.js';
 import { assertSecondFactor } from './oauth.js';
+import { accountStore } from './accounts.js';
+import { rulesFromEnv } from './rules-store.js';
+import { approvalService } from './approvals.js';
 import { sessionPeople } from './session-people.js';
 
 const ROOT = '/api/v1/w';
@@ -115,10 +119,75 @@ async function needSecondFactor(app, permission) {
 // workspace) and method. Anything else answers 404, as if the route did not exist.
 function appAllows(collection, item, method, extra = []) {
   if (collection === undefined) return true; // who am I
-  if (collection === 'sessions') return method === 'GET' && item !== undefined && extra.length === 1 && extra[0] === 'frame';
+  if (collection === 'sessions') {
+    if (item === undefined || extra[0] === undefined) return false;
+    // The picture of a session, and the approval waiting on it: read it, and answer it by its id.
+    if (extra[0] === 'frame') return method === 'GET' && extra.length === 1;
+    return extra[0] === 'approvals' && ((method === 'GET' && extra.length === 1) || (method === 'POST' && extra.length === 2));
+  }
   if (collection === 'fields') return method === 'GET' && item === undefined;
   if (collection === 'agent') return item === 'tasks'; // never settings or models
-  return ['customers', 'sites', 'devices', 'pairing'].includes(collection);
+  return ['customers', 'sites', 'devices', 'pairing', 'rules'].includes(collection);
+}
+
+// A save of the team's rules asks for a fresh code from the caller's own authenticator, whoever the caller
+// is: an Access login included, which is exempt from the second factor everywhere else. A code works once,
+// through the same record of used steps the sign-in page uses (verifyFactor, src/accounts.js), and a
+// recovery code does not count. The caller is found by the app's token, or by the Access login's email.
+export async function needFreshCode(env, caller, app, code) {
+  if (typeof code !== 'string' || !code.trim()) throw new TeamError(400, 'bad_request', 'send code: a fresh code from your authenticator app');
+  let result;
+  try {
+    const accounts = accountStore(env.DB, { secret: env.AUTH_SECRET });
+    let userId = app ? app.caller.userId : null;
+    if (!userId) {
+      const user = await accounts.userByEmail(normalizeIdentity(caller));
+      userId = user && !user.disabled_at ? user.id : null;
+    }
+    result = userId ? await accounts.verifyFactor(userId, code, { codeOnly: true }) : { ok: false, reason: 'none' };
+  } catch (_) {
+    throw new TeamError(503, 'unavailable', 'the code could not be checked; try again');
+  }
+  if (result.ok) return;
+  if (result.reason === 'none') throw new TeamError(403, 'second_factor', 'set up an authenticator on your account first, then send a code from it');
+  if (result.reason === 'locked') throw new TeamError(429, 'locked', 'too many wrong codes; the authenticator is locked for a while');
+  throw new TeamError(403, 'second_factor', 'that code is wrong or was already used; wait for the next one from your authenticator');
+}
+
+// Ring the PCs a change of rules reaches, so they check in and take the new rules: every PC of the team for the
+// team's rules, the customer's for an override. Best effort: a PC that misses the ring has its next check-in.
+async function ringRules(env, rules, slug, customerId) {
+  try {
+    const hooks = deviceHooks(env);
+    if (customerId) await hooks.ringMany(slug, await rules.customerDevices(slug, customerId));
+    else await hooks.ringAll(slug);
+  } catch (_) { /* the PC's own check-in is the fallback */ }
+}
+
+// GET sessions/<session id>/approvals and POST sessions/<session id>/approvals/<approval id> with
+// { approve: true|false, code }, for the technician app only. An answer is taken from a person (never a
+// service identity) whose role holds sessions.unattended at the moment of answering, with the second factor of
+// that permission on the app's sign-in. To approve, a fresh code from the person's own authenticator is also
+// needed: it works once (verifyFactor), so it cannot be used for a second action, and a code that is wrong
+// leaves the approval waiting. The approval must still be waiting when the code is checked. A denial needs no
+// code: it can only stop an action. The Session ends the wait and sends the command with approved_by.
+async function handleApprovals({ env, team, slug, caller, app, method, request, item, extra, need }) {
+  const sid = decodeSegment(item);
+  if (!/^[0-9a-f]{64}$/.test(sid)) throw new TeamError(404, 'not_found', 'not found');
+  await need(team, slug, caller, ['sessions.unattended']);
+  if (identityKind(normalizeIdentity(caller)) !== 'person') throw new TeamError(403, 'forbidden', 'approvals are answered by a person, not a service token');
+  const approvals = approvalService(env);
+  if (method === 'GET') return json(await approvals.list(slug, sid));
+  const id = decodeSegment(extra[1]);
+  if (!/^[0-9a-f]{32}$/.test(id)) throw new TeamError(404, 'not_found', 'not found');
+  const body = await readBody(request);
+  if (typeof body.approve !== 'boolean') throw new TeamError(400, 'bad_request', 'send approve: true or false');
+  if (body.approve) {
+    // Read the approval first: a code is not spent on one that is gone.
+    if (!(await approvals.list(slug, sid)).approvals.some((a) => a.id === id)) throw new TeamError(404, 'not_found', 'that approval is not waiting: it was answered or cancelled, or it timed out');
+    await needFreshCode(env, caller, app, body.code);
+  }
+  return json(await approvals.answer(slug, sid, id, body.approve, caller));
 }
 
 // deps: { accessCaller(request, env, url) -> identity|null, isJsonContentType(request) -> bool, origin } from app.js.
@@ -155,6 +224,12 @@ export async function handleApi(request, env, url, { accessCaller, isJsonContent
     }
     // The last picture of a live session. A session id is 64 hex characters, not a 20-character item id.
     if (collection === 'sessions') {
+      // The approval waiting on a session (src/approvals.js): the technician app's route only, never the team API
+      // an Access login or a service token uses, and never an MCP tool.
+      if (item !== undefined && extra[0] === 'approvals') {
+        if (!app) throw new TeamError(404, 'not_found', 'not found');
+        return await handleApprovals({ env, team, slug, caller, app, method, request, item, extra, need });
+      }
       if (item === undefined || extra.length !== 1 || extra[0] !== 'frame') throw new TeamError(404, 'not_found', 'not found');
       const sid = decodeSegment(item);
       if (!/^[0-9a-f]{64}$/.test(sid)) throw new TeamError(404, 'not_found', 'not found');
@@ -308,6 +383,39 @@ export async function handleApi(request, env, url, { accessCaller, isJsonContent
         return json({ removed: await devs.removeDevice(slug, caller, id) });
       }
       return notAllowed('GET, PATCH, DELETE');
+    }
+
+    // The team's rules (src/rules.js), at /rules, and a customer's overrides at /rules/<customer id>. Reading
+    // takes devices.view. Saving takes rules.manage, a person (never a service identity, whatever its role),
+    // the rev that was read (409 stale when it moved) and a fresh authenticator code. An override is saved and
+    // removed the same way; removing it gives the customer the team's rules.
+    if (collection === 'rules') {
+      const rules = rulesFromEnv(env, team);
+      const customerId = item === undefined ? '' : itemId(item);
+      if (method === 'GET') {
+        await need(team, slug, caller, ['devices.view']);
+        return json(customerId ? await rules.readCustomer(slug, customerId) : await rules.listAll(slug));
+      }
+      if (method !== 'PATCH' && !(method === 'DELETE' && customerId)) return notAllowed(customerId ? 'GET, PATCH, DELETE' : 'GET, PATCH');
+      await need(team, slug, caller, ['rules.manage'], 'first_member');
+      if (identityKind(normalizeIdentity(caller)) !== 'person') throw new TeamError(403, 'forbidden', 'rules are saved by a person with their authenticator, not by a service token');
+      const body = await readBody(request, RECORD_BODY_MAX);
+      const revSent = Object.hasOwn(body, 'rev');
+      if (revSent && (!Number.isSafeInteger(body.rev) || body.rev < 0)) throw new TeamError(400, 'bad_request', 'rev must be the revision you read, a whole number from 0');
+      if (method === 'DELETE') {
+        await needFreshCode(env, caller, app, body.code);
+        const removed = await rules.removeOverride(slug, caller, customerId, revSent ? body.rev : null);
+        if (removed.changed) await ringRules(env, rules, slug, customerId);
+        return json({ removed: { customer_id: customerId } });
+      }
+      if (!revSent) throw new TeamError(400, 'bad_request', 'send rev: the revision you read (0 when the rules were never saved)');
+      if (!body.doc || typeof body.doc !== 'object' || Array.isArray(body.doc)) throw new TeamError(400, 'bad_request', 'send doc: the whole rules document');
+      // What cannot be saved is refused before the person's code is spent on it.
+      await rules.check(slug, customerId, body.doc, body.rev);
+      await needFreshCode(env, caller, app, body.code);
+      const { changed, ...saved } = await rules.save(slug, caller, customerId, body.doc, body.rev);
+      if (changed) await ringRules(env, rules, slug, customerId);
+      return json(customerId ? { override: { customer_id: customerId, ...saved } } : { rules: saved });
     }
 
     if (collection === 'fields') {
