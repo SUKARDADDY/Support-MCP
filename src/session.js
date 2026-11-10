@@ -62,6 +62,8 @@ import { registryName } from './registry.js';
 import { identityKind, normalizeIdentity, teamFromEnv } from './workspace.js';
 import { ID_RE, MIN_SESSION_VERSION, devicesFromEnv } from './devices.js';
 import { notifyStore } from './notify.js';
+import { accountStore } from './accounts.js';
+import { agentStoreFromEnv } from './agent-store.js';
 import { UNATTENDED_PERMISSION } from './permissions.js';
 import { compareVersions, validVersion } from './release.js';
 import { REFUSALS, decide, installArgsProblem, installerProblem, isAppProgramId, localAbsolutePath } from './rules.js';
@@ -151,6 +153,7 @@ export class Session {
     this.env = env;
     this.sql = ctx.storage.sql;
     this.pending = new Map(); // uuid -> {resolve, tag}
+    this.held = new Set(); // approved commands not yet sent: from the technician's answer to the send, so a cancel reaches them (see holdApproved)
     this.laneWaitMs = LANE_WAIT_MS; // how long an approved command waits for a busy lane (a test may shorten it)
     this.httpCommands = { cmd: null, screen: null }; // app mode: per lane, {frame, tag, sent_at} waiting for its result
     this.httpPoll = null; // app mode: the parked long poll, if any, {resolve, timer, busy}
@@ -552,6 +555,15 @@ export class Session {
   // already waited for a technician's approval and got it: { hash, by }. The command then starts again from the
   // top, so the state, the driver, the actor, the PC's attachment and the rules are all read again after the wait.
   async command(b, approved) {
+    try {
+      return await this.commandOnce(b, approved);
+    } finally {
+      // The approved record lives until the command is sent or refused, however many times it started over.
+      if (approved?.held) this.held.delete(approved.held);
+    }
+  }
+
+  async commandOnce(b, approved) {
     if (await this.otherWorkspace(b.workspace)) return Response.json({ ok: false, error: 'session ended' });
     await this.expireIfDue();
     const state = await this.get('state');
@@ -604,13 +616,27 @@ export class Session {
       if (g.approved) return this.command(b, g.approved);
       guard = g;
     }
+    // An approved command is sent only to someone who may still send it, for a task that still runs, and only if
+    // nothing cancelled it since the technician said yes. The last await is here: the lane check below follows
+    // at once.
+    if (approved) {
+      const stale = await this.recheckRequester(b);
+      if (stale) return stale;
+      const gone = this.heldRefusal(approved.held);
+      if (gone) return gone;
+    }
     // From this check to the reservation below there is no await, so two
     // concurrent calls can't both take the same lane.
     if (isHttp && this.httpCommands[lane]) {
       // A command a technician has approved waits for its lane, up to laneWaitMs, instead of throwing the approval
-      // away. It then starts over (the state, the rules and the lane are all read again), with the wait spent.
+      // away. It then starts over (the state, the rules and the lane are all read again), with the wait spent. The
+      // wait is part of the approved record, so a cancel (the agent's Pause or Stop, a handover, a take-over, the
+      // end of the session) ends it at once.
       if (approved && !approved.waited) {
-        if (await this.laneFree(lane, this.laneWaitMs)) return this.command(b, { ...approved, waited: true });
+        const free = await this.laneFree(lane, this.laneWaitMs, approved.held);
+        const gone = this.heldRefusal(approved.held);
+        if (gone) return gone;
+        if (free) return this.command(b, { ...approved, waited: true });
       }
       if (approved) {
         return codedRefusal('busy', `${approved.by}'s approval was used: the PC stayed busy with another command for ${Math.round(this.laneWaitMs / 1000)} seconds, so this one did not run. Ask again, and a technician must approve it again`);
@@ -865,7 +891,7 @@ export class Session {
     const outcome = await waiting;
     if (outcome.approved) {
       this.logRow('approval', `approved by ${outcome.approver}: ${rec.summary}`, who);
-      return { approved: { hash: rec.hash, by: outcome.approver } };
+      return { approved: { hash: rec.hash, by: outcome.approver, held: outcome.held } };
     }
     if (outcome.ended) return { response: Response.json({ ok: false, error: 'session ended' }) };
     this.logRow('approval', `${outcome.refuse}: ${rec.summary}`, who);
@@ -874,12 +900,79 @@ export class Session {
 
   // Wait until the lane has no command waiting for its result, up to about ms. True when it is free. The wait is
   // counted in steps, not timed, so a test with a frozen clock still ends.
-  async laneFree(lane, ms) {
+  // `held` (the approved record) ends the wait early when it is cancelled.
+  async laneFree(lane, ms, held = null) {
     for (let left = Math.ceil(ms / LANE_STEP_MS); this.httpCommands[lane]; left--) {
-      if (left <= 0) return false;
-      await new Promise((resolve) => setTimeout(resolve, LANE_STEP_MS));
+      if (left <= 0 || held?.cancelled) return false;
+      await new Promise((resolve) => {
+        if (held) held.wake = resolve;
+        setTimeout(resolve, LANE_STEP_MS);
+      });
     }
-    return true;
+    return !held?.cancelled;
+  }
+
+  // ---- an approved command before it is sent ---------------------------------------------------------------
+  // A technician's yes does not end the command's wait: it may still wait for its lane, and it starts over from
+  // the top. From the moment of the answer to the send (or the refusal) the command has a record in this.held, so
+  // the cancels that stop a waiting approval stop it as well: the agent's Pause or Stop (for its own task), a
+  // handover or take-over, and the end of the session. The record is made in the same step that resolves the
+  // approval, with no await in between, so no cancel can fall in a gap.
+  holdApproved(rec) {
+    const held = { task_id: rec.task_id, via: rec.via, actor: rec.actor, cancelled: null, ended: false, wake: null };
+    this.held.add(held);
+    return held;
+  }
+
+  // Cancel the approved commands (all of them, or those of one agent task) with a reason, and wake any that wait for a lane.
+  cancelHeld(why, taskId = null, { ended = false } = {}) {
+    for (const h of this.held) {
+      if (taskId !== null && h.task_id !== taskId) continue;
+      h.cancelled = why;
+      h.ended = ended;
+      h.wake?.();
+    }
+  }
+
+  // The refusal for an approved command whose record was cancelled, or null.
+  heldRefusal(held) {
+    if (!held?.cancelled) return null;
+    if (held.ended) return Response.json({ ok: false, error: 'session ended' });
+    return codedRefusal('declined', `the approval was cancelled: ${held.cancelled}`);
+  }
+
+  // The requester's standing now, read from the database, just before an approved command is sent. The router
+  // checked it when the command was asked for, which may be minutes ago. A command goes only to a person who is
+  // still a member holding sessions.control, whose sign-in is not disabled, in a workspace and a relay that are
+  // not stopped; for the built-in agent, only for a task that is still running (not paused, not ended) and was
+  // started by this person. Fails closed: a database that cannot answer refuses. Returns a refusal or null.
+  async recheckRequester(b) {
+    const slug = await this.get('workspace', DEFAULT_WORKSPACE);
+    const actor = sameIdentity(b.actor);
+    const no = (why) => codedRefusal('declined', `the approval was cancelled: ${why}`);
+    if (String(this.env.EMERGENCY_STOP ?? '') !== '') return no('this relay was stopped by its operator');
+    try {
+      const team = teamFromEnv(this.env);
+      const a = await team.authorize(slug, actor, 'sessions.control', { membersOnly: true });
+      if (!a.ok) return no(a.reason === 'not_member' ? `${actor} is no longer a member of this team` : `${actor}'s role no longer allows sessions.control`);
+      const accounts = accountStore(this.env.DB, { secret: this.env.AUTH_SECRET });
+      const user = await accounts.userByEmail(actor);
+      if (user?.disabled_at) return no(`${actor}'s account was disabled`);
+      if ((await team.stopState(slug)).stopped) return no('the workspace was stopped');
+      if (b.via === 'agent') {
+        const task = typeof b.task_id === 'string' ? await agentStoreFromEnv(this.env, team).getTask(slug, b.task_id) : null;
+        if (!task || task.ended_at !== null) return no('the agent task ended');
+        if (task.state !== 'running') return no(`the agent task is ${task.state}`);
+        if (sameIdentity(task.started_by) !== actor) return no('the agent task was started by someone else');
+        if (task.started_by_user) {
+          const owner = await accounts.userById(task.started_by_user);
+          if (!owner || owner.disabled_at) return no('the account that started the agent task was disabled');
+        }
+      }
+    } catch (_) {
+      return no('could not check that the requester may still do this; try again');
+    }
+    return null;
   }
 
   // The waiting approval is over, one way: { approved, approver } or { refuse, text } or { ended }. Nothing happens
@@ -890,13 +983,19 @@ export class Session {
     clearTimeout(a.timer);
     this.approval = null;
     this.setMany({ approval: null }).catch(() => {});
-    a.resolve(outcome);
+    // The answer and the record of the approved command are made together, so a cancel cannot fall between them.
+    a.resolve(outcome.approved ? { ...outcome, held: this.holdApproved(a.rec) } : outcome);
     return true;
   }
 
   // Cancel the waiting approval because something it depended on changed (control moved, the agent was stopped).
-  cancelApproval(why) {
-    if (this.approval) this.finishApproval(this.approval.rec.id, { refuse: 'declined', text: `the approval was cancelled: ${why}` });
+  // `taskId` limits it to what that agent task asked for. It also reaches a command already approved that has not
+  // been sent yet (see holdApproved).
+  cancelApproval(why, taskId = null) {
+    if (this.approval && (taskId === null || this.approval.rec.task_id === taskId)) {
+      this.finishApproval(this.approval.rec.id, { refuse: 'declined', text: `the approval was cancelled: ${why}` });
+    }
+    this.cancelHeld(why, taskId);
   }
 
   approvalView() {
@@ -924,7 +1023,7 @@ export class Session {
       return Response.json({ ok: true, approved: b.approve });
     }
     if (b.op === 'cancel') {
-      if (this.approval && (typeof b.task_id !== 'string' || this.approval.rec.task_id === b.task_id)) this.cancelApproval(typeof b.why === 'string' ? truncate(b.why, 100) : 'it was withdrawn');
+      this.cancelApproval(typeof b.why === 'string' ? truncate(b.why, 100) : 'it was withdrawn', typeof b.task_id === 'string' ? b.task_id : null);
       return Response.json({ ok: true });
     }
     return refusal('bad_request', 'op must be list, answer or cancel');
@@ -1640,6 +1739,7 @@ export class Session {
     this.over = true;
     this.frame = null;
     if (this.approval) this.finishApproval(this.approval.rec.id, { ended: true });
+    this.cancelHeld('the session ended', null, { ended: true });
     const device = await this.get('device_id', null);
     await this.setMany({
       state: 'ended',

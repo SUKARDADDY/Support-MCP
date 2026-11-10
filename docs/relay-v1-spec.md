@@ -1716,7 +1716,11 @@ path (a drive letter and a separator; no UNC, device or stream name) of a `.msi`
 named as a Windows tool (`msiexec.exe`, `wusa.exe`, `shutdown.exe`, `cmd.exe`, `powershell.exe`, `pwsh.exe`, `reg.exe`, `sc.exe`,
 `taskkill.exe` and the rest of `SYSTEM_TOOLS` in `src/rules.js`, wherever the file sits); and `args` (at most 1,000 characters, no line
 breaks, since the PC strips them) must not ask for a restart (`/forcerestart`, `/promptrestart`, `REBOOT=Force`, `/restart`) or, for an
-`.msi` or `.msu`, an uninstall (`/x`, `/uninstall`). These are plain errors (not coded) and spend no approval. The PC also runs its
+`.msi` or `.msu`, an uninstall (`/x`, `/uninstall`). For an `.msi` (msiexec runs it as SYSTEM) `args` must also not remove or change
+other installed state: the properties `REMOVE=`, `ADVERTISE=` and `ADDSOURCE=` (any case, quoted or not, spaces around the `=` or not;
+`REMOVE=ALL` on a product that is already installed would uninstall it round the uninstall rule and the protected programs), and the
+msiexec switches `/f..` (repair), `/p` and `/update` (patch), `/j..` and `/advertise`, `/y` and `/z`. `ADDLOCAL`, `ADDDEFAULT`,
+`REINSTALL`, `REINSTALLMODE`, `/a`, `/l` and `/q..` are left alone: they take nothing off. These are plain errors (not coded) and spend no approval. The PC also runs its
 raw-command screen over the path and arguments (below), so a restart or shutdown verb, a protected name or the Support app named
 there is refused. An `.msi` runs through `msiexec /i`, an `.msu` through `wusa.exe`, an `.exe` as given.
 
@@ -1776,10 +1780,14 @@ agent task counts the wait as activity for its 2-minute watch rule and as time t
   again, the verdict is decided again, and if it is still `approve` the approval must match the action's hash (the session, the PC, the
   rule and the frame's fields), else `declined`. The frame carries `approved_by`, the approver's identity. If the command lane is
   taken at that moment, the command waits for it (up to 60 seconds, `LANE_WAIT_MS`) and starts again once more; if the lane stays
-  busy the call ends `busy` and says the approval was used.
+  busy the call ends `busy` and says the approval was used. From the answer to the send, the approved command has a record in the
+  Session (`held`), so every cancel below reaches it while it waits for the lane. Just before the send, the Session reads the
+  requester's standing from the database again: still a member holding `sessions.control`, account not disabled, workspace and relay not
+  stopped and, for the built-in agent, its task still `running` and started by this person. If not, the call ends
+  `declined: the approval was cancelled: ...` and nothing is sent. A database that cannot answer refuses too.
 - **Ending.** A denial is `declined`; no answer is `approval_timeout`. A handover or take-over cancels it (`declined`:
   `the approval was cancelled: ...`), the end of the session ends the call with `session ended`, and the built-in agent's Stop or Pause cancels
-  one the task asked for. A Session restart drops a stored approval unsent and logs `dropped unsent`.
+  one the task asked for. Each of these also cancels a command that was approved and still waits for its lane. A Session restart drops a stored approval unsent and logs `dropped unsent`.
 
 ### Frames
 

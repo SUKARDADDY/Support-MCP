@@ -1782,13 +1782,25 @@ namespace SupportMcp {
             return null;
         }
         // Why these installer arguments are refused, or null: they ask the installer to uninstall or to restart the PC, which
-        // other rules govern.
+        // other rules govern. For an .msi (which msiexec runs as SYSTEM) also: the properties REMOVE=, ADVERTISE= and ADDSOURCE=
+        // (any case, quoted or not, spaces around the "=" or not), which take features off the PC (REMOVE=ALL on a product that is
+        // already installed uninstalls it, round the uninstall rule and the protected programs), and the msiexec switches that do
+        // something other than install this package: /x /uninstall /f.. /p /update /j.. /advertise /y /z. ADDLOCAL, ADDDEFAULT,
+        // REINSTALL, REINSTALLMODE, /a, /l and /q.. are left alone. Same as installArgsProblem in src/rules.js; the shared cases run on both.
+        const string MsiRemovingProperty = "(?:^|[\\s\"'`;&|,()/-])(?:remove|advertise|addsource)[\"'`\\s]*=";
         public static string InstallArgsProblem(string path, string args) {
             var parts = PathParts(path);
             string name = parts.Count > 0 ? parts[parts.Count - 1] : "";
-            bool windows = name.EndsWith(".msi", StringComparison.Ordinal) || name.EndsWith(".msu", StringComparison.Ordinal);
+            bool msi = name.EndsWith(".msi", StringComparison.Ordinal);
+            bool windows = msi || name.EndsWith(".msu", StringComparison.Ordinal);
+            string lower = (args ?? "").ToLowerInvariant();
+            // A quote in the middle of a name does not break it for the command line, so the properties are looked for with the
+            // quotes taken out as well as with each quote standing for a break.
+            if (msi && (System.Text.RegularExpressions.Regex.IsMatch(lower, MsiRemovingProperty)
+                || System.Text.RegularExpressions.Regex.IsMatch(lower.Replace("\"", "").Replace("'", "").Replace("`", ""), MsiRemovingProperty)))
+                return "installer arguments must not remove or change other installed features (REMOVE, ADVERTISE, ADDSOURCE): use uninstall_program";
             var token = new StringBuilder();
-            string text = (args ?? "").ToLowerInvariant() + " ";
+            string text = lower + " ";
             foreach (char ch in text) {
                 if (!(char.IsWhiteSpace(ch) || "\"'`;&|,()".IndexOf(ch) >= 0)) { token.Append(ch); continue; }
                 if (token.Length == 0) continue;
@@ -1799,6 +1811,8 @@ namespace SupportMcp {
                     if (t.Substring(1).StartsWith("uninstall", StringComparison.Ordinal)) return "installer arguments must not uninstall a program: use uninstall_program";
                     if (t.Length >= 2 && t[1] == 'x' && (t.Length == 2 || !(t[2] >= 'a' && t[2] <= 'z'))) return "installer arguments must not uninstall a program: use uninstall_program";
                 }
+                if (msi && (t[0] == '/' || t[0] == '-') && System.Text.RegularExpressions.Regex.IsMatch(t, "^[/-](?:f[pecmsodauv]*(?![a-z0-9])|(?:p|j[um]?|y|z)(?![a-z])|update|advertise)"))
+                    return "installer arguments must not repair, patch, advertise or register other products: msiexec only installs this package";
             }
             return null;
         }

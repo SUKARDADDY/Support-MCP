@@ -477,3 +477,156 @@ it('Pause cancels it too, and a Pause or Stop of another task leaves a waiting a
   assert.equal(w.taskRow(id).state, 'paused');
   assert.equal(w.sessionCalls.filter((c) => c.sid === sid && c.body?.type === 'result' && c.body.at).length, 0);
 });
+
+// ---- the requester is checked again when an approved command is sent (PR 30 review) ---------------------------------------------
+// The router checked the requester when the command was asked for. After a technician's yes, the Session reads the
+// requester's standing again, so a role change, a removal, a disabled account or a stopped workspace in between wins.
+const BUSY = { frame: { id: 'other-command', lane: 'cmd' }, tag: 'x', sent_at: null };
+const settle = (ms = 350) => new Promise((resolve) => setTimeout(resolve, ms));
+const notHeld = (session) => assert.equal(session().held.size, 0, 'nothing approved is left waiting');
+
+for (const [name, change, expected] of [
+  ['their role lost sessions.control', (w) => w.team.updateMember('default', BOSS, TECH, { role_id: 'viewer' }), /^declined: the approval was cancelled: tech@example\.com's role no longer allows sessions\.control/],
+  ['they were removed from the team', (w) => w.team.removeMember('default', BOSS, TECH), /^declined: the approval was cancelled: tech@example\.com is no longer a member of this team/],
+  ['their account was disabled', (w) => w.sql('UPDATE users SET disabled_at = 5 WHERE email = ?', TECH), /^declined: the approval was cancelled: tech@example\.com's account was disabled/],
+  ['the workspace was stopped', (w) => w.team.stopWorkspace('default', BOSS), /^declined: the approval was cancelled: the workspace was stopped/],
+]) {
+  it(`nothing is sent when ${name} while the approval waited`, async (t) => {
+    const { w, frames, waiting, session } = await setup(t);
+    const { call, approval } = await waiting();
+    await change(w);
+    // The answer goes straight to the Session: a stopped workspace does not take answers through the relay.
+    session().finishApproval(approval.id, { approved: true, approver: LEAD });
+    assert.match((await call).error, expected);
+    assert.equal(powers(frames).length, 0);
+    notHeld(session);
+  });
+}
+
+it('a role that loses sessions.control while the approved command waits for its lane is refused when the lane frees', async (t) => {
+  const { w, frames, approve, waiting, session } = await setup(t);
+  const { call, approval } = await waiting();
+  session().httpCommands.cmd = BUSY;
+  assert.equal((await approve('lead', approval.id)).status, 200);
+  await settle();
+  assert.equal(session().held.size, 1, 'the approved command waits for its lane');
+  await w.team.updateMember('default', BOSS, TECH, { role_id: 'viewer' });
+  session().httpCommands.cmd = null;
+  assert.match((await call).error, /^declined: the approval was cancelled: tech@example\.com's role no longer allows sessions\.control/);
+  assert.equal(powers(frames).length, 0);
+  notHeld(session);
+});
+
+// ---- an approved command waiting for its lane is cancelled like a waiting approval ---------------------------------------------
+it('a handover while the approved command waits for its lane cancels it: nothing is sent when the lane frees', async (t) => {
+  const { w, sid, frames, approve, waiting, session } = await setup(t);
+  assert.equal((await w.tool(TECH, 'session_participants', { session_id: sid, action: 'invite', identity: LEAD })).error, undefined);
+  assert.equal((await w.tool(LEAD, 'session_participants', { session_id: sid, action: 'join' })).error, undefined);
+  const { call, approval } = await waiting();
+  session().httpCommands.cmd = BUSY;
+  await approve('lead', approval.id);
+  await settle();
+  assert.equal(session().held.size, 1);
+  assert.equal((await w.tool(TECH, 'session_handover', { session_id: sid, action: 'offer', identity: LEAD })).error, undefined);
+  assert.equal((await w.tool(LEAD, 'session_handover', { session_id: sid, action: 'accept' })).driver, LEAD);
+  assert.match((await call).error, /^declined: the approval was cancelled: control of the session moved/);
+  session().httpCommands.cmd = null;
+  await settle();
+  assert.equal(powers(frames).length, 0);
+  notHeld(session);
+});
+
+it('a take-over while the approved command waits for its lane cancels it', async (t) => {
+  const { w, pc, frames, approve, waiting, session } = await setup(t);
+  const { call, approval } = await waiting();
+  session().httpCommands.cmd = BUSY;
+  await approve('lead', approval.id);
+  await settle();
+  assert.equal(session().held.size, 1);
+  await w.tool(LEAD, 'device_connect', { device_id: pc.id, take_over: true });
+  assert.match((await call).error, /^declined: the approval was cancelled: control of the session moved/);
+  session().httpCommands.cmd = null;
+  await settle();
+  assert.equal(powers(frames).length, 0);
+  notHeld(session);
+});
+
+it('the end of the session while the approved command waits for its lane ends the call at once', async (t) => {
+  const { w, sid, frames, approve, waiting, session } = await setup(t);
+  const { call, approval } = await waiting();
+  session().httpCommands.cmd = BUSY;
+  await approve('lead', approval.id);
+  await settle();
+  assert.equal(session().held.size, 1);
+  await w.tool(TECH, 'session_end', { session_id: sid });
+  assert.match((await call).error, /session ended/);
+  assert.equal(powers(frames).length, 0);
+  notHeld(session);
+});
+
+// The built-in agent asks for a restart, a technician approves it while the PC's command lane is busy, and the task is
+// paused or stopped during that wait: the restart is not sent when the lane frees.
+for (const action of ['pause', 'stop']) {
+  it(`an agent ${action} while its approved command waits for the lane cancels it, and another task's cancel does not`, async (t) => {
+    const w = await appWorld(t);
+    await enrol(w, LEAD);
+    const lead = await w.connect(LEAD, { app: true });
+    await setRules(w, ruled);
+    await w.ready();
+    w.fake.queue('openai', oai.call('restart_pc', { delay_s: null }), finish());
+    const { id, pc } = await w.startOnPc(TECH, {}, { handler: answerFrame });
+    const sid = w.pointer(pc.id).id;
+    const session = () => w.sessionFor(sid).session;
+    t.after(() => { session().httpCommands.cmd = null; session().cancelApproval('the test is over'); });
+    const driven = w.drive(id);
+    await until(() => session().approval);
+    session().httpCommands.cmd = BUSY;
+    w.sessionFor(sid).ctx.values.set('http_seen_at', w.now());
+    const code = await fresh(w);
+    w.sessionFor(sid).ctx.values.set('http_seen_at', w.now());
+    const done = await w.appCall(lead.access, 'POST', `/api/sessions/${sid}/approvals/${session().approval.rec.id}`, { approve: true, code });
+    assert.equal(done.status, 200, JSON.stringify(done.body));
+    await settle();
+    assert.equal(session().held.size, 1, 'approved, waiting for the lane');
+    await deviceHooks(w.env).approvals('default', sid, { op: 'cancel', task_id: 'someone-else' });
+    assert.equal(session().held.size, 1, 'another task\'s cancel does nothing');
+    assert.equal((await w.tool(TECH, 'agent_control', { task_id: id, action })).state, action === 'pause' ? 'paused' : 'stopped');
+    await settle();
+    notHeld(session);
+    session().httpCommands.cmd = null;
+    await settle();
+    await driven;
+    assert.equal(w.sessionCalls.filter((c) => c.sid === sid && c.body?.type === 'result' && c.body.at).length, 0, 'no restart reached the PC');
+    const log = (await w.tool(TECH, 'session_status', { session_id: sid, log_tail: 50 })).log;
+    assert.ok(!log.some((r) => r.kind === 'power'), 'nothing was queued');
+  });
+}
+
+it('an agent command is not sent for a task that is no longer running, even if no cancel reached the Session', async (t) => {
+  const w = await appWorld(t);
+  await enrol(w, LEAD);
+  const lead = await w.connect(LEAD, { app: true });
+  await setRules(w, ruled);
+  await w.ready();
+  w.fake.queue('openai', oai.call('restart_pc', { delay_s: null }), finish());
+  const { id, pc } = await w.startOnPc(TECH, {}, { handler: answerFrame });
+  const sid = w.pointer(pc.id).id;
+  const session = () => w.sessionFor(sid).session;
+  t.after(() => { session().httpCommands.cmd = null; session().cancelApproval('the test is over'); });
+  const driven = w.drive(id);
+  await until(() => session().approval);
+  session().httpCommands.cmd = BUSY;
+  w.sessionFor(sid).ctx.values.set('http_seen_at', w.now());
+  const code = await fresh(w);
+  w.sessionFor(sid).ctx.values.set('http_seen_at', w.now());
+  await w.appCall(lead.access, 'POST', `/api/sessions/${sid}/approvals/${session().approval.rec.id}`, { approve: true, code });
+  await settle();
+  // The row changes without the task's wake: only the check just before the send can notice.
+  w.sql("UPDATE agent_tasks SET state = 'paused' WHERE workspace = 'default' AND id = ?", id);
+  session().httpCommands.cmd = null;
+  await settle();
+  await driven;
+  assert.equal(w.sessionCalls.filter((c) => c.sid === sid && c.body?.type === 'result' && c.body.at).length, 0, 'no restart reached the PC');
+  const log = (await w.tool(TECH, 'session_status', { session_id: sid, log_tail: 50 })).log;
+  assert.ok(!log.some((r) => r.kind === 'power'), 'nothing was queued');
+});

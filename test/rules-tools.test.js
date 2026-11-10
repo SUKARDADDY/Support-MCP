@@ -207,7 +207,7 @@ test('protected folders: put_file, get_file and an installer inside one are refu
 });
 
 // ---- one tool is not a way round another (PR 9 review) ------------------------------------------------------
-test('install_program runs only installers: other files, the Windows folder, system tools, and arguments that restart or uninstall are refused before anyone is asked', async (t) => {
+test('install_program runs only installers: other files, the Windows folder, system tools, and arguments that restart, uninstall or change other installed state are refused before anyone is asked', async (t) => {
   const w = await agentWorld(t);
   const { sid, frames, session } = await savedPc(w, t);
   await setRules(w, { ...ALLOW, install: 'approve' });
@@ -224,6 +224,11 @@ test('install_program runs only installers: other files, the Windows folder, sys
     [{ path: 'C:\\Temp\\a.msi', args: '/qn /forcerestart' }, /must not restart/],
     [{ path: 'C:\\Temp\\a.msi', args: 'REBOOT=Force' }, /must not restart/],
     [{ path: 'C:\\Temp\\a.exe', args: '/S /restart' }, /must not restart/],
+    // An .msi's properties and switches that act on other installed state (the shared installers cases cover the spellings).
+    [{ path: 'C:\\Temp\\a.msi', args: 'REMOVE=ALL' }, /must not remove or change other installed features/],
+    [{ path: 'C:\\Temp\\a.msi', args: '/qn "REMOVE" = "ALL"' }, /must not remove or change other installed features/],
+    [{ path: 'C:\\Temp\\a.msi', args: '/fa {11111111-2222-3333-4444-555555555555}' }, /must not repair, patch, advertise or register/],
+    [{ path: 'C:\\Temp\\a.msi', args: '/p C:\\Temp\\fix.msp' }, /must not repair, patch, advertise or register/],
     [{ path: 'relative\\setup.exe' }, /absolute path/],
     [{ path: '\\\\server\\share\\setup.exe' }, /absolute path/],
     [{ path: 'C:\\Temp\\setup.exe:stream' }, /absolute path/],
@@ -235,7 +240,7 @@ test('install_program runs only installers: other files, the Windows folder, sys
   assert.equal(frames.length, 0);
   // Real installers, and the installer's own flags, are left alone.
   await setRules(w, ALLOW);
-  for (const args of [{ path: 'C:\\Temp\\Setup.EXE', args: '/S /D=C:\\Apps' }, { path: 'C:\\Temp\\a.msi', args: '/qn /norestart ALLUSERS=1' }, { path: 'C:\\Temp\\update.msu' }]) {
+  for (const args of [{ path: 'C:\\Temp\\Setup.EXE', args: '/S /D=C:\\Apps' }, { path: 'C:\\Temp\\a.msi', args: '/qn /norestart ALLUSERS=1' }, { path: 'C:\\Temp\\a.msi', args: 'ADDLOCAL=ALL' }, { path: 'C:\\Temp\\update.msu' }]) {
     assert.equal((await w.tool(TECH, 'install_program', { session_id: sid, ...args })).ok, true, JSON.stringify(args));
   }
 });

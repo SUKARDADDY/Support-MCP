@@ -376,16 +376,35 @@ export function installerProblem(path) {
   return null;
 }
 
-// Why these installer arguments are refused, or null: they ask the installer to uninstall, or to restart the
-// PC, which other rules govern. What an installer does with its other arguments is its own; the PC also
-// screens the text like a raw command (RunScreen).
+// Why these installer arguments are refused, or null: they ask the installer to uninstall, to restart the PC, or
+// (for an .msi, which msiexec runs as SYSTEM) to act on installed state that other rules govern. What an installer
+// does with its other arguments is its own; the PC also screens the text like a raw command (RunScreen).
+//   Refused for an .msi: the properties REMOVE=, ADVERTISE= and ADDSOURCE= (any case, quoted or not, spaces
+//   around the "=" or not), which take features off the PC: REMOVE=ALL on a product that is already installed
+//   uninstalls it, round the uninstall rule and the protected programs. And the msiexec switches that do
+//   something other than install this package: /x and /uninstall (remove), /f.. (repair or reinstall a named
+//   product), /p and /update (patch a product), /j.. and /advertise (advertise instead of install), /y and /z
+//   (register or unregister a module). Left alone: ADDLOCAL, ADDDEFAULT, REINSTALL and REINSTALLMODE (they add or
+//   redo what this package installs, and take nothing off), /a (an administrative copy), /l (log), /q.., /passive.
+// The PC's Rules.InstallArgsProblem is the same check, and the shared installers cases run on both.
+const MSI_REMOVING_PROPERTY = /(?:^|[\s"'`;&|,()\/-])(?:remove|advertise|addsource)["'`\s]*=/;
 export function installArgsProblem(path, args) {
   const name = pathParts(path).at(-1) ?? '';
-  const windows = name.endsWith('.msi') || name.endsWith('.msu');
-  for (const raw of String(args ?? '').toLowerCase().split(/[\s"'`;&|,()]+/)) {
+  const msi = name.endsWith('.msi');
+  const windows = msi || name.endsWith('.msu');
+  const text = String(args ?? '').toLowerCase();
+  // A quote in the middle of a name does not break it for the command line, so the properties are looked for with the
+  // quotes taken out as well as with each quote standing for a break.
+  if (msi && (MSI_REMOVING_PROPERTY.test(text) || MSI_REMOVING_PROPERTY.test(text.replace(/["'`]/g, '')))) {
+    return 'installer arguments must not remove or change other installed features (REMOVE, ADVERTISE, ADDSOURCE): use uninstall_program';
+  }
+  for (const raw of text.split(/[\s"'`;&|,()]+/)) {
     if (!raw) continue;
     if (/forcerestart|promptrestart|warnrestart|reboot=force/.test(raw) || /^[/-](?:restart|reboot)$/.test(raw)) return 'installer arguments must not restart the PC: use restart_pc';
     if (windows && (/^[/-]uninstall/.test(raw) || /^[/-]x(?![a-z])/.test(raw))) return 'installer arguments must not uninstall a program: use uninstall_program';
+    if (msi && (/^[/-]f[pecmsodauv]*(?![a-z0-9])/.test(raw) || /^[/-](?:p|j[um]?|y|z)(?![a-z])/.test(raw) || /^[/-](?:update|advertise)/.test(raw))) {
+      return 'installer arguments must not repair, patch, advertise or register other products: msiexec only installs this package';
+    }
   }
   return null;
 }
