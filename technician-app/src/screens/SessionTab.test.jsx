@@ -108,9 +108,11 @@ describe('Session tab: watching the screen yourself', () => {
     fake.state.sessions[SID] = { state: 'attached', driver: 'tech@example.com', machine: 'FRONT', log: [] };
     const props = { core: fake.core, account: 'acc1', tab: { key: SID, sessionId: SID, taskId: null }, active: true, me: { identity: 'tech@example.com' }, canControl: true, tuning: FAST, visible: true, onSessionKnown: () => {} };
     // Drawing the stopped state takes longer than the time between pictures, so the next tick is due before the loop is switched off.
+    // Only the first render of the stopped state is slow: that is the window the stop must hold through.
+    let drawnSlowly = false;
     const { result } = renderHook(() => {
       const r = useSession(props);
-      if (r.stopped) for (const end = performance.now() + 150; performance.now() < end;);
+      if (r.stopped && !drawnSlowly) { drawnSlowly = true; for (const end = performance.now() + 150; performance.now() < end;); }
       return r;
     });
     await waitFor(() => expect(result.current.stopped).toBe('busy'));
