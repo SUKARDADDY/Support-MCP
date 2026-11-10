@@ -6,50 +6,18 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { agentWorld, BOSS, TECH, VIEW, LEAD, shot, until } from './agent-world.js';
 import { Session } from '../src/session.js';
+import { appHello, attached, call, oneOff } from './people-world.js';
 
 const JPEG = '/9j/4AAQ';
 const PNG = 'iVBORw0KGgoAAAANSUhEUgAA';
-const TECH2 = 'tech2@example.com';
 
-// A route of one Session object, as the relay calls it.
-async function call(w, sid, path, body, { method = 'POST' } = {}) {
-  const r = await w.env.SESSION.get(w.env.SESSION.idFromString(sid)).fetch(`https://do${path}`, method === 'POST' ? { method, body: JSON.stringify({ workspace: 'default', ...body }) } : { method });
-  return r.json();
-}
 const people = (w, sid, body) => call(w, sid, '/people', body);
 const handover = (w, sid, body) => call(w, sid, '/handover', body);
 const status = (w, sid) => call(w, sid, '/status?workspace=default&log_tail=50', undefined, { method: 'GET' });
 const watch = (w, sid) => call(w, sid, '/watch?workspace=default', undefined, { method: 'GET' });
 const roles = (list) => list.map((p) => `${p.identity}:${p.role}`);
 
-// A saved PC with an attached session driven by TECH.
-async function attached(w, who = TECH) {
-  const pc = await w.addPc({ access: 'any', name: 'Till' });
-  const { sid, welcome } = await w.attach(pc, who);
-  return { pc, sid, generation: welcome.body.generation };
-}
-
 // ---- the one-off driver --------------------------------------------------------------------
-// A link session as a caller that names a driver makes it, and as one that names none does (open mode, or a session
-// made before this rule: its storage has no driver key at all).
-async function oneOff(w, { driver } = {}) {
-  const code = `code${Math.random().toString(36).slice(2, 14)}`.padEnd(16, 'a').slice(0, 16);
-  const id = w.env.SESSION.idFromName(code);
-  const sid = id.toString();
-  const r = await w.env.SESSION.get(id).fetch('https://do/create', {
-    method: 'POST', body: JSON.stringify({ code, sid, label: 'link', windows_mode: 'app', actor: driver ?? BOSS, workspace: 'default', ...(driver ? { driver } : {}) }),
-  });
-  assert.equal((await r.json()).ok, true);
-  return sid;
-}
-// The downloaded app's side: consume the link, then say hello with the key.
-async function appHello(w, sid) {
-  const consumed = await (await w.env.SESSION.get(w.env.SESSION.idFromString(sid)).fetch('https://do/consume', { method: 'POST', body: JSON.stringify({ windows_mode: 'app' }) })).json();
-  const key = consumed.key;
-  const hello = await w.agent(sid, null, { type: 'hello', machine: 'M2', user: 'sam', control: 'full', caps: ['screen', 'lanes'], version: '0.6.0' }, { 'x-attach-key': key });
-  return { key, hello };
-}
-
 test('a one-off session made with a driver keeps it in storage, shows it in status and watch, and refuses everyone else\'s command', async (t) => {
   const w = await agentWorld(t);
   const sid = await oneOff(w, { driver: TECH });
