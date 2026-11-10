@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { endSession, fetchDevices, fetchMe, fetchPlaces, isLiveTask, listTasks, messageOf, participantsAction, refusalText, sessionStatus, startTask } from './api.js';
+import { endSession, fetchDevices, fetchMe, fetchPlaces, isLiveTask, listQueue, listTasks, messageOf, participantsAction, refusalText, sessionStatus, startTask } from './api.js';
 import { Icon } from './components/Icon.jsx';
 import { useConnections } from './connections.js';
 import { AppContext } from './context.jsx';
@@ -11,6 +11,7 @@ import { AddDevice } from './screens/AddDevice.jsx';
 import { Devices } from './screens/Devices.jsx';
 import { Notifications } from './screens/Notifications.jsx';
 import { OneOffLink } from './screens/OneOffLink.jsx';
+import { Queue } from './screens/Queue.jsx';
 import { SessionTab } from './screens/SessionTab.jsx';
 import { Settings } from './screens/Settings.jsx';
 import { SignIn } from './screens/SignIn.jsx';
@@ -57,6 +58,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   const [notifications, setNotifications] = useState([]);
   const knownNotes = useRef(new Set()); // "<account>:<id>" of every item the list has seen
   const [unread, setUnread] = useState(0);
+  const [queueCount, setQueueCount] = useState(0); // items in the queue nobody has claimed
   const [linkOpen, setLinkOpen] = useState(false);
   const [titles, setTitles] = useState(loadTitles); // task id -> first line of the instructions this app sent
   const [toastText, setToastText] = useState(null);
@@ -114,6 +116,31 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     return () => { live = false; };
   }, [core, accountId]);
   const can = useCallback((permission) => me.permissions.includes(permission), [me]);
+
+  // ---- the queue's badge: the items nobody has claimed ----------------------------------
+  // Read when the app starts, when the Queue screen is shown or changes something, and when the relay
+  // says the queue changed (a notification): never by a timer. Its answer counts only if its team is
+  // still the one on screen and no newer read has begun.
+  const queueSeq = useRef(0);
+  const canQueue = me.permissions.includes('sessions.control');
+  const refreshQueue = useCallback(async (owner = accountId) => {
+    if (!owner || !guard.isShown(owner) || !canQueue) return;
+    queueSeq.current += 1;
+    const mine = queueSeq.current;
+    try {
+      const items = await listQueue(core, owner, 'open');
+      if (guard.isShown(owner) && queueSeq.current === mine) setQueueCount(items.length);
+    } catch (_) {
+      // the badge stays as it was
+    }
+  }, [core, accountId, guard, canQueue]);
+  const refreshQueueRef = useRef(refreshQueue);
+  refreshQueueRef.current = refreshQueue;
+  useEffect(() => {
+    queueSeq.current += 1;
+    setQueueCount(0);
+    refreshQueue();
+  }, [accountId, canQueue]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---- devices -----------------------------------------------------------------
   const [deviceData, setDeviceData] = useState({ devices: [], places: new Map(), loading: true, error: null });
@@ -297,6 +324,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
         fresh.push({ ...i, account: acc });
       }
       if (!fresh.length) return;
+      if (isLive && fresh.some((i) => i.event === 'escalation_opened' || i.event === 'escalation_claimed')) refreshQueueRef.current?.(acc);
       setNotifications((cur) => [...cur, ...fresh].slice(-100));
       if (isLive) setUnread((n) => n + fresh.length);
     });
@@ -348,9 +376,9 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     core, appInfo, accounts: accounts ?? [], account, setActive, reloadAccounts: loadAccounts, can, me,
     devices: deviceData.devices, places: deviceData.places, devicesState: deviceData, reloadDevices,
     selectedId, select, conns, connect, cancelConnect, dismissConnect,
-    sessionTabFor, tabForSession, isShown: guard.isShown, showTab, endTab, closeTab, leaveTab, markRole, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true),
+    sessionTabFor, tabForSession, isShown: guard.isShown, showTab, endTab, closeTab, leaveTab, markRole, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true), queueCount, refreshQueue,
     toast, copyText, notifications, openTarget, now, theme, setTheme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded,
-  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, tabForSession, showTab, endTab, closeTab, leaveTab, markRole, updateTab, openSessionTab, go, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded]); // eslint-disable-line react-hooks/exhaustive-deps
+  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, tabForSession, showTab, endTab, closeTab, leaveTab, markRole, updateTab, openSessionTab, go, queueCount, refreshQueue, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (accounts === null) return <div className="app" role="status"><p className="hint">{t('common.loading')}</p></div>;
 
@@ -396,6 +424,12 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
             <button type="button" aria-current={screen === 'devices' ? 'page' : undefined} onClick={() => go('devices')}><Icon name="monitor" />{t('nav.devices')}</button>
             <button type="button" aria-current={screen === 'add' ? 'page' : undefined} onClick={() => go('add')}><Icon name="plus" />{t('nav.add')}</button>
             <button type="button" onClick={() => setLinkOpen(true)}><Icon name="link" />{t('nav.link')}</button>
+            {canQueue ? (
+              <button type="button" aria-current={screen === 'queue' ? 'page' : undefined} onClick={() => go('queue')}>
+                <Icon name="queue" />{t('nav.queue')}
+                {queueCount ? <span className="count" aria-label={t('nav.queue_open', { count: queueCount })}>{queueCount}</span> : null}
+              </button>
+            ) : null}
             <span className="grow" />
             <button type="button" aria-current={screen === 'notifications' ? 'page' : undefined} onClick={() => go('notifications')}>
               <Icon name="bell" />{t('nav.notifications')}
@@ -407,6 +441,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
             <div className="panel-fill" role="tabpanel" id="panel-devices" aria-labelledby="tab-devices" hidden={screen === 'session'}>
               {screen === 'devices' ? <Devices /> : null}
               {screen === 'add' ? <AddDevice /> : null}
+              {screen === 'queue' ? <Queue key={account.id} /> : null}
               {screen === 'notifications' ? <Notifications /> : null}
               {screen === 'settings' ? <Settings /> : null}
             </div>
