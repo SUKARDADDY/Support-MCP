@@ -407,11 +407,13 @@ export class AgentTask {
     return true;
   }
 
-  // leave: the session is someone else's now (they took it over): do not end it.
-  async end(state, reason, summary = null, leave = false) {
+  // leave: the session is someone else's now (they took it over, or the starter handed it over): do not end it.
+  // opts.actor: who ends it, for the log and for whether the starter is told (a person who ends their own task
+  // knows; "relay", the default, is told). opts.escalate: the task needs a person, so its summary goes into the queue.
+  async end(state, reason, summary = null, leave = false, opts = {}) {
     const { workspace, task_id: id } = this.cfg;
     if (leave) this.st.closed = true;
-    await this.store.endTask(workspace, id, { state, reason, summary, actor: 'relay', steps: this.st.calls });
+    await this.store.endTask(workspace, id, { state, reason, summary, actor: opts.actor ?? 'relay', steps: this.st.calls, escalate: opts.escalate === true });
     await this.cleanup();
   }
 
@@ -652,9 +654,21 @@ export class AgentTask {
       return { end: [st.phase === 'waiting' ? 'failed' : 'stopped', why ?? `the session ended${watch.ended_reason ? ` (${watch.ended_reason})` : ''}`, null, true] };
     }
     const starter = cfg.starter;
-    if (watch.device_id) {
-      if (watch.driver && normalizeIdentity(watch.driver) !== starter) return { end: ['stopped', 'someone else took over the session', null, true] };
-    } else if ((watch.actors ?? []).some((a) => normalizeIdentity(a.actor) !== starter && a.ts >= cfg.created_at)) {
+    if (watch.driver) {
+      // A session with a driver (a saved PC's, and a one-off link session a member made): the driver is the starter, or the
+      // task is over. When the starter handed control over, that is their own doing: the task stops quietly, with the
+      // starter as the actor, so they are not told of a problem. A take-over by anyone else raises the notice. The record of
+      // the handover is checked first, and only when it names this starter and the person who drives now.
+      const driver = normalizeIdentity(watch.driver);
+      if (driver !== starter) {
+        const handed = watch.handed_over;
+        if (handed && normalizeIdentity(handed.from) === starter && normalizeIdentity(handed.to) === driver) {
+          return { end: ['stopped', `handed over to ${driver}`, null, true, { actor: starter }] };
+        }
+        return { end: ['stopped', 'someone else took over the session', null, true] };
+      }
+    } else if (!watch.device_id && (watch.actors ?? []).some((a) => normalizeIdentity(a.actor) !== starter && a.ts >= cfg.created_at)) {
+      // A one-off session with no driver (made before sessions had drivers, or in open mode): whoever else commands it ends the task.
       return { end: ['stopped', 'someone else sent a command to the session', null, true] };
     }
     return { watch };
@@ -861,7 +875,8 @@ export class AgentTask {
         answer('outcome must be done, stuck or needs_human, and summary must say what happened', true);
       } else {
         const summary = clip(args.summary.trim(), SUMMARY_MAX);
-        return this.end(args.outcome === 'done' ? 'done' : 'stuck', args.outcome === 'done' ? 'finished' : args.outcome === 'stuck' ? 'finished: stuck' : 'finished: needs a person', summary);
+        // Needs a person is the one finish that also opens a queue item (explicitly: nothing else that ends a task does).
+        return this.end(args.outcome === 'done' ? 'done' : 'stuck', args.outcome === 'done' ? 'finished' : args.outcome === 'stuck' ? 'finished: stuck' : 'finished: needs a person', summary, false, { escalate: args.outcome === 'needs_human' });
       }
     } else {
       // The session id is the runner's: whatever the model sent for it is replaced. The action

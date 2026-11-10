@@ -393,3 +393,67 @@ test('the people list names the members who are people and whether each can cont
   assert.deepEqual(by, { [BOSS]: true, [TECH]: true, [VIEW]: false, [LEAD]: true, [TECH2]: true });
   assert.ok(list.every((p) => p.name === null || typeof p.name === 'string'));
 });
+
+// ---- the built-in agent --------------------------------------------------------------------------------
+const rowsOf = (w, where = '', ...params) => w.sql(`SELECT recipient, event, task_id, title, body FROM notifications ${where} ORDER BY id`, ...params).map((r) => ({ ...r }));
+
+test('a handover by the starter stops their task quietly and leaves the session running; the new driver keeps it', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  await addTech2(w);
+  const a = await w.startOnPc(TECH, { keep_working: true });
+  const sid = a.joined.sid;
+  const people = sessionPeople(w.env);
+  await part(people, sid, TECH, 'invite', TECH2);
+  await part(people, sid, TECH2, 'join');
+  await hand(people, sid, TECH, 'offer', TECH2);
+  await hand(people, sid, TECH2, 'accept');
+  assert.equal(w.pointer(a.pc.id).by, TECH2);
+  await w.drive(a.id);
+  const row = w.taskRow(a.id);
+  assert.deepEqual([row.state, row.end_reason], ['stopped', `handed over to ${TECH2}`]);
+  // The starter did it themselves: no "needs attention", and the log names them as the actor.
+  assert.deepEqual(rowsOf(w, "WHERE task_id = ? AND event LIKE 'task%'", a.id), []);
+  const ended = (await w.log()).find((r) => r.kind === 'agent_task_ended');
+  assert.equal(ended.actor, TECH);
+  assert.match(ended.detail, new RegExp(`${a.id} stopped handed over to ${TECH2}`));
+  // The session is the new driver's now: not ended, and the pointer still names them.
+  assert.equal(w.stateOf(sid), 'attached');
+  assert.equal(w.pointer(a.pc.id).by, TECH2);
+  assert.equal(w.sql('SELECT COUNT(*) AS n FROM escalations')[0].n, 0);
+});
+
+test('a take-over by someone else still ends the task with the notice, even when the starter had offered control', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  await addTech2(w);
+  const a = await w.startOnPc(TECH, { keep_working: true });
+  const people = sessionPeople(w.env);
+  // The starter offered control to TECH2, but LEAD took the session over before it was accepted.
+  await part(people, a.joined.sid, TECH, 'invite', TECH2);
+  await part(people, a.joined.sid, TECH2, 'join');
+  await hand(people, a.joined.sid, TECH, 'offer', TECH2);
+  await w.tool(LEAD, 'device_connect', { device_id: a.pc.id, take_over: true });
+  await w.drive(a.id);
+  assert.deepEqual([w.taskRow(a.id).state, w.taskRow(a.id).end_reason], ['stopped', 'someone else took over the session']);
+  assert.deepEqual(rowsOf(w, "WHERE task_id = ? AND event = 'task_problem'", a.id).map((r) => [r.recipient, r.body]), [[TECH, 'The printer stopped printing.: someone else took over the session']]);
+  assert.equal((await w.log()).find((r) => r.kind === 'agent_task_ended').actor, 'relay');
+});
+
+test('a handover that is later taken over by someone else raises the notice: the handover record names the new driver only', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  await addTech2(w);
+  const a = await w.startOnPc(TECH, { keep_working: true });
+  const sid = a.joined.sid;
+  const people = sessionPeople(w.env);
+  await part(people, sid, TECH, 'invite', TECH2);
+  await part(people, sid, TECH2, 'join');
+  await hand(people, sid, TECH, 'offer', TECH2);
+  await hand(people, sid, TECH2, 'accept');
+  // Before the task looks again, LEAD takes the session over from TECH2.
+  await w.tool(LEAD, 'device_connect', { device_id: a.pc.id, take_over: true });
+  await w.drive(a.id);
+  assert.equal(w.taskRow(a.id).end_reason, 'someone else took over the session', 'handed_over is cleared by a take-over');
+  assert.equal(rowsOf(w, "WHERE task_id = ? AND event = 'task_problem'", a.id).length, 1);
+});

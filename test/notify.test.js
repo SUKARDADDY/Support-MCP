@@ -77,7 +77,9 @@ test('a task that gets stuck, needs a person, fails or is stopped by the relay t
   assert.equal((await w.tool(TECH, 'agent_control', { task_id: mine.id, action: 'stop' })).state, 'stopped');
   await w.drive(mine.id);
 
-  const rows = rowsOf(w);
+  // The task that needs a person also tells the others who control sessions that the queue has an item (tested in escalations.test.js).
+  assert.deepEqual(rowsOf(w).filter((r) => r.event === 'escalation_opened').map((r) => r.task_id), [cases[1][1], cases[1][1]]);
+  const rows = rowsOf(w).filter((r) => r.event !== 'escalation_opened');
   assert.deepEqual(rows.map((r) => [r.event, r.recipient, r.task_id]), cases.map(([, id]) => ['task_problem', TECH, id]));
   assert.ok(rows.every((r) => r.title === 'Task needs attention'));
   assert.match(rows[0].body, /: finished: stuck$/);

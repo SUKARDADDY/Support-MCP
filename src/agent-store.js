@@ -11,10 +11,16 @@
 // A task that ends raises a notification for its starter (src/notify.js), written in
 // the same batch as the end: "finished" when it is done, "needs attention" when it is
 // stuck, failed or stopped by the relay itself (not when a person stopped it).
+//
+// A task that finishes with "needs a person" also opens an item in the escalation queue, in the same
+// batch as its end (endTask with escalate: true), so a stuck agent's summary reaches the team. Only that
+// explicit finish does: a task that ran out of time or calls, or gave up, opens nothing.
 import { MIN_SECRET_LENGTH, seal } from './crypto.js';
 import { TeamError, normalizeIdentity, teamFromEnv } from './workspace.js';
 import { MAX_ADDED_MODELS, PROVIDERS, findSpec, monthBounds, usd } from './agent-models.js';
 import { notifyStore } from './notify.js';
+import { newId } from './devices.js';
+import { insertItem, NOTE_MAX } from './escalations.js';
 
 export const MODES = Object.freeze(['mcp', 'agent', 'both']);
 const KEY_RE = /^[\x21-\x7e]{16,400}$/;
@@ -297,12 +303,22 @@ export function agentStore(db, team, { authSecret = '' } = {}) {
   }
 
   // End a task, once. state is done, stuck, stopped or failed. actor is a person
-  // or "relay". A task that has already ended is left as it is.
-  async function endTask(slug, id, { state, reason, summary = null, actor = 'relay', steps = null }) {
+  // or "relay". A task that has already ended is left as it is. escalate: the task
+  // needs a person, so its summary goes into the queue as an item in the same batch: opened
+  // by the starter, with the PC, and with the session only when the task leaves it open.
+  async function endTask(slug, id, { state, reason, summary = null, actor = 'relay', steps = null, escalate = false }) {
     return mutate(slug, actor, async () => {
       const cur = await getTask(slug, id);
       if (!cur || cur.ended_at !== null) return { noop: true, result: { ended: false } };
       const now = Date.now();
+      const item = escalate && (summary ?? cur.summary) ? {
+        id: newId(), kind: 'agent', device_id: cur.device_id, session_id: cur.opened_session ? null : cur.sid, task_id: id,
+        summary: String(summary ?? cur.summary).slice(0, NOTE_MAX), note: null, opened_by: normalizeIdentity(cur.started_by), opened_at: now,
+      } : null;
+      const queued = item ? await notify.rows(slug, 'escalation_opened', { holding: 'sessions.control', except: [cur.started_by] }, {
+        device_id: item.device_id, task_id: id, session_id: item.session_id, title: 'A stuck agent needs a person', body: cur.title,
+        dedupe: `escalation:${item.id}:opened`,
+      }) : [];
       // A person who stops their own task knows. Everything else the starter should hear about.
       const finished = state === 'done';
       const problem = state === 'stuck' || state === 'failed' || (state === 'stopped' && actor === 'relay');
@@ -311,11 +327,16 @@ export function agentStore(db, team, { authSecret = '' } = {}) {
         title: finished ? 'Task finished' : 'Task needs attention', body: finished ? cur.title : `${cur.title}: ${reason}`, dedupe: `task:${id}:ended`,
       }) : [];
       return {
-        entries: [{ kind: 'agent_task_ended', detail: `${id} ${state} ${reason}` }],
+        entries: [
+          { kind: 'agent_task_ended', detail: `${id} ${state} ${reason}` },
+          ...(item ? [{ kind: 'escalation_opened', detail: `${item.id} agent task ${id}${item.device_id ? ` pc ${item.device_id}` : ''}` }] : []),
+        ],
         guard: taskLive(slug, id),
-        // The notifications come first: the update ends the task the guard asks to be live.
+        // The notifications and the queue item come first: the update ends the task the guard asks to be live.
         change: (cond) => [
           ...notify.statements(slug, heard, cond),
+          ...notify.statements(slug, queued, cond),
+          ...(item ? [insertItem(db, slug, item, cond)] : []),
           q(
             `UPDATE agent_tasks SET state = ?, ended_at = ?, end_reason = ?, summary = COALESCE(?, summary), steps = COALESCE(?, steps)
              WHERE workspace = ? AND id = ? AND ended_at IS NULL AND ${cond[0]}`,

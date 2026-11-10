@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { agentWorld, BOSS, TECH, VIEW, LEAD } from './agent-world.js';
 import { TECH2, addTech2, attached, attachedLink, call } from './people-world.js';
+import { oai } from './agent-fakes.js';
 import { escalationService } from '../src/escalations.js';
 import { teamStore } from '../src/workspace.js';
 
@@ -414,4 +415,105 @@ test('the escalation tool: open, list mine, claim a live session and close, with
   assert.deepEqual([closed.escalation.closed_by, closed.escalation.close_note], [TECH2, 'Vendor tool run']);
   assert.match((await w.tool(TECH, 'escalation', { action: 'claim', id: opened.escalation.id })).error, /^already_claimed: /);
   assert.equal((await w.tool(BOSS, 'escalation', { action: 'list', status: 'closed' })).escalations.length, 1);
+});
+
+// ---- a stuck agent's summary --------------------------------------------------------------------------------
+const shotCall = () => oai.call('screenshot', { display: null });
+const finishCall = (outcome, summary) => oai.call('finish', { outcome, summary });
+
+test('a task that finishes with "needs a person" opens exactly one item with its summary, for the PC it worked on', async (t) => {
+  const w = await agentWorld(t);
+  await addTech2(w);
+  await w.ready();
+  const a = await w.startOnPc(TECH, { keep_working: true });
+  w.fake.queue('openai', shotCall(), finishCall('needs_human', 'The sign-in needs a password I do not have.'));
+  await w.drive(a.id);
+  assert.equal(w.taskRow(a.id).state, 'stuck');
+  assert.equal(w.taskRow(a.id).end_reason, 'finished: needs a person');
+  const [row, ...rest] = items(w);
+  assert.equal(rest.length, 0, 'one item');
+  assert.deepEqual([row.kind, row.device_id, row.task_id, row.summary, row.note, row.opened_by, row.claimed_by, row.closed_at], ['agent', a.pc.id, a.id, 'The sign-in needs a password I do not have.', null, TECH, null, null]);
+  assert.equal(row.session_id, null, 'the task opened its session and ended it');
+  assert.equal(row.opened_at, w.taskRow(a.id).ended_at);
+  // It is in the open list, with the PC's name.
+  const listed = (await service(w).list('default', BOSS, {})).escalations;
+  assert.deepEqual(listed.map((x) => [x.id, x.kind, x.device_name, x.summary]), [[row.id, 'agent', 'Till', row.summary]]);
+  // The team log: the end and the item, in that order, names and ids only.
+  const kinds = (await w.log()).map((r) => r.kind).filter((k) => k === 'agent_task_ended' || k === 'escalation_opened');
+  assert.deepEqual(kinds, ['agent_task_ended', 'escalation_opened']);
+  assert.ok(!JSON.stringify(await w.log()).includes('password'));
+  // The others who control sessions are told once; the starter has their own "task needs attention".
+  assert.deepEqual(notes(w, 'escalation_opened').map((n) => [n.recipient, n.task_id, n.device_id, n.session_id]).sort(), [BOSS, LEAD, TECH2].sort().map((r) => [r, a.id, a.pc.id, null]));
+  assert.deepEqual(w.sql("SELECT recipient FROM notifications WHERE event = 'task_problem'").map((r) => r.recipient), [TECH]);
+  // Anyone free claims it: a ticket, which names the PC.
+  const got = await service(w).claim('default', TECH2, { id: row.id });
+  assert.deepEqual([got.device_id, got.device_name, got.escalation.claimed_by, got.escalation.summary], [a.pc.id, 'Till', TECH2, row.summary]);
+  assert.deepEqual(notes(w, 'escalation_claimed').map((n) => [n.recipient, n.task_id]), [[TECH, a.id]]);
+});
+
+test('only "needs a person" opens an item: done, stuck and a time limit open nothing', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const done = await w.startOnPc(TECH, { keep_working: true });
+  w.fake.queue('openai', shotCall(), finishCall('done', 'all good'));
+  await w.drive(done.id);
+  const stuck = await w.startOnPc(TECH, { keep_working: true }, { pc: await w.addPc({ access: 'any', name: 'Stuck' }) });
+  w.fake.queue('openai', shotCall(), finishCall('stuck', 'tried everything'));
+  await w.drive(stuck.id);
+  // The two-hour limit.
+  const slow = await w.startOnPc(TECH, { keep_working: true }, { pc: await w.addPc({ access: 'any', name: 'Slow' }) });
+  w.fake.queue('openai', shotCall(), shotCall());
+  await w.alarm(slow.id);
+  w.advance(2 * 3600_000 + 1000);
+  await w.drive(slow.id);
+  assert.deepEqual([w.taskRow(done.id).state, w.taskRow(stuck.id).state, w.taskRow(slow.id).state, w.taskRow(slow.id).end_reason], ['done', 'stuck', 'stuck', 'reached the limit of 2 hours']);
+  assert.equal(items(w).length, 0);
+  assert.equal(notes(w, 'escalation_opened').length, 0);
+});
+
+test('a task given a session it leaves open carries that session in its item; the item and the end commit together or not at all', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const pc = await w.addPc({ access: 'any', name: 'Given' });
+  const { sid } = await w.attach(pc, TECH);
+  const started = await w.tool(TECH, 'agent_start', { session_id: sid, instructions: 'Check the printer.', keep_working: true });
+  assert.equal(started.error, undefined, JSON.stringify(started));
+  const pump = w.pump({ sid, key: pc.key, generation: (await w.agent(sid, pc.key, { type: 'hello', control: 'full', caps: ['screen', 'lanes'] })).body.generation });
+  t.after(() => pump.stop());
+  // The end fails after the item was written: nothing stays.
+  w.db.sqlite.exec("CREATE TRIGGER no_end BEFORE UPDATE ON agent_tasks WHEN NEW.state = 'stuck' BEGIN SELECT RAISE(ABORT, 'the end failed'); END");
+  w.fake.queue('openai', shotCall(), finishCall('needs_human', 'Needs the owner to approve a prompt.'));
+  await w.alarm(started.task_id);
+  await w.alarm(started.task_id); // finish: the batch fails
+  assert.equal(w.taskRow(started.task_id).ended_at, null, 'the task did not end');
+  assert.equal(items(w).length, 0, 'and the item was not written');
+  assert.equal((await w.log()).filter((r) => r.kind === 'escalation_opened' || r.kind === 'agent_task_ended').length, 0);
+  assert.equal(notes(w, 'escalation_opened').length, 0);
+  // It tries again once the database works, and writes one item.
+  w.db.sqlite.exec('DROP TRIGGER no_end');
+  w.fake.queue('openai', shotCall(), finishCall('needs_human', 'Needs the owner to approve a prompt.'));
+  await w.drive(started.task_id);
+  assert.equal(w.taskRow(started.task_id).state, 'stuck');
+  const [row, ...rest] = items(w);
+  assert.equal(rest.length, 0);
+  assert.deepEqual([row.session_id, row.device_id, row.summary], [sid, pc.id, 'Needs the owner to approve a prompt.']);
+  assert.equal(w.stateOf(sid), 'attached', 'a session it was given stays open');
+  assert.equal(w.pointer(pc.id).by, TECH);
+  // The item is a live session its opener still drives: whoever is free takes it over.
+  await addTech2(w);
+  const got = await service(w).claim('default', TECH2, { id: row.id });
+  assert.equal(got.driver, TECH2);
+  assert.equal(w.pointer(pc.id).by, TECH2);
+});
+
+test('an agent item is unique per task, even if the end is recorded twice', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const a = await w.startOnPc(TECH, { keep_working: true });
+  w.fake.queue('openai', shotCall(), finishCall('needs_human', 'Help.'));
+  await w.drive(a.id);
+  const store = (await import('../src/agent-store.js')).agentStoreFromEnv(w.env);
+  assert.deepEqual(await store.endTask('default', a.id, { state: 'stuck', reason: 'again', summary: 'again', escalate: true }), { ended: false });
+  assert.equal(items(w).length, 1);
+  assert.throws(() => w.db.sqlite.prepare("INSERT INTO escalations(workspace, id, kind, task_id, opened_by, opened_at) VALUES ('default', ?, 'agent', ?, ?, 1)").run('b'.repeat(20), a.id, TECH), /UNIQUE/);
 });

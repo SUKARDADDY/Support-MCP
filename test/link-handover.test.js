@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { agentWorld, BOSS, TECH, VIEW, LEAD } from './agent-world.js';
 import { TECH2, addTech2, appHello, call, oneOff } from './people-world.js';
+import { oai } from './agent-fakes.js';
 
 const rows = (list) => list.map((p) => `${p.identity}:${p.role}`);
 const kinds = async (w) => (await w.log()).map((r) => r.kind).filter((k) => /session_(handed|taken)_over/.test(k));
@@ -145,4 +146,71 @@ test('only a person who controls sessions and is a member can be invited to a on
   assert.match((await part(w, TECH, l.sid, 'invite', VIEW)).error, /^cannot_control: /);
   assert.match((await part(w, VIEW, l.sid, 'join')).error, /your role does not allow sessions\.control/);
   assert.match((await part(w, 'stranger@example.com', l.sid, 'join')).error, /not a member of this team/);
+});
+
+// ---- the built-in agent in a one-off session ------------------------------------------------------------------------
+const shotCall = () => oai.call('screenshot', { display: null });
+const finishCall = () => oai.call('finish', { outcome: 'done', summary: 'ok' });
+const notices = (w, taskId) => w.sql("SELECT recipient, body FROM notifications WHERE task_id = ? AND event = 'task_problem'", taskId).map((r) => ({ ...r }));
+
+// A link session driven by `who` with the app attached and answering, and a task of theirs working in it.
+async function taskInLink(w, t, who = TECH) {
+  const l = await link(w, who);
+  const pump = w.pump({ sid: l.sid, key: null, generation: l.generation, headers: { 'X-Attach-Key': l.key } });
+  t.after(() => pump.stop());
+  const started = await w.tool(who, 'agent_start', { session_id: l.sid, instructions: 'Check the printer.', keep_working: true });
+  assert.equal(started.error, undefined, JSON.stringify(started));
+  return { ...l, task: started.task_id };
+}
+
+test('the built-in agent works in a one-off session its starter drives, and cannot be started in one someone else drives', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const l = await taskInLink(w, t, TECH);
+  w.fake.queue('openai', shotCall(), finishCall());
+  await w.drive(l.task);
+  assert.equal(w.taskRow(l.task).state, 'done', w.taskRow(l.task).end_reason);
+  assert.equal(w.stateOf(l.sid), 'attached', 'a session it was given stays open');
+  // Someone else drives: the same refusal as for a saved PC.
+  const other = await link(w, BOSS);
+  assert.equal((await w.tool(TECH, 'agent_start', { session_id: other.sid, instructions: 'x' })).error, `${BOSS} is driving that session`);
+});
+
+test('a handover of a one-off session by the starter stops the task quietly; the log has the starter as actor', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  await addTech2(w);
+  const l = await taskInLink(w, t, TECH);
+  await part(w, TECH, l.sid, 'invite', TECH2);
+  await part(w, TECH2, l.sid, 'join');
+  await hand(w, TECH, l.sid, 'offer', TECH2);
+  await hand(w, TECH2, l.sid, 'accept');
+  await w.drive(l.task);
+  assert.deepEqual([w.taskRow(l.task).state, w.taskRow(l.task).end_reason], ['stopped', `handed over to ${TECH2}`]);
+  assert.deepEqual(notices(w, l.task), []);
+  assert.equal((await w.log()).find((r) => r.kind === 'agent_task_ended').actor, TECH);
+  assert.equal(w.stateOf(l.sid), 'attached');
+  assert.equal((await w.tool(TECH, 'session_status', { session_id: l.sid })).driver, TECH2);
+});
+
+test('an admin\'s take-over of a running agent\'s one-off session ends the task as a take-over, with the notice', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const l = await taskInLink(w, t, TECH);
+  assert.equal((await hand(w, BOSS, l.sid, 'take_over')).driver, BOSS);
+  await w.drive(l.task);
+  assert.deepEqual([w.taskRow(l.task).state, w.taskRow(l.task).end_reason], ['stopped', 'someone else took over the session']);
+  assert.deepEqual(notices(w, l.task).map((n) => n.recipient), [TECH]);
+  assert.equal((await w.log()).find((r) => r.kind === 'agent_task_ended').actor, 'relay');
+  assert.equal(w.stateOf(l.sid), 'attached');
+});
+
+test('the agent does not mistake another person\'s refused command for a take-over: only the driver changing ends it', async (t) => {
+  const w = await agentWorld(t);
+  await w.ready();
+  const l = await taskInLink(w, t, TECH);
+  assert.match((await w.tool(LEAD, 'run', { session_id: l.sid, command: 'whoami' })).error, /is driving this session/);
+  w.fake.queue('openai', shotCall(), finishCall());
+  await w.drive(l.task);
+  assert.equal(w.taskRow(l.task).state, 'done');
 });
