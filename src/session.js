@@ -881,7 +881,8 @@ export class Session {
       // takes over; `actor` drives already, so nothing changes; anything else drives or has driven since (a take-over
       // landed in between, even one by the same person who drove before), so it stops and the later change stands.
       // `from_gen` is the generation the accept or claim marked, and `gen` the one the move gives (a saved PC's
-      // pointer has already taken it). A call with no `from_gen` compares the driver only.
+      // pointer has already taken it, and the Session adopts that number: it never makes one up). A call with no
+      // `from_gen` compares the driver only.
       const to = actor;
       if (!to) return refusal('bad_request', 'actor is required');
       if (this.driver === to) {
@@ -894,6 +895,7 @@ export class Session {
       const takeOver = b.kind === 'take_over';
       const checked = Number.isInteger(b.from_gen);
       if (!this.driver || (!takeOver && this.driver !== sameIdentity(b.from)) || (checked && this.gen !== b.from_gen)) return notDriver();
+      if (checked && !(Number.isInteger(b.gen) && b.gen > this.gen)) return notDriver();
       await this.applyDriver(to, { kind: takeOver ? 'take_over' : b.kind === 'claim' ? 'claim' : 'accept', gen: Number.isInteger(b.gen) ? b.gen : undefined });
       return ok({ changed: true });
     }
@@ -1218,6 +1220,8 @@ export class Session {
       // A one-off session shows its driver here too (never to the PC), or null when it has none.
       driver: s.get('driver') ?? null,
       gen: this.gen,
+      // The reservation made before the PC's record changes, for the queue to tell a claim that is still finishing.
+      accepting: this.currentAccepting() ? { to: this.people.accepting.to, claim: !!this.people.accepting.claim } : null,
       handed_over: this.people.handed_over,
       participants: this.roster(),
       offer: this.offerView(),
@@ -1243,6 +1247,9 @@ export class Session {
     // that has not finished): what began before it can no longer apply. `gen` is the one the PC's pointer took. An
     // older one than the session's own is a late delivery of a take-over that a newer change has passed.
     const to = Number.isInteger(gen) ? gen : this.gen + 1;
+    // A take-over that is not above the session's own generation and names someone else does not apply, and says so: the
+    // PC's pointer took the number first, so the session has passed it, and the caller must not be told they drive.
+    if (to <= this.gen && !(to === this.gen && this.driver === next)) return Response.json({ ok: false, stale: true });
     if (to > this.gen) {
       if (this.driver !== next) {
         await this.applyDriver(next, { kind: 'take_over', gen: to });

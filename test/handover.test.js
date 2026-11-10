@@ -374,6 +374,64 @@ test('a half-finished accept, then a take-over by a third person, leaves them dr
   assert.deepEqual([w.pointer(pc.id).by, (await call(w, sid, '/watch?workspace=default', undefined, { method: 'GET' })).driver], [LEAD, LEAD]);
 });
 
+for (const lapsed of [false, true]) {
+  test(`a half-finished accept from before generations existed (${lapsed ? 'offer lapsed' : 'offer open'}): a repeat settles both sides to the same number, and a take-over after it really drives`, async (t) => {
+    const w = await agentWorld(t);
+    const { sid, pc } = await attached(w, LEAD);
+    const people = sessionPeople(w.env);
+    const watchOf = () => call(w, sid, '/watch?workspace=default', undefined, { method: 'GET' });
+    await part(people, sid, LEAD, 'invite', BOSS);
+    await part(people, sid, BOSS, 'join');
+    await hand(people, sid, LEAD, 'offer', BOSS);
+    // The old code moved the PC's pointer and stopped: no generation in the pointer, none in the Session.
+    w.db.sqlite.prepare("UPDATE devices SET session = json_set(session, '$.by', ?) WHERE id = ?").run(BOSS, pc.id);
+    assert.equal(w.pointer(pc.id).gen, undefined);
+    assert.deepEqual([(await watchOf()).driver, (await watchOf()).gen], [LEAD, 0]);
+    if (lapsed) w.advance(180_000);
+    const done = await hand(people, sid, BOSS, 'accept');
+    assert.equal(done.driver, BOSS);
+    const settled = await watchOf();
+    assert.deepEqual([w.pointer(pc.id).by, settled.driver], [BOSS, BOSS]);
+    assert.equal(w.pointer(pc.id).gen, settled.gen, 'both sides count the same');
+    assert.ok(settled.gen >= 1);
+    // A repeat changes nothing. Then LEAD takes over: both sides name LEAD at the same, higher number.
+    assert.equal((await hand(people, sid, BOSS, 'accept')).driver, BOSS);
+    const took = await w.tool(LEAD, 'device_connect', { device_id: pc.id, take_over: true });
+    assert.equal(took.session_id, sid, JSON.stringify(took));
+    const after = await watchOf();
+    assert.deepEqual([w.pointer(pc.id).by, after.driver], [LEAD, LEAD]);
+    assert.equal(w.pointer(pc.id).gen, after.gen);
+    assert.ok(after.gen > settled.gen);
+    // LEAD really drives: the session lets their command through to the next check and refuses BOSS's.
+    assert.doesNotMatch((await call(w, sid, '/command', { op: 'screenshot', actor: LEAD, timeout_ms: 50 })).error ?? '', /is driving this session/);
+    assert.match((await call(w, sid, '/command', { op: 'run', command: 'x', actor: BOSS })).error, /is driving this session/);
+  });
+}
+
+test('a take-over that the session has already passed answers a failure, so the caller is not told they drive', async (t) => {
+  const w = await agentWorld(t);
+  const { sid } = await attached(w, LEAD);
+  // The session is at generation 3 (as after the older code made one up) and the pointer takes 1: a late take-over.
+  await call(w, sid, '/takeover', { actor: LEAD, gen: 3 });
+  const stale = await call(w, sid, '/takeover', { actor: BOSS, gen: 1 });
+  assert.deepEqual([stale.ok, stale.stale], [false, true]);
+  assert.equal((await call(w, sid, '/watch?workspace=default', undefined, { method: 'GET' })).driver, LEAD);
+  // The same take-over delivered twice is fine.
+  assert.equal((await call(w, sid, '/takeover', { actor: LEAD, gen: 3 })).ok, true);
+});
+
+test('complete never makes up a generation: one that is not above the session\'s stops', async (t) => {
+  const w = await agentWorld(t);
+  const { sid } = await attached(w, LEAD);
+  const people = sessionPeople(w.env);
+  await part(people, sid, LEAD, 'invite', BOSS);
+  await part(people, sid, BOSS, 'join');
+  const body = { op: 'complete', actor: BOSS, from: LEAD, kind: 'accept', from_gen: 0 };
+  assert.equal((await call(w, sid, '/handover', { ...body, gen: 0 })).code, 'not_driver');
+  assert.equal((await call(w, sid, '/handover', body)).code, 'not_driver');
+  assert.equal((await call(w, sid, '/handover', { ...body, gen: 1 })).driver, BOSS);
+});
+
 test('a cancel between the steps leaves one driver, whichever way it lands', async (t) => {
   const w = await agentWorld(t);
   const { sid, pc, people } = await asked(w);

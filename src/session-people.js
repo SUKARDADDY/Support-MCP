@@ -145,6 +145,20 @@ export function sessionPeople(env, { devTtlMs = 0 } = {}) {
     return { driver: r.driver, participants: await named(slug, r.participants), offer: r.offer ?? null };
   }
 
+  // Only step 3 of a move whose step 2 is done: the saved PC's pointer already names `me`, and the Session still has
+  // someone else. The pointer is the proof (the full guard wrote it), so no offer or mark is needed. The pointer gets
+  // its next generation if it has none above the Session's (a move made before generations), and the Session adopts it.
+  // For a one-off session there is no pointer: the caller shows the reservation the earlier try made (`watch.accepting`).
+  async function finishMove(slug, me, sid, watch, kind, caps) {
+    const fromGen = watch.gen ?? 0;
+    let gen = fromGen + 1;
+    if (watch.device_id) {
+      const moved = await devs.handOver(slug, me, { sid, deviceId: watch.device_id, from: watch.driver, fromGen, kind, settleOnly: true }, caps);
+      gen = moved?.gen ?? gen;
+    }
+    return complete(slug, sid, me, watch.driver, kind, { fromGen, gen });
+  }
+
   // Steps 1 to 3 for an accept, a claim or a take-over. For a claim, `claim` is { expectDriver, extra, recorded } and the
   // queue's pieces (extra) ride in the same guarded change; recorded says an earlier try already wrote them.
   async function moveControl(slug, me, sid, watch, kind, caps, claim = null) {
@@ -208,8 +222,8 @@ export function sessionPeople(env, { devTtlMs = 0 } = {}) {
       // A saved PC's pointer already names the caller while the Session still has someone else: an earlier accept
       // moved the pointer and its session step failed, and the offer has lapsed since. The pointer moved under the
       // full guard, so that is the proof; only the session step is left.
-      if (pointer && watch.driver && pointer.by === me && (pointer.gen ?? 0) > (watch.gen ?? 0)) {
-        return out(slug, await complete(slug, sid, me, watch.driver, 'accept', { fromGen: watch.gen ?? 0, gen: pointer.gen }));
+      if (pointer && watch.driver && pointer.by === me && (pointer.gen ?? 0) >= (watch.gen ?? 0)) {
+        return out(slug, await finishMove(slug, me, sid, watch, 'accept', caps));
       }
       return out(slug, await moveControl(slug, me, sid, watch, 'accept', caps));
     }
@@ -237,5 +251,5 @@ export function sessionPeople(env, { devTtlMs = 0 } = {}) {
     throw new TeamError(r.status, r.body?.code ?? 'not_found', String(r.body?.error ?? 'no picture'));
   }
 
-  return { participants, handover, frame, peopleList, named, moveControl, live, sessionId };
+  return { participants, handover, frame, peopleList, named, moveControl, finishMove, live, sessionId };
 }

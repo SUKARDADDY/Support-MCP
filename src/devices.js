@@ -1018,6 +1018,7 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
     let state = 'waiting';
     if (result.takeover) {
       const t = await hooks.takeOver(slug, result.session_id, actor, result.gen);
+      if (t?.stale) throw new TeamError(409, 'busy', 'control changed hands while this take-over was on its way; check who drives, then connect again');
       if (!t || t.ok !== true) throw new TeamError(409, 'ended', 'that session has just ended; connect again');
       state = t.state === 'attached' ? 'attached' : 'waiting';
     }
@@ -1133,7 +1134,7 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
   // kind: accept (an offer), claim (a queue item) or take_over (an admin, on a one-off session). A
   // saved PC's take-over is device_connect. Returns { moved }; moved is false when the PC's record
   // already names the caller, which is what a retry after a failed session step finds.
-  async function handOver(slug, actorIdentity, { sid, deviceId = null, from = null, fromGen = null, kind, extra = null }, caps = {}) {
+  async function handOver(slug, actorIdentity, { sid, deviceId = null, from = null, fromGen = null, kind, extra = null, settleOnly = false }, caps = {}) {
     if (!['accept', 'claim', 'take_over'].includes(kind) || (kind === 'take_over' && deviceId)) throw new TypeError('bad handover kind');
     const actor = normalizeIdentity(actorIdentity);
     const was = normalizeIdentity(from);
@@ -1149,7 +1150,21 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
         pointer = cur && cur.status === 'active' ? livePointer(cur) : null;
         if (!pointer || pointer.id !== sid) throw new TeamError(404, 'not_found', 'that session is no longer live on the PC');
         const had = pointer.gen ?? 0;
-        if (pointer.by === actor) return { noop: true, result: { moved: false, gen: had } };
+        if (pointer.by === actor) {
+          // The pointer already names the caller. One from before generations existed (or not above the one the move
+          // began from) takes the next number now, so the Session can adopt it: the move was proven by the full guard
+          // that wrote the name, and this changes nothing else.
+          if (fromGen !== null && had <= fromGen) {
+            const r = await q(
+              "UPDATE devices SET session = json_set(session, '$.gen', ?) WHERE workspace = ? AND id = ? AND json_extract(session, '$.id') = ? AND json_extract(session, '$.by') = ? AND COALESCE(json_extract(session, '$.gen'), 0) = ?",
+              fromGen + 1, slug, deviceId, sid, actor, had).run();
+            if (r.meta.changes !== 1) throw new TeamError(403, 'not_driver', 'control changed hands since this began');
+            return { noop: true, result: { moved: false, gen: fromGen + 1 } };
+          }
+          return { noop: true, result: { moved: false, gen: had } };
+        }
+        // Finishing a step that an earlier try began must never start a move of its own.
+        if (settleOnly) throw new TeamError(403, 'not_driver', `${pointer.by} is driving this session`);
         // Who drives, and in which generation: a take-over since the accept or claim was marked, even one that gave the
         // pointer back to the same person, changed the generation and ends this move.
         if (pointer.by !== was) throw new TeamError(403, 'not_driver', `${pointer.by} is driving this session`);

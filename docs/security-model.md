@@ -730,8 +730,10 @@ apply to only one client say which.
     one-off session) takes the next driver generation, kept in the PC's pointer (`gen`) and in the
     Session. The change records the generation it moved to, and the Session's step applies only
     in the generation the accept or claim began from (or is already past it, for a repeat), so a
-    step that began before a take-over can never apply after it. A Session step that fails is retried at once and, if it keeps failing,
-    reported, and repeating the call runs only that step. Fault tests cover each of these.
+    step that began before a take-over can never apply after it. The Session adopts the pointer's
+    number and never makes one up; a pointer from before generations existed gets its next number
+    when the step is repeated. A Session step that fails is retried at once and, if it keeps
+    failing, reported, and repeating the call runs only that step. Fault tests cover each of these.
   - *A take-over makes the previous driver a watcher, and access is rechecked on every read.* When an
     admin takes a session over (`device_connect` with `take_over`, or `session_handover` on a one-off
     session), the previous driver stays on it as a watcher. That is a lesser right, not a leftover
