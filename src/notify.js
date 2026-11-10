@@ -14,10 +14,20 @@
 // Only members who are people get rows: a service token never receives one. The
 // team log is not touched. Title and body may repeat text from a customer's PC and
 // are shown as text.
+//
+// Two events are not switchable: session_invited ("you were invited to a session") and
+// control_offered ("someone offered you control"). They are addressed to one named person and
+// always reach them, whatever their settings say, so a person cannot miss that a colleague is
+// waiting on them. They have their own write path (direct) and are not in EVENTS. The queue's
+// events (escalation_opened, escalation_claimed) are switchable like the first six.
 import { ADMIN_ROLE } from './permissions.js';
 import { TeamError, normalizeIdentity } from './workspace.js';
 
-export const EVENTS = Object.freeze(['task_finished', 'task_problem', 'session_declined', 'device_online', 'device_missing', 'device_waiting']);
+export const EVENTS = Object.freeze([
+  'task_finished', 'task_problem', 'session_declined', 'device_online', 'device_missing', 'device_waiting', 'escalation_opened', 'escalation_claimed',
+]);
+// Addressed to one named person and always delivered: no switch, and no recipients() lookup.
+export const DIRECT_EVENTS = Object.freeze(['session_invited', 'control_offered']);
 export const WATCH_MAX = 500;
 export const FEED_LIMIT = 50;
 export const KEEP_MS = 30 * 24 * 60 * 60 * 1000;
@@ -53,10 +63,12 @@ export function notifyStore(db, team) {
 
   // The people an event goes to, as identities. `to` names people (the starter, the
   // driver), `watching` a PC id (those who watch it), `holding` a permission (those
-  // whose role holds it). Someone whose own settings switch the event off is left out.
-  async function recipients(slug, event, { to = [], watching = null, holding = null } = {}) {
+  // whose role holds it). Someone whose own settings switch the event off is left out, and so is
+  // anyone in `except` (the person who caused the event hears nothing of it).
+  async function recipients(slug, event, { to = [], watching = null, holding = null, except = [] } = {}) {
     if (!EVENTS.includes(event)) throw new TypeError('unknown notification event');
     const named = new Set(to.map(normalizeIdentity));
+    const skip = new Set(except.map(normalizeIdentity));
     if (!named.size && !watching && !holding) return [];
     const { results } = await q("SELECT identity, role_id, notify FROM members WHERE workspace = ? AND kind = 'person'", slug).all();
     const roles = holding ? new Map((await team.listRoles(slug)).map((r) => [r.id, r.permissions])) : null;
@@ -66,7 +78,7 @@ export function notifyStore(db, team) {
       const hit = named.has(m.identity)
         || (watching !== null && mine.watch.includes(watching))
         || (holding !== null && (m.role_id === ADMIN_ROLE || (roles.get(m.role_id) ?? []).includes(holding)));
-      if (hit && mine.events[event]) out.push(m.identity);
+      if (hit && mine.events[event] && !skip.has(m.identity)) out.push(m.identity);
     }
     return out;
   }
@@ -80,6 +92,20 @@ export function notifyStore(db, team) {
       device_id: what.device_id ?? null, task_id: what.task_id ?? null, session_id: what.session_id ?? null,
       title: clip(what.title, TITLE_MAX), body: clip(what.body, BODY_MAX), dedupe: String(what.dedupe),
     }));
+  }
+
+  // The row for a direct event (session_invited, control_offered): one named member who is a person,
+  // whatever their settings say. Nothing for a name that is not such a member. Nothing is written.
+  async function direct(slug, event, to, what) {
+    if (!DIRECT_EVENTS.includes(event)) throw new TypeError('unknown direct notification event');
+    const who = normalizeIdentity(to);
+    const found = await q("SELECT identity FROM members WHERE workspace = ? AND identity = ? AND kind = 'person'", slug, who).first('identity');
+    if (!found) return [];
+    return [{
+      recipient: who, event, created_at: Date.now(),
+      device_id: what.device_id ?? null, task_id: what.task_id ?? null, session_id: what.session_id ?? null,
+      title: clip(what.title, TITLE_MAX), body: clip(what.body, BODY_MAX), dedupe: String(what.dedupe),
+    }];
   }
 
   // The statements that add `list` inside a guarded change: each runs only where the
@@ -145,7 +171,7 @@ export function notifyStore(db, team) {
     return r.meta.changes;
   }
 
-  return { recipients, rows, statements, write, feed, settings, patchSettings, prune };
+  return { recipients, rows, direct, statements, write, feed, settings, patchSettings, prune };
 }
 
 // The feed, held open: the rows after `after` if there are any, otherwise a check every
