@@ -1,8 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { claimEscalation, closeEscalation, listQueue, refusalText } from '../api.js';
 import { useApp } from '../context.jsx';
 import { formatAgo } from '../format.js';
-import { tabKeyDown, useDialog, useLoad } from '../hooks.js';
+import { tabKeyDown, useDialog, useInterval, useLoad } from '../hooks.js';
 import { t } from '../i18n/index.js';
 import { same } from '../session.js';
 import { NOTE_MAX } from './EscalateDialog.jsx';
@@ -15,7 +15,7 @@ const STATUSES = ['open', 'mine', 'closed'];
 // claim opens the PC. Notes, summaries and PC names were written by people and by an agent that
 // read a customer's PC, so they are shown as text and labelled as such.
 export function Queue() {
-  const { core, account, me, can, now, toast, openTarget, openSessionTab, tabForSession, showTab, refreshQueue, isShown } = useApp();
+  const { core, account, me, can, now, toast, openTarget, openSessionTab, tabForSession, showTab, refreshQueue, queueTick, tuning, visible, isShown } = useApp();
   const [status, setStatus] = useState('open');
   const [busy, setBusy] = useState(null); // the id of the item a claim is on its way for
   const [error, setError] = useState(null);
@@ -23,8 +23,24 @@ export function Queue() {
   const { data, error: loadError, loading, reload } = useLoad(async () => ({ status, items: await listQueue(core, account.id, status) }), [core, account.id, status]);
   const shown = data && data.status === status ? data.items : null;
 
-  // The list is read when the screen is shown and again after a change: no polling.
+  // The list is read when the screen is shown and after a change, and again when the window is shown or focused again,
+  // when a queue notice arrives, and every 30 seconds while the screen is on show: another person may have claimed or
+  // closed an item meanwhile. A hidden window reads nothing.
   useEffect(() => { refreshQueue(); }, [account.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  const again = useCallback(() => { reload(); refreshQueue(); }, [reload, refreshQueue]);
+  const againRef = useRef(again);
+  againRef.current = again;
+  useInterval(() => againRef.current(), tuning.queueMs, visible, { immediate: false });
+  const first = useRef(true);
+  useEffect(() => {
+    if (first.current) { first.current = false; return; }
+    if (visible) againRef.current();
+  }, [visible, queueTick]);
+  useEffect(() => {
+    const onFocus = () => { if (visible) againRef.current(); };
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [visible]);
 
   async function claim(item) {
     const owner = account.id;

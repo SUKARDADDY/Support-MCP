@@ -42,7 +42,7 @@ const write = (key, value) => {
 };
 
 // How often the app looks again. Tests pass shorter times through `tuning`.
-export const TUNING = { connectPollMs: 2000, devicePollMs: 15000, watchMs: 3000, screenshotMs: 3000, taskCheckMs: 15000, statusMs: 10000, taskWaitS: 25, taskGapMs: 1000, taskRetryMs: 2000 };
+export const TUNING = { connectPollMs: 2000, devicePollMs: 15000, watchMs: 3000, screenshotMs: 3000, taskCheckMs: 15000, statusMs: 10000, taskWaitS: 25, taskGapMs: 1000, taskRetryMs: 2000, queueMs: 30000 };
 
 const NO_TUNING = {};
 
@@ -60,6 +60,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   const knownNotes = useRef(new Set()); // "<account>:<id>" of every item the list has seen
   const [unread, setUnread] = useState(0);
   const [queueCount, setQueueCount] = useState(0); // items in the queue nobody has claimed
+  const [queueTick, setQueueTick] = useState(0); // counts the queue notices that arrived, so the Queue screen reads its list again
   const [linkOpen, setLinkOpen] = useState(false);
   const [titles, setTitles] = useState(loadTitles); // task id -> first line of the instructions this app sent
   const [toastText, setToastText] = useState(null);
@@ -342,7 +343,10 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
         fresh.push({ ...i, account: acc });
       }
       if (!fresh.length) return;
-      if (isLive && fresh.some((i) => i.event === 'escalation_opened' || i.event === 'escalation_claimed')) refreshQueueRef.current?.(acc);
+      if (isLive && fresh.some((i) => i.event === 'escalation_opened' || i.event === 'escalation_claimed')) {
+        refreshQueueRef.current?.(acc);
+        setQueueTick((n) => n + 1);
+      }
       setNotifications((cur) => [...cur, ...fresh].slice(-100));
       if (isLive) setUnread((n) => n + fresh.length);
     });
@@ -413,9 +417,9 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     core, appInfo, accounts: accounts ?? [], account, setActive, reloadAccounts: loadAccounts, can, me,
     devices: deviceData.devices, places: deviceData.places, devicesState: deviceData, reloadDevices,
     selectedId, select, conns, connect, cancelConnect, dismissConnect,
-    sessionTabFor, tabForSession, isShown: guard.isShown, showTab, endTab, closeTab, leaveTab, markStance, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true), queueCount, refreshQueue,
+    sessionTabFor, tabForSession, isShown: guard.isShown, showTab, endTab, closeTab, leaveTab, markStance, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true), queueCount, queueTick, refreshQueue,
     toast, copyText, notifications, openTarget, now, theme, setTheme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded,
-  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, tabForSession, showTab, endTab, closeTab, leaveTab, markStance, updateTab, openSessionTab, go, queueCount, refreshQueue, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded]); // eslint-disable-line react-hooks/exhaustive-deps
+  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, tabForSession, showTab, endTab, closeTab, leaveTab, markStance, updateTab, openSessionTab, go, queueCount, queueTick, refreshQueue, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (accounts === null) return <div className="app" role="status"><p className="hint">{t('common.loading')}</p></div>;
 

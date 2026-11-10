@@ -2,7 +2,7 @@
 import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, test } from 'vitest';
-import { ID, ToolFail, fakeCore, renderApp } from '../test-utils.jsx';
+import { FAST, ID, ToolFail, fakeCore, renderApp } from '../test-utils.jsx';
 
 const SID = 'q'.repeat(64);
 const ME = 'tech@example.com';
@@ -17,9 +17,9 @@ const item = (over = {}) => ({
 });
 const nav = (name) => within(screen.getByRole('navigation', { name: 'Main' })).getByRole('button', { name: new RegExp(name) });
 
-async function openQueue(items = [item()], fake = fakeCore()) {
+async function openQueue(items = [item()], fake = fakeCore(), tuning = FAST) {
   fake.state.queue = items;
-  const view = renderApp(fake);
+  const view = renderApp(fake, tuning);
   const user = userEvent.setup();
   await screen.findByRole('button', { name: /Front counter/ });
   await user.click(await screen.findByRole('button', { name: /^Queue/ }));
@@ -218,5 +218,65 @@ describe('the Queue badge', () => {
     await user.click(await screen.findByRole('button', { name: 'Claim' }));
     await waitFor(() => expect(screen.queryByLabelText('1 open')).not.toBeInTheDocument());
     expect(fake.state.queue[0].claimed_by).toBe(ME);
+  });
+});
+
+describe('the Queue screen reads again when someone else changes an item', () => {
+  const mine = () => item({ claimed_by: ME, claimed_at: Date.now() - 60000 });
+  const closeElsewhere = (fake) => { Object.assign(fake.state.queue[0], { closed_by: 'lead@example.com', closed_at: Date.now() }); };
+  const openMine = async (tuning) => {
+    const { user, fake } = await openQueue([mine()], fakeCore(), tuning);
+    await user.click(await screen.findByRole('tab', { name: 'Mine' }));
+    expect(await screen.findByText('Printer jams')).toBeInTheDocument();
+    return { user, fake };
+  };
+  const SLOW = { ...FAST, queueMs: 600000 };
+  const setVisibility = (state) => {
+    Object.defineProperty(document, 'visibilityState', { value: state, configurable: true });
+    act(() => { document.dispatchEvent(new Event('visibilitychange')); });
+  };
+  afterEach(() => setVisibility('visible'));
+
+  test('on a timer while the screen is on show: an item another person closed leaves Mine', async () => {
+    const { fake } = await openMine({ ...FAST, queueMs: 60 });
+    closeElsewhere(fake);
+    await waitFor(() => expect(screen.queryByText('Printer jams')).not.toBeInTheDocument());
+  });
+
+  test('not while the window is hidden, and at once when it is shown again', async () => {
+    const { fake } = await openMine({ ...FAST, queueMs: 60 });
+    setVisibility('hidden');
+    await sleep(100);
+    const frozen = queueCalls(fake, 'list').length;
+    closeElsewhere(fake);
+    await sleep(250);
+    expect(queueCalls(fake, 'list').length).toBe(frozen);
+    expect(screen.getByText('Printer jams')).toBeInTheDocument();
+    setVisibility('visible');
+    await waitFor(() => expect(screen.queryByText('Printer jams')).not.toBeInTheDocument());
+  });
+
+  test('when the window gets focus', async () => {
+    const { fake } = await openMine(SLOW);
+    closeElsewhere(fake);
+    act(() => { window.dispatchEvent(new Event('focus')); });
+    await waitFor(() => expect(screen.queryByText('Printer jams')).not.toBeInTheDocument());
+  });
+
+  test('when a queue notice arrives', async () => {
+    const { fake } = await openMine(SLOW);
+    await waitFor(() => expect(fake.core.on).toHaveBeenCalledWith('feed://items', expect.any(Function)));
+    closeElsewhere(fake);
+    act(() => fake.emit('feed://items', { account: 'acc1', live: true, items: [{ id: 9, event: 'escalation_claimed', at: Date.now(), title: 'x', body: 'y', device_id: ID('a'), task_id: null, session_id: null }] }));
+    await waitFor(() => expect(screen.queryByText('Printer jams')).not.toBeInTheDocument());
+  });
+
+  test('with a slow timer and no event, nothing is read again', async () => {
+    const { fake } = await openMine(SLOW);
+    const before = queueCalls(fake, 'list').length;
+    closeElsewhere(fake);
+    await sleep(200);
+    expect(queueCalls(fake, 'list').length).toBe(before);
+    expect(screen.getByText('Printer jams')).toBeInTheDocument();
   });
 });
