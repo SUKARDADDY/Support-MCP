@@ -21,8 +21,8 @@ const REFRESH_SKEW_MS: u64 = 60_000;
 const REVOKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The MCP tools the screens may call. No tool that clicks, types or runs a command is here:
-/// the app is view only, and the core enforces it whatever the screens ask for. Tasks are
-/// started and controlled through the team API (route_allowed), not through agent_start.
+/// the app never drives a PC itself, and the core enforces it whatever the screens ask for. Tasks
+/// are started and controlled through the team API (route_allowed), not through agent_start.
 pub const TOOLS: &[&str] = &[
     "device_list",
     "device_connect",
@@ -33,7 +33,15 @@ pub const TOOLS: &[&str] = &[
     "screenshot",
     // Read only: the team's models and the month's cost, for starting a task.
     "agent_status",
+    // People in a session: the team's people, invite/join/leave/remove, hand over, the queue.
+    "people_list",
+    "session_participants",
+    "session_handover",
+    "escalation",
 ];
+
+/// The tools whose errors start with a code: "<code>: <message>".
+const CODED_TOOLS: &[&str] = &["people_list", "session_participants", "session_handover", "escalation"];
 
 #[derive(Clone, Copy, Debug)]
 pub struct RetryPolicy {
@@ -131,6 +139,11 @@ fn is_id(s: &str) -> bool {
     s.len() == 20 && s.bytes().all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
 }
 
+/// A session id as the relay writes it: 64 lower-case hex characters.
+pub fn is_session_id(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Which relay routes the screens may reach through `relay_request`, after the team's
 /// `/app/w/<team>` prefix. `path` may carry a query. Everything else is refused here.
 pub fn route_allowed(method: &str, path: &str) -> bool {
@@ -167,6 +180,8 @@ pub fn route_allowed(method: &str, path: &str) -> bool {
         ("GET", ["api", "agent", "tasks", id]) => is_id(id),
         ("GET", ["api", "agent", "tasks", id, "frame"]) => is_id(id),
         ("POST", ["api", "agent", "tasks", id, "pause" | "resume" | "stop"]) => is_id(id),
+        // The watcher's picture: the last full screenshot of a live session.
+        ("GET", ["api", "sessions", sid, "frame"]) => is_session_id(sid),
         ("GET", ["teams"]) => true,
         ("GET" | "PATCH", ["notifications", "settings"]) => true,
         _ => false,
@@ -388,8 +403,30 @@ impl AccountClient {
     pub async fn tool(&self, name: &str, args: Value) -> CoreResult<ToolOutput> {
         let rpc = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": args } });
         let answer = self.request(Method::POST, "/mcp", Some(&rpc), None).await?;
-        parse_tool_answer(&answer)
+        let out = parse_tool_answer(&answer);
+        if CODED_TOOLS.contains(&name) {
+            return out.map_err(coded_tool_error);
+        }
+        out
     }
+}
+
+/// The error a new tool gave: "<code>: <message>" becomes a code and a message. An error with
+/// no code in front (the generic checks of the MCP layer, such as a lost second factor) stays
+/// the tool's plain text.
+pub fn coded_tool_error(e: CoreError) -> CoreError {
+    let CoreError::Tool(text) = e else { return e };
+    match split_code(&text) {
+        Some((code, message)) => CoreError::ToolCoded { code: code.to_string(), message: message.to_string() },
+        None => CoreError::Tool(text),
+    }
+}
+
+// A code is lower-case words joined by underscores, then a colon and a space.
+fn split_code(text: &str) -> Option<(&str, &str)> {
+    let (code, message) = text.split_once(": ")?;
+    let ok = (2..=40).contains(&code.len()) && code.starts_with(|c: char| c.is_ascii_lowercase()) && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    ok.then_some((code, message))
 }
 
 /// An MCP answer: an image block, if any, then the tool's JSON text.
@@ -456,6 +493,7 @@ mod tests {
     #[test]
     fn only_the_routes_the_screens_use_are_allowed() {
         let id = "abcdefghijklmnopqrst";
+        let sid = "0123456789abcdef".repeat(4);
         let yes = [
             ("GET", "/api".to_string()),
             ("GET", "/api/devices".into()),
@@ -471,6 +509,7 @@ mod tests {
             ("POST", "/api/agent/tasks".into()),
             ("GET", format!("/api/agent/tasks/{id}?wait_s=25")),
             ("GET", format!("/api/agent/tasks/{id}/frame")),
+            ("GET", format!("/api/sessions/{sid}/frame")),
             ("POST", format!("/api/agent/tasks/{id}/stop")),
             ("POST", format!("/api/agent/tasks/{id}/pause")),
             ("POST", format!("/api/agent/tasks/{id}/resume")),
@@ -502,6 +541,16 @@ mod tests {
             ("GET", "/api/devices?status=a b".into()),
             ("POST", "/api/agent/tasks?wait_s=1".into()),
             ("GET", format!("/api/agent/tasks/{id}/kill")),
+            // The picture route takes a 64-hex session id, only reads, and has nothing else under it.
+            ("GET", format!("/api/sessions/{id}/frame")),
+            ("GET", format!("/api/sessions/{}/frame", "0123456789ABCDEF".repeat(4))),
+            ("GET", format!("/api/sessions/{}/frame", "0123456789abcdef".repeat(3))),
+            ("GET", format!("/api/sessions/{}/frame", "0123456789abcdeg".repeat(4))),
+            ("POST", format!("/api/sessions/{sid}/frame")),
+            ("GET", format!("/api/sessions/{sid}")),
+            ("GET", "/api/sessions".into()),
+            ("GET", format!("/api/sessions/{sid}/frame/extra")),
+            ("GET", format!("/api/sessions/{sid}/end")),
             ("GET", "https://evil.example/api".into()),
         ];
         for (m, p) in &no {
@@ -515,6 +564,54 @@ mod tests {
             assert!(!TOOLS.contains(&banned), "{banned}");
         }
         assert!(TOOLS.contains(&"screenshot") && TOOLS.contains(&"device_list"));
+        // The pinned list: the eight of 0.8.0 and the four of people in a session.
+        assert_eq!(
+            TOOLS,
+            [
+                "device_list", "device_connect", "session_create", "session_list", "session_status", "session_end", "screenshot", "agent_status",
+                "people_list", "session_participants", "session_handover", "escalation",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_session_id_is_sixty_four_lower_case_hex_characters() {
+        assert!(is_session_id(&"ab01".repeat(16)));
+        assert!(!is_session_id(&"AB01".repeat(16)) && !is_session_id(&"ab01".repeat(15)) && !is_session_id(&"ab01".repeat(17)) && !is_session_id(&"zz01".repeat(16)) && !is_session_id(""));
+    }
+
+    #[test]
+    fn a_new_tools_error_text_gives_its_code_and_other_text_stays_plain() {
+        let err = |text: &str| json!({ "result": { "isError": true, "content": [{ "type": "text", "text": text }] } });
+        let coded = coded_tool_error(parse_tool_answer(&err("needs_unattended: this PC was connected without asking")).unwrap_err());
+        match &coded {
+            CoreError::ToolCoded { code, message } => assert_eq!((code.as_str(), message.as_str()), ("needs_unattended", "this PC was connected without asking")),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(coded.code(), "needs_unattended");
+        assert_eq!(coded.to_string(), "this PC was connected without asking");
+        for plain in ["a second factor is required", "Not a code: yes", "agent busy; wait for the current operation", "x: too short a code", "bad-code: no", "mode:no space"] {
+            match coded_tool_error(parse_tool_answer(&err(plain)).unwrap_err()) {
+                CoreError::Tool(m) => assert_eq!(m, plain),
+                other => panic!("{plain}: {other:?}"),
+            }
+        }
+        // Errors that are not a tool's text pass through.
+        assert!(matches!(coded_tool_error(CoreError::SignedOut), CoreError::SignedOut));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_the_new_tools_errors_are_read_for_a_code() {
+        let server = FakeServer::start(|_| Resp::json(200, json!({ "jsonrpc": "2.0", "id": 1, "result": { "isError": true, "content": [{ "type": "text", "text": "not_driver: ann@example.com is driving this session" }] } }))).await;
+        let (c, _s, _e, _i) = client(&server.url(), tokens("tok-a", "ref-a", 3_600_000)).await;
+        for name in ["session_participants", "session_handover", "escalation", "people_list"] {
+            let e = c.tool(name, json!({})).await.unwrap_err();
+            assert_eq!((e.code(), e.to_string().as_str()), ("not_driver", "ann@example.com is driving this session"), "{name}");
+        }
+        // The older tools keep their plain text: no code is read from it.
+        let e = c.tool("session_end", json!({})).await.unwrap_err();
+        assert_eq!(e.code(), "tool");
+        assert_eq!(e.to_string(), "not_driver: ann@example.com is driving this session");
     }
 
     #[tokio::test(flavor = "multi_thread")]
