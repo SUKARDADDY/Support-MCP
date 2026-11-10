@@ -14,8 +14,10 @@
 //   2. for a saved PC, one guarded change in the database moves the pointer's driver, and writes the
 //      team log row (and, for a claim, claims the queue item in the same batch).
 //   3. the Session sets its driver. This step can be repeated: it does nothing when the driver is
-//      already the new one, and it stops with not_driver when someone else drives, because a
-//      take-over that landed between steps 2 and 3 is the later decision and stands.
+//      already the new one, and it stops with not_driver when the driver generation is no longer the one the
+//      move began from. Every driver change (an accept, a claim, a take-over, also one by the person who already
+//      drives) takes the next generation, in the PC's pointer ($.gen) and in the Session, so a take-over that landed
+//      between steps 2 and 3 is the later decision and stands, even when it gave control back to the same person.
 // A step 3 that fails is retried at once; if it keeps failing the call says so and the caller repeats
 // it: step 2 sees that the pointer already names them, and only step 3 runs again. An accept finds the same
 // state after the offer has lapsed, and finishes step 3 without an offer: the pointer is the proof.
@@ -129,9 +131,10 @@ export function sessionPeople(env, { devTtlMs = 0 } = {}) {
 
   // ---- session_handover ----------------------------------------------------------------------------
   // Step 3, repeated on a transient failure.
-  async function complete(slug, sid, me, from, kind) {
+  // `gens` is { fromGen, gen }: the generation the move began from (the Session applies it only then) and the one it gives.
+  async function complete(slug, sid, me, from, kind, gens) {
     for (let i = 0; i < COMPLETE_TRIES; i++) {
-      const r = await hooks.handover(slug, sid, { op: 'complete', actor: me, from, kind });
+      const r = await hooks.handover(slug, sid, { op: 'complete', actor: me, from, kind, from_gen: gens.fromGen, gen: gens.gen });
       if (r?.ok) return r;
       if (r) throw refused(r);
     }
@@ -146,6 +149,7 @@ export function sessionPeople(env, { devTtlMs = 0 } = {}) {
   // queue's pieces (extra) ride in the same guarded change; recorded says an earlier try already wrote them.
   async function moveControl(slug, me, sid, watch, kind, caps, claim = null) {
     let from = null;
+    let fromGen = watch.gen ?? 0;
     if (kind !== 'take_over') {
       const mark = await hooks.handover(slug, sid, {
         op: 'accepting', actor: me, ...(claim ? { claim: { expect_driver: claim.expectDriver } } : {}),
@@ -153,19 +157,22 @@ export function sessionPeople(env, { devTtlMs = 0 } = {}) {
       if (!mark) throw unavailable();
       if (!mark.ok) throw refused(mark);
       from = mark.from;
+      fromGen = mark.gen ?? 0;
     } else {
       from = watch.driver;
     }
     let changed = false;
+    let moved = null;
     try {
       // A claim that an earlier try already recorded (a one-off session has no pointer to show it) skips the record.
-      if (!claim?.recorded) await devs.handOver(slug, me, { sid, deviceId: watch.device_id, from, kind, extra: claim?.extra ?? null }, caps);
+      if (!claim?.recorded) moved = await devs.handOver(slug, me, { sid, deviceId: watch.device_id, from, fromGen, kind, extra: claim?.extra ?? null }, caps);
       changed = true;
     } finally {
       // Nothing changed in the database: let the session go again at once, not after its 30 seconds.
       if (!changed && kind !== 'take_over') await hooks.handover(slug, sid, { op: 'release', actor: me });
     }
-    return complete(slug, sid, me, from, kind);
+    // A saved PC's pointer took the next generation; a one-off session's is taken by the Session itself.
+    return complete(slug, sid, me, from, kind, { fromGen, gen: moved?.gen ?? fromGen + 1 });
   }
 
   async function handover(slug, actor, args, caps = {}) {
@@ -201,7 +208,9 @@ export function sessionPeople(env, { devTtlMs = 0 } = {}) {
       // A saved PC's pointer already names the caller while the Session still has someone else: an earlier accept
       // moved the pointer and its session step failed, and the offer has lapsed since. The pointer moved under the
       // full guard, so that is the proof; only the session step is left.
-      if (pointer && watch.driver && pointer.by === me) return out(slug, await complete(slug, sid, me, watch.driver, 'accept'));
+      if (pointer && watch.driver && pointer.by === me && (pointer.gen ?? 0) > (watch.gen ?? 0)) {
+        return out(slug, await complete(slug, sid, me, watch.driver, 'accept', { fromGen: watch.gen ?? 0, gen: pointer.gen }));
+      }
       return out(slug, await moveControl(slug, me, sid, watch, 'accept', caps));
     }
     // take_over: a one-off session only. A saved PC's is device_connect with take_over.

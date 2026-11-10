@@ -154,9 +154,9 @@ export function deviceHooks(env, { devTtlMs = 0 } = {}) {
 
     // Make `actor` the driver of a live session. Returns the Session's answer
     // ({ok, state}) or { ok: false } when it cannot be reached.
-    async takeOver(slug, sid, actor) {
+    async takeOver(slug, sid, actor, gen = null) {
       try {
-        return await (await post(session(sid), '/takeover', { actor, workspace: slug })).json();
+        return await (await post(session(sid), '/takeover', { actor, workspace: slug, ...(Number.isInteger(gen) ? { gen } : {}) })).json();
       } catch (_) {
         return { ok: false };
       }

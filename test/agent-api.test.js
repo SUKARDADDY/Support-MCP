@@ -381,7 +381,7 @@ test('the Session\'s watch route reports its state, driver and who has commanded
   const watch = async (query = 'workspace=default') => (await (await w.env.SESSION.get(w.env.SESSION.idFromString(sid)).fetch(`https://do/watch?${query}`)).json());
   const since = (await watch()).participants[0].since;
   assert.deepEqual(await watch(), {
-    state: 'attached', opened_by_task: null, ended_reason: null, device_id: pc.id, device_name: 'Till', driver: TECH, handed_over: null, offer: null, actors: [],
+    state: 'attached', opened_by_task: null, ended_reason: null, device_id: pc.id, device_name: 'Till', driver: TECH, gen: 0, handed_over: null, offer: null, actors: [],
     participants: [{ identity: TECH, name: null, role: 'driver', since }],
   });
   assert.deepEqual(await watch('workspace=acme'), { state: 'unknown', actors: [] });

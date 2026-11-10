@@ -326,6 +326,54 @@ test('an open offer, a handover in progress and a missing second factor are each
   assert.equal(e.code, 'second_factor');
 });
 
+test('a take-over by the previous driver between the PC\'s change and the session step ends the accept for good: no split between the PC and the session', async (t) => {
+  const w = await agentWorld(t);
+  await addTech2(w);
+  const { sid, pc, people } = await attached(w, LEAD).then((s) => ({ ...s, people: sessionPeople(w.env) }));
+  assert.equal(w.pointer(pc.id).ask, false);
+  await part(people, sid, LEAD, 'invite', BOSS);
+  await part(people, sid, BOSS, 'join');
+  await hand(people, sid, LEAD, 'offer', BOSS);
+  // BOSS's accept moved the PC's pointer; before the session step, LEAD (the driver the accept began from) takes over again.
+  // The identity "LEAD" is back on both sides, so comparing names would let the step run: only the generation stops it.
+  let took = null;
+  const f = around(w, { op: 'complete', before: async () => { took ??= await w.tool(LEAD, 'device_connect', { device_id: pc.id, take_over: true }); } });
+  const e = await hand(people, sid, BOSS, 'accept').catch((x) => x);
+  assert.equal(took.session_id, sid, JSON.stringify(took));
+  assert.equal(e.code, 'not_driver');
+  assert.equal(f.calls, 1, 'it did not try again');
+  const watch = await call(w, sid, '/watch?workspace=default', undefined, { method: 'GET' });
+  assert.deepEqual([w.pointer(pc.id).by, watch.driver], [LEAD, LEAD]);
+  assert.equal(w.pointer(pc.id).gen, watch.gen, 'the pointer and the session count the same changes');
+  assert.ok(watch.gen >= 2);
+  // A retry cannot bring the older accept back: the offer is gone.
+  assert.equal(await code(hand(people, sid, BOSS, 'accept')), 'no_offer');
+  assert.deepEqual([w.pointer(pc.id).by, (await call(w, sid, '/watch?workspace=default', undefined, { method: 'GET' })).driver], [LEAD, LEAD]);
+  // An honest handover afterwards still works, in the next generation.
+  await hand(people, sid, LEAD, 'offer', BOSS);
+  assert.equal((await hand(people, sid, BOSS, 'accept')).driver, BOSS);
+  const after = await call(w, sid, '/watch?workspace=default', undefined, { method: 'GET' });
+  assert.deepEqual([w.pointer(pc.id).by, after.driver, w.pointer(pc.id).gen === after.gen], [BOSS, BOSS, true]);
+});
+
+test('a half-finished accept, then a take-over by a third person, leaves them driving on both sides, and the lapsed retry cannot undo it', async (t) => {
+  const w = await agentWorld(t);
+  const { sid, pc, people } = await asked(w);
+  await part(people, sid, TECH, 'invite', TECH2);
+  await part(people, sid, TECH2, 'join');
+  await hand(people, sid, TECH, 'offer', TECH2);
+  around(w, { op: 'complete', times: 3 });
+  assert.equal(await code(hand(people, sid, TECH2, 'accept')), 'busy');
+  // The pointer names TECH2 at the next generation; the session is a generation behind. LEAD takes over: both sides move to LEAD.
+  await w.tool(LEAD, 'device_connect', { device_id: pc.id, take_over: true });
+  const watch = await call(w, sid, '/watch?workspace=default', undefined, { method: 'GET' });
+  assert.deepEqual([w.pointer(pc.id).by, watch.driver, w.pointer(pc.id).gen === watch.gen], [LEAD, LEAD, true]);
+  w.advance(180_000);
+  // TECH2's repeated accept finds no offer, and the pointer no longer names them, so nothing moves.
+  assert.equal(await code(hand(people, sid, TECH2, 'accept')), 'no_offer');
+  assert.deepEqual([w.pointer(pc.id).by, (await call(w, sid, '/watch?workspace=default', undefined, { method: 'GET' })).driver], [LEAD, LEAD]);
+});
+
 test('a cancel between the steps leaves one driver, whichever way it lands', async (t) => {
   const w = await agentWorld(t);
   const { sid, pc, people } = await asked(w);
@@ -355,7 +403,7 @@ test('a take-over that lands between the accept\'s steps stops it with not_drive
   // Before the PC's record moves: LEAD takes over (device_connect), so the guard on the old driver fails.
   await hand(people, sid, TECH, 'offer', TECH2);
   let first = null;
-  const a = around(w, { op: 'accepting', after: async () => { first = await w.tool(LEAD, 'device_connect', { device_id: pc.id, take_over: true }); } });
+  const a = around(w, { op: 'accepting', after: async () => { first ??= await w.tool(LEAD, 'device_connect', { device_id: pc.id, take_over: true }); } });
   const early = await hand(people, sid, TECH2, 'accept').catch((x) => x);
   assert.equal(first.session_id, sid, JSON.stringify(first));
   assert.equal(early.code, 'not_driver');

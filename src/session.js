@@ -120,6 +120,7 @@ export class Session {
     this.pending = new Map(); // uuid -> {resolve, tag}
     this.httpCommands = { cmd: null, screen: null }; // app mode: per lane, {frame, tag, sent_at} waiting for its result
     this.httpPoll = null; // app mode: the parked long poll, if any, {resolve, timer, busy}
+    this.gen = 0; // the driver generation (see applyDriver); read with the driver
     this.driver = undefined; // who drives (undefined: not read yet, null: nobody; a one-off session may have none)
     this.device = false; // a saved-PC session (read with the driver)
     this.people = undefined; // participants, offer, accepting, handed_over: read once, then kept here and in storage
@@ -686,6 +687,7 @@ export class Session {
   async loadDriver() {
     if (this.driver === undefined) {
       this.driver = (await this.get('driver', null)) || null;
+      this.gen = (await this.get('driver_gen', 0)) || 0;
       this.device = !!(await this.get('device_id', null));
     }
     if (this.people === undefined) {
@@ -865,7 +867,7 @@ export class Session {
       }
       p.accepting = { to: actor, from: this.driver, until: now + ACCEPTING_MS, claim: !!b.claim };
       await this.savePeople();
-      return ok({ from: this.driver, device_id: await this.get('device_id', null) });
+      return ok({ from: this.driver, gen: this.gen, device_id: await this.get('device_id', null) });
     }
     if (b.op === 'release') {
       if (p.accepting && p.accepting.to === actor) {
@@ -875,9 +877,11 @@ export class Session {
       return ok();
     }
     if (b.op === 'complete') {
-      // Three outcomes, so it can be repeated: still `from` drives, so `actor` takes over; `actor`
-      // drives already, so nothing changes; someone else drives (a take-over landed in between), so it
-      // stops and the later take-over stands. A take-over (kind take_over) names no `from`.
+      // Three outcomes, so it can be repeated: the driver and the generation are those the step began from, so `actor`
+      // takes over; `actor` drives already, so nothing changes; anything else drives or has driven since (a take-over
+      // landed in between, even one by the same person who drove before), so it stops and the later change stands.
+      // `from_gen` is the generation the accept or claim marked, and `gen` the one the move gives (a saved PC's
+      // pointer has already taken it). A call with no `from_gen` compares the driver only.
       const to = actor;
       if (!to) return refusal('bad_request', 'actor is required');
       if (this.driver === to) {
@@ -888,8 +892,9 @@ export class Session {
         return ok({ changed: false });
       }
       const takeOver = b.kind === 'take_over';
-      if (!this.driver || (!takeOver && this.driver !== sameIdentity(b.from))) return notDriver();
-      await this.applyDriver(to, { kind: takeOver ? 'take_over' : b.kind === 'claim' ? 'claim' : 'accept' });
+      const checked = Number.isInteger(b.from_gen);
+      if (!this.driver || (!takeOver && this.driver !== sameIdentity(b.from)) || (checked && this.gen !== b.from_gen)) return notDriver();
+      await this.applyDriver(to, { kind: takeOver ? 'take_over' : b.kind === 'claim' ? 'claim' : 'accept', gen: Number.isInteger(b.gen) ? b.gen : undefined });
       return ok({ changed: true });
     }
     return refusal('bad_request', 'op must be offer, cancel, decline, accepting, release or complete');
@@ -899,7 +904,7 @@ export class Session {
   // is gone, and a saved PC is told at once so its corner window shows the new name. A handover (accept
   // or claim) is recorded for the built-in agent, which stops quietly when its starter handed over; a
   // take-over clears that record, so the agent raises its notice.
-  async applyDriver(next, { kind }) {
+  async applyDriver(next, { kind, gen }) {
     const p = this.people;
     const previous = this.driver;
     const now = Date.now();
@@ -910,7 +915,8 @@ export class Session {
     p.handed_over = kind === 'take_over' ? null : { from: previous, to: next, at: now };
     p.driver_since = now;
     this.driver = next;
-    await this.setMany({ driver: next });
+    this.gen = Number.isInteger(gen) && gen > this.gen ? gen : this.gen + 1;
+    await this.setMany({ driver: next, driver_gen: this.gen });
     await this.savePeople();
     this.logRow(kind === 'take_over' ? 'driver' : 'handover', `${previous} to ${next}`);
     if (this.device) this.replyToPoll({ type: 'idle' });
@@ -1211,6 +1217,7 @@ export class Session {
       device_name: s.get('device_id') ? s.get('device_name') ?? null : null,
       // A one-off session shows its driver here too (never to the PC), or null when it has none.
       driver: s.get('driver') ?? null,
+      gen: this.gen,
       handed_over: this.people.handed_over,
       participants: this.roster(),
       offer: this.offerView(),
@@ -1223,16 +1230,33 @@ export class Session {
   async doTakeover(request) {
     let actor = null;
     let workspace;
+    let gen = null;
     try {
-      ({ actor = null, workspace } = await request.json());
+      ({ actor = null, workspace, gen = null } = await request.json());
     } catch (_) {}
     if (await this.otherWorkspace(workspace)) return Response.json({ ok: false });
     await this.expireIfDue();
     const state = await this.get('state');
     const next = sameIdentity(actor);
     if (!(await this.get('device_id', null)) || !['waiting', 'attached'].includes(state) || !next) return Response.json({ ok: false });
-    if (this.driver !== next) await this.applyDriver(next, { kind: 'take_over' });
-    return Response.json({ ok: true, state, driver: next });
+    // Every take-over is a new generation, also by the person who drives already (a pointer taken back from an accept
+    // that has not finished): what began before it can no longer apply. `gen` is the one the PC's pointer took. An
+    // older one than the session's own is a late delivery of a take-over that a newer change has passed.
+    const to = Number.isInteger(gen) ? gen : this.gen + 1;
+    if (to > this.gen) {
+      if (this.driver !== next) {
+        await this.applyDriver(next, { kind: 'take_over', gen: to });
+      } else {
+        const p = this.people;
+        p.offer = null;
+        p.accepting = null;
+        p.handed_over = null;
+        this.gen = to;
+        await this.setMany({ driver_gen: to });
+        await this.savePeople();
+      }
+    }
+    return Response.json({ ok: true, state, driver: this.driver });
   }
 
   // A saved-PC session pins its pointer's end to the real one at the first hello.

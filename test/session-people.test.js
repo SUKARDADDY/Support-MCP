@@ -232,6 +232,29 @@ test('accepting reserves the session, complete moves control once and again chan
   assert.equal((await call(w, sid, '/command', { op: 'nothing', actor: LEAD })).error, 'bad op', 'the new driver is past the driver check');
 });
 
+test('complete applies only in the generation the move began from, also when the same person drives again', async (t) => {
+  const w = await agentWorld(t);
+  const { sid } = await attached(w);
+  await watching(w, sid, LEAD);
+  await handover(w, sid, { op: 'offer', actor: TECH, to: LEAD });
+  const mark = await handover(w, sid, { op: 'accepting', actor: LEAD });
+  assert.equal(mark.gen, 0);
+  // TECH, who drives, takes the session over from themselves (a new generation, the same name).
+  const took = await call(w, sid, '/takeover', { actor: TECH, gen: 1 });
+  assert.deepEqual([took.ok, took.driver], [true, TECH]);
+  assert.equal((await watch(w, sid)).gen, 1);
+  assert.equal((await watch(w, sid)).offer, null, 'the pending offer and its reservation are void');
+  assert.equal((await handover(w, sid, { op: 'complete', actor: LEAD, from: TECH, kind: 'accept', from_gen: 0, gen: 1 })).code, 'not_driver');
+  assert.equal((await watch(w, sid)).driver, TECH);
+  // A late delivery of an older take-over changes nothing.
+  await call(w, sid, '/takeover', { actor: LEAD, gen: 1 });
+  assert.equal((await watch(w, sid)).driver, TECH);
+  // The current generation applies once, and a repeat changes nothing.
+  assert.equal((await handover(w, sid, { op: 'complete', actor: LEAD, from: TECH, kind: 'accept', from_gen: 1, gen: 2 })).driver, LEAD);
+  assert.deepEqual([(await watch(w, sid)).driver, (await watch(w, sid)).gen], [LEAD, 2]);
+  assert.equal((await handover(w, sid, { op: 'complete', actor: LEAD, from: TECH, kind: 'accept', from_gen: 1, gen: 2 })).changed, false);
+});
+
 test('complete stops when someone else drives now: a take-over that landed in between stands', async (t) => {
   const w = await agentWorld(t);
   const { sid } = await attached(w);

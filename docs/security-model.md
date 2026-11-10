@@ -725,7 +725,12 @@ apply to only one client say which.
     The change holds only while the old driver is still named and the new driver still holds
     what the rule asks, so a take-over that landed first wins and the call says `not_driver`; a
     take-over that lands after the change wins too, because the Session's step stops when
-    someone else drives. A Session step that fails is retried at once and, if it keeps failing,
+    someone else drives. Names alone are not enough, since a take-over can give control back to
+    the same person: every driver change (an accept, a claim, a take-over, on a saved PC or a
+    one-off session) takes the next driver generation, kept in the PC's pointer (`gen`) and in the
+    Session. The change records the generation it moved to, and the Session's step applies only
+    in the generation the accept or claim began from (or is already past it, for a repeat), so a
+    step that began before a take-over can never apply after it. A Session step that fails is retried at once and, if it keeps failing,
     reported, and repeating the call runs only that step. Fault tests cover each of these.
   - *A take-over makes the previous driver a watcher, and access is rechecked on every read.* When an
     admin takes a session over (`device_connect` with `take_over`, or `session_handover` on a one-off

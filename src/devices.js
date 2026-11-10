@@ -961,18 +961,22 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
         }
         if (live && !takeOver) throw new TeamError(409, 'connected', `${live.by} is connected`);
         if (live) {
+          // Every driver change takes the next generation, a take-over too, also by the person who already drives: a handover
+          // that began earlier can then never finish after it. The guard holds the generation the plan read, so the number
+          // the Session is told is the one the pointer took.
+          const gen = (live.gen ?? 0) + 1;
           return {
             entries: [{ kind: 'device_session_taken_over', detail: `${id} ${JSON.stringify(cur.name)} from ${live.by}` }],
             guard: and(
               base,
               actorHas(slug, actor, UNATTENDED_PERMISSION),
-              ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND status = 'active' AND json_extract(session, '$.id') = ? AND json_extract(session, '$.expires_at') > ?)", [slug, id, live.id, now]],
+              ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND status = 'active' AND json_extract(session, '$.id') = ? AND json_extract(session, '$.expires_at') > ? AND COALESCE(json_extract(session, '$.gen'), 0) = ?)", [slug, id, live.id, now, gen - 1]],
             ),
             change: ([cond, params]) => [q(
-              `UPDATE devices SET session = json_set(session, '$.by', ?) WHERE workspace = ? AND id = ? AND ${cond}`,
-              actor, slug, id, ...params,
+              `UPDATE devices SET session = json_set(session, '$.by', ?, '$.gen', ?) WHERE workspace = ? AND id = ? AND ${cond}`,
+              actor, gen, slug, id, ...params,
             )],
-            result: { takeover: true, session_id: live.id, ask: live.ask },
+            result: { takeover: true, session_id: live.id, ask: live.ask, gen },
           };
         }
         // The session asks unless the PC is set to any time, the caller did not
@@ -1013,7 +1017,7 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
     if (made && result.session_id !== made.sid) await hooks.discardSession(slug, made.sid);
     let state = 'waiting';
     if (result.takeover) {
-      const t = await hooks.takeOver(slug, result.session_id, actor);
+      const t = await hooks.takeOver(slug, result.session_id, actor, result.gen);
       if (!t || t.ok !== true) throw new TeamError(409, 'ended', 'that session has just ended; connect again');
       state = t.state === 'attached' ? 'attached' : 'waiting';
     }
@@ -1129,7 +1133,7 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
   // kind: accept (an offer), claim (a queue item) or take_over (an admin, on a one-off session). A
   // saved PC's take-over is device_connect. Returns { moved }; moved is false when the PC's record
   // already names the caller, which is what a retry after a failed session step finds.
-  async function handOver(slug, actorIdentity, { sid, deviceId = null, from = null, kind, extra = null }, caps = {}) {
+  async function handOver(slug, actorIdentity, { sid, deviceId = null, from = null, fromGen = null, kind, extra = null }, caps = {}) {
     if (!['accept', 'claim', 'take_over'].includes(kind) || (kind === 'take_over' && deviceId)) throw new TypeError('bad handover kind');
     const actor = normalizeIdentity(actorIdentity);
     const was = normalizeIdentity(from);
@@ -1139,12 +1143,18 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
       await extra?.check?.();
       let pointer = null;
       let name = '';
+      let gen = null; // the generation the pointer takes
       if (deviceId) {
         const cur = await q('SELECT * FROM devices WHERE workspace = ? AND id = ?', slug, deviceId).first();
         pointer = cur && cur.status === 'active' ? livePointer(cur) : null;
         if (!pointer || pointer.id !== sid) throw new TeamError(404, 'not_found', 'that session is no longer live on the PC');
-        if (pointer.by === actor) return { noop: true, result: { moved: false } };
+        const had = pointer.gen ?? 0;
+        if (pointer.by === actor) return { noop: true, result: { moved: false, gen: had } };
+        // Who drives, and in which generation: a take-over since the accept or claim was marked, even one that gave the
+        // pointer back to the same person, changed the generation and ends this move.
         if (pointer.by !== was) throw new TeamError(403, 'not_driver', `${pointer.by} is driving this session`);
+        if (fromGen !== null && had !== fromGen) throw new TeamError(403, 'not_driver', 'control changed hands since this began');
+        gen = had + 1;
         name = cur.name;
         if (pointer.ask === false) {
           if (!(await holds(slug, actor, UNATTENDED_PERMISSION))) throw new TeamError(403, 'needs_unattended', UNASKED);
@@ -1157,7 +1167,7 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
       }
       const detail = deviceId ? `${deviceId} ${JSON.stringify(name)} from ${pointer.by} to ${actor}` : `${sid.slice(0, 8)}${was ? ` from ${was}` : ''} to ${actor}`;
       const proof = deviceId
-        ? ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND json_extract(session, '$.id') = ? AND json_extract(session, '$.by') = ?)", [slug, deviceId, sid, actor]]
+        ? ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND json_extract(session, '$.id') = ? AND json_extract(session, '$.by') = ? AND COALESCE(json_extract(session, '$.gen'), 0) = ?)", [slug, deviceId, sid, actor, gen]]
         : null;
       return {
         entries: [...(extra?.entries ?? []), { kind: deviceId ? 'device_session_handed_over' : kind === 'take_over' ? 'session_taken_over' : 'session_handed_over', detail }],
@@ -1166,8 +1176,8 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
           actorUnchanged(slug, ctx),
           notStopped(slug),
           deviceId
-            ? ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND status = 'active' AND json_extract(session, '$.id') = ? AND json_extract(session, '$.by') = ? AND json_extract(session, '$.expires_at') > ? AND json_extract(session, '$.ask') IS ?)",
-              [slug, deviceId, sid, pointer.by, Date.now(), pointer.ask === false ? 0 : pointer.ask === true ? 1 : null]]
+            ? ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND status = 'active' AND json_extract(session, '$.id') = ? AND json_extract(session, '$.by') = ? AND json_extract(session, '$.expires_at') > ? AND json_extract(session, '$.ask') IS ? AND COALESCE(json_extract(session, '$.gen'), 0) = ?)",
+              [slug, deviceId, sid, pointer.by, Date.now(), pointer.ask === false ? 0 : pointer.ask === true ? 1 : null, gen - 1]]
             : lit(true),
           pointer?.ask === false || kind === 'take_over' ? actorHas(slug, actor, UNATTENDED_PERMISSION) : lit(true),
           extra?.guard ?? lit(true),
@@ -1175,10 +1185,10 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
         // The PC's pointer moves first. What reads the guard comes after it only on the proof that it moved:
         // the guard itself no longer holds once the pointer names the caller.
         change: (cond) => [
-          ...(deviceId ? [q(`UPDATE devices SET session = json_set(session, '$.by', ?) WHERE workspace = ? AND id = ? AND ${cond[0]}`, actor, slug, deviceId, ...cond[1])] : []),
+          ...(deviceId ? [q(`UPDATE devices SET session = json_set(session, '$.by', ?, '$.gen', ?) WHERE workspace = ? AND id = ? AND ${cond[0]}`, actor, gen, slug, deviceId, ...cond[1])] : []),
           ...(extra ? extra.statements(proof ?? cond) : []),
         ],
-        result: { moved: true },
+        result: { moved: true, gen },
       };
     });
   }
