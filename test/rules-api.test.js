@@ -379,6 +379,32 @@ test('a removal that cannot be done is refused before the code is spent', async 
   assert.equal((await w.api(BOSS, 'GET', `/rules/${a.customer}`)).body.effective.restart, DEFAULTS.restart);
 });
 
+test('an override\'s revision never repeats: a save that read an override removed since then is stale against a new one', async (t) => {
+  const w = await ready(t);
+  const a = await customerWithPc(w);
+  assert.equal((await save(w, BOSS, a.customer, { restart: 'never' }, 0)).body.override.rev, 1);
+  // Another admin read rev 1 and is still holding it. The override is removed, then made again.
+  assert.equal((await w.api(BOSS, 'DELETE', `/rules/${a.customer}`, { rev: 1, code: await fresh(w) })).status, 200);
+  const none = (await w.api(BOSS, 'GET', `/rules/${a.customer}`)).body;
+  assert.deepEqual([none.rev, none.doc, none.updated_by], [0, {}, null], 'a removed override reads as none');
+  assert.deepEqual((await w.api(BOSS, 'GET', '/rules')).body.overrides, [], 'and is not listed');
+  assert.equal((await save(w, BOSS, a.customer, { restart: 'never' }, 1)).status, 409, 'the old rev is stale while there is none');
+  const again = await save(w, BOSS, a.customer, { shutdown: 'never' }, 0);
+  assert.equal(again.status, 200, JSON.stringify(again.body));
+  assert.ok(again.body.override.rev > 1, `a new revision: ${again.body.override.rev}`);
+  // The save that read the first override is stale, and cannot loosen the new one.
+  const late = await save(w, BOSS, a.customer, { restart: 'allow' }, 1);
+  assert.deepEqual([late.status, late.body.error.code], [409, 'stale']);
+  const now = (await w.api(BOSS, 'GET', `/rules/${a.customer}`)).body;
+  assert.deepEqual([now.rev, now.doc], [again.body.override.rev, { shutdown: 'never' }]);
+  assert.deepEqual((await w.api(BOSS, 'GET', '/rules')).body.overrides.map((o) => [o.customer_id, o.rev]), [[a.customer, again.body.override.rev]]);
+  assert.equal((await helloRules(w, a.pc)).rules.shutdown, 'never');
+  // Saving an override with no fields removes it the same way.
+  assert.deepEqual((await save(w, BOSS, a.customer, {}, again.body.override.rev)).body.override.rev, 0);
+  assert.equal((await w.api(BOSS, 'GET', `/rules/${a.customer}`)).body.rev, 0);
+  assert.equal((await save(w, BOSS, a.customer, { restart: 'never' }, again.body.override.rev)).status, 409);
+});
+
 test('an override is judged with the team\'s rules, may not name a customer that is not there, and goes with its customer', async (t) => {
   const w = await ready(t);
   const a = await customerWithPc(w);

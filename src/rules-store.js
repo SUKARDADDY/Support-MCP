@@ -8,6 +8,11 @@
 // A log detail holds the names of the fields a save changed and the customer's id, never a folder path
 // or a program name.
 //
+// A removed override keeps its row, with the document {} (no fields, so the customer has the team's rules)
+// and its rev moved on, so an override's revision never repeats for a customer: an admin who read the
+// old override cannot save over a new one made after the removal. The API shows such a row as no override
+// (rev 0); a save over it is judged against rev 0 and written as the row's rev + 1.
+//
 // The PC's own copy of the rules comes with its check-in (src/devices.js); this store serves the team
 // API (src/api.js) and the relay's own checks.
 import { TeamError, normalizeIdentity } from './workspace.js';
@@ -19,6 +24,9 @@ import {
 const LIST_MAX = 1000;
 // The most PCs one customer's change rings in one call to the Registry.
 export const RING_CHUNK = 500;
+
+// The document of a removed override.
+const REMOVED = '{}';
 
 const stale = () => new TeamError(409, 'stale', 'the rules changed since you read them; read them again');
 const bad = (message) => new TeamError(400, 'bad_request', message);
@@ -32,6 +40,8 @@ export function rulesStore(db, team, { defaultTimeZone = '' } = {}) {
 
   const readRow = (slug, customerId) => q('SELECT customer_id, doc, rev, updated_at, updated_by FROM rules WHERE workspace = ? AND customer_id = ?', slug, customerId).first();
   const customerExists = async (slug, id) => !!(await q('SELECT 1 AS ok FROM customers WHERE workspace = ? AND id = ?', slug, id).first('ok'));
+  // A customer's row that holds no override: a removed one.
+  const live = (row) => (row && row.customer_id !== '' && row.doc === REMOVED ? null : row ?? null);
   const revIs = (slug, customerId, rev) => ['(SELECT COALESCE((SELECT rev FROM rules WHERE workspace = ? AND customer_id = ?), 0)) = ?', [slug, customerId, rev]];
 
   // A row as the API shows it. No row is revision 0 with the defaults (or nothing, for an override).
@@ -44,7 +54,7 @@ export function rulesStore(db, team, { defaultTimeZone = '' } = {}) {
 
   // The team's rules and every customer's override. default_time_zone is the zone a null time_zone resolves to.
   async function listAll(slug) {
-    const rows = (await q("SELECT customer_id, doc, rev, updated_at, updated_by FROM rules WHERE workspace = ? AND customer_id <> '' ORDER BY customer_id LIMIT ?", slug, LIST_MAX).all()).results;
+    const rows = (await q("SELECT customer_id, doc, rev, updated_at, updated_by FROM rules WHERE workspace = ? AND customer_id <> '' AND doc <> ? ORDER BY customer_id LIMIT ?", slug, REMOVED, LIST_MAX).all()).results;
     return {
       rules: view(await readRow(slug, ''), false),
       overrides: rows.map((r) => ({ customer_id: r.customer_id, ...view(r, true) })),
@@ -56,12 +66,13 @@ export function rulesStore(db, team, { defaultTimeZone = '' } = {}) {
   async function readCustomer(slug, customerId) {
     if (!(await customerExists(slug, customerId))) throw new TeamError(404, 'not_found', 'no such customer');
     const [teamRow, row] = await Promise.all([readRow(slug, ''), readRow(slug, customerId)]);
-    return { customer_id: customerId, ...view(row, true), effective: effectiveFromRows(teamRow, row, { defaultTimeZone }) };
+    return { customer_id: customerId, ...view(live(row), true), effective: effectiveFromRows(teamRow, row, { defaultTimeZone }) };
   }
 
   // Read the state a save is judged against, and refuse what cannot be saved: a document that does not
   // pass, a stale rev, a customer that does not exist. Both the route (before it spends the person's
-  // code) and the guarded change (on each attempt) call it. Returns what the change needs.
+  // code) and the guarded change (on each attempt) call it. Returns what the change needs: cur is the row
+  // that holds the document now (null for none or a removed override), last the stored row's rev.
   async function check(slug, customerId, input, rev) {
     const override = customerId !== '';
     let doc;
@@ -73,14 +84,15 @@ export function rulesStore(db, team, { defaultTimeZone = '' } = {}) {
     }
     if (override && !(await customerExists(slug, customerId))) throw new TeamError(404, 'not_found', 'no such customer');
     const [teamRow, row] = await Promise.all([readRow(slug, ''), override ? readRow(slug, customerId) : null]);
-    const cur = override ? row : teamRow;
+    const stored = override ? row : teamRow;
+    const cur = live(stored);
     if ((cur?.rev ?? 0) !== rev) throw stale();
     // An override is judged merged over the team's rules: an hour rule needs hours from one of them.
     if (override) {
       const problem = hourRuleProblem({ ...DEFAULT_RULES, ...(teamRow ? parseStored(teamRow.doc) : {}), ...doc });
       if (problem) throw bad(problem);
     }
-    return { doc, cur, teamRev: teamRow?.rev ?? 0 };
+    return { doc, cur, last: stored?.rev ?? 0, teamRev: teamRow?.rev ?? 0 };
   }
 
   const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -97,7 +109,7 @@ export function rulesStore(db, team, { defaultTimeZone = '' } = {}) {
     const override = customerId !== '';
     return mutate(slug, actor, async () => {
       const ctx = await actorContext(slug, actor, 'rules.manage');
-      const { doc, cur, teamRev } = await check(slug, customerId, input, rev);
+      const { doc, cur, last, teamRev } = await check(slug, customerId, input, rev);
       const before = cur ? parseStored(cur.doc, { override }) : override ? {} : parseRules({});
       const fields = changedFields(before, doc);
       if (!fields.length) return { noop: true, result: { ...view(cur, override), changed: false } };
@@ -108,16 +120,17 @@ export function rulesStore(db, team, { defaultTimeZone = '' } = {}) {
         guard: and(
           actorHas(slug, actor, 'rules.manage'),
           actorUnchanged(slug, ctx),
-          revIs(slug, customerId, rev),
+          revIs(slug, customerId, last),
           // An override was judged against the team's rules as read: they are still those.
           ...(override ? [revIs(slug, '', teamRev), ['EXISTS (SELECT 1 FROM customers WHERE workspace = ? AND id = ?)', [slug, customerId]]] : []),
         ),
         change: ([cond, params]) => [q(
           `INSERT INTO rules(workspace, customer_id, doc, rev, updated_at, updated_by) SELECT ?, ?, ?, ?, ?, ? WHERE ${cond}
            ON CONFLICT(workspace, customer_id) DO UPDATE SET doc = excluded.doc, rev = excluded.rev, updated_at = excluded.updated_at, updated_by = excluded.updated_by`,
-          slug, customerId, text, rev + 1, now, actor, ...params,
+          slug, customerId, text, last + 1, now, actor, ...params,
         )],
-        result: { rev: rev + 1, doc, updated_at: now, updated_by: actor, changed: true },
+        // An override saved with no fields is a removed one, shown as none.
+        result: { ...(override && text === REMOVED ? view(null, true) : { rev: last + 1, doc, updated_at: now, updated_by: actor }), changed: true },
       };
     });
   }
@@ -128,13 +141,14 @@ export function rulesStore(db, team, { defaultTimeZone = '' } = {}) {
   // override's row, or null when there is none.
   async function checkRemove(slug, customerId, rev = null) {
     if (!(await customerExists(slug, customerId))) throw new TeamError(404, 'not_found', 'no such customer');
-    const cur = await readRow(slug, customerId);
+    const cur = live(await readRow(slug, customerId));
     if (rev !== null && (cur?.rev ?? 0) !== rev) throw stale();
     return cur ?? null;
   }
 
-  // Remove a customer's override, so the customer has the team's rules again. rev, when given, is the
-  // revision the caller read. Needs rules.manage. Returns { changed: false } when there was none.
+  // Remove a customer's override, so the customer has the team's rules again: its row keeps the document {}
+  // and the next rev (see the top of this file). rev, when given, is the revision the caller read. Needs
+  // rules.manage. Returns { changed: false } when there was none.
   async function removeOverride(slug, actorIdentity, customerId, rev = null) {
     const actor = normalizeIdentity(actorIdentity);
     return mutate(slug, actor, async () => {
@@ -145,7 +159,10 @@ export function rulesStore(db, team, { defaultTimeZone = '' } = {}) {
       return {
         entries: [{ kind: 'rules_changed', detail: `${scopeOf(customerId)}: override removed${fields.length ? ` (${fields.join(', ')})` : ''}` }],
         guard: and(actorHas(slug, actor, 'rules.manage'), actorUnchanged(slug, ctx), revIs(slug, customerId, cur.rev)),
-        change: ([cond, params]) => [q('DELETE FROM rules WHERE workspace = ? AND customer_id = ? AND ' + cond, slug, customerId, ...params)],
+        change: ([cond, params]) => [q(
+          'UPDATE rules SET doc = ?, rev = rev + 1, updated_at = ?, updated_by = ? WHERE workspace = ? AND customer_id = ? AND ' + cond,
+          REMOVED, Date.now(), actor, slug, customerId, ...params,
+        )],
         result: { changed: true },
       };
     });

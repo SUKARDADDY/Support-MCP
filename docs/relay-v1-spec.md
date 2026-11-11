@@ -1634,7 +1634,9 @@ authenticator code in the body (below). While `default` is open a write is 409 `
 | `DELETE .../rules/<customer id>` | `{code, rev?}` | `{removed:{customer_id}}`; the customer has the team's rules again |
 
 Other methods are 405. `rev` must be a whole number from 0; a `PATCH` without it is 400. A `rev` that
-is not the current one is 409 `stale`. A document that fails the checks above, an override that would leave an hour
+is not the current one is 409 `stale`. An override's `rev` never repeats for a customer: a removed override
+(by `DELETE`, or a `PATCH` with no fields) keeps its row as `{}` with the next revision and reads as none
+(`rev` 0), and the next override for that customer goes on from there, so a save that read the old one is stale. A document that fails the checks above, an override that would leave an hour
 rule with no hours from the team or itself, and a customer that does not exist are refused before the code is checked,
 so a code is not spent on a save that cannot happen. A `DELETE` for a customer that does not exist (404) or with a stale
 `rev` (409) is refused the same way, and a `DELETE` of an override that is not there changes nothing and checks no code.
