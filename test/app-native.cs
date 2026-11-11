@@ -3456,6 +3456,15 @@ public static class AppTests {
             Assert(Wire.Flag(r, "ok") && Wire.Number(r, "exit_code") == 7, "install runs the installer and answers its exit code: " + Refusal(r) + " " + Wire.Text(r, "detail"));
             r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", setup, "args", "--exit 0", "rules_tag", "g1"));
             Assert(Wire.Flag(r, "ok") && Wire.Number(r, "exit_code") == 0, "and 0 for a good one");
+            // The installer is started directly, with its own quoted name and the arguments exactly as given. No script holds them and no
+            // shell reads them, so quotes, a dollar sign, backticks, a percent sign and non-ASCII text arrive unchanged.
+            string record = Path.Combine(dir, "argv-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".txt");
+            string given = "--record \"" + record + "\" PROP=\"a b\" it's $env:TEMP $(1+1) `x %PATH% caf\u00e9 '' {braces}";
+            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", setup, "args", given, "timeout_s", 60, "rules_tag", "g1"));
+            Assert(Wire.Flag(r, "ok") && Wire.Number(r, "exit_code") == 0 && File.Exists(record), "an installer with awkward arguments runs: " + Refusal(r) + " " + Wire.Text(r, "detail"));
+            string got = File.ReadAllText(record, Encoding.UTF8);
+            Assert(got == "\"" + setup + "\" " + given, "the installer received exactly the arguments given, in no script: " + got);
+            Assert(Programs.InstallerCommandLine(@"C:\a b\s.exe", "REM\u2019+\u2019OVE=ALL") == "\"C:\\a b\\s.exe\" REM\u2019+\u2019OVE=ALL" && Programs.InstallerCommandLine(@"C:\s.exe", "") == "\"C:\\s.exe\"", "the command line is the quoted name and the text, untouched");
             r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", Path.Combine(dir, "no-such-setup.msi"), "rules_tag", "g1"));
             Assert(Refusal(r).StartsWith("not_found:"), "an installer that is not there: " + Refusal(r));
             r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", "setup.exe", "rules_tag", "g1"));
@@ -3463,6 +3472,8 @@ public static class AppTests {
             // One tool is not a way round another: only installers, never Windows' own tools, arguments that restart or uninstall, or a raw command's verbs.
             string cmd = Path.Combine(Environment.SystemDirectory, "cmd.exe");
             Func<string, string, string> install = delegate(string path, string args) { return Refusal(relay.Call(Wire.Map("type", "programs", "action", "install", "path", path, "args", args, "rules_tag", "g1"))); };
+            Assert(install(setup, "--exit 0 REM\u2019+\u2019OVE=ALL").Contains("typographic"), "typographic quotes are refused for an .exe");
+            Assert(install(Path.Combine(dir, "a.msi"), "REM\u2019+\u2019OVE=ALL").Contains("typographic"), "and for an .msi, where REMOVE=ALL could otherwise be spelled with them");
             Assert(install(cmd, "/c exit 7").Contains("Windows folder"), "cmd.exe in the Windows folder is not an installer");
             Assert(install(Path.Combine(dir, "shutdown.exe"), "/r /t 0").Contains("Windows tool"), "shutdown.exe is not an installer wherever it sits");
             Assert(install(Path.Combine(dir, "MsiExec.EXE"), "/x {11111111-2222-3333-4444-555555555555}").Contains("Windows tool"), "nor is msiexec.exe, in any case");
@@ -3667,6 +3678,7 @@ public static class AppTests {
         if (args.Length == 2 && args[0] == "--peer") { Screen.Dpi(); return PeerWindow(int.Parse(args[1])); }
         if (args.Length == 2 && args[0] == "--sleep") { Thread.Sleep(int.Parse(args[1])); return 0; } // a stand-in program for the close tests
         if (args.Length == 2 && args[0] == "--exit") return int.Parse(args[1]); // a stand-in installer for the install tests
+        if (args.Length >= 2 && args[0] == "--record") { File.WriteAllText(args[1], Environment.CommandLine, new UTF8Encoding(false)); return 0; } // a stand-in installer that keeps the command line it got
         if (args.Length == 2 && args[0] == "--settle") { Thread.Sleep(250); File.WriteAllText(args[1], "done"); return 0; }
         string dir = Path.Combine(Path.GetTempPath(), "support-mcp-native-test-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
         try {

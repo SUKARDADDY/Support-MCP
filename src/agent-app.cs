@@ -253,6 +253,17 @@ namespace SupportMcp {
         public Dictionary<string, object> Run(string scriptPath, string cwd, int timeoutSeconds, WaitHandle stop) { return Run(scriptPath, cwd, timeoutSeconds, stop, IntPtr.Zero); }
         // token: a primary token to run as (full control: the signed-in user, in their session), or zero for this process's own.
         public Dictionary<string, object> Run(string scriptPath, string cwd, int timeoutSeconds, WaitHandle stop, IntPtr token) {
+            string exe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"WindowsPowerShell\v1.0\powershell.exe");
+            string args = "\"" + exe + "\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -OutputFormat Text -File \"" + scriptPath + "\"";
+            return Execute(exe, args, cwd, timeoutSeconds, stop, token);
+        }
+        // Runs one program in the Job with exactly this command line (its own name first, as CreateProcess wants it), as this
+        // process's own account. No shell reads the text and no script holds it: what the program receives is what is given here.
+        // Throws Win32Exception when the program cannot be started.
+        public Dictionary<string, object> RunProgram(string exe, string commandLine, string cwd, int timeoutSeconds, WaitHandle stop) {
+            return Execute(exe, commandLine, cwd, timeoutSeconds, stop, IntPtr.Zero);
+        }
+        Dictionary<string, object> Execute(string exe, string args, string cwd, int timeoutSeconds, WaitHandle stop, IntPtr token) {
             IntPtr outRead = IntPtr.Zero, outWrite = IntPtr.Zero, errRead = IntPtr.Zero, errWrite = IntPtr.Zero, input = IntPtr.Zero, env = IntPtr.Zero;
             ProcessInfo pi = new ProcessInfo();
             try {
@@ -263,8 +274,6 @@ namespace SupportMcp {
                 Check(SetHandleInformation(outRead, 1, 0)); Check(SetHandleInformation(errRead, 1, 0));
                 input = CreateFile("NUL", 0x80000000, 3, ref security, 3, 0, IntPtr.Zero); Check(input != new IntPtr(-1));
                 var si = new Startup { Size = Marshal.SizeOf(typeof(Startup)), Flags = 0x101, Input = input, Output = outWrite, Error = errWrite };
-                string exe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"WindowsPowerShell\v1.0\powershell.exe");
-                string args = "\"" + exe + "\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -OutputFormat Text -File \"" + scriptPath + "\"";
                 if (token == IntPtr.Zero) Check(CreateProcess(exe, new StringBuilder(args), IntPtr.Zero, IntPtr.Zero, true, 0x08000004, IntPtr.Zero, cwd, ref si, out pi));
                 else {
                     Check(CreateEnvironmentBlock(out env, token, false)); si.Desktop = @"winsta0\default";
@@ -1782,27 +1791,34 @@ namespace SupportMcp {
             return null;
         }
         // Why these installer arguments are refused, or null: they ask the installer to uninstall or to restart the PC, which
-        // other rules govern. For an .msi (which msiexec runs as SYSTEM) also: the properties REMOVE=, ADVERTISE= and ADDSOURCE=
-        // (any case, quoted or not, spaces around the "=" or not), which take features off the PC (REMOVE=ALL on a product that is
-        // already installed uninstalls it, round the uninstall rule and the protected programs), and the msiexec switches that do
-        // something other than install this package: /x /uninstall /f.. /p /update /j.. /advertise /y /z. ADDLOCAL, ADDDEFAULT,
-        // REINSTALL, REINSTALLMODE, /a, /l and /q.. are left alone. Same as installArgsProblem in src/rules.js; the shared cases run on both.
-        const string MsiRemovingProperty = "(?:^|[\\s\"'`;&|,()/-])(?:remove|advertise|addsource)[\"'`\\s]*=";
+        // other rules govern. Any installer also refuses the typographic quotation marks U+2018 to U+201E (a quote to PowerShell
+        // and to a reader, none to the installer; the arguments never go through PowerShell here, so this is a second line of
+        // defence). For an .msi (which msiexec runs as SYSTEM) also: the properties REMOVE=, ADVERTISE=, ADDSOURCE=, COMPADDSOURCE=,
+        // FILEADDSOURCE=, MSIPATCHREMOVE= and PATCH= (any case, quoted or not, spaces around the "=" or not), which take features
+        // off the PC or patch it (REMOVE=ALL on a product that is already installed uninstalls it, round the uninstall rule and
+        // the protected programs), and the msiexec switches that do something other than install this package: /x /uninstall
+        // /f.. /p /update /j.. /advertise /y /z. ADDLOCAL, ADDDEFAULT, REINSTALL, REINSTALLMODE, /a, /l and /q.. are left alone.
+        // Every check runs twice, once with each quote standing for a break and once with the quotes taken out (REM""OVE=ALL is
+        // REMOVE=ALL and /"f"a is /fa). Same as installArgsProblem in src/rules.js; the shared cases run on both.
+        const string MsiRemovingProperty = "(?:^|[\\s\"'`;&|,()/-])(?:remove|advertise|addsource|compaddsource|fileaddsource|msipatchremove|patch)[\"'`\\s]*=";
         public static string InstallArgsProblem(string path, string args) {
             var parts = PathParts(path);
             string name = parts.Count > 0 ? parts[parts.Count - 1] : "";
             bool msi = name.EndsWith(".msi", StringComparison.Ordinal);
             bool windows = msi || name.EndsWith(".msu", StringComparison.Ordinal);
-            string lower = (args ?? "").ToLowerInvariant();
-            // A quote in the middle of a name does not break it for the command line, so the properties are looked for with the
-            // quotes taken out as well as with each quote standing for a break.
-            if (msi && (System.Text.RegularExpressions.Regex.IsMatch(lower, MsiRemovingProperty)
-                || System.Text.RegularExpressions.Regex.IsMatch(lower.Replace("\"", "").Replace("'", "").Replace("`", ""), MsiRemovingProperty)))
-                return "installer arguments must not remove or change other installed features (REMOVE, ADVERTISE, ADDSOURCE): use uninstall_program";
+            string given = args ?? "";
+            foreach (char ch in given) if (ch >= '\u2018' && ch <= '\u201e') return "installer arguments must not contain typographic quotation marks: use plain quotes or none";
+            string lower = given.ToLowerInvariant();
+            string bare = lower.Replace("\"", "").Replace("'", "").Replace("`", "");
+            if (msi && (System.Text.RegularExpressions.Regex.IsMatch(lower, MsiRemovingProperty) || System.Text.RegularExpressions.Regex.IsMatch(bare, MsiRemovingProperty)))
+                return "installer arguments must not remove or change other installed features (REMOVE, ADVERTISE, ADDSOURCE, PATCH): use uninstall_program";
+            return ArgTokenProblem(lower, "\"'`;&|,()", msi, windows) ?? ArgTokenProblem(bare, ";&|,()", msi, windows);
+        }
+        // The switch checks over the words of text. breaks: the characters, besides white space, that end a word.
+        static string ArgTokenProblem(string text, string breaks, bool msi, bool windows) {
             var token = new StringBuilder();
-            string text = lower + " ";
-            foreach (char ch in text) {
-                if (!(char.IsWhiteSpace(ch) || "\"'`;&|,()".IndexOf(ch) >= 0)) { token.Append(ch); continue; }
+            foreach (char ch in text + " ") {
+                if (!(char.IsWhiteSpace(ch) || breaks.IndexOf(ch) >= 0)) { token.Append(ch); continue; }
                 if (token.Length == 0) continue;
                 string t = token.ToString(); token.Length = 0;
                 if (t.Contains("forcerestart") || t.Contains("promptrestart") || t.Contains("warnrestart") || t.Contains("reboot=force")
@@ -2322,16 +2338,16 @@ namespace SupportMcp {
                 if (notInstaller != null) return Wire.Map("ok", false, "error", notInstaller);
                 if (!File.Exists(path)) return Wire.Map("ok", false, "error", Rules.Err("not_found", "there is no installer at " + path));
                 string tail = args.Length > 0 ? " " + args : "";
-                if (path.EndsWith(".msi", StringComparison.OrdinalIgnoreCase)) return RunInstaller(Path.Combine(Environment.SystemDirectory, "msiexec.exe"), "/i \"" + path + "\" /qn /norestart" + tail, timeoutS, work, stop);
+                if (path.EndsWith(".msi", StringComparison.OrdinalIgnoreCase)) return RunInstaller(Path.Combine(Environment.SystemDirectory, "msiexec.exe"), "/i \"" + path + "\" /qn /norestart" + tail, timeoutS, stop);
                 // An update package goes to Windows Update Standalone Installer, never straight to the shell.
-                if (path.EndsWith(".msu", StringComparison.OrdinalIgnoreCase)) return RunInstaller(Path.Combine(Environment.SystemDirectory, "wusa.exe"), "\"" + path + "\" /quiet /norestart" + tail, timeoutS, work, stop);
-                return RunInstaller(path, args, timeoutS, work, stop);
+                if (path.EndsWith(".msu", StringComparison.OrdinalIgnoreCase)) return RunInstaller(Path.Combine(Environment.SystemDirectory, "wusa.exe"), "\"" + path + "\" /quiet /norestart" + tail, timeoutS, stop);
+                return RunInstaller(path, args, timeoutS, stop);
             }
             Installed p = Find(Wire.Text(frame, "program_id"));
             if (p == null) return Wire.Map("ok", false, "error", Rules.Err("not_found", "no installed program has that id; take it from list_programs"));
             string guid = MsiCode(p);
-            if (guid != null) return RunInstaller(Path.Combine(Environment.SystemDirectory, "msiexec.exe"), "/x " + guid + " /qn /norestart", timeoutS, work, stop);
-            if (p.Quiet.Length > 0) return RunInstaller(Path.Combine(Environment.SystemDirectory, "cmd.exe"), "/c \"" + p.Quiet + "\"", timeoutS, work, stop);
+            if (guid != null) return RunInstaller(Path.Combine(Environment.SystemDirectory, "msiexec.exe"), "/x " + guid + " /qn /norestart", timeoutS, stop);
+            if (p.Quiet.Length > 0) return RunInstaller(Path.Combine(Environment.SystemDirectory, "cmd.exe"), "/c \"" + p.Quiet + "\"", timeoutS, stop);
             return Wire.Map("ok", false, "error", "this program has no silent uninstall command, so it cannot be removed from here");
         }
         // Why a path is not run as an installer on this PC, or null: it is in this PC's Windows folder (links and short names
@@ -2380,22 +2396,23 @@ namespace SupportMcp {
             if (running.Count > 400) running.RemoveRange(400, running.Count - 400);
             return Wire.Map("ok", true, "installed", installed, "running", running);
         }
-        // Runs exe with args as SYSTEM, from a PowerShell script in the work folder, in the same kill-on-close Job as a
-        // command, and answers with its exit code (3010, a restart is needed, is not a failure of this call).
-        static Dictionary<string, object> RunInstaller(string exe, string args, int timeoutS, string work, WaitHandle stop) {
-            string script = "$ProgressPreference = 'SilentlyContinue'\r\n$p = Start-Process -FilePath '" + exe.Replace("'", "''") + "'"
-                + (args.Length > 0 ? " -ArgumentList '" + args.Replace("'", "''") + "'" : "") + " -PassThru -Wait\r\nexit $p.ExitCode\r\n";
-            string file = Path.Combine(work, "program-" + Guid.NewGuid().ToString("N") + ".ps1");
+        // Runs exe with args as SYSTEM, in the same kill-on-close Job as a command, and answers with its exit code (3010, a
+        // restart is needed, is not a failure of this call). The program is started directly: the command line is its own
+        // quoted name, a space and args as given. Nothing from the relay goes into a script or through a shell, so the
+        // installer receives exactly the text the rules judged, whatever quotes or dashes it holds.
+        internal static string InstallerCommandLine(string exe, string args) { return "\"" + exe + "\"" + (args.Length > 0 ? " " + args : ""); }
+        static Dictionary<string, object> RunInstaller(string exe, string args, int timeoutS, WaitHandle stop) {
             try {
-                File.WriteAllText(file, script, new UTF8Encoding(true));
                 Dictionary<string, object> r;
-                using (var job = new CommandJob()) r = job.Run(file, Environment.SystemDirectory, timeoutS, stop);
+                using (var job = new CommandJob()) r = job.RunProgram(exe, InstallerCommandLine(exe, args), Environment.SystemDirectory, timeoutS, stop);
                 if (Wire.Flag(r, "timed_out")) return Wire.Map("ok", false, "error", "it did not finish in " + timeoutS + " seconds and was stopped");
                 var result = Wire.Map("ok", true, "exit_code", r["exit_code"]);
                 string detail = Wire.Clean(Encoding.UTF8.GetString(Convert.FromBase64String(Wire.Text(r, "stderr_b64"))), 300);
                 if (detail.Length > 0) result["detail"] = detail;
                 return result;
-            } finally { try { File.Delete(file); } catch (Exception) { } }
+            } catch (Win32Exception e) {
+                return Wire.Map("ok", false, "error", "the program could not be started: " + Wire.Clean(e.Message, 200));
+            }
         }
     }
 
@@ -2452,13 +2469,17 @@ namespace SupportMcp {
             Disarm(cfg);
             // Delete only the scoped support executable after it exits. Keep
             // this helper outside command Jobs; it performs no privileged work.
-            string file = PathFor(cfg).Replace("'", "''"), folder = Folder(cfg).Replace("'", "''");
-            string script = "$ErrorActionPreference='SilentlyContinue'; for($i=0;$i -lt 20;$i++){ Start-Sleep -Seconds 1; Remove-Item -LiteralPath '" + file + "' -Force; if(-not(Test-Path -LiteralPath '" + file + "')){ if(@(Get-ChildItem -LiteralPath '" + folder + "' -Force).Count -eq 0){ Remove-Item -LiteralPath '" + folder + "' -Force }; break } }";
-            Process.Start(new ProcessStartInfo {
+            // The script is fixed text. The two paths reach it in environment variables, so no quote in them (a user name may
+            // hold a typographic one, which PowerShell reads as a single quote) can end a string and run what follows.
+            string script = "$ErrorActionPreference='SilentlyContinue'; $file=$env:SMCP_CLEANUP_FILE; $folder=$env:SMCP_CLEANUP_FOLDER; for($i=0;$i -lt 20;$i++){ Start-Sleep -Seconds 1; Remove-Item -LiteralPath $file -Force; if(-not(Test-Path -LiteralPath $file)){ if(@(Get-ChildItem -LiteralPath $folder -Force).Count -eq 0){ Remove-Item -LiteralPath $folder -Force }; break } }";
+            var start = new ProcessStartInfo {
                 FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"WindowsPowerShell\v1.0\powershell.exe"),
                 Arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand " + Convert.ToBase64String(Encoding.Unicode.GetBytes(script)),
                 UseShellExecute = false, CreateNoWindow = true
-            });
+            };
+            start.EnvironmentVariables["SMCP_CLEANUP_FILE"] = PathFor(cfg);
+            start.EnvironmentVariables["SMCP_CLEANUP_FOLDER"] = Folder(cfg);
+            Process.Start(start);
         }
     }
 

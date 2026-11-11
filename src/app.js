@@ -132,8 +132,9 @@ function installPage(query, hasCode) {
 // that does not exist.
 // via is "agent" when the built-in agent makes the call as its starter: the Session's
 // log row says so, and the actor stays the starter for every check. taskId (agent calls only,
-// never an argument of a tool) is written on a session its device_connect makes.
-function makeBackend(env, origin, devTtlMs, actor, workspace, via = null, taskId = null) {
+// never an argument of a tool) is written on a session its device_connect makes. oauthCaller (an OAuth caller's token)
+// is passed on with each command, so the Session can read that person's standing again before it sends an approved one.
+function makeBackend(env, origin, devTtlMs, actor, workspace, via = null, taskId = null, oauthCaller = null) {
   const sessionStub = (sid) => {
     if (sid === undefined || sid === null || sid === '') throw new Error('session_id is required; call session_list to find it');
     if (!/^[0-9a-f]{64}$/.test(String(sid))) throw new Error('session_id must be the 64 hex characters from session_create or session_list');
@@ -142,7 +143,9 @@ function makeBackend(env, origin, devTtlMs, actor, workspace, via = null, taskId
   async function cmd(sid, body) {
     const r = await sessionStub(sid).fetch('https://do/command', {
       method: 'POST',
-      body: JSON.stringify({ ...body, actor, workspace, ...(via ? { via } : {}), ...(via === 'agent' && taskId ? { task_id: taskId } : {}) }),
+      body: JSON.stringify({ ...body, actor, workspace, ...(via ? { via } : {}), ...(via === 'agent' && taskId ? { task_id: taskId } : {}),
+        // An OAuth caller's account and the authenticator their grant was made with, for the check the Session makes again when an approved command is sent.
+        ...(oauthCaller ? { oauth: { user_id: oauthCaller.userId, factor: oauthCaller.factor ?? null } } : {}) }),
     });
     return r.json();
   }
@@ -765,7 +768,7 @@ async function runMcp(request, env, url, origin, devTtlMs, workspace, actor, oau
     }
     if (mode === 'agent') throw new Error(`${mark}this team uses the built-in agent`);
   };
-  const backend = authorizedBackend(makeBackend(env, origin, devTtlMs, actor, workspace), env, actor, toolName, workspace, oauthCaller, { gate });
+  const backend = authorizedBackend(makeBackend(env, origin, devTtlMs, actor, workspace, null, null, oauthCaller), env, actor, toolName, workspace, oauthCaller, { gate });
   const { status, body } = await handleRpc(msg, backend, options);
   if (body === null) return new Response(null, { status });
   return json(body, status);

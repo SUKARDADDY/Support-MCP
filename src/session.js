@@ -63,6 +63,7 @@ import { identityKind, normalizeIdentity, teamFromEnv } from './workspace.js';
 import { ID_RE, MIN_SESSION_VERSION, devicesFromEnv } from './devices.js';
 import { notifyStore } from './notify.js';
 import { accountStore } from './accounts.js';
+import { assertPersonActive, assertSecondFactor } from './oauth.js';
 import { agentStoreFromEnv } from './agent-store.js';
 import { UNATTENDED_PERMISSION } from './permissions.js';
 import { compareVersions, validVersion } from './release.js';
@@ -928,8 +929,10 @@ export class Session {
   cancelHeld(why, taskId = null, { ended = false } = {}) {
     for (const h of this.held) {
       if (taskId !== null && h.task_id !== taskId) continue;
-      h.cancelled = why;
-      h.ended = ended;
+      // The first reason stays, and a command whose session ended stays ended: a later cancel (a task's stop) must
+      // not turn "session ended" back into "declined".
+      h.cancelled ??= why;
+      h.ended = h.ended || ended;
       h.wake?.();
     }
   }
@@ -944,21 +947,47 @@ export class Session {
   // The requester's standing now, read from the database, just before an approved command is sent. The router
   // checked it when the command was asked for, which may be minutes ago. A command goes only to a person who is
   // still a member holding sessions.control, whose sign-in is not disabled, in a workspace and a relay that are
-  // not stopped; for the built-in agent, only for a task that is still running (not paused, not ended) and was
-  // started by this person. Fails closed: a database that cannot answer refuses. Returns a refusal or null.
+  // not stopped. The same checks the router makes for the kind of caller it was: an OAuth caller (b.oauth, set by the
+  // router) must still exist, be enabled and be invited (assertPersonActive), and the authenticator their grant was made
+  // with must still be theirs (assertSecondFactor, for sessions.control). The built-in agent's task must still be running
+  // (not paused, not ended) and have been started by this person, whose account must still be active; it needs no second
+  // factor here, since the person passed it when starting the task (the router makes the same exception for `person`).
+  // An Access login has no grant to check. Fails closed: a database that cannot answer refuses. Returns a refusal or null.
   async recheckRequester(b) {
     const slug = await this.get('workspace', DEFAULT_WORKSPACE);
     const actor = sameIdentity(b.actor);
     const no = (why) => codedRefusal('declined', `the approval was cancelled: ${why}`);
     if (String(this.env.EMERGENCY_STOP ?? '') !== '') return no('this relay was stopped by its operator');
+    // assertPersonActive says one thing for a person who is gone; any other error is the database failing.
+    const gone = async (userId) => {
+      try {
+        await assertPersonActive(this.env, team, { userId, email: actor });
+        return null;
+      } catch (e) {
+        if (e?.message === 'you are not a member of this team') return no(`${actor} is no longer an active member of this team`);
+        throw e;
+      }
+    };
+    let team;
     try {
-      const team = teamFromEnv(this.env);
+      team = teamFromEnv(this.env);
       const a = await team.authorize(slug, actor, 'sessions.control', { membersOnly: true });
       if (!a.ok) return no(a.reason === 'not_member' ? `${actor} is no longer a member of this team` : `${actor}'s role no longer allows sessions.control`);
       const accounts = accountStore(this.env.DB, { secret: this.env.AUTH_SECRET });
       const user = await accounts.userByEmail(actor);
       if (user?.disabled_at) return no(`${actor}'s account was disabled`);
       if ((await team.stopState(slug)).stopped) return no('the workspace was stopped');
+      if (b.oauth) {
+        if (!user || user.id !== b.oauth.user_id) return no(`${actor}'s account is no longer the one that signed in`);
+        const left = await gone(user.id);
+        if (left) return left;
+        try {
+          await assertSecondFactor(this.env, { userId: user.id, factor: b.oauth.factor ?? null }, 'sessions.control');
+        } catch (e) {
+          if (String(e?.message).startsWith('a second factor is required')) return no(`${actor}'s authenticator changed; connect the client again and enter the authenticator code`);
+          throw e;
+        }
+      }
       if (b.via === 'agent') {
         const task = typeof b.task_id === 'string' ? await agentStoreFromEnv(this.env, team).getTask(slug, b.task_id) : null;
         if (!task || task.ended_at !== null) return no('the agent task ended');
@@ -967,6 +996,8 @@ export class Session {
         if (task.started_by_user) {
           const owner = await accounts.userById(task.started_by_user);
           if (!owner || owner.disabled_at) return no('the account that started the agent task was disabled');
+          const left = await gone(task.started_by_user);
+          if (left) return left;
         }
       }
     } catch (_) {

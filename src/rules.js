@@ -379,26 +379,25 @@ export function installerProblem(path) {
 // Why these installer arguments are refused, or null: they ask the installer to uninstall, to restart the PC, or
 // (for an .msi, which msiexec runs as SYSTEM) to act on installed state that other rules govern. What an installer
 // does with its other arguments is its own; the PC also screens the text like a raw command (RunScreen).
-//   Refused for an .msi: the properties REMOVE=, ADVERTISE= and ADDSOURCE= (any case, quoted or not, spaces
-//   around the "=" or not), which take features off the PC: REMOVE=ALL on a product that is already installed
-//   uninstalls it, round the uninstall rule and the protected programs. And the msiexec switches that do
-//   something other than install this package: /x and /uninstall (remove), /f.. (repair or reinstall a named
-//   product), /p and /update (patch a product), /j.. and /advertise (advertise instead of install), /y and /z
-//   (register or unregister a module). Left alone: ADDLOCAL, ADDDEFAULT, REINSTALL and REINSTALLMODE (they add or
-//   redo what this package installs, and take nothing off), /a (an administrative copy), /l (log), /q.., /passive.
+//   Refused for any installer: the typographic quotation marks U+2018 to U+201E. They are no quote to the installer,
+//   but they are one to PowerShell and to a person reading the text, so text that holds them is not what it looks like.
+//   (The PC passes the arguments to the installer on a command line it builds itself and puts none of the text in a
+//   script, so this is a second line of defence, not the only one.)
+//   Refused for an .msi: the properties REMOVE=, ADVERTISE=, ADDSOURCE=, COMPADDSOURCE=, FILEADDSOURCE=,
+//   MSIPATCHREMOVE= and PATCH= (any case, quoted or not, spaces around the "=" or not), which take features off the PC
+//   or apply patches to it: REMOVE=ALL on a product that is already installed uninstalls it, round the uninstall rule
+//   and the protected programs. And the msiexec switches that do something other than install this package: /x and
+//   /uninstall (remove), /f.. (repair or reinstall a named product), /p and /update (patch a product), /j.. and
+//   /advertise (advertise instead of install), /y and /z (register or unregister a module). Left alone: ADDLOCAL,
+//   ADDDEFAULT, REINSTALL and REINSTALLMODE (they add or redo what this package installs, and take nothing off),
+//   /a (an administrative copy), /l (log), /q.., /passive.
+// Every check runs twice, once with each quote standing for a break and once with the quotes taken out, since a quote in
+// the middle of a name does not break it for the command line (REM""OVE=ALL is REMOVE=ALL, /"f"a is /fa).
 // The PC's Rules.InstallArgsProblem is the same check, and the shared installers cases run on both.
-const MSI_REMOVING_PROPERTY = /(?:^|[\s"'`;&|,()\/-])(?:remove|advertise|addsource)["'`\s]*=/;
-export function installArgsProblem(path, args) {
-  const name = pathParts(path).at(-1) ?? '';
-  const msi = name.endsWith('.msi');
-  const windows = msi || name.endsWith('.msu');
-  const text = String(args ?? '').toLowerCase();
-  // A quote in the middle of a name does not break it for the command line, so the properties are looked for with the
-  // quotes taken out as well as with each quote standing for a break.
-  if (msi && (MSI_REMOVING_PROPERTY.test(text) || MSI_REMOVING_PROPERTY.test(text.replace(/["'`]/g, '')))) {
-    return 'installer arguments must not remove or change other installed features (REMOVE, ADVERTISE, ADDSOURCE): use uninstall_program';
-  }
-  for (const raw of text.split(/[\s"'`;&|,()]+/)) {
+const MSI_REMOVING_PROPERTY = /(?:^|[\s"'`;&|,()\/-])(?:remove|advertise|addsource|compaddsource|fileaddsource|msipatchremove|patch)["'`\s]*=/;
+const TYPOGRAPHIC_QUOTE = /[\u2018-\u201e]/;
+function argTokenProblem(tokens, msi, windows) {
+  for (const raw of tokens) {
     if (!raw) continue;
     if (/forcerestart|promptrestart|warnrestart|reboot=force/.test(raw) || /^[/-](?:restart|reboot)$/.test(raw)) return 'installer arguments must not restart the PC: use restart_pc';
     if (windows && (/^[/-]uninstall/.test(raw) || /^[/-]x(?![a-z])/.test(raw))) return 'installer arguments must not uninstall a program: use uninstall_program';
@@ -407,6 +406,19 @@ export function installArgsProblem(path, args) {
     }
   }
   return null;
+}
+export function installArgsProblem(path, args) {
+  const name = pathParts(path).at(-1) ?? '';
+  const msi = name.endsWith('.msi');
+  const windows = msi || name.endsWith('.msu');
+  const raw = String(args ?? '');
+  if (TYPOGRAPHIC_QUOTE.test(raw)) return 'installer arguments must not contain typographic quotation marks: use plain quotes or none';
+  const text = raw.toLowerCase();
+  const bare = text.replace(/["'`]/g, '');
+  if (msi && (MSI_REMOVING_PROPERTY.test(text) || MSI_REMOVING_PROPERTY.test(bare))) {
+    return 'installer arguments must not remove or change other installed features (REMOVE, ADVERTISE, ADDSOURCE, PATCH): use uninstall_program';
+  }
+  return argTokenProblem(text.split(/[\s"'`;&|,()]+/), msi, windows) ?? argTokenProblem(bare.split(/[\s;&|,()]+/), msi, windows);
 }
 
 // ---- the decision -------------------------------------------------------------------

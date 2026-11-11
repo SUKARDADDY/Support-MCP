@@ -503,6 +503,70 @@ for (const [name, change, expected] of [
   });
 }
 
+it('nothing is sent when an OAuth caller\'s authenticator was reset while the approval waited, and the same caller with their authenticator is sent', async (t) => {
+  const { w, sid, frames, approve, waiting, session } = await setup(t);
+  const tech = await w.connect(TECH, { app: false });
+  assert.equal(tech.tokens.status, 200, JSON.stringify(tech.tokens.body));
+  // Control: the authenticator is unchanged, so the approved command goes.
+  const first = w.appTool(tech.access, 'restart_pc', { session_id: sid }, { base: '/mcp' });
+  await until(() => session().approval);
+  assert.equal((await approve('lead', session().approval.rec.id)).status, 200);
+  assert.equal((await first).error, undefined);
+  assert.equal(powers(frames).length, 1, 'an approved command from an OAuth caller with a valid sign-in is sent');
+  // The authenticator is gone, as after a reset, between the approval being asked for and answered.
+  const second = w.appTool(tech.access, 'restart_pc', { session_id: sid }, { base: '/mcp' });
+  await until(() => session().approval);
+  const asked = session().approval.rec;
+  w.loseFactor(tech.userId);
+  session().finishApproval(asked.id, { approved: true, approver: LEAD });
+  assert.match((await second).error, /^declined: the approval was cancelled: tech@example\.com's authenticator changed; connect the client again/);
+  assert.equal(powers(frames).length, 1, 'nothing more was sent');
+  notHeld(session);
+});
+
+it('nothing is sent when the requester can no longer be checked, and nothing is left held', async (t) => {
+  const { w, frames, waiting, session } = await setup(t);
+  const { call, approval } = await waiting();
+  const real = w.env.DB;
+  t.after(() => { w.env.DB = real; });
+  // The database answers everything but the question about the account.
+  w.env.DB = new Proxy(real, {
+    get: (target, key) => {
+      if (key === 'prepare') return (sql) => { if (/FROM users WHERE email = \?/.test(sql)) throw new Error('D1 is down'); return target.prepare(sql); };
+      return typeof target[key] === 'function' ? target[key].bind(target) : target[key];
+    },
+  });
+  session().finishApproval(approval.id, { approved: true, approver: LEAD });
+  assert.match((await call).error, /^declined: the approval was cancelled: could not check that the requester may still do this; try again/);
+  assert.equal(powers(frames).length, 0, 'no frame was sent');
+  notHeld(session);
+});
+
+// A later cancel does not change why a command was cancelled: the first reason stays, and a session that ended stays ended.
+it('cancelHeld keeps the first reason, and a task cancel after the end of the session does not turn it back into declined', async (t) => {
+  const { session } = await setup(t);
+  const body = async (r) => (await r.json()).error;
+  const a = session().holdApproved({ task_id: 't1', via: 'agent', actor: TECH });
+  const b = session().holdApproved({ task_id: 't2', via: 'agent', actor: TECH });
+  t.after(() => { session().held.delete(a); session().held.delete(b); });
+  session().cancelHeld('the agent task was stopped', 't1');
+  assert.equal(a.cancelled, 'the agent task was stopped');
+  assert.equal(b.cancelled, null, 'another task is not touched');
+  session().cancelHeld('session ended', null, { ended: true });
+  session().cancelHeld('the agent task was stopped again', 't1');
+  assert.equal(a.cancelled, 'the agent task was stopped', 'the first reason stays');
+  assert.equal(a.ended, true, 'and the end of the session is not undone');
+  assert.equal(await body(session().heldRefusal(a)), 'session ended');
+  assert.equal(await body(session().heldRefusal(b)), 'session ended');
+  // And the other way: ended first, a task cancel after.
+  const c = session().holdApproved({ task_id: 't3', via: 'agent', actor: TECH });
+  t.after(() => { session().held.delete(c); });
+  session().cancelHeld('session ended', null, { ended: true });
+  session().cancelHeld('the agent task was stopped', 't3');
+  assert.equal(c.ended, true);
+  assert.equal(await body(session().heldRefusal(c)), 'session ended');
+});
+
 it('a role that loses sessions.control while the approved command waits for its lane is refused when the lane frees', async (t) => {
   const { w, frames, approve, waiting, session } = await setup(t);
   const { call, approval } = await waiting();
