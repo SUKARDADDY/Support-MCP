@@ -2032,6 +2032,8 @@ function decodePrograms(b, action) {
     if (!Number.isSafeInteger(b.closed) || b.closed < 0) throw new Error('bad closed');
     return { ok: true, closed: b.closed, ...(Number.isSafeInteger(b.still_running) && b.still_running > 0 ? { still_running: b.still_running } : {}) };
   }
-  const detail = typeof b.detail === 'string' && b.detail ? { detail: truncate(b.detail, 300) } : {};
+  // The note is the PC's text: control characters other than tabs and line breaks become spaces.
+  const note = typeof b.detail === 'string' ? b.detail.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, ' ').trim() : '';
+  const detail = note ? { detail: truncate(note, 300) } : {};
   return { ok: true, exit_code: Number.isInteger(b.exit_code) ? b.exit_code : null, ...detail };
 }

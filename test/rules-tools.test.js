@@ -87,14 +87,14 @@ test('the delay is brought into 5 to 600 seconds, and a list, an install, an uni
   for (const f of [i, u, c1, c2]) assert.ok(f.rules_tag && f.decided_at, f.action);
 });
 
-test("the PC's detail for an install or uninstall, and still_running for a close, reach the caller", async (t) => {
+test("the PC's detail for an install or uninstall, and still_running for a close, reach the caller; the detail's control characters become spaces", async (t) => {
   const w = await agentWorld(t);
   const handler = (frame) => frame.type === 'programs'
-    ? { install: { exit_code: 1603, detail: '1 process it started was still running and was stopped' }, uninstall: { exit_code: 0, detail: 'x'.repeat(400) }, close: { closed: 1, still_running: 2 } }[frame.action] ?? answerFrame(frame)
+    ? { install: { exit_code: 1603, detail: '\u00001 process it\u001b[31m started\u0007 was stopped\r\nline two\u0085' }, uninstall: { exit_code: 0, detail: 'x'.repeat(400) }, close: { closed: 1, still_running: 2 } }[frame.action] ?? answerFrame(frame)
     : answerFrame(frame);
   const { sid } = await savedPc(w, t, { handler });
   await setRules(w, ALLOW);
-  assert.deepEqual(await w.tool(TECH, 'install_program', { session_id: sid, path: 'C:\\Temp\\setup.msi' }), { ok: true, exit_code: 1603, detail: '1 process it started was still running and was stopped' });
+  assert.deepEqual(await w.tool(TECH, 'install_program', { session_id: sid, path: 'C:\\Temp\\setup.msi' }), { ok: true, exit_code: 1603, detail: '1 process it [31m started  was stopped\r\nline two' });
   const u = await w.tool(TECH, 'uninstall_program', { session_id: sid, program_id: 'acrobat' });
   assert.equal(u.exit_code, 0);
   assert.ok(u.detail.startsWith('xxx') && u.detail.length <= 301, 'the text from the PC is clipped');
