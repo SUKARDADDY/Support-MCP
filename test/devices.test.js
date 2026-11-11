@@ -1097,7 +1097,7 @@ test('the check-in query names every devices column, so a join cannot shadow one
 
 // ---- a move between customers is a change of rules (PR 9 review) ---------------------------------------
 test('moving an active PC to another customer, or to no site, is refused without the rules clearance, and logs rules_changed with it', async () => {
-  const { team, devs } = await setup();
+  const { db, team, devs } = await setup();
   const a = await devs.addRecord('customer', W, TECH, { name: 'A' });
   const b = await devs.addRecord('customer', W, TECH, { name: 'B' });
   const sa = await devs.addRecord('site', W, TECH, { name: 'A1', customer_id: a.id });
@@ -1121,8 +1121,10 @@ test('moving an active PC to another customer, or to no site, is refused without
   const before = (await kinds(team)).length;
   await devs.updateDevice(W, TECH, id, { site_id: sa2.id });
   assert.deepEqual((await kinds(team)).slice(before), ['device_changed']);
-  // Cleared, it moves and logs both, never a value of the rules.
+  // Cleared, it moves and logs both, never a value of the rules. The two sites' customers are read once each.
+  db.seen.length = 0;
   await devs.updateDevice(W, BOSS, id, { site_id: sb.id }, CLEARED);
+  assert.equal(db.seen.filter((x) => /^SELECT customer_id FROM sites/.test(x.sql)).length, 2);
   const rows2 = (await team.readAudit(W, { limit: 500 })).rows.slice(-2);
   assert.deepEqual(rows2.map((r) => r.kind).sort(), ['device_changed', 'rules_changed']);
   assert.match(rows2.find((r) => r.kind === 'rules_changed').detail, new RegExp(`device ${id}: site ${sa2.id} to ${sb.id}, customer ${a.id} to ${b.id}`));

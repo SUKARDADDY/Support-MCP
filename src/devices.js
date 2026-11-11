@@ -580,7 +580,9 @@ export function deviceStore(db, team, { authSecret = '', hooks = null, defaultTi
       const sets = [];
       const values = [];
       const siteChanges = hasSite && siteId !== cur.site_id;
-      const rulesChange = siteChanges && cur.status === 'active' && (await customerOf(slug, cur.site_id)) !== (await customerOf(slug, siteId));
+      // The customers of the old and the new site, read once for the check and the log.
+      const [fromCustomer, toCustomer] = siteChanges && cur.status === 'active' ? await Promise.all([customerOf(slug, cur.site_id), customerOf(slug, siteId)]) : [null, null];
+      const rulesChange = siteChanges && cur.status === 'active' && fromCustomer !== toCustomer;
       if (rulesChange && !rulesCleared) {
         throw new TeamError(409, 'rules_change', 'moving an active PC to another customer, or to no site, changes the rules that apply to it: it needs rules.manage and a fresh authenticator code');
       }
@@ -597,7 +599,7 @@ export function deviceStore(db, team, { authSecret = '', hooks = null, defaultTi
       return {
         entries: [
           { kind: 'device_changed', detail: `${id} ${changed.join(', ')}` },
-          ...(rulesChange ? [{ kind: 'rules_changed', detail: `device ${id}: site ${cur.site_id ?? 'none'} to ${siteId ?? 'none'}, customer ${(await customerOf(slug, cur.site_id)) ?? 'none'} to ${(await customerOf(slug, siteId)) ?? 'none'}` }] : []),
+          ...(rulesChange ? [{ kind: 'rules_changed', detail: `device ${id}: site ${cur.site_id ?? 'none'} to ${siteId ?? 'none'}, customer ${fromCustomer ?? 'none'} to ${toCustomer ?? 'none'}` }] : []),
         ],
         guard: and(
           base,
