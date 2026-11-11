@@ -878,12 +878,16 @@ export class Session {
       const name = rec.device_name;
       const sid = await this.get('sid', null);
       const asker = rec.via === 'agent' ? `${actor}'s agent` : actor;
-      const people = [...new Set([actor, ...holders])];
-      const rows = (await Promise.all(people.map((to) => notify.direct(slug, 'approval_requested', to, {
+      const what = {
         device_id: rec.device_id, session_id: sid, title: 'Approval needed',
         body: `${asker} asks to: ${rec.summary}${name ? ` on ${name}` : ''}. Approve or deny it in the app.`,
         dedupe: `approval:${rec.id}`,
-      })))).flat();
+      };
+      // The holders were just read as active people, so only the asker, when not one of them, is looked up.
+      const rows = [
+        ...(holders.includes(actor) ? [] : await notify.direct(slug, 'approval_requested', actor, what)),
+        ...notify.directKnown('approval_requested', holders, what),
+      ];
       await notify.write(slug, rows);
     } catch (_) {
       // Nobody could be told, so nobody could answer: refuse now instead of waiting for nothing.

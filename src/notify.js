@@ -112,11 +112,19 @@ export function notifyStore(db, team) {
     const who = normalizeIdentity(to);
     const found = await q(`SELECT identity FROM members WHERE workspace = ? AND identity = ? AND kind = 'person' AND ${ACTIVE}`, slug, who).first('identity');
     if (!found) return [];
-    return [{
-      recipient: who, event, created_at: Date.now(),
+    return directKnown(event, [who], what);
+  }
+
+  // The rows for a direct event to people already read as active members who are persons (the answer of
+  // holders), one each, with no second look-up. Nothing is written.
+  function directKnown(event, people, what) {
+    if (!DIRECT_EVENTS.includes(event)) throw new TypeError('unknown direct notification event');
+    const at = Date.now();
+    return people.map((who) => ({
+      recipient: who, event, created_at: at,
       device_id: what.device_id ?? null, task_id: what.task_id ?? null, session_id: what.session_id ?? null,
       title: clip(what.title, TITLE_MAX), body: clip(what.body, BODY_MAX), dedupe: String(what.dedupe),
-    }];
+    }));
   }
 
   // The statements that add `list` inside a guarded change: each runs only where the
@@ -182,7 +190,7 @@ export function notifyStore(db, team) {
     return r.meta.changes;
   }
 
-  return { recipients, holders, rows, direct, statements, write, feed, settings, patchSettings, prune };
+  return { recipients, holders, rows, direct, directKnown, statements, write, feed, settings, patchSettings, prune };
 }
 
 // The feed, held open: the rows after `after` if there are any, otherwise a check every

@@ -42,6 +42,8 @@ async function setup(t, { rules = ruled } = {}) {
 // ---- released by an approval --------------------------------------------------------------------------------------
 it('a restart waits for an approval, tells the driver and the members who may approve, and goes to the PC with approved_by once approved', async (t) => {
   const { w, app, sid, pc, frames, list, approve, waiting, session } = await setup(t);
+  const lookups = () => w.db.seen.filter((x) => /^SELECT identity FROM members WHERE workspace = \? AND identity = \?/.test(x.sql)).length;
+  const looked = lookups();
   const { call, approval } = await waiting();
   assert.equal(frames.length, 0, 'nothing is queued while it waits');
   assert.equal(approval.summary, 'Restart the PC in 30 seconds');
@@ -51,6 +53,7 @@ it('a restart waits for an approval, tells the driver and the members who may ap
   await until(() => rows(w).length === 3);
   const told = rows(w);
   assert.deepEqual(told.map((r) => r.recipient).sort(), [BOSS, LEAD, TECH].sort());
+  assert.equal(lookups() - looked, 1, 'the holders are read once; only the driver, not one of them, is looked up');
   assert.deepEqual([told[0].event, told[0].session_id, told[0].device_id, told[0].title], ['approval_requested', sid, pc.id, 'Approval needed']);
   assert.match(told[0].body, /^tech@example\.com asks to: Restart the PC in 30 seconds on Till\./);
   assert.equal(new Set(told.map((r) => r.dedupe)).size, 1);
