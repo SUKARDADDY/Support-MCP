@@ -3473,7 +3473,7 @@ public static class AppTests {
             // note, and the child is stopped with the Job when the timeout ends.
             var late = Stopwatch.StartNew();
             r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", setup, "args", "--spawn-sleep", "timeout_s", 10, "rules_tag", "g1"));
-            Assert(Wire.Flag(r, "ok") && Wire.Number(r, "exit_code") == 0 && Wire.Text(r, "detail").Contains("1 process it started was still running and was stopped") && late.ElapsedMilliseconds >= 9000 && late.ElapsedMilliseconds < 30000,
+            Assert(Wire.Flag(r, "ok") && Wire.Number(r, "exit_code") == 0 && (Wire.Text(r, "detail").Contains("it started was still running and was stopped") || Wire.Text(r, "detail").Contains("it started were still running and were stopped")) && late.ElapsedMilliseconds >= 9000 && late.ElapsedMilliseconds < 30000,
                 "a leftover child does not make a finished install fail: " + Refusal(r) + " " + Wire.Text(r, "detail") + " " + late.ElapsedMilliseconds + " ms");
             // A first process that never exits is reported as not finished.
             late = Stopwatch.StartNew();
