@@ -246,7 +246,9 @@ export function effectiveRules(team, customer = null, { defaultTimeZone = '', re
 }
 
 // The same from stored rows: the team's row and the customer's, each { doc, rev } or null. The rev shown
-// is the two revisions added, so it moves whenever either row is saved.
+// is the two revisions added. Neither row's rev ever goes back (a removed override keeps its row with the
+// next rev, src/rules-store.js), so for the PCs of one customer it rises with every change of their rules
+// and never repeats. It is for display: the PC tells rules apart by rules_tag, a hash of their content.
 export function effectiveFromRows(teamRow, customerRow, { defaultTimeZone = '' } = {}) {
   return effectiveRules(
     teamRow ? parseStored(teamRow.doc) : null,

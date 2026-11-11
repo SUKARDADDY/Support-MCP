@@ -397,6 +397,8 @@ test('an override\'s revision never repeats: a save that read an override remove
   assert.deepEqual([late.status, late.body.error.code], [409, 'stale']);
   const now = (await w.api(BOSS, 'GET', `/rules/${a.customer}`)).body;
   assert.deepEqual([now.rev, now.doc], [again.body.override.rev, { shutdown: 'never' }]);
+  // The effective revision the PC is shown never went back: 1 with the first override, 2 once removed, 3 now.
+  assert.deepEqual([none.effective.rev, now.effective.rev], [2, 3]);
   assert.deepEqual((await w.api(BOSS, 'GET', '/rules')).body.overrides.map((o) => [o.customer_id, o.rev]), [[a.customer, again.body.override.rev]]);
   assert.equal((await helloRules(w, a.pc)).rules.shutdown, 'never');
   // Saving an override with no fields removes it the same way.
