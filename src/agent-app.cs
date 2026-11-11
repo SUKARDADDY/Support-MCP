@@ -261,8 +261,9 @@ namespace SupportMcp {
         // process's own account. No shell reads the text and no script holds it: what the program receives is what is given here.
         // Throws Win32Exception when the program cannot be started. It waits for the whole process tree: an installer or an
         // uninstaller may hand its work to a copy of itself or to a setup it starts, and exit at once. The call ends when the Job
-        // holds no process, or timed_out when that takes longer than timeoutSeconds (the Job is then closed, which stops what
-        // is left). The exit code is the first process's.
+        // holds no process, or when timeoutSeconds ends (the Job is then closed, which stops what is left). The exit code is the
+        // first process's; timed_out is true only when that process never exited. Processes it started that were still running
+        // at the end are counted in left_running, and job_query_failed says the Job could not be asked how many there were.
         public Dictionary<string, object> RunProgram(string exe, string commandLine, string cwd, int timeoutSeconds, WaitHandle stop) {
             return Execute(exe, commandLine, cwd, timeoutSeconds, stop, IntPtr.Zero, true);
         }
@@ -296,10 +297,16 @@ namespace SupportMcp {
                 }
                 uint exit; Check(GetExitCodeProcess(process, out exit));
                 Accounting info;
-                // A program that waits for its tree: keep going until the Job is empty, within the time that is left.
-                while (wholeTree && !timedOut && QueryInformationJobObject(job, 1, out info, Marshal.SizeOf(typeof(Accounting)), IntPtr.Zero) && info.Active > 0) {
-                    if (clock.ElapsedMilliseconds >= timeoutSeconds * 1000L) timedOut = true;
-                    else if (stop.WaitOne(50)) throw new OperationCanceledException();
+                uint left = 0; bool queryFailed = false;
+                // A program that waits for its tree: once the first process has exited, keep going until the Job is empty, within the
+                // time that is left. Processes still there at the end are leftovers (an updater, a tray helper), not a failure of the
+                // first process; timedOut stays for a first process that never exited.
+                while (wholeTree && !timedOut) {
+                    if (!QueryInformationJobObject(job, 1, out info, Marshal.SizeOf(typeof(Accounting)), IntPtr.Zero)) { queryFailed = true; break; }
+                    if (info.Active == 0) break;
+                    left = info.Active;
+                    if (clock.ElapsedMilliseconds >= timeoutSeconds * 1000L) break;
+                    if (stop.WaitOne(50)) throw new OperationCanceledException();
                 }
                 // PowerShell does not wait for a GUI program it starts, such as rundll32.exe user32.dll,LockWorkStation. Give what
                 // is left in the Job up to SettleMs to finish by itself, so it is not stopped before it did its work.
@@ -310,7 +317,8 @@ namespace SupportMcp {
                 outReader.Join(5000); errReader.Join(5000);
                 return Wire.Map("ok", true, "exit_code", timedOut ? null : (object)unchecked((int)exit), "timed_out", timedOut,
                     "stdout_b64", Convert.ToBase64String(stdout.ToArray()), "stderr_b64", Convert.ToBase64String(stderr.ToArray()),
-                    "stdout_truncated", OutClipped, "stderr_truncated", ErrClipped);
+                    "stdout_truncated", OutClipped, "stderr_truncated", ErrClipped,
+                    "left_running", (int)left, "job_query_failed", queryFailed);
             } finally {
                 // Assignment can fail on Windows 7 inside an existing Job. The
                 // unassigned suspended process must be terminated explicitly.
@@ -1803,9 +1811,11 @@ namespace SupportMcp {
         // other rules govern. Any installer also refuses control characters (the relay refuses them too, since this PC strips
         // them before it checks) and the typographic quotation marks U+2018 to U+201E (a quote to PowerShell and to a reader,
         // none to the installer; the arguments never go through PowerShell here, so this is a second line of defence).
+        // An .msi or .msu (run as SYSTEM) also refuses any non-ASCII character (msiexec folds some to ASCII letters in a property
+        // name), and an .msi any REBOOT= value that starts with F (MSI reads only the first letter, so REBOOT=F is Force).
         // Letters are lower-cased as ASCII only and white space is the explicit set ArgSpace, the same on both sides (the
         // framework's IsWhiteSpace and the relay's \s differ on U+FEFF, U+180E and U+0085). For an .msi (which msiexec runs as
-        // SYSTEM) also: any non-ASCII character (msiexec folds some to ASCII letters in a property name), any braced GUID (a
+        // SYSTEM) also: any braced GUID (a
         // package's own Upgrade-table properties take product codes and can make it remove another product), the properties
         // REMOVE=, ADVERTISE=, ADDSOURCE=, COMPADDSOURCE=, FILEADDSOURCE=, MSIPATCHREMOVE= and PATCH= (any case, quoted or not,
         // spaces around the "=" or not), which take features off the PC or patch it (REMOVE=ALL on a product that is already
@@ -1817,6 +1827,9 @@ namespace SupportMcp {
         // installArgsProblem in src/rules.js; the shared cases run on both.
         const string ArgSpace = " \\t\\n\\v\\f\\r\\u0085\\u00a0\\u1680\\u180e\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff";
         static readonly string MsiRemovingProperty = "(?:^|[" + ArgSpace + "\"'`;&|,()/-])(?:remove|advertise|addsource|compaddsource|fileaddsource|msipatchremove|patch)[\"'`" + ArgSpace + "]*=";
+        // MSI reads only the first letter of REBOOT's value, so any value starting with F (Force, F, force) forces a restart.
+        static readonly string MsiRebootForce = "(?:^|[" + ArgSpace + "\"'`;&|,()/-])reboot[\"'`" + ArgSpace + "]*=[\"'`" + ArgSpace + "]*f";
+        const string RestartProblem = "installer arguments must not restart the PC: use restart_pc";
         const string BracedGuid = "\\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\}";
         static bool IsArgSpace(char ch) {
             return ch == ' ' || (ch >= '\t' && ch <= '\r') || ch == '\u0085' || ch == '\u00a0' || ch == '\u1680' || ch == '\u180e' || (ch >= '\u2000' && ch <= '\u200a')
@@ -1835,11 +1848,12 @@ namespace SupportMcp {
             string given = args ?? "";
             foreach (char ch in given) if (ch >= '\u2018' && ch <= '\u201e') return "installer arguments must not contain typographic quotation marks: use plain quotes or none";
             foreach (char ch in given) if (ch <= '\u001f' || (ch >= '\u007f' && ch <= '\u009f')) return "installer arguments must not contain control characters or line breaks";
-            if (msi) foreach (char ch in given) if (ch > '\u007f') return "installer arguments for an .msi must be ASCII only: msiexec reads some other letters as ASCII ones";
+            if (windows) foreach (char ch in given) if (ch > '\u007f') return "installer arguments for an .msi or .msu must be ASCII only: msiexec and wusa read some other letters as ASCII ones. Leave INSTALLDIR out or use an ASCII path";
             string lower = AsciiLower(given);
             string bare = lower.Replace("\"", "").Replace("'", "").Replace("`", "");
             if (msi && (System.Text.RegularExpressions.Regex.IsMatch(lower, MsiRemovingProperty) || System.Text.RegularExpressions.Regex.IsMatch(bare, MsiRemovingProperty)))
                 return "installer arguments must not remove or change other installed features (REMOVE, ADVERTISE, ADDSOURCE, PATCH): use uninstall_program";
+            if (msi && (System.Text.RegularExpressions.Regex.IsMatch(lower, MsiRebootForce) || System.Text.RegularExpressions.Regex.IsMatch(bare, MsiRebootForce))) return RestartProblem;
             string switches = ArgTokenProblem(lower, "\"'`;&|,()", msi, windows) ?? ArgTokenProblem(bare, ";&|,()", msi, windows);
             if (switches != null) return switches;
             if (msi && (System.Text.RegularExpressions.Regex.IsMatch(lower, BracedGuid) || System.Text.RegularExpressions.Regex.IsMatch(bare, BracedGuid)))
@@ -1854,7 +1868,7 @@ namespace SupportMcp {
                 if (token.Length == 0) continue;
                 string t = token.ToString(); token.Length = 0;
                 if (t.Contains("forcerestart") || t.Contains("promptrestart") || t.Contains("warnrestart") || t.Contains("reboot=force")
-                    || ((t[0] == '/' || t[0] == '-') && (t.Substring(1) == "restart" || t.Substring(1) == "reboot"))) return "installer arguments must not restart the PC: use restart_pc";
+                    || ((t[0] == '/' || t[0] == '-') && (t.Substring(1) == "restart" || t.Substring(1) == "reboot"))) return RestartProblem;
                 if (windows && (t[0] == '/' || t[0] == '-')) {
                     if (t.Substring(1).StartsWith("uninstall", StringComparison.Ordinal)) return "installer arguments must not uninstall a program: use uninstall_program";
                     if (t.Length >= 2 && t[1] == 'x' && (t.Length == 2 || !(t[2] >= 'a' && t[2] <= 'z'))) return "installer arguments must not uninstall a program: use uninstall_program";
@@ -2444,6 +2458,10 @@ namespace SupportMcp {
                 if (Wire.Flag(r, "timed_out")) return Wire.Map("ok", false, "error", "it did not finish in " + timeoutS + " seconds and was stopped");
                 var result = Wire.Map("ok", true, "exit_code", r["exit_code"]);
                 string detail = Wire.Clean(Encoding.UTF8.GetString(Convert.FromBase64String(Wire.Text(r, "stderr_b64"))), 300);
+                long left = Wire.Number(r, "left_running");
+                string note = (left > 0 ? left + (left == 1 ? " process" : " processes") + " it started " + (left == 1 ? "was" : "were") + " still running and " + (left == 1 ? "was" : "were") + " stopped" : "")
+                    + (Wire.Flag(r, "job_query_failed") ? (left > 0 ? "; " : "") + "could not check whether it left processes running" : "");
+                if (note.Length > 0) detail = detail.Length > 0 ? note + ". " + detail : note;
                 if (detail.Length > 0) result["detail"] = detail;
                 return result;
             } catch (Win32Exception e) {

@@ -386,9 +386,11 @@ export function installerProblem(path) {
 //   puts none of the text in a script, so this is a second line of defence, not the only one.)
 //   Letters are lower-cased as ASCII only, and white space is the explicit set ARG_SPACE on both sides (JS \s and
 //   .NET's IsWhiteSpace differ on U+FEFF, U+180E and U+0085), so the relay and the PC split the text the same way.
-//   Refused for an .msi: any non-ASCII character (msiexec folds some of them to ASCII letters in a property name, so
+//   Refused for an .msi or .msu: any non-ASCII character (msiexec folds some of them to ASCII letters in a property name, so
 //   MSIPATCHREMOVE can be spelled with a dotless i; all of the arguments are checked, not only names, since quote
-//   tracking is not reliable enough to leave values alone); any braced GUID (a package's own Upgrade-table
+//   tracking is not reliable enough to leave values alone).
+//   Refused for an .msi: any REBOOT= value that starts with F (MSI reads only the first letter, so REBOOT=F is Force);
+//   any braced GUID (a package's own Upgrade-table
 //   properties, such as WIX_UPGRADE_DETECTED= or OLDPRODUCTS=, take product codes and make RemoveExistingProducts
 //   uninstall another product); the properties REMOVE=, ADVERTISE=, ADDSOURCE=, COMPADDSOURCE=, FILEADDSOURCE=,
 //   MSIPATCHREMOVE= and PATCH= (any case, quoted or not, spaces around the "=" or not), which take features off the PC
@@ -404,6 +406,9 @@ export function installerProblem(path) {
 // The PC's Rules.InstallArgsProblem is the same check, and the shared installers cases run on both.
 const ARG_SPACE = ' \\t\\n\\v\\f\\r\\u0085\\u00a0\\u1680\\u180e\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff';
 const MSI_REMOVING_PROPERTY = new RegExp(`(?:^|[${ARG_SPACE}"'\`;&|,()/-])(?:remove|advertise|addsource|compaddsource|fileaddsource|msipatchremove|patch)["'\`${ARG_SPACE}]*=`);
+// MSI reads only the first letter of REBOOT's value, so any value starting with F (Force, F, force) forces a restart.
+const MSI_REBOOT_FORCE = new RegExp(`(?:^|[${ARG_SPACE}"'\`;&|,()/-])reboot["'\`${ARG_SPACE}]*=["'\`${ARG_SPACE}]*f`);
+const RESTART_PROBLEM = 'installer arguments must not restart the PC: use restart_pc';
 const ARG_BREAKS_QUOTED = new RegExp(`[${ARG_SPACE}"'\`;&|,()]+`);
 const ARG_BREAKS_BARE = new RegExp(`[${ARG_SPACE};&|,()]+`);
 const BRACED_GUID = /\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}/;
@@ -413,7 +418,7 @@ const asciiLower = (text) => text.replace(/[A-Z]/g, (c) => String.fromCharCode(c
 function argTokenProblem(tokens, msi, windows) {
   for (const raw of tokens) {
     if (!raw) continue;
-    if (/forcerestart|promptrestart|warnrestart|reboot=force/.test(raw) || /^[/-](?:restart|reboot)$/.test(raw)) return 'installer arguments must not restart the PC: use restart_pc';
+    if (/forcerestart|promptrestart|warnrestart|reboot=force/.test(raw) || /^[/-](?:restart|reboot)$/.test(raw)) return RESTART_PROBLEM;
     if (windows && (/^[/-]uninstall/.test(raw) || /^[/-]x(?![a-z])/.test(raw))) return 'installer arguments must not uninstall a program: use uninstall_program';
     if (msi && (/^[/-]f[pecmsodauv]*(?![a-z0-9])/.test(raw) || /^[/-](?:p|j[um]?|y|z)(?![a-z])/.test(raw) || /^[/-](?:update|advertise)/.test(raw))) {
       return 'installer arguments must not repair, patch, advertise or register other products: msiexec only installs this package';
@@ -430,9 +435,10 @@ export function installArgsProblem(path, args) {
   const raw = String(args ?? '');
   if (TYPOGRAPHIC_QUOTE.test(raw)) return 'installer arguments must not contain typographic quotation marks: use plain quotes or none';
   if (ARG_CONTROL.test(raw)) return 'installer arguments must not contain control characters or line breaks';
-  if (msi && /[^\u0000-\u007f]/.test(raw)) return 'installer arguments for an .msi must be ASCII only: msiexec reads some other letters as ASCII ones';
+  if (windows && /[^\u0000-\u007f]/.test(raw)) return 'installer arguments for an .msi or .msu must be ASCII only: msiexec and wusa read some other letters as ASCII ones. Leave INSTALLDIR out or use an ASCII path';
   const text = asciiLower(raw);
   const bare = text.replace(/["'`]/g, '');
+  if (msi && (MSI_REBOOT_FORCE.test(text) || MSI_REBOOT_FORCE.test(bare))) return RESTART_PROBLEM;
   if (msi && (MSI_REMOVING_PROPERTY.test(text) || MSI_REMOVING_PROPERTY.test(bare))) {
     return 'installer arguments must not remove or change other installed features (REMOVE, ADVERTISE, ADDSOURCE, PATCH): use uninstall_program';
   }

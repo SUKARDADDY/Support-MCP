@@ -3469,10 +3469,16 @@ public static class AppTests {
             string marker = Path.Combine(dir, "tree-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".txt");
             r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", setup, "args", "--spawn-delayed \"" + marker + "\"", "timeout_s", 60, "rules_tag", "g1"));
             Assert(Wire.Flag(r, "ok") && Wire.Number(r, "exit_code") == 0 && File.Exists(marker), "install waits for the installer's child process: " + Refusal(r) + " " + Wire.Text(r, "detail"));
-            // One that outlives the time it has is reported as not finished, and its child is stopped with the Job.
+            // One that exits 0 but leaves a long-running child (an updater, a tray helper) has finished: it answers ok with its own exit code and a
+            // note, and the child is stopped with the Job when the timeout ends.
             var late = Stopwatch.StartNew();
             r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", setup, "args", "--spawn-sleep", "timeout_s", 10, "rules_tag", "g1"));
-            Assert(!Wire.Flag(r, "ok") && Wire.Text(r, "error").Contains("did not finish") && late.ElapsedMilliseconds >= 9000 && late.ElapsedMilliseconds < 30000, "a child that outlives the timeout is reported and stopped: " + Refusal(r) + " " + late.ElapsedMilliseconds + " ms");
+            Assert(Wire.Flag(r, "ok") && Wire.Number(r, "exit_code") == 0 && Wire.Text(r, "detail").Contains("1 process it started was still running and was stopped") && late.ElapsedMilliseconds >= 9000 && late.ElapsedMilliseconds < 30000,
+                "a leftover child does not make a finished install fail: " + Refusal(r) + " " + Wire.Text(r, "detail") + " " + late.ElapsedMilliseconds + " ms");
+            // A first process that never exits is reported as not finished.
+            late = Stopwatch.StartNew();
+            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", setup, "args", "--sleep 120000", "timeout_s", 10, "rules_tag", "g1"));
+            Assert(!Wire.Flag(r, "ok") && Wire.Text(r, "error").Contains("did not finish") && late.ElapsedMilliseconds >= 9000 && late.ElapsedMilliseconds < 30000, "an installer that never exits is reported and stopped: " + Refusal(r) + " " + late.ElapsedMilliseconds + " ms");
             Assert(Programs.InstallerCommandLine(@"C:\a b\s.exe", "REM\u2019+\u2019OVE=ALL") == "\"C:\\a b\\s.exe\" REM\u2019+\u2019OVE=ALL" && Programs.InstallerCommandLine(@"C:\s.exe", "") == "\"C:\\s.exe\"", "the command line is the quoted name and the text, untouched");
             r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", Path.Combine(dir, "no-such-setup.msi"), "rules_tag", "g1"));
             Assert(Refusal(r).StartsWith("not_found:"), "an installer that is not there: " + Refusal(r));
