@@ -1324,10 +1324,19 @@ the restart and program tools (`not_saved_pc`). Bullets say what holds, and what
   arguments, so it would defeat the restart and uninstall rules if it ran anything. It accepts
   only a `.msi`, `.msu` or `.exe` on a local drive that is not in a `Windows` folder and is not named
   as a Windows tool (`shutdown.exe`, `msiexec.exe`, `wusa.exe`, `cmd.exe`, `powershell.exe` and the
-  like, by file name, wherever it sits) or as an uninstaller (an `.exe` whose name starts with `unins`
-  or holds `uninst`, such as `unins000.exe` or `Uninstall.exe`). It refuses arguments that ask for a
-  restart, and for any installer the uninstall switches `/uninstall`, `/removeonly` and `/x`, after
-  `/`, `-` or `--`. It refuses before an approval is asked, on the relay, and again on the
+  like, by file name, wherever it sits). It also refuses what looks like an uninstaller: an `.exe`
+  whose name starts with `unins` or holds `uninst` (`unins000.exe`, `Uninstall.exe`), an `.exe` in a
+  folder whose name starts with `uninst` (`Mozilla Firefox\uninstall\helper.exe`), and a short 8.3
+  name with a `~` and a digit (`VENDOR~1.EXE`), which would hide the real name. The name check also
+  refuses the setup of an uninstaller tool, such as `UninstallToolSetup.exe` or
+  `iobit-uninstaller-setup.exe`; send such a setup through `run` or install it by hand. For any
+  installer it refuses arguments that ask for a restart, the uninstall switches `/uninst..`
+  (`/uninstall`, InstallShield's `/uninst`), `/removeonly` and `/action=uninstall` after `/`, `-` or
+  `--`, a first argument that is the word `uninstall` or `remove` (winget, choco, vs_installer), and
+  `/x`. For an `.exe`, `/x` counts only alone or followed by `"` or `{`, so `/x64`, `-x86` and a hotfix's
+  `/x:folder` pass. For any installer it also refuses the msiexec properties that remove or patch
+  (`REMOVE=`, `PATCH=` and the like) and `REBOOT=F..`, since an `.exe` can hand them to msiexec
+  (InstallShield's `/v"REMOVE=ALL"`, and `/v/x` counts as `/x`). It refuses before an approval is asked, on the relay, and again on the
   PC, where the raw-command screen also reads the path and the arguments. What a vendor's `.exe`
   does with its own other arguments is its own: the checks are a guardrail there, like the screen.
   An uninstall by a program's own `QuietUninstallString` is screened the same way, and the Support

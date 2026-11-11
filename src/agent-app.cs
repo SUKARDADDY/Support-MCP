@@ -1798,21 +1798,34 @@ namespace SupportMcp {
             "wmic", "certutil", "bitsadmin", "cmstp", "msbuild", "installutil", "forfiles", "runas", "takeown", "icacls", "cacls", "vssadmin",
             "wevtutil", "wsl", "bash", "logoff", "tsdiscon", "psexec", "psexec64" };
         // Why a file may not be run by install_program, or null: only .msi, .msu and .exe installers, none in the Windows
-        // folder (on any drive), none named as a system tool, and none named as an uninstaller (an .exe whose name starts
-        // with unins or holds uninst, such as unins000.exe or Uninstall.exe, removes a program, round the uninstall rule).
+        // folder (on any drive), none named by a short 8.3 name (a ~ and a digit, such as VENDOR~1.EXE, which would hide the
+        // names checked here), none named as a system tool, and none that looks like an uninstaller: an .exe whose name starts
+        // with unins or holds uninst (unins000.exe, Uninstall.exe), or that sits in a folder whose name starts with uninst
+        // (Mozilla Firefox\uninstall\helper.exe), removes a program, round the uninstall rule.
         public static string InstallerProblem(string path) {
             var parts = PathParts(path);
             string name = parts.Count > 0 ? parts[parts.Count - 1] : "";
-            if (!(name.EndsWith(".msi", StringComparison.Ordinal) || name.EndsWith(".msu", StringComparison.Ordinal) || name.EndsWith(".exe", StringComparison.Ordinal))) return "install_program runs only .msi, .msu or .exe installers";
+            bool exe = name.EndsWith(".exe", StringComparison.Ordinal);
+            if (!(name.EndsWith(".msi", StringComparison.Ordinal) || name.EndsWith(".msu", StringComparison.Ordinal) || exe)) return "install_program runs only .msi, .msu or .exe installers";
             if (parts.Count > 1 && parts[1] == "windows") return "install_program does not run files from the Windows folder";
-            if (name.EndsWith(".exe", StringComparison.Ordinal) && Array.IndexOf(SystemTools, name.Substring(0, name.Length - 4)) >= 0) return "install_program does not run " + name + ": it is a Windows tool, not an installer";
-            if (name.EndsWith(".exe", StringComparison.Ordinal) && (name.StartsWith("unins", StringComparison.Ordinal) || name.Contains("uninst"))) return "install_program does not run " + name + ": it is an uninstaller. Use uninstall_program";
+            for (int i = 0; i + 1 < name.Length; i++) {
+                if (name[i] == '~' && name[i + 1] >= '0' && name[i + 1] <= '9') return "install_program needs the installer's full file name, not the short name " + name;
+            }
+            if (exe && Array.IndexOf(SystemTools, name.Substring(0, name.Length - 4)) >= 0) return "install_program does not run " + name + ": it is a Windows tool, not an installer";
+            if (exe && (name.StartsWith("unins", StringComparison.Ordinal) || name.Contains("uninst"))) return "install_program does not run " + name + ": it is an uninstaller. Use uninstall_program";
+            for (int i = 1; exe && i < parts.Count - 1; i++) {
+                if (parts[i].StartsWith("uninst", StringComparison.Ordinal)) return "install_program does not run " + name + " from an uninstall folder: it is an uninstaller. Use uninstall_program";
+            }
             return null;
         }
         // Why these installer arguments are refused, or null: they ask the installer to uninstall or to restart the PC, which
-        // other rules govern. Any installer refuses the uninstall switches /uninstall.., /removeonly.. and /x (not /xml), each
-        // with a /, - or -- in front (setup.exe /uninstall, InstallShield's /x and /removeonly). Any installer also refuses
-        // control characters (the relay refuses them too, since this PC strips them before it checks) and the typographic quotation marks U+2018 to U+201E (a quote to PowerShell and to a reader,
+        // other rules govern. Any installer refuses the uninstall switches /uninst.. (/uninstall, InstallShield's /uninst),
+        // /removeonly.. and /action=uninst.. (SQL Server's setup), each with a /, - or -- in front; a first argument that is the
+        // bare word uninstall or remove (winget, choco, vs_installer); and /x: for an .msi or .msu /x not followed by a letter,
+        // for an .exe only /x alone or followed by " or { (InstallShield's /x), so /x64, /x86 and a hotfix's /x:folder pass.
+        // InstallShield's /v hands the rest of its text to msiexec, so /v/x counts as /x. Any installer also refuses the
+        // msiexec properties and REBOOT=F described below for an .msi, also right after /v, since an .exe can hand them to
+        // msiexec (/v"REMOVE=ALL"). Any installer also refuses control characters (the relay refuses them too, since this PC strips them before it checks) and the typographic quotation marks U+2018 to U+201E (a quote to PowerShell and to a reader,
         // none to the installer; the arguments never go through PowerShell here, so this is a second line of defence).
         // An .msi or .msu (run as SYSTEM) also refuses any non-ASCII character (msiexec folds some to ASCII letters in a property
         // name), and an .msi any REBOOT= value that starts with F (MSI reads only the first letter, so REBOOT=F is Force).
@@ -1829,9 +1842,9 @@ namespace SupportMcp {
         // standing for a break and once with the quotes taken out (REM""OVE=ALL is REMOVE=ALL and /"f"a is /fa). Same as
         // installArgsProblem in src/rules.js; the shared cases run on both.
         const string ArgSpace = " \\t\\n\\v\\f\\r\\u0085\\u00a0\\u1680\\u180e\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff";
-        static readonly string MsiRemovingProperty = "(?:^|[" + ArgSpace + "\"'`;&|,()/-])(?:remove|advertise|addsource|compaddsource|fileaddsource|msipatchremove|patch)[\"'`" + ArgSpace + "]*=";
+        static readonly string MsiRemovingProperty = "(?:^|[" + ArgSpace + "\"'`;&|,()/-]|[/-]v)(?:remove|advertise|addsource|compaddsource|fileaddsource|msipatchremove|patch)[\"'`" + ArgSpace + "]*=";
         // MSI reads only the first letter of REBOOT's value, so any value starting with F (Force, F, force) forces a restart.
-        static readonly string MsiRebootForce = "(?:^|[" + ArgSpace + "\"'`;&|,()/-])reboot[\"'`" + ArgSpace + "]*=[\"'`" + ArgSpace + "]*f";
+        static readonly string MsiRebootForce = "(?:^|[" + ArgSpace + "\"'`;&|,()/-]|[/-]v)reboot[\"'`" + ArgSpace + "]*=[\"'`" + ArgSpace + "]*f";
         const string RestartProblem = "installer arguments must not restart the PC: use restart_pc";
         const string BracedGuid = "\\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\}";
         static bool IsArgSpace(char ch) {
@@ -1854,30 +1867,41 @@ namespace SupportMcp {
             if (windows) foreach (char ch in given) if (ch > '\u007f') return "installer arguments for an .msi or .msu must be ASCII only: msiexec and wusa read some other letters as ASCII ones. Leave INSTALLDIR out or use an ASCII path";
             string lower = AsciiLower(given);
             string bare = lower.Replace("\"", "").Replace("'", "").Replace("`", "");
-            if (msi && (System.Text.RegularExpressions.Regex.IsMatch(lower, MsiRemovingProperty) || System.Text.RegularExpressions.Regex.IsMatch(bare, MsiRemovingProperty)))
+            if (System.Text.RegularExpressions.Regex.IsMatch(lower, MsiRemovingProperty) || System.Text.RegularExpressions.Regex.IsMatch(bare, MsiRemovingProperty))
                 return "installer arguments must not remove or change other installed features (REMOVE, ADVERTISE, ADDSOURCE, PATCH): use uninstall_program";
-            if (msi && (System.Text.RegularExpressions.Regex.IsMatch(lower, MsiRebootForce) || System.Text.RegularExpressions.Regex.IsMatch(bare, MsiRebootForce))) return RestartProblem;
+            if (System.Text.RegularExpressions.Regex.IsMatch(lower, MsiRebootForce) || System.Text.RegularExpressions.Regex.IsMatch(bare, MsiRebootForce)) return RestartProblem;
             string switches = ArgTokenProblem(lower, "\"'`;&|,()", msi, windows) ?? ArgTokenProblem(bare, ";&|,()", msi, windows);
             if (switches != null) return switches;
             if (msi && (System.Text.RegularExpressions.Regex.IsMatch(lower, BracedGuid) || System.Text.RegularExpressions.Regex.IsMatch(bare, BracedGuid)))
                 return "installer arguments for an .msi must not hold a product code ({GUID}): a package property could make it remove another product";
             return null;
         }
+        const string UninstallRefusal = "installer arguments must not uninstall a program: use uninstall_program";
+        // Whether a word is an uninstall switch (above). windows: the text goes to msiexec or wusa.
+        static bool UninstallSwitch(string t, bool windows) {
+            if (t.Length == 0 || (t[0] != '/' && t[0] != '-')) return false;
+            // The switch's name after its /, - or --.
+            string sw = t.StartsWith("--", StringComparison.Ordinal) ? t.Substring(2) : t.Substring(1);
+            if (sw.StartsWith("uninst", StringComparison.Ordinal) || sw.StartsWith("removeonly", StringComparison.Ordinal) || sw.StartsWith("action=uninst", StringComparison.Ordinal)) return true;
+            if (sw.Length >= 1 && sw[0] == 'x') {
+                if (windows && (sw.Length == 1 || !(sw[1] >= 'a' && sw[1] <= 'z'))) return true;
+                if (!windows && (sw.Length == 1 || sw[1] == '"' || sw[1] == '{')) return true;
+            }
+            return sw.Length >= 2 && sw[0] == 'v' && (sw[1] == '/' || sw[1] == '-') && UninstallSwitch(sw.Substring(1), true);
+        }
         // The switch checks over the words of text. breaks: the characters, besides white space, that end a word.
         static string ArgTokenProblem(string text, string breaks, bool msi, bool windows) {
             var token = new StringBuilder();
+            bool first = true;
             foreach (char ch in text + " ") {
                 if (!(IsArgSpace(ch) || breaks.IndexOf(ch) >= 0)) { token.Append(ch); continue; }
                 if (token.Length == 0) continue;
                 string t = token.ToString(); token.Length = 0;
+                if (first && (t == "uninstall" || t == "remove")) return UninstallRefusal;
+                first = false;
                 if (t.Contains("forcerestart") || t.Contains("promptrestart") || t.Contains("warnrestart") || t.Contains("reboot=force")
                     || ((t[0] == '/' || t[0] == '-') && (t.Substring(1) == "restart" || t.Substring(1) == "reboot"))) return RestartProblem;
-                if (t[0] == '/' || t[0] == '-') {
-                    // The switch's name after its /, - or --.
-                    string sw = t.StartsWith("--", StringComparison.Ordinal) ? t.Substring(2) : t.Substring(1);
-                    if (sw.StartsWith("uninstall", StringComparison.Ordinal) || sw.StartsWith("removeonly", StringComparison.Ordinal)) return "installer arguments must not uninstall a program: use uninstall_program";
-                    if (sw.Length >= 1 && sw[0] == 'x' && (sw.Length == 1 || !(sw[1] >= 'a' && sw[1] <= 'z'))) return "installer arguments must not uninstall a program: use uninstall_program";
-                }
+                if (UninstallSwitch(t, windows)) return UninstallRefusal;
                 if (msi && (t[0] == '/' || t[0] == '-') && System.Text.RegularExpressions.Regex.IsMatch(t, "^[/-](?:f[pecmsodauv]*(?![a-z0-9])|(?:p|j[um]?|y|z)(?![a-z])|update|advertise)"))
                     return "installer arguments must not repair, patch, advertise or register other products: msiexec only installs this package";
                 if (msi && (t[0] == '/' || t[0] == '-') && System.Text.RegularExpressions.Regex.IsMatch(t, "^[/-](?:i|a|package)(?![a-z])"))

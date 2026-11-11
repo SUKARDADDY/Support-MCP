@@ -373,24 +373,37 @@ export function localAbsolutePath(path) {
 }
 
 // Why a file may not be run by install_program, or null. Only .msi, .msu and .exe installers, and none in the
-// Windows folder (on any drive), named as a system tool, or named as an uninstaller: an .exe whose name starts
-// with unins (unins000.exe, uninst.exe) or holds uninst (Uninstall.exe, app-uninstaller.exe) removes a program,
-// round the uninstall rule. The PC checks the same, and its own Windows folder with links resolved besides.
+// Windows folder (on any drive), named by a short 8.3 name (a ~ and a digit, such as VENDOR~1.EXE, which would hide
+// the names checked here), named as a system tool, or that looks like an uninstaller: an .exe whose name starts
+// with unins (unins000.exe, uninst.exe) or holds uninst (Uninstall.exe, app-uninstaller.exe), or that sits in a
+// folder whose name starts with uninst (Mozilla Firefox\uninstall\helper.exe), removes a program, round the
+// uninstall rule. So an installer of an uninstaller tool (UninstallToolSetup.exe) is refused too. The PC checks the
+// same, and its own Windows folder with links resolved besides.
 export function installerProblem(path) {
   const parts = pathParts(path);
   const name = parts.at(-1) ?? '';
+  const exe = name.endsWith('.exe');
   if (!/\.(?:msi|msu|exe)$/.test(name)) return 'install_program runs only .msi, .msu or .exe installers';
   if (parts.length > 1 && parts[1] === 'windows') return 'install_program does not run files from the Windows folder';
-  if (name.endsWith('.exe') && SYSTEM_TOOLS.includes(name.slice(0, -4))) return `install_program does not run ${name}: it is a Windows tool, not an installer`;
-  if (name.endsWith('.exe') && (name.startsWith('unins') || name.includes('uninst'))) return `install_program does not run ${name}: it is an uninstaller. Use uninstall_program`;
+  if (/~[0-9]/.test(name)) return `install_program needs the installer's full file name, not the short name ${name}`;
+  if (exe && SYSTEM_TOOLS.includes(name.slice(0, -4))) return `install_program does not run ${name}: it is a Windows tool, not an installer`;
+  if (exe && (name.startsWith('unins') || name.includes('uninst'))) return `install_program does not run ${name}: it is an uninstaller. Use uninstall_program`;
+  if (exe && parts.slice(1, -1).some((p) => p.startsWith('uninst'))) return `install_program does not run ${name} from an uninstall folder: it is an uninstaller. Use uninstall_program`;
   return null;
 }
 
 // Why these installer arguments are refused, or null: they ask the installer to uninstall, to restart the PC, or
 // (for an .msi, which msiexec runs as SYSTEM) to act on installed state that other rules govern. What an installer
 // does with its other arguments is its own; the PC also screens the text like a raw command (RunScreen).
-//   Refused for any installer: the uninstall switches /uninstall.., /removeonly.. and /x (not /xml), each with a
-//   /, - or -- in front (setup.exe /uninstall, InstallShield's /x and /removeonly, msiexec's /x).
+//   Refused for any installer: the uninstall switches /uninst.. (/uninstall, InstallShield's /uninst), /removeonly..
+//   and /action=uninst.. (SQL Server's setup), each with a /, - or -- in front; a first argument that is the bare
+//   word uninstall or remove (winget, choco, vs_installer); and /x: for an .msi or .msu /x not followed by a letter
+//   (msiexec's /x{code}), for an .exe only /x alone or followed by " or { (InstallShield's /x), so /x64, /x86 and a
+//   hotfix's /x:folder pass. InstallShield's /v hands the rest of its text to msiexec, so /v/x counts as /x.
+//   Refused for any installer, since an .exe can hand them to msiexec (InstallShield's /v"REMOVE=ALL", or an
+//   installer that passes on what it does not know): the properties REMOVE=, ADVERTISE=, ADDSOURCE=,
+//   COMPADDSOURCE=, FILEADDSOURCE=, MSIPATCHREMOVE= and PATCH= and a REBOOT= value that starts with F, also right
+//   after /v (described below for an .msi).
 //   Refused for any installer: control characters (the PC strips them before it checks, so the relay refuses them
 //   rather than check text the PC will not see), and the typographic quotation marks U+2018 to U+201E. They are no
 //   quote to the installer, but they are one to PowerShell and to a person reading the text, so text that holds them
@@ -417,9 +430,9 @@ export function installerProblem(path) {
 // the middle of a name does not break it for the command line (REM""OVE=ALL is REMOVE=ALL, /"f"a is /fa).
 // The PC's Rules.InstallArgsProblem is the same check, and the shared installers cases run on both.
 const ARG_SPACE = ' \\t\\n\\v\\f\\r\\u0085\\u00a0\\u1680\\u180e\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff';
-const MSI_REMOVING_PROPERTY = new RegExp(`(?:^|[${ARG_SPACE}"'\`;&|,()/-])(?:remove|advertise|addsource|compaddsource|fileaddsource|msipatchremove|patch)["'\`${ARG_SPACE}]*=`);
+const MSI_REMOVING_PROPERTY = new RegExp(`(?:^|[${ARG_SPACE}"'\`;&|,()/-]|[/-]v)(?:remove|advertise|addsource|compaddsource|fileaddsource|msipatchremove|patch)["'\`${ARG_SPACE}]*=`);
 // MSI reads only the first letter of REBOOT's value, so any value starting with F (Force, F, force) forces a restart.
-const MSI_REBOOT_FORCE = new RegExp(`(?:^|[${ARG_SPACE}"'\`;&|,()/-])reboot["'\`${ARG_SPACE}]*=["'\`${ARG_SPACE}]*f`);
+const MSI_REBOOT_FORCE = new RegExp(`(?:^|[${ARG_SPACE}"'\`;&|,()/-]|[/-]v)reboot["'\`${ARG_SPACE}]*=["'\`${ARG_SPACE}]*f`);
 const RESTART_PROBLEM = 'installer arguments must not restart the PC: use restart_pc';
 const ARG_BREAKS_QUOTED = new RegExp(`[${ARG_SPACE}"'\`;&|,()]+`);
 const ARG_BREAKS_BARE = new RegExp(`[${ARG_SPACE};&|,()]+`);
@@ -427,11 +440,23 @@ const BRACED_GUID = /\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 const TYPOGRAPHIC_QUOTE = /[\u2018-\u201e]/;
 const ARG_CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
 const asciiLower = (text) => text.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+const UNINSTALL_PROBLEM = 'installer arguments must not uninstall a program: use uninstall_program';
+// Whether a word is an uninstall switch (above). windows: the text goes to msiexec or wusa.
+function uninstallSwitch(raw, windows) {
+  if (raw[0] !== '/' && raw[0] !== '-') return false;
+  const sw = raw.startsWith('--') ? raw.slice(2) : raw.slice(1);
+  if (/^(?:uninst|removeonly|action=uninst)/.test(sw)) return true;
+  if (windows ? /^x(?![a-z])/.test(sw) : /^x(?:$|["{])/.test(sw)) return true;
+  return /^v[/-]/.test(sw) && uninstallSwitch(sw.slice(1), true);
+}
 function argTokenProblem(tokens, msi, windows) {
+  let first = true;
   for (const raw of tokens) {
     if (!raw) continue;
+    if (first && (raw === 'uninstall' || raw === 'remove')) return UNINSTALL_PROBLEM;
+    first = false;
     if (/forcerestart|promptrestart|warnrestart|reboot=force/.test(raw) || /^[/-](?:restart|reboot)$/.test(raw)) return RESTART_PROBLEM;
-    if (/^(?:--|[/-])(?:uninstall|removeonly)/.test(raw) || /^(?:--|[/-])x(?![a-z])/.test(raw)) return 'installer arguments must not uninstall a program: use uninstall_program';
+    if (uninstallSwitch(raw, windows)) return UNINSTALL_PROBLEM;
     if (msi && (/^[/-]f[pecmsodauv]*(?![a-z0-9])/.test(raw) || /^[/-](?:p|j[um]?|y|z)(?![a-z])/.test(raw) || /^[/-](?:update|advertise)/.test(raw))) {
       return 'installer arguments must not repair, patch, advertise or register other products: msiexec only installs this package';
     }
@@ -450,8 +475,8 @@ export function installArgsProblem(path, args) {
   if (windows && /[^\u0000-\u007f]/.test(raw)) return 'installer arguments for an .msi or .msu must be ASCII only: msiexec and wusa read some other letters as ASCII ones. Leave INSTALLDIR out or use an ASCII path';
   const text = asciiLower(raw);
   const bare = text.replace(/["'`]/g, '');
-  if (msi && (MSI_REBOOT_FORCE.test(text) || MSI_REBOOT_FORCE.test(bare))) return RESTART_PROBLEM;
-  if (msi && (MSI_REMOVING_PROPERTY.test(text) || MSI_REMOVING_PROPERTY.test(bare))) {
+  if (MSI_REBOOT_FORCE.test(text) || MSI_REBOOT_FORCE.test(bare)) return RESTART_PROBLEM;
+  if (MSI_REMOVING_PROPERTY.test(text) || MSI_REMOVING_PROPERTY.test(bare)) {
     return 'installer arguments must not remove or change other installed features (REMOVE, ADVERTISE, ADDSOURCE, PATCH): use uninstall_program';
   }
   const switches = argTokenProblem(text.split(ARG_BREAKS_QUOTED), msi, windows) ?? argTokenProblem(bare.split(ARG_BREAKS_BARE), msi, windows);
