@@ -64,7 +64,7 @@ test('every tool the MCP endpoint lists needs a known permission', () => {
 });
 
 test('the built-in roles and permission keys are as specified', () => {
-  assert.deepEqual(PERMISSIONS, ['members.manage', 'roles.manage', 'audit.view', 'devices.view', 'devices.manage', 'fields.manage', 'sessions.create', 'sessions.view', 'sessions.control', 'sessions.end', 'sessions.unattended']);
+  assert.deepEqual(PERMISSIONS, ['members.manage', 'roles.manage', 'audit.view', 'devices.view', 'devices.manage', 'fields.manage', 'sessions.create', 'sessions.view', 'sessions.control', 'sessions.end', 'sessions.unattended', 'rules.manage']);
   assert.deepEqual(BUILTIN_ROLES.admin.permissions, PERMISSIONS);
   assert.deepEqual(BUILTIN_ROLES.technician.permissions, ['devices.view', 'devices.manage', 'sessions.create', 'sessions.view', 'sessions.control', 'sessions.end']);
   assert.deepEqual(BUILTIN_ROLES.viewer.permissions, ['audit.view', 'devices.view', 'sessions.view']);
@@ -114,7 +114,7 @@ test('tools/list never touches the team database', async () => {
   const r = await handler.fetch(new Request('http://127.0.0.1:8787/mcp', {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
   }), { DEV_SKIP_ACCESS: '1', DB: trap, ...fakeSessions() });
-  assert.equal((await r.json()).result.tools.length, 31);
+  assert.equal((await r.json()).result.tools.length, 37);
 });
 
 test('a tool call without a team database is refused and never reaches a session', async () => {
@@ -137,9 +137,10 @@ test('a Viewer can list and read status; run is refused naming the permission, a
   assert.ok(!list.isError);
   assert.deepEqual(JSON.parse(list.content[0].text), { sessions: [{ sid: SID }] });
   assert.ok(!(await mcp(env, 'session_status', { session_id: SID })).isError);
-  assert.equal(s.calls.at(-1).search, '?log_tail=20&workspace=default');
+  assert.equal(s.calls.at(-1).search, '?log_tail=20&workspace=default&rules=1');
   s.calls.length = 0;
-  for (const [name, args] of [['run', { command: 'whoami' }], ['click', { x: 1, y: 2 }], ['type_secret', { text: 'pw' }], ['put_file', { path: 'x', data_b64: '' }]]) {
+  for (const [name, args] of [['run', { command: 'whoami' }], ['click', { x: 1, y: 2 }], ['type_secret', { text: 'pw' }], ['put_file', { path: 'x', data_b64: '' }],
+    ['restart_pc', {}], ['shutdown_pc', {}], ['list_programs', {}], ['install_program', { path: 'C:\\a.msi' }], ['uninstall_program', { program_id: 'a' }], ['close_program', { name: 'a.exe' }]]) {
     const out = await mcp(env, name, { session_id: SID, ...args });
     assert.deepEqual(out, { content: [{ type: 'text', text: 'your role does not allow sessions.control' }], isError: true }, name);
   }
@@ -1012,6 +1013,7 @@ const SESSION_TOOLS = {
   scroll: { x: 1, y: 1, direction: 'down' }, type_text: { text: 'hi' }, press_key: { keys: 'enter' }, wait: {},
   zoom: { x1: 0, y1: 0, x2: 10, y2: 10 }, ui_tree: {}, ui_act: { ref: 1, verb: 'invoke' },
   block_input: { on: true }, send_sas: {}, type_secret: { text: 'hunter2-secret' }, request_full_control: {},
+  restart_pc: {}, shutdown_pc: {}, list_programs: {}, install_program: { path: 'C:\\setup.msi' }, uninstall_program: { program_id: 'app-1' }, close_program: { name: 'notepad.exe' },
 };
 
 async function twoWorkspaces() {
@@ -1136,7 +1138,7 @@ test('tools/list on any well-formed workspace address never touches the database
     const r = await handler.fetch(new Request(`http://127.0.0.1:8787${path}`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
     }), env);
-    assert.equal((await r.json()).result.tools.length, 31, path);
+    assert.equal((await r.json()).result.tools.length, 37, path);
   }
 });
 

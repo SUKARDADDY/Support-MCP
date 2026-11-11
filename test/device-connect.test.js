@@ -48,7 +48,7 @@ test('device_list returns the team shape with online from one Registry request, 
   assert.equal(out.devices.length, 3);
   const by = Object.fromEntries(out.devices.map((d) => [d.id, d]));
   assert.deepEqual([by[a.id].online, by[b.id].online, by[pending.id].online], [true, false, false]);
-  assert.deepEqual([by[a.id].name, by[a.id].status, by[a.id].access, by[a.id].control, by[a.id].app_version], ['Till', 'active', 'ask', 'full', '0.6.0']);
+  assert.deepEqual([by[a.id].name, by[a.id].status, by[a.id].access, by[a.id].control, by[a.id].app_version], ['Till', 'active', 'ask', 'full', '1.0.0']);
   assert.ok('fields' in by[a.id] && 'last_seen' in by[a.id]);
   assert.equal(JSON.stringify(out).includes('key_hash'), false);
   assert.equal(JSON.stringify(out).includes('"session"'), false, 'the pointer is not part of the team shape');
@@ -138,15 +138,15 @@ test('a session asks unless the PC is any time, the caller may connect without a
 test('device_connect refuses a pending, unknown or foreign PC, an old version, a busy PC and bad arguments', async (t) => {
   const w = await world(t);
   const pending = await w.addPc({ status: 'pending' });
-  const old = await w.addPc({ name: 'Old', version: '0.5.0' });
+  const old = await w.addPc({ name: 'Old', version: '0.9.9' });
   const unknownVersion = await w.addPc({ name: 'Blank', version: '' });
-  const rc = await w.addPc({ name: 'RC', version: '0.6.0-rc.1' });
-  const ok = await w.addPc({ name: 'Fine', version: '0.6.1' });
+  const rc = await w.addPc({ name: 'RC', version: '1.0.0-rc.1' });
+  const ok = await w.addPc({ name: 'Fine', version: '1.0.1' });
   assert.match((await w.tool(TECH, 'device_connect', { device_id: pending.id })).error, /waiting for approval/);
   assert.equal((await w.tool(TECH, 'device_connect', { device_id: 'a'.repeat(20) })).error, 'no such PC in this team');
-  assert.equal((await w.tool(TECH, 'device_connect', { device_id: old.id })).error, 'this PC updates itself to 0.6.0 first');
-  assert.equal((await w.tool(TECH, 'device_connect', { device_id: unknownVersion.id })).error, 'this PC updates itself to 0.6.0 first');
-  assert.equal((await w.tool(TECH, 'device_connect', { device_id: rc.id })).error, 'this PC updates itself to 0.6.0 first');
+  assert.equal((await w.tool(TECH, 'device_connect', { device_id: old.id })).error, 'this PC updates itself to 1.0.0 first');
+  assert.equal((await w.tool(TECH, 'device_connect', { device_id: unknownVersion.id })).error, 'this PC updates itself to 1.0.0 first');
+  assert.equal((await w.tool(TECH, 'device_connect', { device_id: rc.id })).error, 'this PC updates itself to 1.0.0 first');
   assert.equal((await w.tool(TECH, 'device_connect', {})).error, 'device_id must be the id of a PC from device_list');
   assert.equal((await w.tool(TECH, 'device_connect', { device_id: 'nope' })).error, 'device_id must be the id of a PC from device_list');
   assert.equal((await w.tool(TECH, 'device_connect', { device_id: ok.id, ask: 'yes' })).error, 'ask must be true or false');
@@ -256,7 +256,7 @@ test('the check-in answer carries session {id, by, team, ask, expires_at} only f
   });
   assert.deepEqual(Object.keys(hello.body.session), ['id', 'by', 'team', 'ask', 'expires_at']);
   assert.equal(JSON.stringify(hello.body).includes('check_in_s'), false, 'no check-in interval is sent');
-  assert.deepEqual(Object.keys(hello.body).sort(), ['device', 'protocol', 'session']);
+  assert.deepEqual(Object.keys(hello.body).sort(), ['device', 'hours_until', 'hours_utc', 'protocol', 'rules', 'rules_tag', 'server_time', 'session']);
   assert.equal(Object.hasOwn(hello.body.device, 'session'), false, 'the key sits beside device, never inside it');
   // A pending PC never gets the key, even with a pointer on its row.
   const waiting = await w.addPc({ status: 'pending' });

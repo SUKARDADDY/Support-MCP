@@ -10,7 +10,7 @@ An MCP server on Cloudflare Workers that lets your AI agent see, control and run
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers%20%2B%20Durable%20Objects-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/durable-objects/)
 [![.NET Framework 4.5.2+](https://img.shields.io/badge/.NET%20Framework-4.5.2%2B-512BD4)](src/agent-app.cs)
 [![PowerShell 5.1](https://img.shields.io/badge/PowerShell-5.1-5391FE)](src/agent.ps1)
-[![MCP](https://img.shields.io/badge/MCP-31%20tools-d97757)](#mcp-tools)
+[![MCP](https://img.shields.io/badge/MCP-37%20tools-d97757)](#mcp-tools)
 
 <img src="docs/hero.svg" alt="Claude Code calls session_create, run and put_file. A Cloudflare Worker relays them to the customer's PC, where a small Remote support window in the corner of the screen shows that an agent is connected, with an End session button." width="100%">
 
@@ -45,6 +45,11 @@ AI agent does the diagnosis and the fix while a person watches.
   to ask, one technician drives at a time, and a workspace or the whole relay can
   be stopped at once. A saved PC updates itself, but only to a release signed with
   the project's offline release key. See [Saved devices](#saved-devices).
+- A team's rules limit what anyone, person or AI agent, may do to a saved PC:
+  restart, shut down, install, uninstall and close programs, and files in
+  protected folders. An action can be allowed, held for a technician's approval,
+  limited to or kept out of business hours, or never allowed. The relay checks
+  the rules, and the PC checks them again. See [Rules and approvals](#rules-and-approvals).
 - When the customer uses the mouse or keyboard, support's input pauses for 3
   seconds.
 - Access ends 24 hours after the PC connects, or sooner if either side ends it.
@@ -207,10 +212,15 @@ an error.
 |---|---|
 | `session_create` | `windows_mode` `app` (default) returns `{session_id, windows_mode, download_url, one_liner, code_expires_at}`; `powershell` returns `{session_id, windows_mode, one_liner, code_expires_at}` |
 | `session_list` | every session with its state, expiry and machine |
-| `session_status` | state, `windows_mode`, machine, user, expiry, `startup_expires_at` while waiting, whether the client is attached, `client_version`, `client_agent`, last audit rows. App sessions add `elevated`, `control` (`full`, `normal` or `null`), `caps`, and when the app reports them `desktop`, `paused_until` and `input_blocked_until` |
+| `session_status` | state, `windows_mode`, machine, user, expiry, `startup_expires_at` while waiting, whether the client is attached, `client_version`, `client_agent`, last audit rows. App sessions add `elevated`, `control` (`full`, `normal` or `null`), `caps`, and when the app reports them `desktop`, `paused_until` and `input_blocked_until`. A saved PC's session also adds `rules` (the rules in force for the PC) and `approval` (an action waiting for approval, or `null`) |
 | `run` | runs PowerShell on the customer's PC. `as` is `user` (default) or `system`. Under full control `user` is the signed-in console user, with administrator rights when that user has them, and fails with `nobody is signed in; use as: "system"` at the sign-in screen; `system` is SYSTEM. In normal mode the relay refuses `system`. Returns exit code, stdout, stderr, timed_out |
 | `put_file` | writes base64 data to a path, with append for chunking. As SYSTEM under full control |
 | `get_file` | reads a byte range as base64, with `eof` for chunking. As SYSTEM under full control |
+| `restart_pc`, `shutdown_pc` | restart or shut down a saved PC: `{session_id, delay_s?}`, `delay_s` 5 to 600, default 30. The call answers `{ok: true, at}` before the PC acts, and forces programs closed, so unsaved work is lost. Governed by the team's rules. Full control only |
+| `list_programs` | the installed programs (`id`, `name`, `version`, `publisher`) and the running ones (`name`, `pid`, `session`) of a saved PC. It only reads, so the rules never refuse it |
+| `install_program` | runs an installer that is already on a saved PC (use `put_file` first): `{session_id, path, args?, timeout_s?}`. A `.msi` runs silent; an `.exe` runs with `args`. `timeout_s` is 10 to 600, default 300. Returns `{ok, exit_code}`. It runs as SYSTEM. Governed by the team's rules. Full control only |
+| `uninstall_program` | removes a program by its `list_programs` id: `{session_id, program_id, timeout_s?}`. Returns `{ok, exit_code}`. Governed by the team's rules. Full control only |
+| `close_program` | closes a running program by `name` or `pid`: `{session_id, name \| pid, force?}`. Without `force` it asks the program's windows to close; with `force` it ends what is left and unsaved work is lost. Returns `{ok, closed}`. Governed by the team's rules |
 | `session_end` | tells the client to stop and marks the session ended |
 | `device_list` | the team's saved PCs with their fields and `online` (true while the PC's doorbell is connected). Needs `devices.view`. Names and custom field values are untrusted text |
 | `device_connect` | connect to a saved PC by its id: `{device_id, ask?, take_over?}`. Returns `{session_id, state: "waiting", asks, rang}`; poll `session_status` until it is attached, then use the session tools. The PC asks its person first when it is set to ask, when you pass `ask: true`, or when your role may not connect without asking. `take_over: true` takes the driving seat of a session another technician started |
@@ -233,8 +243,12 @@ Add `?ui=0` to the MCP URL to hide `ui_tree` and `ui_act`; any other value is a
 above, and a request that still sends `shape` gets a 400 error. Every tool except
 `session_create`, `session_list`, `device_list`, `device_connect`, the three agent tools, `people_list` and `escalation` needs a `session_id`; a call without one
 fails with `session_id is required; call session_list to find it`, and the relay
-never picks a session for you. `run`, `put_file` and `get_file` use their own
-lane, so a long command does not block the screen.
+never picks a session for you. `run`, `put_file`, `get_file` and the six tools
+for restarts and programs use their own lane, so a long command does not block
+the screen. The six work only in a session on a saved PC. A refusal by the rules
+or by a technician is an error that starts with a code, for example
+`rule_never: ...` or `approval_timeout: ...`. Codes and what they mean are in
+[docs/mcp-clients.md](docs/mcp-clients.md#restarts-programs-and-approvals).
 
 ## Teams
 
@@ -275,9 +289,11 @@ an attempt to edit or add a role, or to change or remove a member, gets a 409
   while no member holds them, and add roles of their own from these permissions:
   `members.manage`, `roles.manage`, `audit.view`, `devices.view`,
   `devices.manage`, `fields.manage`, `sessions.create`, `sessions.view`,
-  `sessions.control`, `sessions.end`, `sessions.unattended`. Only `admin` holds
-  `sessions.unattended` ("connect to a PC without asking the person at it, and
-  switch a PC to any time") by default, and open mode never grants it. A workspace that edited `technician` or
+  `sessions.control`, `sessions.end`, `sessions.unattended`, `rules.manage`. Only
+  `admin` holds `sessions.unattended` ("connect to a PC without asking the person
+  at it, switch a PC to any time, and approve actions the rules hold") and
+  `rules.manage` ("change the team's rules") by default, and open mode never
+  grants either. A workspace that edited `technician` or
   `viewer` before the device permissions existed keeps its edit, without them
   (admins hold every permission). Because `technician` and `viewer` now hold
   more, a custom role with `members.manage` but no device permissions can no
@@ -300,7 +316,9 @@ an attempt to edit or add a role, or to change or remove a member, gets a 409
   `session_list` and `session_status` need `sessions.view`, `session_end` needs
   `sessions.end`, `device_list` needs `devices.view`, and every other tool needs
   `sessions.control` (`device_connect` also needs `sessions.unattended` to connect
-  without asking or to take over). Controlling a
+  without asking or to take over). That includes the six restart and program
+  tools: the role lets a person call them, and the team's rules decide what
+  happens next. Controlling a
   full-control session is administrator-level on the customer's PC, so give
   `sessions.control` only to people you would trust with that.
 - **A refused call** is a tool error: `you are not a member of this team`, or
@@ -353,11 +371,11 @@ tied to a 24-hour session. A PC's owner can install the Windows app on it
 permanently, as a saved PC. The support team lists, pairs and connects to saved
 PCs. One-off support links work as before.
 
-> **Not for real customers' unattended PCs yet.** Technicians can connect to a
-> saved PC, but the rules that decide who may connect, and when, beyond the ones
-> below are not enforced yet. Until a later release ships them, do not install a
-> saved PC on a real customer's unattended machine. Use it on your own test
-> machines.
+Version 1.0.0 enforces the team's rules for saved PCs, on the relay and on the PC
+itself: restarts, shutdowns, installs, uninstalls, closing programs and files in
+protected folders follow them. [Rules and approvals](#rules-and-approvals) says
+what they cover and what they do not. Read its last list before you put a saved
+PC on a customer's unattended machine.
 
 - **Records.** A customer has a name, phone, email and notes. A site belongs to
   one customer and has a name, address and notes. A saved PC has the name its
@@ -416,14 +434,15 @@ PCs. One-off support links work as before.
   the person at the PC can end it from the corner window or the tray, and the
   window then says whether the team can connect again later or will ask first.
   Removing a PC ends its session. No update is installed on the PC during a
-  session.
+  session. `device_connect` needs a PC on 1.0.0 or later, the first version that
+  enforces the rules; an older PC updates itself first.
 - **Stopping.** `POST /api/v1/w/<slug>/stop` (needs `sessions.end`) ends every live
   session in a workspace and refuses its tool calls until `DELETE .../stop` (needs
   `members.manage`) resumes it. Neither is an MCP tool. The `EMERGENCY_STOP`
   deploy setting, any non-empty value, does the same for the whole relay.
 - **The team log** records every change to customers, sites, custom fields,
-  pairing codes and PCs, with names and ids but never a code, a key or a field
-  value. A detail can hold customer, site and PC names, so anyone with
+  pairing codes, PCs and rules, with names and ids but never a code, a key or a field
+  value. A rules change lists the fields it changed, never a folder or program name. A detail can hold customer, site and PC names, so anyone with
   `audit.view` can read them. A PC's routine check-ins are not logged.
 
 `/device/pair`, `/device/hello`, `/device/update`, `/device/leave` and the
@@ -434,6 +453,108 @@ Rotating `AUTH_SECRET` ends every live pairing code and every waiting PC's
 six-digit number, because both are stored as keyed hashes; a PC's key is a plain
 SHA-256 and keeps working.
 To try it locally, see [docs/development.md](docs/development.md#pairing-a-pc-locally).
+
+### Rules and approvals
+
+A workspace has a set of rules for what anyone may do to a saved PC, and a customer can
+override them for its own PCs. The rules cover:
+
+- **A time zone and business hours.** The time zone is an IANA name such as
+  `Asia/Jerusalem`. With none set, a team uses the deployment's `DEFAULT_TIME_ZONE`, and
+  UTC when that is empty. Business hours are a start and end for each day of the week
+  (`mon` to `sun`); a day left out has none.
+- **Five actions**, each set to one of `allow`, `approve`, `approve_in_hours` (a
+  technician approves during business hours; outside them the action is allowed),
+  `outside_hours` (refused during business hours, allowed outside) or `never`:
+  `restart`, `shutdown`, `install`, `uninstall` and `close_program`.
+- **Protected programs and folders.** The tools never close or uninstall a protected
+  program, and the file tools and `install_program` never read from, write to, or install
+  from a protected folder. A raw `run` command is only screened for them (see below), so
+  they are not a wall. Each list holds at most 50 entries, and a folder must be a
+  folder, not a whole drive such as `C:\`. The Support app itself, its processes and its
+  install folder are protected from the tools whatever the lists say.
+
+With no rules saved, `restart`, `shutdown`, `install` and `uninstall` are `approve`,
+`close_program` is `allow`, and nothing is protected. A customer's override holds only
+the fields it changes, and each field it sets replaces the team's: a list replaces the
+team's list, it does not add to it.
+
+An admin (`rules.manage`) saves them through the team API, with a fresh code from their
+own authenticator app each time. A service token cannot save rules, whatever its role.
+
+```sh
+api=https://support.example.com/api/v1/w/default
+cloudflared access curl "$api/rules"                  # the team's rules, each customer's override, the default time zone
+cloudflared access curl "$api/rules/<customer id>"    # one customer's override and the rules in force for it
+cloudflared access curl "$api/rules" -X PATCH -H 'content-type: application/json' \
+  -d '{"rev":0,"code":"123456","doc":{"time_zone":"Asia/Jerusalem","hours":{"mon":["08:00","18:00"],"tue":["08:00","18:00"]},"restart":"approve_in_hours","shutdown":"never","protected_folders":["C:\\POS\\Data"]}}'
+cloudflared access curl "$api/rules/<customer id>" -X DELETE -H 'content-type: application/json' \
+  -d '{"code":"123456"}'                              # the customer has the team's rules again
+```
+
+Moving an active PC to a site under another customer, or off any site, changes which override
+applies to it, so it takes the same: `rules.manage` and a fresh code in the `PATCH .../devices/<id>` body.
+`rev` is the revision you read (0 when nothing was saved); a save for any other
+revision is a 409 `stale`. The technician app has a **Rules** screen for the same: anyone who can see PCs reads
+the team's rules and each customer's overrides, and an admin edits them and types the
+code before each save. A PC's page shows the rules in force for it. Changing rules rings the PCs they reach, so they
+take them within seconds.
+
+**The six tools.** `restart_pc`, `shutdown_pc`, `install_program`, `uninstall_program` and
+`close_program` act on the PC, and `list_programs` reads what is installed and running.
+The relay checks each action against the rules in force for that PC, read fresh from the
+database, before anything reaches it. The answer is one of three:
+
+- **Refused**, with a code: `rule_never`, `business_hours`, `protected_program`,
+  `protected_folder` or `needs_full_control` (a restart, shutdown, install and uninstall
+  need a PC set to full control).
+- **Allowed.** A restart or shutdown with a delay is judged over the whole wait, so one
+  decided just before business hours cannot land inside them when the rule forbids it.
+- **Held for approval.** The call waits, up to 5 minutes, for a technician to approve it in
+  the technician app. A technician with `sessions.unattended` is told with a notification
+  (`approval_requested`, which cannot be switched off) and approves with a fresh code from
+  their own authenticator app, or denies without one. The customer is never asked and sees
+  nothing for the action: the corner window's "connected" notice stays as it was. An
+  approval is for exactly that action on that PC; it is dropped, never carried out later, if
+  the session ends, control of it moves, the relay restarts, or the built-in agent that asked
+  is stopped or paused. A refusal by a technician is `declined`, no answer in time is
+  `approval_timeout`, and a caller nobody can approve for (a service token, or a team where
+  no member holds `sessions.unattended`) is `approval_unavailable`.
+
+The built-in agent has the same six tools, follows the same rules, and waits for approval
+the same way. `put_file` and `get_file` are checked against the protected folders only.
+`install_program` runs only installers (`.msi`, `.msu` or `.exe`, not in the Windows folder, never
+a Windows tool such as `shutdown.exe` or `msiexec.exe`, never what looks like an uninstaller such as
+`unins000.exe`) and refuses arguments that restart or uninstall. For a vendor's `.exe` these checks
+are a guardrail, not a boundary: what it does with its own other arguments is its own.
+
+**The PC enforces them too.** Every check-in answer carries the rules in force for that
+PC. The PC keeps them on disk, checks every action itself, and refuses what they forbid
+even if the relay sent it. A command that carries newer rules makes it check in first.
+It also screens raw `run` commands: one that restarts, shuts down, installs, uninstalls
+or closes a program, when that action is not `allow`, is refused with `use_tool`, and so is
+one that names a protected program or folder. The PC checks folders after it expands
+short names (`PROGRA~1`) and follows links.
+
+**What the rules do not do.** Read this before you rely on them.
+
+- A raw `run` command is not limited by the rules beyond that screen. The screen is a
+  guardrail: anyone writing a different command gets past it, and `run` as SYSTEM can do
+  anything the five actions can, to a protected program or folder and to the Support app too.
+  Give `sessions.control` only to people you trust with that.
+- The screen tools (`click`, `type_text`, `press_key`, UAC prompts and the rest) are not
+  checked against the rules. Someone who can click can open Windows Settings and uninstall a program.
+- The rules are not signed. The PC trusts the relay for them, unlike a release: a relay
+  that is compromised, or an admin who holds `rules.manage`, changes what the PC allows.
+- Business hours follow the team's time zone and the relay's clock.
+- An approval is checked by the relay. The PC sees that a technician is named on the
+  command, not who approved it or whether they did.
+- A session that was live before the 1.0.0 deploy, on a PC still running an older app, is
+  not enforced on the PC; the relay checks the tools, and the release steps say to end such
+  sessions.
+
+The full design is in the [security model](docs/security-model.md#rules-and-approvals) and
+the [spec](docs/relay-v1-spec.md#rules-and-approvals).
 
 ### Setting up a saved PC
 
@@ -503,7 +624,11 @@ the old version until the next sign-in.
 
 A release reaches 10% of PCs for a day, then half for a day, then all.
 `UPDATE_ROLLOUT` pauses it or pins a share, and a PC that waits for approval is
-never offered one. Releases are signed at deploy time; see
+never offered one. A deploy does not make a connected PC check in, so the relay
+rings the PCs that are due: right after a deploy a deployment admin calls
+`POST /api/v1/deployment/ring-updates`, and the hourly run does the same for the PCs
+it finds. A PC that changed its app version shows the new one within 2 seconds, so
+the next ring does not treat it as old. Releases are signed at deploy time; see
 [Sign and deploy a release](docs/development.md#sign-and-deploy-a-release). If
 you build your own app, put your own release key in it, as that section says.
 
@@ -513,7 +638,9 @@ The tray icon opens a panel with the PC's name, its access mode, its state (for
 example "Your support team can see this PC" or "Waiting for approval"), who is
 connected ("No one is connected.", or "Connected: <technician>" with an "End
 session" button while a session is live), a few lines of recent local history,
-"Uninstall Support" and the app's version.
+"Check now", "Uninstall Support" and the app's version. "Check now" makes the PC
+check in with the relay at once, which helps a PC that is waiting for approval or
+cannot reach the team (at most once every 30 seconds).
 
 While the mode is "ask each time", the panel says "Support asks you before each
 connection. Your support team's admins can change this." On the PC the mode
@@ -526,9 +653,8 @@ key (which only SYSTEM or an elevated administrator can read), as PR 3 pinned.
 
 This means **any user signed in at the PC, including a standard user or a guest,
 can turn on unattended access.** Windows asks for no administrator prompt for
-this. It is the owner's call, made with that in mind, and it is one more reason
-not to use a saved PC on a real customer's unattended machine yet. A technician
-who holds `sessions.unattended` can then connect to that PC without asking.
+this. It is the owner's call, made with that in mind. A technician who holds `sessions.unattended` can then connect to that PC
+without asking, and the team's rules still limit what that technician can do.
 
 ### Uninstalling
 
@@ -709,7 +835,9 @@ A new `scheduled` handler runs hourly (a Cron Trigger in `wrangler.toml`); see
 
 A small Windows app for your technicians: it signs in to the relay, lists saved PCs, pairs and
 approves them, shows a PC's screen and the built-in agent's work in a tab, lets a driver invite
-colleagues to watch a session, hand control over and send a session to a shared queue, and raises Windows
+colleagues to watch a session, hand control over and send a session to a shared queue, shows the team's
+rules on a **Rules** screen (an admin saves a change with a fresh authenticator code), is where a technician
+approves or denies an action the rules hold (Approve takes a fresh code, Deny none), and raises Windows
 notifications for what needs a person. It is a Tauri 2 app (a Rust core and React
 screens) in `technician-app/`, installs per user, updates itself from signed releases, and never clicks or
 types on a PC itself (that comes in a later release). Install, sign-in, what each screen does, updates, the
@@ -740,9 +868,12 @@ flowchart LR
 | `GET /ws?sid=` | attach key in a header, https only | PowerShell agent WebSocket, using the hibernation API |
 | `POST /mcp` | Cloudflare Access, then the caller's role | MCP JSON-RPC 2.0, stateless HTTP, for the `default` workspace |
 | `POST /w/<slug>/mcp` | Cloudflare Access, then the caller's role | the same endpoint for another workspace |
-| `/api/v1/w/<slug>/...` | Cloudflare Access, then the caller's role | the team API: members, roles, the team log, stop and resume, customers, sites, saved PCs, custom fields, pairing codes, and the built-in agent's settings, models and tasks |
+| `/api/v1/w/<slug>/...` | Cloudflare Access, then the caller's role | the team API: members, roles, the team log, stop and resume, customers, sites, saved PCs, custom fields, pairing codes, the team's rules, and the built-in agent's settings, models and tasks |
 | `POST /app/w/<slug>/mcp` | a bearer token made for the technician app, then the caller's role | the same tools as `/mcp`, for the technician app. Any workspace, `default` included. An MCP client's token is a 401 here |
-| `/app/w/<slug>/api/...` | the app's bearer token, then the caller's role and second factor | the part of the team API the app uses: who you are, customers, sites, saved PCs, custom fields (read only), pairing codes, and the built-in agent's tasks. Members, roles, the team log, stop and the agent's settings and models answer 404 here. `GET .../api/agent/tasks/<id>/frame` returns the last full screenshot the agent took |
+| `/app/w/<slug>/api/...` | the app's bearer token, then the caller's role and second factor | the part of the team API the app uses: who you are, customers, sites, saved PCs, custom fields (read only), pairing codes, the team's rules, the approval waiting on a session, and the built-in agent's tasks. Members, roles, the team log, stop and the agent's settings and models answer 404 here. `GET .../api/agent/tasks/<id>/frame` returns the last full screenshot the agent took |
+| `GET`, `PATCH /api/v1/w/<slug>/rules`, `GET`, `PATCH`, `DELETE /api/v1/w/<slug>/rules/<customer id>`, and the same under `/app/w/<slug>/api/` | Cloudflare Access, or the app's bearer token; `devices.view` to read, `rules.manage` and a fresh authenticator code to save | the team's rules and each customer's overrides. A service token cannot save |
+| `GET`, `POST /app/w/<slug>/api/sessions/<sid>/approvals[/<approval id>]` | the app's bearer token; `sessions.unattended`, a person, and a fresh authenticator code to approve | the action waiting for approval on a session, and the answer to it. Not on the Access routes |
+| `POST /api/v1/deployment/ring-updates` | Cloudflare Access, an email in `DEPLOYMENT_ADMINS` | rings connected PCs that are due the release this relay serves, right after a deploy |
 | `GET /api/v1/w/<slug>/sessions/<sid>/frame`, `GET /app/w/<slug>/api/sessions/<sid>/frame` | Cloudflare Access, or the app's bearer token; `sessions.control` and the access rule for watching | the last full screenshot of a live session, for its driver and for a person who joined it. Held in memory only |
 | `GET /app/w/<slug>/teams`, `GET /app/w/<slug>/notifications`, `GET` and `PATCH /app/w/<slug>/notifications/settings` | the app's bearer token, a member | the person's teams, their notification feed (held open up to 25 seconds for a new item), and which of the eight switchable events they hear of and which PCs they watch |
 | `POST /device/pair`, `hello`, `update`, `leave` | public, https only; a saved PC's key in a header (pair: a pairing code or a workspace in the body) | the PC's side of saved devices. Not behind Access |
@@ -767,17 +898,18 @@ keyed by workspace. So do the built-in agent's settings and tasks.
 | `src/workspace.js` | team data in D1: members, roles, recent callers, the chained team log, and the role check. All team SQL is here |
 | `src/api.js` | the team API under `/api/v1/w/<slug>`, and workspace creation and listing |
 | `src/devices.js` | customers, sites, saved PCs, custom fields and pairing codes in D1. All their SQL is here; each change goes through `src/workspace.js`'s guarded change |
+| `src/rules.js`, `src/rules-store.js`, `src/approvals.js` | the team's rules: the document, its checks, the defaults, business hours turned into UTC spans and `decide()`, the one function that judges an action; the rules' D1 queries; and the relay's side of approvals |
 | `src/device-api.js` | the PC wire under `/device/`: pair, hello, update, leave and the doorbell |
 | `src/session-people.js`, `src/escalations.js` | who is on a live session and who drives it (invites, offers of control, the picture a watcher sees), and the escalation queue |
 | `src/agent.js`, `src/agent-api.js`, `src/agent-store.js` | the built-in agent: starting, following and controlling tasks, its settings and models, its team API routes and its D1 queries |
 | `src/agent-task.js`, `src/agent-providers.js`, `src/agent-check.js` | the `AgentTask` Durable Object (one step per alarm), the OpenAI and Claude adapters, and the check a new model passes |
 | `src/agent-models.js`, `src/agent-tools.js` | the model table with its prices and the cost arithmetic, and the tools the agent's model sees |
-| `migrations/` | the D1 tables, applied in name order: `0001_team.sql` (members, roles, callers, the team log, each keyed by workspace), `0002_workspaces.sql` (the workspaces table and an index on members by identity), `0003_signin.sql` (people, sign-ins, links and authenticators) `0004_devices.sql` (customers, sites, devices, custom field definitions and pairing codes), `0005_device_sessions.sql` (the live session pointer on a device) `0006_agent.sql` (the built-in agent's settings and tasks) `0007_notify.sql` (notifications, and each member's notification settings) and `0008_escalations.sql` (the escalation queue) |
+| `migrations/` | the D1 tables, applied in name order: `0001_team.sql` (members, roles, callers, the team log, each keyed by workspace), `0002_workspaces.sql` (the workspaces table and an index on members by identity), `0003_signin.sql` (people, sign-ins, links and authenticators) `0004_devices.sql` (customers, sites, devices, custom field definitions and pairing codes), `0005_device_sessions.sql` (the live session pointer on a device) `0006_agent.sql` (the built-in agent's settings and tasks) `0007_notify.sql` (notifications, and each member's notification settings), `0008_escalations.sql` (the escalation queue) and `0009_rules.sql` (the team's rules) |
 | `src/mcp.js` | JSON-RPC dispatch, the tool schemas, and the mapping of each screen tool to one normalized action |
 | `src/screen.js` | the screen actions, their audit text, and the strict check of every field an app result may carry |
 | `src/jwt.js` | RS256 verification of the Access JWT with WebCrypto |
 | `src/template.js` | builds the served script and the downloaded executable, validates every value placed in them, and maps the mode aliases |
-| `src/notify.js`, `src/sweep.js` | notifications for the technician app: who hears of each of the eight switchable events and the two that are not, the rows, the feed and each member's settings; and the hourly run that finds PCs missing for 7 days and deletes notifications older than 30 days |
+| `src/notify.js`, `src/sweep.js` | notifications for the technician app: who hears of each of the eight switchable events and the two that are not, the rows, the feed and each member's settings; and the hourly run that finds PCs missing for 7 days, rings connected PCs that are due an update, and deletes notifications older than 30 days |
 | `src/agent-app.cs` | the Windows app: C# source for .NET Framework 4.5.2 or later. One exe with several roles: the customer's app (WPF window, dialogs, HTTPS polling client with two lanes, normal-mode screen control), `--elevate-install`, the full-control `--service`, the SYSTEM `--helper` that runs screen operations on the console session, and the `--window` corner window. For a saved PC it also has the setup wizard (no arguments, with a device footer), `--device-install`, the `--device-service` (which also hosts a session), the `--device-ask` question, the `--tray` and `--uninstall` with `--device-remove` |
 | `src/agent-app.manifest` | the app's `asInvoker` manifest. The app asks for elevation only through `--elevate-install`, after the customer started it |
 | `src/app-bundle.json` | the compiled x86 app with the SHA-256 of its source and manifest. Tests fail when the source changed without a rebuild |
@@ -809,9 +941,12 @@ you use it:
   contents, screenshots, window text and the machine name are all written by the
   customer's PC, and they can try to steer your AI agent. Your agent may have a shell on your own
   machine, so don't auto-approve its tool calls.
-- The window shows that access exists. It doesn't limit what you can do. Under
-  full control you have SYSTEM rights, and what you change stays changed after
-  the session ends.
+- The window shows that access exists. It doesn't limit what you can do. The
+  team's rules limit restarts, shutdowns, installs, uninstalls, closing programs
+  and protected folders on a saved PC, and nothing else: under full control a
+  raw `run` command and the screen tools still have SYSTEM rights, and what you
+  change stays changed after the session ends. See
+  [Rules and approvals](#rules-and-approvals) for what is and is not enforced.
 - The UAC prompt, the app's dialogs, the window and the **End session** button
   are how the customer agrees to the session and stops it. Keep them in any
   fork.
@@ -857,8 +992,12 @@ deploy without Windows. You need Windows only to change the app: see
    see [Sign and deploy a release](docs/development.md#sign-and-deploy-a-release).
    With the bundle of a tagged release unchanged, you can use the signature and
    the `released` time from that GitHub release. If you build your own app, it
-   needs your own release key. The file also has one Cron Trigger, hourly. It
-   finds saved PCs that have not been seen for 7 days and deletes notifications
+   needs your own release key. Right after a signed deploy, ring the PCs that are
+   due it (step 4 of that section). `DEFAULT_TIME_ZONE` is the time zone a team's
+   business hours use until the team sets its own: an IANA name such as
+   `Asia/Jerusalem`, and UTC when it is empty or not a time zone. The file also
+   has one Cron Trigger, hourly. It finds saved PCs that have not been seen for 7
+   days, rings connected PCs that are due an update, and deletes notifications
    older than 30 days. If you deploy with a copy of the file, give the copy the
    same `[triggers]` block. A free account allows a few Cron Triggers in all, so
    check how many it already uses.
@@ -880,13 +1019,14 @@ deploy without Windows. You need Windows only to change the app: see
      '{"type":"http","url":"https://support.example.com/mcp","headersHelper":"/path/to/Support-MCP/cf/mcp-headers.sh"}'
    ```
 
-   Codex, in `~/.codex/config.toml`. `tool_timeout_sec` has to be above 600
-   seconds, the longest `run` timeout:
+   Codex, in `~/.codex/config.toml`. `tool_timeout_sec` has to cover a 5-minute
+   approval, a minute's wait for a busy PC and the longest `run` timeout, 1000
+   seconds (see [docs/mcp-clients.md](docs/mcp-clients.md)):
    ```toml
    [mcp_servers.support-mcp]
    url = "https://support.example.com/mcp"
    http_headers_helper = "/path/to/Support-MCP/cf/mcp-headers.sh"
-   tool_timeout_sec = 630
+   tool_timeout_sec = 1000
    ```
 
    For another workspace, use `https://support.example.com/w/<slug>/mcp` with
@@ -958,7 +1098,7 @@ check are in [docs/development.md](docs/development.md).
   SmartScreen doesn't apply to the PowerShell agent, but Defender heuristics
   could still flag either on some machines.
 - The app runs one command and one screen operation at a time. A second
-  `run`, `put_file` or `get_file` while one is waiting returns `agent busy`, and
+  `run`, `put_file`, `get_file` or program tool while one is waiting returns `agent busy`, and
   so does a second screen call. Its output is capped at 64 KiB per stream, and
   its file chunks match the PowerShell agent's.
 - Full control works on the console session only, not in Remote Desktop
@@ -990,16 +1130,21 @@ check are in [docs/development.md](docs/development.md).
   PowerShell fallback has no screen access either.
 - A workspace holds at most 10,000 customers, 10,000 sites and 2,000 saved PCs,
   30 custom fields per record type, 20 live pairing codes and 20 waiting PCs.
-  Saved PCs cannot be connected to yet: in this release a saved PC is a record,
-  a key and a service that only checks in, and nothing in the relay reads a
-  record to decide who may do what. Do not use a saved PC on a real customer's
-  unattended machine until the release that enforces those rules.
+- The team's rules cover five actions (restart, shutdown, install, uninstall and
+  close a program), protected programs and protected folders. They do not limit a
+  raw `run` command beyond a text screen that anyone can get past by writing a
+  different command, and they do not check the screen tools (click, keys, UAC
+  prompts). The rules are not signed, so a PC trusts the relay for them. Business
+  hours follow the team's time zone and the relay's clock. An action held for
+  approval waits at most 5 minutes, one at a time per session. Restarts and
+  shutdowns force programs closed, so unsaved work is lost. Installs and
+  uninstalls need a PC set to full control and run as SYSTEM.
 - The built-in agent runs at most 120 tool calls and 2 hours per task, one task at a
   time on a PC, on the OpenAI or Claude key the team saved. It cannot type passwords. It
   can run system-level commands, so the caps bound spend and time, not the harm of one bad
-  command. On the free plan a Durable Object's 13,000 GB-s a day allow about 14 fully
-  active two-hour tasks a day. Like saved PCs, it stays off real customers' unattended
-  machines until the release that enforces the saved-PC rules.
+  command. It follows the team's rules for the five actions and protected folders, and an
+  action held for approval waits for a technician, as for any other caller. On the free
+  plan a Durable Object's 13,000 GB-s a day allow about 14 fully active two-hour tasks a day.
 - The technician app uses the free plan's allowances (100,000 Worker requests and
   100,000 KV reads a day). Its notification feed holds each call open for up to 25
   seconds, so one person with the app open around the clock makes about 3,500 feed

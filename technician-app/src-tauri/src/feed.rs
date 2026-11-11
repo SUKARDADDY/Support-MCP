@@ -452,6 +452,32 @@ mod tests {
         assert_eq!(sink.recent.all().len(), 3);
     }
 
+    #[test]
+    fn an_approval_request_is_raised_like_any_live_item_and_carries_its_session_for_the_screens() {
+        let (store, _id) = store_with_account("sink4", "http://127.0.0.1:1", &tokens("a", "b", 1000));
+        let emits = Arc::new(Emits::default());
+        let shown = Arc::new(Shown::default());
+        let sink = CoreSink { recent: Arc::new(Recent::default()), emitter: emits.clone(), notifier: shown.clone(), store };
+        let sid = "0123456789abcdef".repeat(4);
+        let ask = FeedItem {
+            id: 7,
+            event: "approval_requested".into(),
+            at: 1,
+            title: "Approval needed".into(),
+            body: "tech@example.com asks to: Restart the PC in 30 seconds on Till. Approve or deny it in the app.".into(),
+            device_id: Some("abcdefghijklmnopqrst".into()),
+            task_id: None,
+            session_id: Some(sid.clone()),
+        };
+        sink.items("acc", &[ask], true);
+        assert_eq!(*shown.0.lock().unwrap(), vec![("acc".to_string(), 7)], "a Windows notification, though the item has no switch");
+        // The screens read the session from the item to find the approval waiting on it.
+        let sent = emits.0.lock().unwrap();
+        assert_eq!(sent[0].0, "feed://items");
+        assert_eq!(sent[0].1["items"][0]["event"], "approval_requested");
+        assert_eq!(sent[0].1["items"][0]["session_id"], json!(sid));
+    }
+
     struct Bodies(Mutex<Vec<String>>);
     impl Notifier for Bodies {
         fn show(&self, _a: &str, i: &FeedItem) {

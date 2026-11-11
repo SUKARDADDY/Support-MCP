@@ -52,7 +52,9 @@ refuses the other mode's transport (`/ws` for an `app` session, `/agent` for a
 | `src/agent.js`, `src/agent-api.js`, `src/agent-store.js`, `src/agent-models.js` | the built-in agent: its service (settings, models, tasks), its team API routes, its D1 queries, and its model table and cost arithmetic. See [The built-in agent](#the-built-in-agent) |
 | `src/agent-task.js`, `src/agent-providers.js`, `src/agent-check.js`, `src/agent-tools.js` | the `AgentTask` Durable Object (one per task, and one per model check), the OpenAI and Claude adapters, the two-turn model check, and the tool list the model sees |
 | `src/session-people.js`, `src/escalations.js` | who is on a live session and who drives it (invites, offers, the three steps that move control, the picture), and the escalation queue (its D1 queries, claim and close). See [People on a session](#people-on-a-session-and-the-escalation-queue) |
+| `src/rules.js`, `src/rules-store.js`, `src/approvals.js` | a team's rules for saved PCs: the document, its checks, the defaults, business hours as UTC spans and `decide()` (pure); the rules' D1 queries; the relay's side of approvals. See [Rules and approvals](#rules-and-approvals) |
 | `migrations/0006_agent.sql` | the D1 tables `agent_settings` and `agent_tasks` |
+| `migrations/0009_rules.sql` | the D1 table `rules` (the team's rules and each customer's overrides) |
 | `migrations/0008_escalations.sql` | the D1 table `escalations` and its indexes |
 | `migrations/0001_team.sql`, `migrations/0002_workspaces.sql` | the D1 tables `members`, `roles`, `callers` and `audit`, each keyed by workspace first; then `workspaces` (one row per workspace other than `default`) and the index `members_by_identity`. `wrangler d1 migrations apply` runs them in name order, and so does `test/d1-fake.js` |
 | `src/agent.ps1` | PowerShell agent template (imported as text, placeholders substituted) |
@@ -98,6 +100,7 @@ work in the request path; use the WebSocket Hibernation API
 | `POST /device/pair`, `/device/hello`, `/device/update`, `/device/leave` | none (pair) or a device key in `Authorization: Bearer` | the PC wire for saved PCs ([below](#the-pc-wire-device)). Public: not under any Access app. 403 over plain `http:` except loopback, 405 other methods, 403 on any `Origin` header, 400 on `?key=` or `?code=`, 415 non-JSON, 413 over 8 KB |
 | `GET /device/ring?protocol=1` | a device key in `Authorization: Bearer` | the doorbell, a WebSocket upgrade ([below](#the-doorbell)). Public, with the refusals of the PC wire |
 | `GET`, `POST`, `DELETE /api/v1/w/<slug>/stop` | Access JWT | read, set and clear a workspace's stop ([below](#stop-and-resume)) |
+| `POST /api/v1/deployment/ring-updates` | Access JWT, a deployment admin | rings the connected PCs that are due the release this relay serves, right after a deploy ([below](#update-rings)). Outside the team API |
 | `POST /api/v1/w`, `GET /api/v1/w` | Access JWT | create a workspace, list yours (below) |
 | `GET /auth/signin`, `GET /auth/google`, `GET /auth/microsoft`, `GET /auth/<provider>/callback`, `POST /auth/email`, `GET` and `POST /auth/email/confirm`, `GET` and `POST /auth/factor`, `POST /auth/signout`, `GET /account`, `POST /account/signout-everywhere` | none, then a browser sign-in | people sign in; see [Sign-in](#sign-in-auth-and-account) |
 | anything else | — | 404 |
@@ -180,7 +183,7 @@ The session's own log keeps it as sent, in the `[identity] detail` form.
 ### Role check (`tools/call`)
 
 `initialize`, `ping`, `tools/list` and every refusal above never read team
-data, so `tools/list` answers the same 31 tools on any well-formed
+data, so `tools/list` answers the same 37 tools on any well-formed
 `/w/<slug>/mcp`, created or not, without touching D1 or a Durable Object. On
 `tools/call` for a listed tool, after the `session_id` check, the relay checks
 that the workspace exists (`default` always does; any other slug needs a row in
@@ -294,11 +297,11 @@ at most 200 characters with no spaces; names at most 100 characters with no
 control characters. Role ids match `[a-z0-9-]{1,40}`. Permission keys are
 `members.manage`, `roles.manage`, `audit.view`, `devices.view`,
 `devices.manage`, `fields.manage`, `sessions.create`, `sessions.view`,
-`sessions.control`, `sessions.end`, `sessions.unattended`. Built-in roles:
+`sessions.control`, `sessions.end`, `sessions.unattended`, `rules.manage`. Built-in roles:
 `admin` (every key, fixed), `technician` (`devices.view`, `devices.manage` and
 `sessions.create`, `sessions.view`, `sessions.control`, `sessions.end`),
 `viewer` (`audit.view`, `devices.view`, `sessions.view`). Only `admin` holds
-`sessions.unattended` by default.
+`sessions.unattended` and `rules.manage` by default, and open mode grants neither.
 
 `sessions.unattended` means "connect to a PC without asking the person at it, and
 switch a PC to any time". It needs a second factor like `sessions.control` does.
@@ -324,6 +327,9 @@ edited `technician` or `viewer`, and a deleted one keeps a row with `deleted = 1
 | 409 | `workspace_exists` | `POST /api/v1/w` with a slug that is taken, or `default` |
 | 409 | `workspace_limit` | `POST /api/v1/w` when the server already holds 500 workspaces besides `default` |
 | 409 | `first_member` | in `default`: the first member is not the caller as `admin`, or `DEPLOYMENT_ADMINS` is set and the caller is not in it; or any other team write while it has no members |
+| 409 | `stale` | a rules save or removal for a revision that is not the current one ([Rules](#team-api-routes)) |
+| 403 | `second_factor` | a rules save, a rules removal or an approval whose `code` is wrong, already used, or from an account with no authenticator; also a permission that needs the sign-in's factor |
+| 429 | `locked` | too many wrong authenticator codes; the factor is locked for a while |
 | 409 | `member_exists`, `role_exists` | already there |
 | 409 | `last_admin` | removing or demoting the last admin |
 | 409 | `role_fixed` | creating, editing or deleting `admin` |
@@ -459,7 +465,7 @@ commit together, and a permission lost between the read and the commit is a 403.
 | `GET`, `PATCH`, `DELETE .../sites/<id>` | as customers | `PATCH`: `name, address, notes, fields` | `{site}`; `DELETE` is 409 `in_use` with PCs or live codes |
 | `GET .../devices?site=&status=&after=&limit=` | `devices.view` | | `{devices:[...], next}`; `status` is `pending` or `active` |
 | `GET .../devices/<id>` | `devices.view` | | `{device}` |
-| `PATCH .../devices/<id>` | `devices.manage`; a change of `access` from `ask` to `any` also needs `sessions.unattended` (403 `permission_denied` otherwise, checked again at commit). Sending `access: "any"` for a PC that is already `any` changes nothing and needs only `devices.manage` | `{site_id?, fields?, access?, owner_contact?, approve?:{confirm}}`; `owner_contact` is at most 200 characters and an empty string clears it; `name`, `control`, `os`, `machine` or `app_version` is 400 `bad_request` | `{device}` |
+| `PATCH .../devices/<id>` | `devices.manage`; a change of `access` from `ask` to `any` also needs `sessions.unattended` (403 `permission_denied` otherwise, checked again at commit). Sending `access: "any"` for a PC that is already `any` changes nothing and needs only `devices.manage`. A change of `site_id` on an **active** PC that changes its customer (another customer's site, or `null`; the same customer's other site does not) changes which customer override of the rules applies to it, so it is a change of rules: it also needs `rules.manage`, a person and a fresh authenticator `code` in the body ([Rules and approvals](#rules-and-approvals)) | `{site_id?, fields?, access?, owner_contact?, approve?:{confirm}, code?}`; `owner_contact` is at most 200 characters and an empty string clears it; `name`, `control`, `os`, `machine` or `app_version` is 400 `bad_request` | `{device}` |
 | `DELETE .../devices/<id>` | `devices.manage` | | `{removed:{id}}`; the PC's key ends with its row |
 | `GET .../fields` | `devices.view` | | `{fields:[{id,entity,label,position,created_at}]}` |
 | `POST .../fields` | `fields.manage` | `{entity, label}` | 201 `{field}`; `entity` is `customer`, `site` or `device` |
@@ -668,10 +674,14 @@ row and the code unused. A good one writes the device, the `device_paired` (or
 `device_requested`) row and, for a code, marks it used, in one batch.
 
 `POST /device/hello`, key: `{"protocol":1,"os"?,"machine"?,"app_version"?}` answers
-200 `{"protocol":1,"device":{"id","workspace","status":"active"|"pending","name","access","control","site_id"},"update"?:{...},"session"?:{...}}`.
+200 `{"protocol":1,"device":{"id","workspace","status":"active"|"pending","name","access","control","site_id"},"rules"?:{...},"rules_tag"?,"hours_utc"?,"hours_until"?,"server_time"?,"update"?:{...},"session"?:{...}}`.
 Allowed while pending. The reported details are written at most every 5 minutes,
 or once a minute when one changed (a changed value inside that minute is dropped
-and sent again at the next check-in), and are not logged. `update` is there only
+and sent again at the next check-in), and are not logged. A changed `app_version` is
+the exception: it is written once 2 seconds have passed since the last write, so a PC
+that just updated shows its new version at once, and the write is guarded on the stored
+version. The five `rules` fields are there only for an active PC
+([Rules and approvals](#what-a-pc-is-told)); a waiting PC gets none. `update` is there only
 when the relay offers this PC its signed release ([Updates](#updates)); without
 it the answer is exactly as before. `session` is a new top-level key, beside
 `device` and `update`, never inside `device`. It is there only for an active PC
@@ -728,7 +738,8 @@ never connects, and the PC uses the 5-minute check-in instead.
 
 Rung, best effort (the check-in schedule is the fallback): a connect and a
 take-over (`device_connect`), a team change to a PC's `access`, an approval, a
-removal (after the row is deleted, then the doorbell closes), and a workspace
+save or removal of rules (every PC of the team, or a customer's), an update due
+([Update rings](#update-rings)), a removal (after the row is deleted, then the doorbell closes), and a workspace
 stop (every doorbell). `device_list` reports `online` from the Registry's
 sockets, one request per list.
 
@@ -972,7 +983,8 @@ are never remembered.
 | Route | What |
 |---|---|
 | `POST /app/w/<slug>/mcp` | the MCP handler of `/mcp`, with the same tools, role, second-factor, mode and stop checks for an OAuth caller (`?ui=` works as there) |
-| `/app/w/<slug>/api[/...]` | the team API router, as `/api/v1/w/<slug>[/...]`, limited to what the app uses: the root (who you are), `customers`, `sites`, `devices`, `fields` (`GET` of the list only), `pairing` and `agent/tasks[/...]`. Members, roles, `audit`, `stop`, `agent` settings and `agent/models` answer 404 `not_found`, as does anything else |
+| `/app/w/<slug>/api[/...]` | the team API router, as `/api/v1/w/<slug>[/...]`, limited to what the app uses: the root (who you are), `customers`, `sites`, `devices`, `fields` (`GET` of the list only), `pairing`, `rules[/<customer id>]` ([Rules and approvals](#team-api-routes)), `sessions/<sid>/approvals[/<approval id>]` (below) and `agent/tasks[/...]`. Members, roles, `audit`, `stop`, `agent` settings and `agent/models` answer 404 `not_found`, as does anything else |
+| `GET /app/w/<slug>/api/sessions/<sid>/approvals`, `POST .../approvals/<approval id>` | the action waiting for approval on a saved PC's session, and the answer to it: `{approve, code?}`. Needs a person holding `sessions.unattended` with its second factor, and a fresh authenticator code to approve. 404 on the Access routes ([Approvals](#approvals)) |
 | `GET /app/w/<slug>/teams` | `{"teams":[{"slug","name"}]}`: the caller's memberships, `default` included when they are a member |
 | `GET /app/w/<slug>/notifications?after=<id>&wait_s=0..25` | `{"items":[{"id","event","at","title","body","device_id","task_id","session_id"}],"next":<id>}`, the caller's own, oldest first, at most 50 after `after`. With `wait_s` and no item, the relay looks again every 2 seconds until there is one or the wait ends, then answers `{"items":[],"next":<after>}` |
 | `GET`, `PATCH /app/w/<slug>/notifications/settings` | `{"events":{"<event>":bool},"watch":["<device id>"]}`. Every event is on until switched off. A `PATCH` may send part: events not named keep their value, and `watch` replaces the list (at most 500 ids, all PCs of this team). Unknown events or fields, and a non-boolean, are 400 |
@@ -1009,8 +1021,9 @@ read sees. The relay does not store the picture in the Session or Registry eithe
 | `escalation_claimed` | a queue item is claimed | the person who opened it, unless they claimed it |
 | `session_invited` | the driver invited the person to a session | the invited person only. Not switchable |
 | `control_offered` | the driver offered the person control of a session | the person offered only. Not switchable |
+| `approval_requested` | an action the team's rules send to a technician waits for approval (`dedupe` `approval:<id>`) | the session's driver (the agent task's starter for the built-in agent) and every member holding `sessions.unattended`. Not switchable |
 
-A person's own settings can switch an event off, except `session_invited` and `control_offered`. Those
+A person's own settings can switch an event off, except `session_invited`, `control_offered` and `approval_requested`. Those
 are addressed to one named person, written by a path that does not read their settings (`notify.direct`),
 and are not names the settings accept. Their `dedupe` carries the occurrence
 (`invited:<sid>:<person>:<invite time>`, `offered:<sid>:<person>:<offer time>`), as the queue's do
@@ -1022,7 +1035,7 @@ Registry, which learns its workspace from the Worker's hand-off and records when
 doorbell closed), a task whose cleanup gave up, an invite and an offer of control (after the Session recorded them), and the hourly run (`scheduled` in `src/app.js`,
 `src/sweep.js`, a Cron Trigger in `wrangler.toml`), which also deletes rows older than 30 days. A
 `dedupe` key per occurrence, unique per person, makes a retry add nothing; for a missing PC it is
-the PC plus that last contact, so it is told of once. The run picks only PCs that some watcher, who has not switched the event off, has no row for yet, oldest absence first, so a PC already told of costs nothing on later runs and a crowd of PCs that go quiet together is worked through over the hours. A PC whose last contact is more than 14 days past the 7 is left out, which is before the 30-day deletion of rows could make the same absence look new. The run stays under 50 subrequests and takes teams in turn, starting from a different team each hour, so a big team cannot crowd out the others. For each team it asks the Registry which doorbells are connected before it picks the team's PCs, and leaves those out of the query, so connected PCs never fill the list ahead of missing ones. The team log is not written. Title and body are
+the PC plus that last contact, so it is told of once. The run picks only PCs that some watcher, who has not switched the event off, has no row for yet, oldest absence first, so a PC already told of costs nothing on later runs and a crowd of PCs that go quiet together is worked through over the hours. A PC whose last contact is more than 14 days past the 7 is left out, which is before the 30-day deletion of rows could make the same absence look new. The run stays under 50 subrequests and takes teams in turn, starting from a different team each hour, so a big team cannot crowd out the others. For each team it asks the Registry which doorbells are connected before it picks the team's PCs, and leaves those out of the query, so connected PCs never fill the list ahead of missing ones. The run also rings the connected PCs that are due an update, with 9 of its 50 subrequests, before the prune ([Update rings](#update-rings)). The team log is not written. Title and body are
 plain text and may repeat text from a customer's PC.
 
 ## Session state machine (Session DO)
@@ -1114,7 +1127,8 @@ of them and keeps working: see [Lanes](#lanes-screen-and-control-frames).
   with lanes sends `busy_lanes` and keeps long-polling while a lane runs: see
   [Lanes](#lanes-screen-and-control-frames).
 - The command frames are the `run`, `put_file` and `get_file` frames of the
-  WebSocket, with a `lane` field, plus the `screen` and `control` frames below.
+  WebSocket, with a `lane` field, plus the `power` and `programs` frames of a saved PC
+  ([Frames](#frames)) and the `screen` and `control` frames below.
   At most one operation per lane is in flight: a second call for a lane that is
   busy returns the error `agent busy; wait for the current operation`.
 - `result` answers the in-flight command. The relay checks the generation and
@@ -1206,7 +1220,7 @@ saved-PC session, whether idle, a command frame or an end, carries `"driver"`, s
 window shows a take-over at once. `end` from the PC ends the session with the
 reason `owner` (a `"reason":"owner"` in it is optional).
 
-**One driver.** A command (`run`, files, screen, control) from anyone but the
+**One driver.** A command (`run`, files, `power`, `programs`, screen, control) from anyone but the
 driver is refused: `<driver> is driving this session; use device_connect with
 take_over`. `session_status`, `session_list` and `session_end` are not commands.
 `device_connect` with `take_over:true` moves the driver to the caller (always
@@ -1230,7 +1244,7 @@ ended it), `technician` (`session_end`), `stopped` (a workspace stop or
 `EMERGENCY_STOP`), `removed` (the PC was removed or left) and `replaced` (made
 but never claimed: this one is not logged).
 
-`session_status` for a saved-PC session adds `device_id` and `driver`, and its
+`session_status` for a saved-PC session adds `device_id`, `driver` and `approval` (the action waiting for approval, or `null`), and `rules` (the rules in force for the PC) when the `session_status` tool asks for it, and its
 `startup_expires_at` is the waiting deadline while it waits. `session_list` shows
 it with the label `PC <name> (<device id>)`. The log rows are
 `device_session_started` (actor the technician; detail the device id, its name,
@@ -1242,8 +1256,8 @@ with the reason). They hold ids and names, never a code or a key.
 ### Lanes, screen and control frames
 
 **Lanes.** Every operation frame carries `"lane":"cmd"` or `"lane":"screen"`.
-Lane `cmd` takes `run`, `put_file` and `get_file`. Lane `screen` takes `screen`
-and `control` frames. The relay keeps one pending command per lane, so a
+Lane `cmd` takes `run`, `put_file`, `get_file` and, on a saved PC, `power` and `programs`
+([Rules and approvals](#frames)). Lane `screen` takes `screen` and `control` frames. The relay keeps one pending command per lane, so a
 `run` and a screenshot are in flight together, but two screenshots (or two
 `run` calls) are not. An operator call for a busy lane returns `agent busy;
 wait for the current operation`. The relay forwards only the lanes the client
@@ -1412,7 +1426,7 @@ then answers the operator `timeout waiting for agent`.
 
 Audit log: DO SQLite table `log(ts INTEGER ms, kind TEXT, detail TEXT)`;
 kinds `created, consumed, hello, attached, detached, run, put_file, get_file,
-screen, control, ended`. Command text is logged, cut to 512 characters (a
+power, programs, rules, approval, screen, control, ended`. Command text is logged, cut to 512 characters (a
 `run` as SYSTEM starts with `(system) `); file content is not (path + byte
 count only). A `screen` row holds the action in one short line, and **never**
 content: `screenshot 1280x800` (written when the result arrives; `screenshot
@@ -1555,6 +1569,334 @@ driver rule, a one-off session included: if the driver is not the starter, the t
 names the starter and the person who drives now, that was the starter's own handover and the task ends quietly (`stopped`,
 `handed over to <identity>`, the starter as actor, no "needs attention"); a take-over by anyone else ends it as before, with the
 notice. A session with no driver keeps the old rule: another person's command ends the task.
+
+## Rules and approvals
+
+Code: `src/rules.js` (the document, checks, defaults, merge, business hours and `decide()`),
+`src/rules-store.js` (the D1 queries), `src/approvals.js` and `src/session.js` (approvals and the
+guard), `src/devices.js` (`rulesFor`, the check-in's rules), `src/sweep.js` (update rings),
+`migrations/0009_rules.sql`, and on the PC `RulesDoc`, `RulesState`, `Rules.Check`, `RunScreen`,
+`PathCheck`, `PowerAction` and `Programs` in `src/agent-app.cs`. A team's rules say what anyone, a
+person or the built-in agent, may do to a saved PC. They apply to saved PCs only. `docs/security-model.md`
+([Rules and approvals](security-model.md#rules-and-approvals)) says what they do not cover.
+
+### The document
+
+```json
+{"time_zone":"Asia/Jerusalem"|null,
+ "hours":null|{"mon":["08:00","18:00"], ...},
+ "restart":"approve","shutdown":"approve","install":"approve","uninstall":"approve","close_program":"allow",
+ "protected_programs":["outlook"],"protected_folders":["C:\\POS\\Data"]}
+```
+
+`time_zone` is an IANA name as `Intl.supportedValuesOf('timeZone')` lists it, or `UTC`, or `null`
+for the deployment's. `hours` is `null` (no business hours) or an object whose keys are `mon` to `sun`
+(a day left out has none), each `["HH:MM","HH:MM"]` with the end after the start; the end may be
+`24:00`. An action value is `allow`, `approve`, `approve_in_hours` (approve inside business hours,
+allow outside), `outside_hours` (refuse inside business hours, allow outside) or `never`. The two lists
+hold at most 50 entries each; a program is 1 to 100 characters, a folder an absolute local path
+(`C:\...`, no `<>"|?*`, no `.` or `..` part) of at most 260. Entries are trimmed, free of control
+characters, and de-duplicated ignoring case. A team's document is whole: a field left out takes its
+default. An hour rule needs `hours`, else 400. Defaults, for a team with no row and for the PC before its
+first answer: `restart`, `shutdown`, `install` and `uninstall` are `approve`, `close_program` is
+`allow`, no hours, no protected entries, `time_zone` `null`.
+
+A customer's override has the same fields, all optional. A field it sets replaces the team's (a list
+replaces, it never merges). The **effective rules** for a PC are the team's document with its site's
+customer's override over it, `time_zone` resolved (its own, else `DEFAULT_TIME_ZONE`, else `UTC`; a value
+that is not a zone counts as unset), and an hour rule with no hours left counted as `never`. The effective
+document also carries `rev`, the team row's and the override row's revisions added.
+
+### Settings and storage
+
+| Setting | Holds |
+|---|---|
+| `DEFAULT_TIME_ZONE` | the time zone of rules that name none: an IANA name such as `Asia/Jerusalem`. Empty, or a name that is not a time zone, means `UTC`. A change reaches PCs at their next check-in (it changes the rules' tag) |
+
+`migrations/0009_rules.sql` adds one table, `rules(workspace, customer_id, doc, rev, updated_at, updated_by)`,
+primary key `(workspace, customer_id)`. `customer_id` is `''` for the team's row. `doc` is the checked
+JSON, whole for the team and only the fields set for a customer. `rev` counts the row's saves from 1. A
+customer's row is deleted with the customer, in the same batch. Apply it before you deploy: the check-in
+joins the table. A damaged row reads as the defaults (a team's) or as no override.
+
+### Team API routes
+
+Under `/api/v1/w/<slug>` and, for the app, `/app/w/<slug>/api`. Reading takes `devices.view`. A write
+takes `rules.manage`, a **person** (a service identity is 403 `forbidden`, whatever its role) and a fresh
+authenticator code in the body (below). While `default` is open a write is 409 `first_member`.
+
+| Route | Body | Answer |
+|---|---|---|
+| `GET .../rules` | | `{rules:{rev,doc,updated_at,updated_by}, overrides:[{customer_id,rev,doc,updated_at,updated_by}], default_time_zone}`. `rev` 0 and the defaults when never saved; at most 1,000 overrides |
+| `PATCH .../rules` | `{rev, doc, code}` | `{rules:{rev,doc,updated_at,updated_by}}`. `doc` is the whole document, `rev` the revision read (0 if none) |
+| `GET .../rules/<customer id>` | | `{customer_id,rev,doc,updated_at,updated_by,effective}`: `doc` is the override (`{}` when none), `effective` the rules in force for that customer. 404 `not_found` for a customer that does not exist |
+| `PATCH .../rules/<customer id>` | `{rev, doc, code}` | `{override:{customer_id,rev,doc,updated_at,updated_by}}`. `doc` holds only the fields it overrides |
+| `DELETE .../rules/<customer id>` | `{code, rev?}` | `{removed:{customer_id}}`; the customer has the team's rules again |
+
+Other methods are 405. `rev` must be a whole number from 0; a `PATCH` without it is 400. A `rev` that
+is not the current one is 409 `stale`. An override's `rev` never repeats for a customer: a removed override
+(by `DELETE`, or a `PATCH` with no fields) keeps its row as `{}` with the next revision and reads as none
+(`rev` 0), and the next override for that customer goes on from there, so a save that read the old one is stale. A document that fails the checks above, an override that would leave an hour
+rule with no hours from the team or itself, and a customer that does not exist are refused before the code is checked,
+so a code is not spent on a save that cannot happen. A `DELETE` for a customer that does not exist (404) or with a stale
+`rev` (409) is refused the same way, and a `DELETE` of an override that is not there changes nothing and checks no code.
+A document equal to the stored one changes nothing.
+A save is one guarded change: the log row `rules_changed` (detail `team: <field names>` or `customer <id>: <field names>`;
+never a value), the write, the actor's `rules.manage` and the revisions read all commit together.
+After a change the relay rings the PCs it reaches, best effort: the team's rules ring every PC of the team
+(`ringAll`), a customer's the PCs of its sites (`ringMany`, 500 at a time).
+
+A move of an active PC to another customer's site, or off its site, is also a change of rules, because it swaps the customer
+override that applies to it. `PATCH .../devices/<id>` with that `site_id` takes `rules.manage`, a person and a fresh `code` (checked as
+below, after the site is known to exist), and logs `device_changed` and `rules_changed` (detail `device <id>: site <old> to <new>, customer
+<old> to <new>`) in one batch with a guard that the actor still holds `rules.manage` and the PC is still active, then rings the PC. The
+store refuses such a move without that clearance (409 `rules_change`). A site cannot change customer (`PATCH .../sites/<id>` has no
+`customer_id`), a site or customer with PCs cannot be removed (409 `in_use`), a pairing code only places a new PC, and a PC waiting for
+approval has no rules yet, so none of those needs it.
+
+**The code.** `code` is a six-digit code from the caller's own authenticator, checked with
+`verifyFactor(userId, code, {codeOnly:true})`: a recovery code is not accepted, a code works once through
+`user_factors.last_step` (the record the sign-in page and the consent page use), and a wrong one counts toward
+the same lock. The person is the app's token's account or, for an Access login, the account with that email.
+Errors: 400 `bad_request` (no `code`), 403 `second_factor` (no authenticator set up, or the code wrong or already used),
+429 `locked`, 503 `unavailable` (the check could not run). `rules.manage` is in `FACTOR_PERMISSIONS`,
+so a role that holds it makes its members enrol an authenticator.
+
+`rules.manage` is a permission key. Only `admin` holds it by default, and open mode never grants it. A save
+and a removal are in the team log as `rules_changed`.
+
+### What a PC is told
+
+An active PC's `/device/hello` answer adds, from the row the check-in already loads (one query joins the device,
+its site, the team's row and the customer's row):
+
+| Field | Holds |
+|---|---|
+| `rules` | the effective document: `{rev, time_zone, hours, restart, shutdown, install, uninstall, close_program, protected_programs, protected_folders}` |
+| `rules_tag` | the first 16 hex characters of the SHA-256 of the document without `rev`, as canonical JSON. The PC compares it with a frame's tag |
+| `hours_utc` | the business-hour spans of the next 8 days as `[[start,end],...]` in Unix seconds (a span already running is listed whole; empty when there are no hours) |
+| `hours_until` | the end of that 8-day horizon, Unix seconds. Past it every moment counts as business hours |
+| `server_time` | the relay's clock, Unix seconds |
+
+A waiting PC gets none of them. The relay turns hours into UTC spans (across daylight saving changes: a time the clock
+never shows lands just after the gap, a time it shows twice is the first), so the PC needs no time zone data.
+`session_status` of a saved-PC session adds `approval` (below), and `rules` (the effective document) when asked by the
+`session_status` tool.
+
+### The decision
+
+`decide(rules, action, ctx)` returns `{allow}`, `{approve}` or `{refuse: code, text}`. `action` is one of
+`restart`, `shutdown`, `install`, `uninstall`, `close_program`, `put_file` or `get_file`. The files have no value of
+their own: only the protected folders guard them. The order is fixed, because the PC runs the same cases
+(`test/fixtures/rules-cases.json`, run by `test/rules.test.js` and `test/app-native.cs`):
+
+1. the action's value is `never` (an unknown value counts as `never`): `rule_never`;
+2. `restart`, `shutdown`, `install` or `uninstall` on a PC whose control is not `full`: `needs_full_control`;
+3. `close_program` or `uninstall` of a program in `protected_programs`: `protected_program`. Names compare trimmed, lower
+   case, without the trailing dots and spaces Windows drops from a name, and without a trailing `.exe`. A close names a
+   running program, so a folder in front of the name is dropped first (`C:\Office\outlook.exe` is `outlook`), on both sides;
+   an uninstall names an installed program and keeps the text as it is. A `close_program` of the Support app itself
+   (`support.exe`, or `support-<version>-<8 hex>.exe`) is `protected_program` whatever the lists say;
+4. `put_file`, `get_file` or `install` whose path is inside a folder of `protected_folders`: `protected_folder`. A path is
+   inside when its whole components start with the folder's, ignoring case, with `/` as `\`, repeated and trailing
+   separators dropped, `.` and `..` resolved, the `\\?\` prefix and trailing dots and spaces dropped. A path inside the Support
+   app's own folder (`SupportMCP`, or `SupportMCP-<id>`, under a `Program Files` folder on any drive) is `protected_folder`
+   whatever the lists say;
+5. `allow`: allow; `approve`: approve; `approve_in_hours`: approve inside business hours, else allow;
+   `outside_hours`: `business_hours` inside business hours, else allow. For a `restart` or `shutdown` the hours are judged over the
+   whole wait, from the moment of the decision to that moment plus `delay_s`, both included: `outside_hours` refuses when any
+   part of it is inside business hours, and `approve_in_hours` asks for approval when any part is. A window that reaches past
+   `hours_until` counts as inside. `ctx.delay_s` carries it (it is ignored for any other action).
+
+The relay compares paths as written. The PC also expands short names and follows links and junctions first.
+
+A protected folder must be a folder: a whole drive (`C:\`, `d:/`) is refused when the rules are saved (400 `bad_request`, `not a whole drive`),
+since it would refuse every file and installer of the PC.
+
+`install_program` runs installers, never another tool by another name. Before anyone is asked, on the relay and again on the PC
+(`installerProblem`, `installArgsProblem`, the shared `installers` cases of `rules-cases.json`): `path` must be a local absolute
+path (a drive letter and a separator; no UNC, device or stream name) of a `.msi`, `.msu` or `.exe` file; not in a `Windows` folder
+(the first folder under the drive root, on any drive; the PC also checks its own real Windows folder with links resolved); not
+named as a Windows tool (`msiexec.exe`, `wusa.exe`, `shutdown.exe`, `cmd.exe`, `powershell.exe`, `pwsh.exe`, `reg.exe`, `sc.exe`,
+`taskkill.exe` and the rest of `SYSTEM_TOOLS` in `src/rules.js`, wherever the file sits); and `args` (at most 1,000 characters, no line
+breaks, since the PC strips them) must not ask for a restart (`/forcerestart`, `/promptrestart`, `REBOOT=Force`, `/restart`) or, for an
+`.msi` or `.msu`, an uninstall (`/x`, `/uninstall`). For an `.msi` (msiexec runs it as SYSTEM) `args` must also not remove or change
+other installed state: the properties `REMOVE=`, `ADVERTISE=` and `ADDSOURCE=` (any case, quoted or not, spaces around the `=` or not;
+`REMOVE=ALL` on a product that is already installed would uninstall it round the uninstall rule and the protected programs), and the
+msiexec switches `/f..` (repair), `/p` and `/update` (patch), `/j..` and `/advertise`, `/y` and `/z`, `/i` and `/package` (another
+package), `/a` (an administrative copy) and `/l..` (a log file written anywhere as SYSTEM). It must also hold no braced GUID
+(`{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}`, any case: a package's own Upgrade-table properties such as `WIX_UPGRADE_DETECTED=` or
+`OLDPRODUCTS=` take product codes and can make msiexec uninstall another product) and no `REBOOT=` value that starts with F (MSI reads only
+the first letter, so `REBOOT=F` is Force; any case, quoted or not, spaces around the `=` or not). An `.msi` or `.msu` also holds no non-ASCII
+character anywhere (msiexec and wusa fold some letters, such as a dotless i, to ASCII ones; values are not exempt, since quote tracking
+is not reliable enough); the refusal says to leave `INSTALLDIR` out or use an ASCII path. For an `.msu`, `/extract` and `/log` are refused. For every installer, control characters (the PC strips them before it
+checks, so the relay refuses them instead of checking different text) and the typographic quotes U+2018 to U+201E are refused.
+Letters are lower-cased as ASCII only and white space is one explicit set on both sides (space, U+0009 to U+000D, U+0085, U+00A0,
+U+1680, U+180E, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F, U+3000, U+FEFF), since JavaScript's `\s` and .NET's `IsWhiteSpace`
+differ on some of them. `ADDLOCAL`, `ADDDEFAULT`, `REINSTALL`, `REINSTALLMODE` and `/q..` are left alone: they take nothing off.
+The PC waits for the installer's whole process tree (a kill-on-close Job), not only the first process: the call returns when the
+Job holds no process or `timeout_s` ends. If the first process exited and only processes it started remain at the end (an updater,
+a tray helper, a launch-after-install), the answer is still `{ok:true, exit_code}` with the first process's code and a `detail` such as
+`1 process it started was still running and was stopped`; those processes are stopped. Only a first process that never exits within
+`timeout_s` is reported as not finished. The exit code is the first process's: a hand-off uninstaller run through `cmd` may report 0
+regardless, so check `list_programs` afterwards, and use a short `timeout_s` for an installer known to launch the app. If the PC cannot
+ask the Job how many processes remain, `detail` says so. These are plain errors (not coded) and spend no approval. The PC also runs its
+raw-command screen over the path and arguments (below), so a restart or shutdown verb, a protected name or the Support app named
+there is refused. An `.msi` runs through `msiexec /i`, an `.msu` through `wusa.exe`, an `.exe` as given.
+
+### The tools
+
+`restart_pc`, `shutdown_pc`, `install_program`, `uninstall_program` and `close_program` act on the PC, and
+`list_programs` reads. Each needs `sessions.control`, and works only in a session on a saved PC (a one-off link
+refuses with `not_saved_pc`) whose PC runs 1.0.0 or later (`needs_update`). The Session checks the rules, and an approval,
+before it takes the command lane, so a waiting approval blocks nothing else. A command from anyone but the driver is
+refused as for `run`. `list_programs` is not decided and carries no tag.
+
+| Tool | Args | Returns | Rule |
+|---|---|---|---|
+| `restart_pc`, `shutdown_pc` | `session_id`, `delay_s?` (5 to 600, default 30; a value outside is clamped) | `{ok:true, at}`: `at` is when the action will happen, Unix seconds. The answer comes before the PC acts. A second one while one waits is `busy` | `restart`, `shutdown` |
+| `list_programs` | `session_id` | `{installed:[{id,name,version,publisher}], running:[{name,pid,session}]}` | none |
+| `install_program` | `session_id`, `path` (absolute, at most 1,000 characters, an installer), `args?` (at most 1,000), `timeout_s?` (10 to 600, default 300) | `{ok:true, exit_code}` | `install`, and the folder check on `path` |
+| `uninstall_program` | `session_id`, `program_id` (from `list_programs`, at most 200), `timeout_s?` | `{ok:true, exit_code}` | `uninstall`, and the program check |
+| `close_program` | `session_id`, `name` or `pid` (one of the two), `force?` (boolean, default false) | `{ok:true, closed}` | `close_program`, and the program check |
+
+An error result is `isError` text that starts with a code, then a sentence: `<code>: <sentence>`. Codes:
+
+| Code | When |
+|---|---|
+| `rule_never`, `business_hours`, `protected_program`, `protected_folder`, `needs_full_control` | the rules (above), on the relay or on the PC |
+| `declined` | a technician declined, or the approval was cancelled or was for another action |
+| `approval_timeout` | no answer in 5 minutes |
+| `approval_unavailable` | nobody can approve: the caller is not a person, no member holds `sessions.unattended` (open mode too), the technicians could not be told, or a PC refused a frame that needed an approval and carried none |
+| `busy` | the lane is taken, another action waits for approval on the session, or a restart or shutdown already waits on the PC. An approved command whose lane is busy waits for it up to 60 seconds; if it stays busy the error says the approval was used and a new one is needed |
+| `rules_stale` | the relay could not read the rules, or the PC could not get the team's current rules in time or read its last answer |
+| `not_found` | no installed program or running program matches, or the installer is not on the PC |
+| `not_saved_pc` | a one-off link session |
+| `needs_update` | the PC runs a version below 1.0.0 |
+
+`put_file` and `get_file` are refused with `protected_folder` or `rules_stale` the same way. A `run` is never decided
+by the relay. The PC's screen can refuse it with `use_tool` (below).
+The PC's own errors that are not a code (`close needs a name or a pid`, `unknown programs action`) are plain text.
+
+### Approvals
+
+An action whose verdict is `approve` waits up to 5 minutes (`APPROVAL_MS`) in the Session. The caller's call stays open; the
+agent task counts the wait as activity for its 2-minute watch rule and as time toward its limit.
+
+- **Asking.** The caller must be a person (an identity with an `@`): a service token is `approval_unavailable` at once, and so is a team where no
+  member who is a person holds `sessions.unattended` (open mode included). Else the Session keeps
+  one approval `{id (32 hex), hash, action, summary, actor, via, task_id, created_at, expires_at, device_id, device_name}` in its
+  storage and memory, writes `approval` log rows (`requested: <summary>`, then `approved by <person>: ...` or the code), and
+  writes an `approval_requested` notification (`dedupe` `approval:<id>`) for the actor and each holder. The `summary` is built by the
+  relay from the frame (`Restart the PC in 30 seconds`, `Install <path>`, `Close <program>, forced: unsaved work is lost`). Only one
+  approval waits per session: a second request is `busy`. If the notifications cannot be written the approval is refused at once.
+- **Answering.** `GET /app/w/<slug>/api/sessions/<sid>/approvals` returns `{approvals:[]}` or `{approvals:[{id,summary,actor,via,action,created_at,expires_at,device_id,device_name}]}`,
+  and `POST .../approvals/<id>` with `{approve:true|false, code?}` returns `{id, approved}`. The app's route only: on `/api/v1` and
+  for any other `sessions/<sid>/...` path it is 404. Needs a person, a role holding `sessions.unattended` with its second factor on the
+  app's sign-in, and `<sid>` 64 hex and `<id>` 32 hex. To approve, a fresh `code` is checked as above, after the relay reads that the approval is still
+  waiting (else 404 `not_found`: `that approval is not waiting`). A denial needs no code. A wrong code is 403 `second_factor` and leaves the approval
+  waiting. The person who asked may approve their own request if they hold the permission.
+- **Then.** An approval makes the command start again from the top: the state, the driver, the PC's attachment and the rules are read
+  again, the verdict is decided again, and if it is still `approve` the approval must match the action's hash (the session, the PC, the
+  rule and the frame's fields), else `declined`. The frame carries `approved_by`, the approver's identity. If the command lane is
+  taken at that moment, the command waits for it (up to 60 seconds, `LANE_WAIT_MS`) and starts again once more; if the lane stays
+  busy the call ends `busy` and says the approval was used. From the answer to the send, the approved command has a record in the
+  Session (`held`), so every cancel below reaches it while it waits for the lane. Just before the send, the Session reads the
+  requester's standing from the database again: still a member holding `sessions.control`, account not disabled, workspace and relay not
+  stopped and, for the built-in agent, its task still `running` and started by this person. If not, the call ends
+  `declined: the approval was cancelled: ...` and nothing is sent. A database that cannot answer refuses too.
+- **Ending.** A denial is `declined`; no answer is `approval_timeout`. A handover or take-over cancels it (`declined`:
+  `the approval was cancelled: ...`), the end of the session ends the call with `session ended`, and the built-in agent's Stop or Pause cancels
+  one the task asked for. Each of these also cancels a command that was approved and still waits for its lane. A Session restart drops a stored approval unsent and logs `dropped unsent`.
+
+### Frames
+
+Two frame types join the `cmd` lane (`run`, `put_file`, `get_file`, `power`, `programs`). Every one carries `id` and `lane`. A guarded
+frame (`power`, `programs` except `list`, `put_file`, `get_file`) and a `run` also carry, on a saved PC:
+
+| Field | Holds |
+|---|---|
+| `rules_tag` | the tag of the rules the relay decided with |
+| `decided_at` | the relay's time of the decision, Unix seconds |
+| `approved_by` | the approver's identity, only when the action waited for and got an approval |
+
+```
+{"type":"power","id":"<uuid>","lane":"cmd","action":"restart"|"shutdown","delay_s":<5..600>,"rules_tag":"..","decided_at":<s>,"approved_by":".."}
+{"type":"programs","id":"<uuid>","lane":"cmd","action":"list"}
+{"type":"programs","id":"<uuid>","lane":"cmd","action":"install","path":"<abs>","args":"..","timeout_s":<10..600>, ...}
+{"type":"programs","id":"<uuid>","lane":"cmd","action":"uninstall","program_id":"64:<key>","timeout_s":<10..600>, ...}
+{"type":"programs","id":"<uuid>","lane":"cmd","action":"close","name":"OUTLOOK.EXE"|"pid":<int>,"force":<bool>, ...}
+```
+
+Results, as for any command (`{"type":"result","id","generation","ok":true, ...}`): `power`: `at` (a whole number of seconds
+since the epoch). `programs` `list`: `installed` and `running`, at most 2,000 each to the relay (the app sends at most 600 and 400),
+text clipped to 200 (`id`), 260 (`name`, `publisher`) and 100 (`version`) characters; the relay remembers the names for 10 minutes, for its
+checks and for the approval's summary. `install` and `uninstall`: `exit_code` (a whole number or `null`; 3010, a restart is needed, counts as done).
+`close`: `closed`. An error is `{"ok":false,"error":"<code>: <sentence>"}`. The relay waits 60 seconds plus 15 for a
+`power`, `list` or `close` result, and `timeout_s` plus 15 for an install or uninstall, and 15 seconds more (`CATCH_UP_MS`) for any frame
+that carries a `rules_tag`, since the PC may spend that long on a check-in before it decides. The audit log gains the kinds `power`,
+`programs`, `rules` (a refusal) and `approval`.
+
+### On the PC
+
+The service keeps the effective document and its tag in `device.json` (not the hours), takes both from each active check-in, and checks
+every guarded frame in `Client.Execute` before it runs, whoever sent it. `Rules.Check` returns the refusal or goes ahead:
+
+- A one-off session has no rules: `power` and `programs` are `not_saved_pc`, and everything else is unchanged.
+- A frame whose `rules_tag` differs from the stored tag first makes the PC check in outside the 30-second refresh limit (`RulesCatchUp`,
+  one at a time) and wait at most 15 seconds. It is then decided with the new rules, or refused `rules_stale`. A guarded action is
+  also refused `rules_stale` while the last answer could not be read, and a PC whose hour rule needs a time past `hours_until` gets
+  a fresh answer first.
+- The PC's time is `server_time` plus the time since on a stopwatch, never its wall clock. Hour rules are judged at the frame's
+  `decided_at` when it is within 60 seconds of that, else at the PC's own time.
+- It decides with `Rules.Decide`, the same order as above (with the frame's `delay_s`, clamped to 5 to 600 as `power` runs it, for the hour
+  rules), then checks folders again with `PathCheck` (long names, links and junctions), with the Support app's real folders added to the
+  protected ones. For an install it applies the installer checks above, its real Windows folder and the raw-command screen over the path
+  and arguments (the install verbs themselves are not sent back to the tool). For an uninstall it refuses the Support app's own entry
+  (`SupportMcpDevice`) and screens the entry's `QuietUninstallString` when the program has no product code.
+- A verdict of `approve` needs a non-empty `approved_by` on the frame, else `approval_unavailable`. The PC does not know who approved.
+- `power` runs after the answer: the PC waits `delay_s` and calls `InitiateSystemShutdownEx` with no message, a timeout of 0 and force on,
+  so nothing is shown and open programs are closed. A second `power` while one waits is `busy`. The one-at-a-time latch frees itself 120
+  seconds after the action was started, since the PC is not told when a shutdown is aborted (`shutdown /a`) or blocked.
+- `programs` `list` reads `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall` in both registry views (an id is `64:<key>` or `32:<key>`;
+  hidden components and updates are left out) and the running processes. `install` and `uninstall` need full control (`needs_full_control`
+  under limited support), run as SYSTEM in a kill-on-close job (an `.msi` through `msiexec /i` or `/x` with `/qn /norestart`, an `.exe` as given with
+  `args`, a program with no product code through its `QuietUninstallString`, else `this program has no silent uninstall command`), and time out
+  at `timeout_s`. `close` asks the program's windows to close (`WM_CLOSE`, through the helper in the user's session), waits up to 5 seconds,
+  and with `force` ends what is left. It never touches session 0, a critical Windows process or a process of the Support app (any process
+  that runs a file from its folders: the helper, the tray, the corner windows), each `protected_program`, and under limited
+  support only the signed-in user's own programs.
+- A raw `run` gets `RunScreen` only: a command that names a protected program or folder is `protected_program` or `protected_folder`, and one
+  whose verb restarts, shuts down, installs, uninstalls or closes a program (`Restart-Computer`, `Stop-Computer`, `shutdown`, `msiexec`, `wusa`,
+  `taskkill`, `Stop-Process`, `kill`) while that action is not `allow` is `use_tool`. The Support app is protected whatever the rules say: a
+  command that names `support.exe` or a version file, the service `SupportMcpDevice`, the Run value `SupportMcpTray`, the word `SupportMCP` or
+  the install folder is `protected_program` or `protected_folder`, and so is one that ends programs and names the app. It is a guardrail, not a
+  boundary. It goes ahead with the last good rules when no answer comes. Screen frames are not checked.
+
+### Update rings
+
+An app's `app_version` that changed is written at once (at most 2 seconds after the last write), not after the 1-minute floor that other changed
+details keep, so the next ring does not find a PC that updated still old. The write is guarded on the stored version, so of two check-ins that saw
+the old one, the first to write wins.
+
+The hourly run (`sweep`) and `POST /api/v1/deployment/ring-updates` run one pass, `ringUpdates(env, now, appBundle, {budget, idleMs})`, that rings the
+connected PCs that are due the release this relay serves: active, below the release, in the share `offerAtCheckIn` offers it to, and not seen
+within `idleMs` (1 hour for the run, 5 minutes for the route, the check-in's refresh time: a PC seen more recently does not write `last_seen`
+when it checks in, so a shorter span would leave a PC that was rung still due; a PC that checked in lately was offered the release then). It rings at most
+`RING_PC_MAX` = 100 per team per pass, most recently seen first, and nothing under `EMERGENCY_STOP` or without a signed release. The pass keeps
+its own subrequest budget (`RING_SUBREQUESTS` = 9 of the run's 50, `RING_ROUTE_SUBREQUESTS` = 40 for the route). The run takes teams in turn
+(the first team moves every hour). The route takes them in name order from a cursor: the body's `after` (a team name, or none for the first
+call) selects the teams after it, and the pass returns `{rung, teams_left, next}`: `teams_left` counts the teams after the cursor with a PC below the
+release not seen lately that this pass did not reach, and `next` is the last team it reached, or `null` when none is left. A team once
+passed is not visited again in the round, so the calls end even when PCs stay below the release (an old app that cannot update, a PC
+that is not connected, a PC that checks in and does not update).
+
+`POST /api/v1/deployment/ring-updates` is outside the team API: a deployment admin only, an Access login that is a person listed in
+`DEPLOYMENT_ADMINS` (a service token is 403 `forbidden` whatever its name). Gate, in this order: an `Origin` header 403 `forbidden`; other methods
+405 `method_not_allowed` (`Allow: POST`); not JSON 415; no Access login 403; not a deployment admin 403. Answer 200
+`{"rung":12,"teams_left":0,"next":null}`; while `next` is not `null` call it again with `{"after": <next>}`. A body that is not an object, or an `after` that is not a team name,
+is 400 `bad_request`. A failure is 503 `unavailable` with `Retry-After: 1`. Run it right after a deploy
+([Sign and deploy a release](development.md#sign-and-deploy-a-release)).
 
 ## Agent wire (JSON text frames over `/ws`)
 
@@ -1838,13 +2180,18 @@ text content item, not JSON-RPC errors.
 |---|---|---|
 | `session_create` | `label?` string, `windows_mode?` (`app` default, `powershell`; deprecated aliases `legacy`, `standard`) | `app`: `{session_id, windows_mode, download_url, one_liner, code_expires_at}` with `download_url` = `<origin>/j/<code>?client=app` and one-liner = `Start-Process '<download_url>'`. `powershell`: `{session_id, windows_mode, one_liner, code_expires_at}` with one-liner = `irm <origin>/j/<code> \| iex`. An unknown mode is a tool error and creates nothing. |
 | `session_list` | — | sessions from the caller's workspace's Registry with state + expires_at + machine |
-| `session_status` | `session_id`, `log_tail?` (default 20) | state, `windows_mode` (`app` or `powershell`), machine, user, expires_at, startup_expires_at, attached now?, `client_version` (the `version` of the last hello when it sent a valid one, else its `agent` string), `client_agent` (the `agent` string of the last hello, or `null`; it names the protocol generation), last log rows; `app` sessions add `elevated` (`true`, `false`, or `null` when the app did not report it), `control` (`full`, `normal` or `null`), `caps` (array), `desktop` (`default`, `secure`, `unknown` or `null`), `paused_until` and `input_blocked_until` (Unix ms while in the future, else `null`) |
+| `session_status` | `session_id`, `log_tail?` (default 20) | state, `windows_mode` (`app` or `powershell`), machine, user, expires_at, startup_expires_at, attached now?, `client_version` (the `version` of the last hello when it sent a valid one, else its `agent` string), `client_agent` (the `agent` string of the last hello, or `null`; it names the protocol generation), last log rows; `app` sessions add `elevated` (`true`, `false`, or `null` when the app did not report it), `control` (`full`, `normal` or `null`), `caps` (array), `desktop` (`default`, `secure`, `unknown` or `null`), `paused_until` and `input_blocked_until` (Unix ms while in the future, else `null`); a saved PC's session adds `device_id`, `driver`, `approval` (an action waiting for approval, or `null`) and `rules` (the effective rules for the PC) |
 | `run` | `session_id`, `command`, `timeout_s?`, `as?` (`user` default; `system` needs full control and is refused otherwise) | exit_code (null if timed out), stdout, stderr, timed_out |
 | `put_file` | `session_id`, `path`, `data_b64`, `append?` | bytes |
 | `get_file` | `session_id`, `path`, `offset?`, `length?` | data_b64, size, eof |
+| `restart_pc`, `shutdown_pc` | `session_id`, `delay_s?` (5 to 600, default 30) | `{ok:true, at}` (Unix seconds), answered before the PC acts. Saved PCs only; follows the team's rules and may wait up to 5 minutes for an approval. See [Rules and approvals](#the-tools) |
+| `list_programs` | `session_id` | `{installed:[{id,name,version,publisher}], running:[{name,pid,session}]}`. Saved PCs only; the rules never refuse it |
+| `install_program` | `session_id`, `path`, `args?`, `timeout_s?` (10 to 600, default 300) | `{ok:true, exit_code}`. Saved PCs only; follows the rules |
+| `uninstall_program` | `session_id`, `program_id`, `timeout_s?` | `{ok:true, exit_code}`. Saved PCs only; follows the rules |
+| `close_program` | `session_id`, `name` or `pid`, `force?` | `{ok:true, closed}`. Saved PCs only; follows the rules |
 | `session_end` | `session_id` | `{ended:true}`; sends `end` to agent first |
 | `device_list` | `site?` (an id), `status?` (`active` or `pending`), `after?` (an id) | `{devices:[...], next, untrusted_text}`: the team's device shape plus `online` (true while the PC's doorbell is connected; false when the Registry cannot be read), from one Registry request per call. Names, contacts and custom field values come from people and are untrusted data |
-| `device_connect` | `device_id`, `ask?` (boolean), `take_over?` (boolean) | `{session_id, state:"waiting"\|"attached", asks, rang}`. `rang` is true when the PC's doorbell was connected (else the PC sees the request within about 5 minutes). Refused: an unknown PC or one in another workspace, a waiting PC, an `app_version` below 0.6.0 (`this PC updates itself to 0.6.0 first`), a PC already in a session without `take_over` (`<who> is connected`) and a stopped workspace. See [Saved-PC sessions](#saved-pc-sessions) |
+| `device_connect` | `device_id`, `ask?` (boolean), `take_over?` (boolean) | `{session_id, state:"waiting"\|"attached", asks, rang}`. `rang` is true when the PC's doorbell was connected (else the PC sees the request within about 5 minutes). Refused: an unknown PC or one in another workspace, a waiting PC, an `app_version` below 1.0.0 (`this PC updates itself to 1.0.0 first`), a PC already in a session without `take_over` (`<who> is connected`) and a stopped workspace. See [Saved-PC sessions](#saved-pc-sessions) |
 
 | `agent_start` | `device_id` or `session_id`, `instructions`, `keep_working?`, `model?` | `{task_id, state:"running", provider, model, device_id, session_id, task_cap_usd, month_cap_usd, keep_working, next}`. See [The built-in agent](#the-built-in-agent) |
 | `agent_status` | `task_id?`, `wait_s?` (0 to 25) | with a `task_id`: `{task, caps, untrusted_text}`, where `task` has the state, end reason, model, cost, the tool calls (verb and short detail), the notes and the summary. Without one: `{tasks, caps, default_model, starters_pick_model, models, untrusted_text}` |
@@ -1854,7 +2201,8 @@ text content item, not JSON-RPC errors.
 | `session_handover` | `session_id`, `action` (`offer`, `accept`, `decline`, `cancel`, `take_over`), `identity?` (offer) | `{driver, participants, offer:{to,by,expires_at}\|null}` |
 | `escalation` | `action` (`open`, `list`, `claim`, `close`), `session_id?` or `device_id?` and `note?` (open), `status?` (list), `id` and `note?` (claim, close) | `{escalation:E}` for open, claim and close, `{escalations:[E]}` for list, each with `untrusted_text`. A claim of a live session adds `session_id`, `driver`, `participants`; a claim of a ticket adds `device_id` and `device_name`, or `one_off:true` |
 
-The tools above are in every connection, with the screen tools below. `?ui=0`
+A refusal by the rules or by a technician is a tool error of the form `<code>: <sentence>` for the six tools above
+([codes](#the-tools)). The tools above are in every connection, with the screen tools below. `?ui=0`
 hides `ui_tree` and `ui_act` (`?ui=1` is the default); any other value gets 400
 `{"error":"unknown ui value; use 0 or 1"}` after the Access check. The `shape`
 parameter no longer exists: a request that carries it, with any value, gets 400
@@ -2072,7 +2420,7 @@ one of a valid code or a slug. It refuses a session footer.
 | `--device-update-rollback` | LocalSystem, the failure action or a child of the new service | records the version as failed (never taken again), stops the service, points everything back at the old file with its own version and size, puts back the normal failure actions (restart twice, a minute apart), adds a history line, closes the trial and starts the service, trying again for up to 5 minutes when it will not start. The service is started again even when a step fails midway. With no trial open it only puts back the normal failure actions and starts the service; with `update.json` unreadable it changes nothing and only starts the service |
 | `--device-update-rollback --at-deadline` | LocalSystem, a child of the new service at its start on trial | the deadline watcher that survives a restart. It takes the setup mutex, renews the trial's deadline to at least 4 minutes from now, and then watches like the switch: it exits 0 once the trial is committed or rolled back, and rolls back a trial still open at the deadline (exit 32) |
 | `--device-ask <answer>` | the signed-in user, started by the service in the session it asks | the question before a saved-PC session. `<answer>` is one base64url JSON argument of at most 2,048 characters holding exactly `by`, `team` and `control` (never a key). The dialog is the consent dialog's: "Allow <technician> to connect to this PC?" (or "Allow your support team", with no name), naming the technician and the team, saying what the control level allows, and that the corner window and the Support icon end it. "Don't allow" is the default, "Allow" does nothing for its first 500 ms, and with no answer after 2 minutes it closes as "Don't allow". Exit 10 is Allow; anything else (11, a crash, a malformed argument, no answer) is no |
-| `--tray` | the signed-in user, started by the `HKLM` Run value at each sign-in | one per session (a `Local` mutex). A notification icon drawn at run time, and a panel with the name, the access mode, the state, who is connected ("No one is connected.", or "Connected: <technician>" with an "End session" button while a session is live), recent history, "Uninstall Support" and a small "Version x.y.z" line (the service's version; hidden when an older service sends none). The mode line says "Support asks you before each connection. Your support team's admins can change this." in `ask`, and "Support can connect any time." with "Only your support team can change this." in `any`. It reads the service through the pipe, with at most two pipe connections at once (the service allows two per process), and exits when this PC's uninstall event is set. The event's name comes from the status frame and is opened only when SYSTEM or Administrators own it A tray keeps running the file it started from until the next sign-in, after an update too |
+| `--tray` | the signed-in user, started by the `HKLM` Run value at each sign-in | one per session (a `Local` mutex). A notification icon drawn at run time, and a panel with the name, the access mode, the state, who is connected ("No one is connected.", or "Connected: <technician>" with an "End session" button while a session is live), recent history, a "Check now" button (for an active, waiting or offline PC; it sends the pipe's `refresh`, shows "Checking…", and reads the status each second until a newer check-in shows, at most 8 seconds), "Uninstall Support" and a small "Version x.y.z" line (the service's version; hidden when an older service sends none). The mode line says "Support asks you before each connection. Your support team's admins can change this." in `ask`, and "Support can connect any time." with "Only your support team can change this." in `any`. It reads the service through the pipe, with at most two pipe connections at once (the service allows two per process), and exits when this PC's uninstall event is set. The event's name comes from the status frame and is opened only when SYSTEM or Administrators own it A tray keeps running the file it started from until the next sign-in, after an update too |
 | `--uninstall` | the owner | copies itself to a new Temp folder and runs from there. Confirms, then starts `--device-remove` elevated and shows "Support was removed" |
 | `--device-remove <nonce>` | administrator, through UAC | runs from the copy the uninstaller staged (it reads `device.json`, not a footer, so it holds no exe of its own), and goes ahead only while the uninstaller's named event for `<nonce>` still exists. It sends `/device/leave` (a 200 or a 401 both count as done), sets this PC's uninstall event (and the fixed `Global\SupportMcpDeviceUninstall` of 0.5.0, for trays still on it, each only when SYSTEM or Administrators own it) so every tray exits, waits a few seconds and ends any tray that remains, stops and deletes the service, deletes the Run value and the Apps entry, and removes the folder: it is renamed aside first (so a reinstall at the original path is never blocked), deleted with the junction-safe walk, and anything still locked is queued for the next restart. If the relay cannot be reached, or answers anything else (a refusal or a server error), it still removes everything and the owner is told the team must remove the PC. It ends trays started from any exe in the install folder (`support.exe` or a version file), and the folder removal takes every version file and `update.json` with it. One install, remove or update switch runs at a time, under a `Global` mutex. The setup mutex gets the same owner check as the install's; a hostile one is exit 22 and the window shows "Another program is blocking Support. Restart the PC and try again." Exit codes: 0 removed, 10 removed but the relay did not confirm, 20 failed, 21 busy (the mutex is held, or an update's trial is open and less than 10 minutes past its deadline), and then the window says to try again in a few minutes, 22 blocked |
 
@@ -2146,6 +2494,11 @@ What the service does with a session. The relay's side is in
     every command run with the user's own token, files are opened while
     impersonating the user, nothing works once another user is there, and the hello
     says `control: "normal"`.
+  - *The rules.* Every active check-in answer carries the rules in force for the PC. The service keeps them
+    in `device.json`, checks every guarded frame against them before it runs and refuses what they forbid, whoever
+    sent it. It screens a raw `run` and checks protected folders after resolving short names and links. Nothing is
+    shown to the person at the PC: an action that needed approval was approved in the technician app, and its
+    frame names the approver. [Rules and approvals](#on-the-pc) has the rest.
   - *The corner window.* `--window <id>` as the signed-in user shows who is
     connected, the timer and End session, from the service's per-session pipe
     `SupportMcp-<id>-ui`, which only the target session may use. The person can
@@ -2179,7 +2532,7 @@ never update themselves.
    `initialize` → `tools/list` returns the 7 session tools and the two device
    tools (`device_list`, `device_connect`) plus the nine screen tools, `ui_tree`,
    `ui_act`, `block_input`, `send_sas`, `type_secret` and `request_full_control`,
-   the three agent tools and the four team tools (31), `?ui=0` drops `ui_tree` and `ui_act`, and `?shape=...` is a 400 (curl).
+   the three agent tools, the four team tools and the six tools the team's rules govern (37), `?ui=0` drops `ui_tree` and `ui_act`, and `?shape=...` is a 400 (curl).
 3. `/mcp` without the JWT on a non-localhost host → 403 (unit test with a fake
    host + a test for bad aud / expired / wrong sig using a locally generated
    RSA key).
@@ -2239,6 +2592,14 @@ never update themselves.
     queue, claims and the agent's items) and `test/team-tools.test.js` (the agent-mode gate and the agent's
     tool list) run against the real Worker, Session objects and D1 stand-in.
 
+15. Rules and approvals: `test/rules.test.js` runs `decide`, the business hours, the merge and the
+    validation against `test/fixtures/rules-cases.json`, and `test/app-native.cs` runs the same file
+    against the app's own `Rules.Decide`. `test/rules-api.test.js` covers the routes, the fresh code and
+    the stale revision, `test/rules-tools.test.js` the six tools, the refusals and the frames,
+    `test/approvals.test.js` the wait, the answer, the cancel paths and the restart, and
+    `test/update-rings.test.js` the hourly pass and `POST /api/v1/deployment/ring-updates`. The tools list
+    is 37 tools.
+
 ## Must keep
 
 - `/healthz` stays public and 200.
@@ -2261,6 +2622,16 @@ never update themselves.
   and never bytes whose size or SHA-256 differ from the signed note.
 - The relay never holds the release private key and never needs it; CI holds
   none either.
+- A saved PC's rules are checked twice, by the relay before a command is queued and by the PC before it
+  runs, with the same order and the same cases. The relay reads the rules fresh for every guarded
+  command, never from a cache. A guarded action is refused, not allowed, when the rules cannot be read.
+  A raw `run` and the screen tools are not limited by the rules beyond the PC's text screen, and the
+  rules are not signed: the docs say so wherever they claim anything.
+- An approval is answered only by a person holding `sessions.unattended` through the technician app's
+  route, with a fresh authenticator code, is bound to one action on one PC, and is never carried out
+  after the session ends, control moves or the relay restarts. The person at the PC is never asked to
+  approve an action. Saving or removing rules takes `rules.manage`, a person and a fresh code, and the
+  log holds field names, never values.
 - A screenshot, typed text and a secret are never stored by the relay: not in
   the audit log, the Session storage, the registry or the Worker log.
 - `ended` is terminal; no path reopens a session or extends `expires_at`.
@@ -2270,8 +2641,9 @@ never update themselves.
 - A saved PC is connected without asking the person at it only for a caller who
   holds `sessions.unattended`, which open mode never grants; and switching a PC to
   `any` needs it too.
-- Customer, site, device and custom field data is never read when the relay
-  decides who may do what. A device key is never in a URL, never logged, stored
+- No text of a customer, site, device or custom field is read when the relay decides who may do
+  what. The relay reads a PC's site's customer id and the team's rules, and only to decide what an action
+  may do. A device key is never in a URL, never logged, stored
   only as a hash, compared in constant time, and refused on a request with an
   `Origin` header. `/device/` and `/install` stay public and outside every Access
   app.

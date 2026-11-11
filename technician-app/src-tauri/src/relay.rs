@@ -144,6 +144,11 @@ pub fn is_session_id(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// An approval id as the relay writes it: 32 lower-case hex characters.
+pub fn is_approval_id(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Which relay routes the screens may reach through `relay_request`, after the team's
 /// `/app/w/<team>` prefix. `path` may carry a query. Everything else is refused here.
 pub fn route_allowed(method: &str, path: &str) -> bool {
@@ -182,6 +187,12 @@ pub fn route_allowed(method: &str, path: &str) -> bool {
         ("POST", ["api", "agent", "tasks", id, "pause" | "resume" | "stop"]) => is_id(id),
         // The watcher's picture: the last full screenshot of a live session.
         ("GET", ["api", "sessions", sid, "frame"]) => is_session_id(sid),
+        // The approval waiting on a session, and the answer to it (Approve with a code, or Deny).
+        ("GET", ["api", "sessions", sid, "approvals"]) => is_session_id(sid),
+        ("POST", ["api", "sessions", sid, "approvals", id]) => is_session_id(sid) && is_approval_id(id),
+        // The team's rules, and one customer's overrides: read, save (PATCH) and remove an override (DELETE).
+        ("GET" | "PATCH", ["api", "rules"]) => true,
+        ("GET" | "PATCH" | "DELETE", ["api", "rules", id]) => is_id(id),
         ("GET", ["teams"]) => true,
         ("GET" | "PATCH", ["notifications", "settings"]) => true,
         _ => false,
@@ -494,6 +505,7 @@ mod tests {
     fn only_the_routes_the_screens_use_are_allowed() {
         let id = "abcdefghijklmnopqrst";
         let sid = "0123456789abcdef".repeat(4);
+        let aid = "0123456789abcdef".repeat(2);
         let yes = [
             ("GET", "/api".to_string()),
             ("GET", "/api/devices".into()),
@@ -510,6 +522,13 @@ mod tests {
             ("GET", format!("/api/agent/tasks/{id}?wait_s=25")),
             ("GET", format!("/api/agent/tasks/{id}/frame")),
             ("GET", format!("/api/sessions/{sid}/frame")),
+            ("GET", format!("/api/sessions/{sid}/approvals")),
+            ("POST", format!("/api/sessions/{sid}/approvals/{aid}")),
+            ("GET", "/api/rules".into()),
+            ("PATCH", "/api/rules".into()),
+            ("GET", format!("/api/rules/{id}")),
+            ("PATCH", format!("/api/rules/{id}")),
+            ("DELETE", format!("/api/rules/{id}")),
             ("POST", format!("/api/agent/tasks/{id}/stop")),
             ("POST", format!("/api/agent/tasks/{id}/pause")),
             ("POST", format!("/api/agent/tasks/{id}/resume")),
@@ -552,6 +571,31 @@ mod tests {
             ("GET", format!("/api/sessions/{sid}/frame/extra")),
             ("GET", format!("/api/sessions/{sid}/end")),
             ("GET", "https://evil.example/api".into()),
+            // The rules: the team's document is saved, never created or deleted (only an override is removed), and a
+            // customer is named by its 20-character id. The query is for lists, so a write carries none.
+            ("POST", "/api/rules".into()),
+            ("DELETE", "/api/rules".into()),
+            ("PUT", "/api/rules".into()),
+            ("PUT", format!("/api/rules/{id}")),
+            ("POST", format!("/api/rules/{id}")),
+            ("GET", "/api/rules/not-an-id".into()),
+            ("GET", "/api/rules/../members".into()),
+            ("GET", format!("/api/rules/{id}/extra")),
+            ("PATCH", "/api/rules?customer=x".into()),
+            ("GET", "/api/rules?evil=1".into()),
+            // Approvals: a 64-hex session id, a 32-hex approval id, read the list and answer by id, nothing else.
+            ("POST", format!("/api/sessions/{sid}/approvals")),
+            ("GET", format!("/api/sessions/{sid}/approvals/{aid}")),
+            ("PATCH", format!("/api/sessions/{sid}/approvals/{aid}")),
+            ("DELETE", format!("/api/sessions/{sid}/approvals/{aid}")),
+            ("POST", format!("/api/sessions/{sid}/approvals/{aid}/extra")),
+            ("POST", format!("/api/sessions/{sid}/approvals/{id}")),
+            ("POST", format!("/api/sessions/{sid}/approvals/{}", "0123456789ABCDEF".repeat(2))),
+            ("POST", format!("/api/sessions/{sid}/approvals/{}", "0123456789abcdef".repeat(1))),
+            ("POST", format!("/api/sessions/{sid}/approvals/{}", "0123456789abcdeg".repeat(2))),
+            ("GET", format!("/api/sessions/{id}/approvals")),
+            ("GET", format!("/api/sessions/{}/approvals", "0123456789abcdef".repeat(3))),
+            ("POST", format!("/api/sessions/{id}/approvals/{aid}")),
         ];
         for (m, p) in &no {
             assert!(!route_allowed(m, p), "{m} {p}");
@@ -563,6 +607,11 @@ mod tests {
         for banned in ["click", "type_text", "type_secret", "press_key", "run", "put_file", "get_file", "send_sas", "block_input", "request_full_control", "ui_act", "move_mouse", "drag", "scroll", "agent_start", "agent_control"] {
             assert!(!TOOLS.contains(&banned), "{banned}");
         }
+        // The tools the team's rules govern: the app never drives a PC, so it never restarts one, installs or closes anything.
+        for banned in ["restart_pc", "shutdown_pc", "list_programs", "install_program", "uninstall_program", "close_program"] {
+            assert!(!TOOLS.contains(&banned), "{banned}");
+            assert!(!CODED_TOOLS.contains(&banned), "{banned}");
+        }
         assert!(TOOLS.contains(&"screenshot") && TOOLS.contains(&"device_list"));
         // The pinned list: the eight of 0.8.0 and the four of people in a session.
         assert_eq!(
@@ -572,6 +621,12 @@ mod tests {
                 "people_list", "session_participants", "session_handover", "escalation",
             ]
         );
+    }
+
+    #[test]
+    fn an_approval_id_is_thirty_two_lower_case_hex_characters() {
+        assert!(is_approval_id(&"ab01".repeat(8)));
+        assert!(!is_approval_id(&"AB01".repeat(8)) && !is_approval_id(&"ab01".repeat(7)) && !is_approval_id(&"ab01".repeat(9)) && !is_approval_id(&"zz01".repeat(8)) && !is_approval_id(""));
     }
 
     #[test]

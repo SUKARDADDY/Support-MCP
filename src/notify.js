@@ -15,8 +15,9 @@
 // team log is not touched. Title and body may repeat text from a customer's PC and
 // are shown as text.
 //
-// Two events are not switchable: session_invited ("you were invited to a session") and
-// control_offered ("someone offered you control"). They are addressed to one named person and
+// Three events are not switchable: session_invited ("you were invited to a session"),
+// control_offered ("someone offered you control") and approval_requested ("an action waits for
+// your approval"). They are addressed to one named person and
 // always reach them, whatever their settings say, so a person cannot miss that a colleague is
 // waiting on them. They have their own write path (direct) and are not in EVENTS. The queue's
 // events (escalation_opened, escalation_claimed) are switchable like the first six.
@@ -27,7 +28,7 @@ export const EVENTS = Object.freeze([
   'task_finished', 'task_problem', 'session_declined', 'device_online', 'device_missing', 'device_waiting', 'escalation_opened', 'escalation_claimed',
 ]);
 // Addressed to one named person and always delivered: no switch, and no recipients() lookup.
-export const DIRECT_EVENTS = Object.freeze(['session_invited', 'control_offered']);
+export const DIRECT_EVENTS = Object.freeze(['session_invited', 'control_offered', 'approval_requested']);
 export const WATCH_MAX = 500;
 export const FEED_LIMIT = 50;
 export const KEEP_MS = 30 * 24 * 60 * 60 * 1000;
@@ -59,6 +60,9 @@ export function readNotify(text) {
 export function notifyStore(db, team) {
   const q = (sql, ...params) => db.prepare(sql).bind(...params);
   const COLUMNS = 'workspace, recipient, event, created_at, device_id, task_id, session_id, title, body, dedupe';
+  // A person whose sign-in account is disabled (users.disabled_at, set by hand to lock someone out) hears nothing
+  // and cannot be asked to approve. A member with no account row, such as an Access login, is active.
+  const ACTIVE = 'NOT EXISTS (SELECT 1 FROM users u WHERE u.email = members.identity AND u.disabled_at IS NOT NULL)';
   const values = (slug, r) => [slug, r.recipient, r.event, r.created_at, r.device_id, r.task_id, r.session_id, r.title, r.body, r.dedupe];
 
   // The people an event goes to, as identities. `to` names people (the starter, the
@@ -70,7 +74,7 @@ export function notifyStore(db, team) {
     const named = new Set(to.map(normalizeIdentity));
     const skip = new Set(except.map(normalizeIdentity));
     if (!named.size && !watching && !holding) return [];
-    const { results } = await q("SELECT identity, role_id, notify FROM members WHERE workspace = ? AND kind = 'person'", slug).all();
+    const { results } = await q(`SELECT identity, role_id, notify FROM members WHERE workspace = ? AND kind = 'person' AND ${ACTIVE}`, slug).all();
     const roles = holding ? new Map((await team.listRoles(slug)).map((r) => [r.id, r.permissions])) : null;
     const out = [];
     for (const m of results) {
@@ -81,6 +85,13 @@ export function notifyStore(db, team) {
       if (hit && mine.events[event] && !skip.has(m.identity)) out.push(m.identity);
     }
     return out;
+  }
+
+  // The people (never service tokens, never a disabled account) whose role holds `permission`, as identities. Admins hold every one.
+  async function holders(slug, permission) {
+    const { results } = await q(`SELECT identity, role_id FROM members WHERE workspace = ? AND kind = 'person' AND ${ACTIVE}`, slug).all();
+    const roles = new Map((await team.listRoles(slug)).map((r) => [r.id, r.permissions]));
+    return results.filter((m) => m.role_id === ADMIN_ROLE || (roles.get(m.role_id) ?? []).includes(permission)).map((m) => m.identity);
   }
 
   // The rows for one event, one per recipient. what: { device_id, task_id, session_id,
@@ -94,18 +105,26 @@ export function notifyStore(db, team) {
     }));
   }
 
-  // The row for a direct event (session_invited, control_offered): one named member who is a person,
+  // The row for a direct event (session_invited, control_offered, approval_requested): one named member who is a person,
   // whatever their settings say. Nothing for a name that is not such a member. Nothing is written.
   async function direct(slug, event, to, what) {
     if (!DIRECT_EVENTS.includes(event)) throw new TypeError('unknown direct notification event');
     const who = normalizeIdentity(to);
-    const found = await q("SELECT identity FROM members WHERE workspace = ? AND identity = ? AND kind = 'person'", slug, who).first('identity');
+    const found = await q(`SELECT identity FROM members WHERE workspace = ? AND identity = ? AND kind = 'person' AND ${ACTIVE}`, slug, who).first('identity');
     if (!found) return [];
-    return [{
-      recipient: who, event, created_at: Date.now(),
+    return directKnown(event, [who], what);
+  }
+
+  // The rows for a direct event to people already read as active members who are persons (the answer of
+  // holders), one each, with no second look-up. Nothing is written.
+  function directKnown(event, people, what) {
+    if (!DIRECT_EVENTS.includes(event)) throw new TypeError('unknown direct notification event');
+    const at = Date.now();
+    return people.map((who) => ({
+      recipient: who, event, created_at: at,
       device_id: what.device_id ?? null, task_id: what.task_id ?? null, session_id: what.session_id ?? null,
       title: clip(what.title, TITLE_MAX), body: clip(what.body, BODY_MAX), dedupe: String(what.dedupe),
-    }];
+    }));
   }
 
   // The statements that add `list` inside a guarded change: each runs only where the
@@ -171,7 +190,7 @@ export function notifyStore(db, team) {
     return r.meta.changes;
   }
 
-  return { recipients, rows, direct, statements, write, feed, settings, patchSettings, prune };
+  return { recipients, holders, rows, direct, directKnown, statements, write, feed, settings, patchSettings, prune };
 }
 
 // The feed, held open: the rows after `after` if there are any, otherwise a check every

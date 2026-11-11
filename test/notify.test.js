@@ -12,10 +12,15 @@ import { oai } from './agent-fakes.js';
 import { DIRECT_EVENTS, EVENTS, KEEP_MS, notifyStore, readNotify } from '../src/notify.js';
 import { sweep, MISSING_MS, MISSING_WINDOW_MS } from '../src/sweep.js';
 import { ONLINE_AFTER_MS } from '../src/registry.js';
+import { fixtureBundle } from './release-fixture.js';
 
 const shotCall = () => oai.call('screenshot', { display: null });
 const finish = (outcome = 'done', summary = 'ok') => oai.call('finish', { outcome, summary });
 const DAY = 24 * 3600_000;
+// The release settings of a signed release, and the bundle that goes with them: with both, the hourly run also rings
+// PCs that are due an update, and the subrequest counts below include those rings.
+const bundle = fixtureBundle();
+const signedRelease = (w) => Object.assign(w.env, { RELEASE_SIGNATURE: Buffer.alloc(64, 1).toString('base64'), RELEASE_SIGNED_AT: String(Math.floor((w.now() - 72 * 3600_000) / 1000)), UPDATE_ROLLOUT: '100' });
 
 const rowsOf = (w, where = '', ...params) => w.sql(`SELECT workspace, recipient, event, device_id, task_id, session_id, title, body, dedupe FROM notifications ${where} ORDER BY id`, ...params).map((r) => ({ ...r }));
 const who = (rows) => rows.map((r) => r.recipient).sort();
@@ -410,6 +415,10 @@ test('a big team does not crowd the others out of the hourly run, and a run stay
   const watch = (slug, ids) => w.db.sqlite.prepare('UPDATE members SET notify = ? WHERE workspace = ? AND identity = ?').run(JSON.stringify({ watch: ids }), slug, TECH);
   watch('default', [small]);
   watch('acme', w.sql("SELECT id FROM devices WHERE workspace = 'acme'").map((r) => r.id).slice(0, 500));
+  // Both teams also hold PCs that are due an update (acme's with doorbells connected), so the run's rings count too.
+  signedRelease(w);
+  w.db.sqlite.exec("UPDATE devices SET app_version = '0.0.1'");
+  for (const id of w.sql("SELECT id FROM devices WHERE workspace = 'acme' LIMIT 150").map((r) => r.id)) w.ringSocket(id, 'acme');
   w.advance(7 * DAY + 1000);
   // Count what the free plan counts: each statement run on its own, each batch once.
   let calls = 0;
@@ -417,11 +426,12 @@ test('a big team does not crowd the others out of the hourly run, and a run stay
   const counted = (st) => ({ ...st, bind: (...a) => counted(st.bind(...a)), run: (...a) => (calls++, st.run(...a)), all: (...a) => (calls++, st.all(...a)), first: (...a) => (calls++, st.first(...a)) });
   w.env.DB = { ...real, prepare: (sql) => counted(real.prepare(sql)), batch: (list) => (calls++, real.batch(list)) };
   const registryCalls = w.registryCalls.length;
-  await sweep(w.env);
+  await sweep(w.env, w.now(), bundle);
   w.env.DB = real;
   assert.ok(calls + (w.registryCalls.length - registryCalls) <= 50, `${calls} D1 calls and ${w.registryCalls.length - registryCalls} Registry calls`);
+  assert.equal(w.registryCalls.slice(registryCalls).filter((c) => c.path === '/ring').length, 2, 'a call for each team');
   // Over the hours, the small team is reached although the big one had the earlier PCs.
-  for (let h = 0; h < 3; h++) { w.advance(3600_000); await sweep(w.env); }
+  for (let h = 0; h < 3; h++) { w.advance(3600_000); await sweep(w.env, w.now(), bundle); }
   assert.ok(rowsOf(w, "WHERE workspace = 'default'").length > 0, 'the small team was reached');
 });
 
@@ -443,6 +453,7 @@ async function lostTogether(t, { teams }) {
     }
     w.db.sqlite.prepare('UPDATE members SET notify = ? WHERE workspace = ? AND identity = ?').run(JSON.stringify({ watch: ids.get(slug) }), slug, TECH);
   }
+  signedRelease(w);
   w.advance(7 * DAY + 3600_000);
   // Count what the free plan counts: each statement run on its own, each batch once, each Registry call.
   let calls = 0;
@@ -453,7 +464,7 @@ async function lostTogether(t, { teams }) {
   const hour = async () => {
     calls = 0;
     const before = w.registryCalls.length;
-    await sweep(w.env);
+    await sweep(w.env, w.now(), bundle);
     worst = Math.max(worst, calls + (w.registryCalls.length - before));
     w.advance(3600_000);
   };
@@ -580,7 +591,7 @@ test('the queue\'s two events are switchable and on by default; the invite and t
   const w = await agentWorld(t);
   const notify = notifyStore(w.db, w.team);
   assert.deepEqual(EVENTS.slice(-2), ['escalation_opened', 'escalation_claimed']);
-  assert.deepEqual(DIRECT_EVENTS, ['session_invited', 'control_offered']);
+  assert.deepEqual(DIRECT_EVENTS, ['session_invited', 'control_offered', 'approval_requested']);
   assert.equal(DIRECT_EVENTS.some((e) => EVENTS.includes(e)), false);
   assert.deepEqual((await notify.settings('default', TECH)).events.escalation_opened, true);
   const off = await notify.patchSettings('default', TECH, { events: { escalation_opened: false } });

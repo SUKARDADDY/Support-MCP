@@ -12,6 +12,8 @@ export default defineConfig({
     setupFiles: ['./src/test-setup.js'],
     include: ['src/**/*.test.{js,jsx}'],
     globals: false,
+    // The slowest screen tests take about 2 s alone and more on a loaded machine.
+    testTimeout: 15000,
     // A promise nobody handled fails the run. Vitest's default is the same; it is written here so
     // nobody turns it off to quiet a test, and the screens' loops catch their own errors.
     dangerouslyIgnoreUnhandledErrors: false,

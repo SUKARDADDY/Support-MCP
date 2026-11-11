@@ -86,12 +86,19 @@ In `~/.codex/config.toml`:
 ```toml
 [mcp_servers.support-mcp]
 url = "https://support.example.com/mcp"
-tool_timeout_sec = 630
+tool_timeout_sec = 1000
 ```
 
 Then run `codex mcp login support-mcp`. Older Codex versions need
-`experimental_use_rmcp_client = true` for OAuth. `tool_timeout_sec` has to be
-above 600 seconds, the longest `run` timeout.
+`experimental_use_rmcp_client = true` for OAuth. `tool_timeout_sec` has to cover
+the longest call. A restart, shutdown, install, uninstall or close can wait up
+to 5 minutes (300 seconds) for a technician's approval in the technician app.
+Once approved, it can wait up to 60 seconds for the PC to finish a command
+already running. Then a command can run for up to 600 seconds, the longest
+`run` timeout. The relay adds 15 seconds of slack for the answer and 15 seconds
+for the PC to check in for newer rules. 990 seconds is that total, and 1000
+leaves room for the network. `install_program` and `uninstall_program` take the
+same 600-second limit as `run`.
 
 **Cursor**
 
@@ -154,7 +161,9 @@ and needs `sessions.control`. It returns `{session_id, state: "waiting", asks,
 rang}`. Poll `session_status` until the state is `attached`, then use the
 session tools with that `session_id`. A PC set to ask first, or a call with
 `ask: true`, makes the person at the PC allow it; if they refuse or nobody is
-there, the session ends as `declined` or `nobody`.
+there, the session ends as `declined` or `nobody`. The PC must run 1.0.0 or later,
+the first version that enforces the team's rules (below); an older PC updates itself
+first, and `device_connect` says so.
 
 Two things need `sessions.unattended` ("connect to a PC without asking the person
 at it, and switch a PC to any time"), which admins hold and no other built-in role
@@ -171,6 +180,73 @@ approved without one can connect only with a prompt and cannot take over. One
 technician drives a session at a time, and a command from anyone else is refused
 with the driver's name. Stopping a workspace is a team API call, not a tool: while
 a workspace is stopped every tool call fails with a message that says so.
+
+## Restarts, programs and approvals
+
+Six tools act on a saved PC's session and follow the team's rules: `restart_pc`,
+`shutdown_pc`, `install_program`, `uninstall_program` and `close_program`, plus
+`list_programs`, which only reads. They need `sessions.control`, like `run`, and work only
+in a session on a saved PC. A one-off link refuses them with `not_saved_pc`.
+
+- `restart_pc` and `shutdown_pc` take `{session_id, delay_s?}`, with `delay_s` from 5 to 600
+  (default 30). The answer, `{ok: true, at}`, comes before the PC acts, and `at` is when it
+  will, in Unix seconds. Do not call again to check or retry: a second call schedules a
+  second action. The PC forces open programs closed, so unsaved work is lost.
+- `list_programs` returns `installed` (`id`, `name`, `version`, `publisher`) and `running`
+  (`name`, `pid`, `session`). Take the ids from it.
+- `install_program` takes `{session_id, path, args?, timeout_s?}`: `path` is an installer
+  that is already on the PC (send it with `put_file`), `.msi`, `.msu` or `.exe`, not in the Windows
+  folder, never a Windows tool such as `shutdown.exe` or `msiexec.exe` and never an uninstaller
+  such as `unins000.exe` or `Uninstall.exe`; `args` is at most 1,000
+  characters with no line breaks, and arguments that restart the PC or uninstall are refused (use
+  `restart_pc` and `uninstall_program`). `uninstall_program`
+  takes `{session_id, program_id, timeout_s?}`. `timeout_s` is 10 to 600, default 300. Both
+  return `{ok, exit_code}`, with a `detail` note when the installer wrote an error or left
+  processes that were stopped, and run as SYSTEM, so the PC must be set to full control.
+- `close_program` takes `{session_id, name | pid, force?}` and returns `{ok, closed}`, with
+  `still_running` when some of them did not close. Without
+  `force` it asks the program to close. With it, the program ends at once and unsaved work is
+  lost. The Support app's own processes are never closed (`protected_program`).
+
+The relay checks each action against the rules in force for that PC before anything reaches
+it, and the PC checks again. The result is one of three. The action runs. It is refused. Or it
+waits for a technician's approval: the call stays open for up to 5 minutes while a member
+holding `sessions.unattended` approves or denies it in the technician app, with a fresh code
+from their authenticator to approve. The person at the PC is not asked and sees nothing for
+these actions. A call that waits can take longer than a `run`, so set your client's tool
+timeout to cover it (for Codex, `tool_timeout_sec`, above).
+
+**Errors start with a code,** then a sentence: `<code>: <sentence>`. A refusal is the team's
+decision or a technician's, not a fault. Do not retry it, and do not work round it with a raw
+`run`: a `run` is not limited by the rules beyond a screen, but that is not permission, and
+the screen refuses the obvious command with `use_tool`. The same goes for the other tools:
+`install_program` is for installers, so it is not a way to restart the PC or uninstall a program.
+
+| Code | Means |
+|---|---|
+| `rule_never` | the team's rules never allow this action on this PC |
+| `business_hours` | the rules allow it only outside business hours (`outside_hours`) |
+| `protected_program`, `protected_folder` | the rules protect that program or folder. Windows' own critical processes are `protected_program` too |
+| `needs_full_control` | a restart, shutdown, install or uninstall needs a PC set to full control |
+| `declined` | a technician declined, or the approval was cancelled |
+| `approval_timeout` | no technician answered in 5 minutes |
+| `approval_unavailable` | nobody can approve for this caller: a service token, or a team where no member holds `sessions.unattended` (open mode included) |
+| `busy` | another action waits for approval on this session, or a restart or shutdown already waits on the PC. After an approval, if the PC stays busy for a minute the error says the approval was used |
+| `rules_stale` | the relay or the PC could not get the team's current rules; try again in a minute |
+| `not_found` | no such program, or no installer at that path |
+| `not_saved_pc` | the session is a one-off link |
+| `needs_update` | the PC runs a version below 1.0.0 |
+
+A service token can use the tools when the rules allow the action without approval, but it cannot
+be approved for. The built-in agent has the same six tools and the same rules, and waits for
+approval as its starter. Stop or Pause on its task cancels the approval it waits for. In
+"built-in agent only" mode these tools answer "this team uses the built-in agent", like the other
+session tools. `session_status` shows the PC's `rules` and the `approval` that waits, if any.
+
+Rules are saved through the team API or the technician app's **Rules** screen, never through a
+tool, so text on a customer's screen cannot change them. See
+[Rules and approvals](../README.md#rules-and-approvals) and the
+[security model](security-model.md#rules-and-approvals).
 
 ## Working together: people_list, session_participants, session_handover and escalation
 
