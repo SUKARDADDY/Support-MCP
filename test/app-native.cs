@@ -3464,6 +3464,15 @@ public static class AppTests {
             Assert(Wire.Flag(r, "ok") && Wire.Number(r, "exit_code") == 0 && File.Exists(record), "an installer with awkward arguments runs: " + Refusal(r) + " " + Wire.Text(r, "detail"));
             string got = File.ReadAllText(record, Encoding.UTF8);
             Assert(got == "\"" + setup + "\" " + given, "the installer received exactly the arguments given, in no script: " + got);
+            // An installer that hands its work to a child and exits at once (an uninstaller that copies itself to Temp, a bootstrapper)
+            // is waited for: the child writes its marker about 2 s later, and the call answers only once the whole tree has finished.
+            string marker = Path.Combine(dir, "tree-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".txt");
+            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", setup, "args", "--spawn-delayed \"" + marker + "\"", "timeout_s", 60, "rules_tag", "g1"));
+            Assert(Wire.Flag(r, "ok") && Wire.Number(r, "exit_code") == 0 && File.Exists(marker), "install waits for the installer's child process: " + Refusal(r) + " " + Wire.Text(r, "detail"));
+            // One that outlives the time it has is reported as not finished, and its child is stopped with the Job.
+            var late = Stopwatch.StartNew();
+            r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", setup, "args", "--spawn-sleep", "timeout_s", 10, "rules_tag", "g1"));
+            Assert(!Wire.Flag(r, "ok") && Wire.Text(r, "error").Contains("did not finish") && late.ElapsedMilliseconds >= 9000 && late.ElapsedMilliseconds < 30000, "a child that outlives the timeout is reported and stopped: " + Refusal(r) + " " + late.ElapsedMilliseconds + " ms");
             Assert(Programs.InstallerCommandLine(@"C:\a b\s.exe", "REM\u2019+\u2019OVE=ALL") == "\"C:\\a b\\s.exe\" REM\u2019+\u2019OVE=ALL" && Programs.InstallerCommandLine(@"C:\s.exe", "") == "\"C:\\s.exe\"", "the command line is the quoted name and the text, untouched");
             r = relay.Call(Wire.Map("type", "programs", "action", "install", "path", Path.Combine(dir, "no-such-setup.msi"), "rules_tag", "g1"));
             Assert(Refusal(r).StartsWith("not_found:"), "an installer that is not there: " + Refusal(r));
@@ -3679,6 +3688,15 @@ public static class AppTests {
         if (args.Length == 2 && args[0] == "--sleep") { Thread.Sleep(int.Parse(args[1])); return 0; } // a stand-in program for the close tests
         if (args.Length == 2 && args[0] == "--exit") return int.Parse(args[1]); // a stand-in installer for the install tests
         if (args.Length >= 2 && args[0] == "--record") { File.WriteAllText(args[1], Environment.CommandLine, new UTF8Encoding(false)); return 0; } // a stand-in installer that keeps the command line it got
+        if (args.Length == 2 && args[0] == "--delayed") { Thread.Sleep(2000); File.WriteAllText(args[1], "done"); return 0; } // the child of --spawn-delayed
+        if (args.Length == 2 && args[0] == "--spawn-delayed") { // a stand-in installer that starts a child and exits at once
+            Process.Start(new ProcessStartInfo(System.Reflection.Assembly.GetExecutingAssembly().Location, "--delayed \"" + args[1] + "\"") { UseShellExecute = false, CreateNoWindow = true }).Dispose();
+            return 0;
+        }
+        if (args.Length == 1 && args[0] == "--spawn-sleep") { // the same, with a child that keeps running
+            Process.Start(new ProcessStartInfo(System.Reflection.Assembly.GetExecutingAssembly().Location, "--sleep 120000") { UseShellExecute = false, CreateNoWindow = true }).Dispose();
+            return 0;
+        }
         if (args.Length == 2 && args[0] == "--settle") { Thread.Sleep(250); File.WriteAllText(args[1], "done"); return 0; }
         string dir = Path.Combine(Path.GetTempPath(), "support-mcp-native-test-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
         try {

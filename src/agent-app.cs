@@ -255,15 +255,18 @@ namespace SupportMcp {
         public Dictionary<string, object> Run(string scriptPath, string cwd, int timeoutSeconds, WaitHandle stop, IntPtr token) {
             string exe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), @"WindowsPowerShell\v1.0\powershell.exe");
             string args = "\"" + exe + "\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -OutputFormat Text -File \"" + scriptPath + "\"";
-            return Execute(exe, args, cwd, timeoutSeconds, stop, token);
+            return Execute(exe, args, cwd, timeoutSeconds, stop, token, false);
         }
         // Runs one program in the Job with exactly this command line (its own name first, as CreateProcess wants it), as this
         // process's own account. No shell reads the text and no script holds it: what the program receives is what is given here.
-        // Throws Win32Exception when the program cannot be started.
+        // Throws Win32Exception when the program cannot be started. It waits for the whole process tree: an installer or an
+        // uninstaller may hand its work to a copy of itself or to a setup it starts, and exit at once. The call ends when the Job
+        // holds no process, or timed_out when that takes longer than timeoutSeconds (the Job is then closed, which stops what
+        // is left). The exit code is the first process's.
         public Dictionary<string, object> RunProgram(string exe, string commandLine, string cwd, int timeoutSeconds, WaitHandle stop) {
-            return Execute(exe, commandLine, cwd, timeoutSeconds, stop, IntPtr.Zero);
+            return Execute(exe, commandLine, cwd, timeoutSeconds, stop, IntPtr.Zero, true);
         }
-        Dictionary<string, object> Execute(string exe, string args, string cwd, int timeoutSeconds, WaitHandle stop, IntPtr token) {
+        Dictionary<string, object> Execute(string exe, string args, string cwd, int timeoutSeconds, WaitHandle stop, IntPtr token, bool wholeTree) {
             IntPtr outRead = IntPtr.Zero, outWrite = IntPtr.Zero, errRead = IntPtr.Zero, errWrite = IntPtr.Zero, input = IntPtr.Zero, env = IntPtr.Zero;
             ProcessInfo pi = new ProcessInfo();
             try {
@@ -292,10 +295,16 @@ namespace SupportMcp {
                     if (clock.ElapsedMilliseconds >= timeoutSeconds * 1000L) { timedOut = true; break; }
                 }
                 uint exit; Check(GetExitCodeProcess(process, out exit));
+                Accounting info;
+                // A program that waits for its tree: keep going until the Job is empty, within the time that is left.
+                while (wholeTree && !timedOut && QueryInformationJobObject(job, 1, out info, Marshal.SizeOf(typeof(Accounting)), IntPtr.Zero) && info.Active > 0) {
+                    if (clock.ElapsedMilliseconds >= timeoutSeconds * 1000L) timedOut = true;
+                    else if (stop.WaitOne(50)) throw new OperationCanceledException();
+                }
                 // PowerShell does not wait for a GUI program it starts, such as rundll32.exe user32.dll,LockWorkStation. Give what
                 // is left in the Job up to SettleMs to finish by itself, so it is not stopped before it did its work.
-                Accounting info; var settle = Stopwatch.StartNew();
-                while (!timedOut && settle.ElapsedMilliseconds < SettleMs && QueryInformationJobObject(job, 1, out info, Marshal.SizeOf(typeof(Accounting)), IntPtr.Zero) && info.Active > 0 && !stop.WaitOne(20)) { }
+                var settle = Stopwatch.StartNew();
+                while (!wholeTree && !timedOut && settle.ElapsedMilliseconds < SettleMs && QueryInformationJobObject(job, 1, out info, Marshal.SizeOf(typeof(Accounting)), IntPtr.Zero) && info.Active > 0 && !stop.WaitOne(20)) { }
                 Close(ref job); // then stop the descendants that are still running
                 WaitForSingleObject(process, 5000);
                 outReader.Join(5000); errReader.Join(5000);
@@ -1791,16 +1800,33 @@ namespace SupportMcp {
             return null;
         }
         // Why these installer arguments are refused, or null: they ask the installer to uninstall or to restart the PC, which
-        // other rules govern. Any installer also refuses the typographic quotation marks U+2018 to U+201E (a quote to PowerShell
-        // and to a reader, none to the installer; the arguments never go through PowerShell here, so this is a second line of
-        // defence). For an .msi (which msiexec runs as SYSTEM) also: the properties REMOVE=, ADVERTISE=, ADDSOURCE=, COMPADDSOURCE=,
-        // FILEADDSOURCE=, MSIPATCHREMOVE= and PATCH= (any case, quoted or not, spaces around the "=" or not), which take features
-        // off the PC or patch it (REMOVE=ALL on a product that is already installed uninstalls it, round the uninstall rule and
-        // the protected programs), and the msiexec switches that do something other than install this package: /x /uninstall
-        // /f.. /p /update /j.. /advertise /y /z. ADDLOCAL, ADDDEFAULT, REINSTALL, REINSTALLMODE, /a, /l and /q.. are left alone.
-        // Every check runs twice, once with each quote standing for a break and once with the quotes taken out (REM""OVE=ALL is
-        // REMOVE=ALL and /"f"a is /fa). Same as installArgsProblem in src/rules.js; the shared cases run on both.
-        const string MsiRemovingProperty = "(?:^|[\\s\"'`;&|,()/-])(?:remove|advertise|addsource|compaddsource|fileaddsource|msipatchremove|patch)[\"'`\\s]*=";
+        // other rules govern. Any installer also refuses control characters (the relay refuses them too, since this PC strips
+        // them before it checks) and the typographic quotation marks U+2018 to U+201E (a quote to PowerShell and to a reader,
+        // none to the installer; the arguments never go through PowerShell here, so this is a second line of defence).
+        // Letters are lower-cased as ASCII only and white space is the explicit set ArgSpace, the same on both sides (the
+        // framework's IsWhiteSpace and the relay's \s differ on U+FEFF, U+180E and U+0085). For an .msi (which msiexec runs as
+        // SYSTEM) also: any non-ASCII character (msiexec folds some to ASCII letters in a property name), any braced GUID (a
+        // package's own Upgrade-table properties take product codes and can make it remove another product), the properties
+        // REMOVE=, ADVERTISE=, ADDSOURCE=, COMPADDSOURCE=, FILEADDSOURCE=, MSIPATCHREMOVE= and PATCH= (any case, quoted or not,
+        // spaces around the "=" or not), which take features off the PC or patch it (REMOVE=ALL on a product that is already
+        // installed uninstalls it, round the uninstall rule and the protected programs), and the msiexec switches that do
+        // something other than install this package: /i /package /a (name another package) /x /uninstall /f.. /p /update
+        // /j.. /advertise /y /z and /l.. (a log file written anywhere as SYSTEM). ADDLOCAL, ADDDEFAULT, REINSTALL,
+        // REINSTALLMODE and /q.. are left alone. For an .msu: /extract and /log. Every check runs twice, once with each quote
+        // standing for a break and once with the quotes taken out (REM""OVE=ALL is REMOVE=ALL and /"f"a is /fa). Same as
+        // installArgsProblem in src/rules.js; the shared cases run on both.
+        const string ArgSpace = " \\t\\n\\v\\f\\r\\u0085\\u00a0\\u1680\\u180e\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff";
+        static readonly string MsiRemovingProperty = "(?:^|[" + ArgSpace + "\"'`;&|,()/-])(?:remove|advertise|addsource|compaddsource|fileaddsource|msipatchremove|patch)[\"'`" + ArgSpace + "]*=";
+        const string BracedGuid = "\\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\}";
+        static bool IsArgSpace(char ch) {
+            return ch == ' ' || (ch >= '\t' && ch <= '\r') || ch == '\u0085' || ch == '\u00a0' || ch == '\u1680' || ch == '\u180e' || (ch >= '\u2000' && ch <= '\u200a')
+                || ch == '\u2028' || ch == '\u2029' || ch == '\u202f' || ch == '\u205f' || ch == '\u3000' || ch == '\ufeff';
+        }
+        static string AsciiLower(string text) {
+            var b = new StringBuilder(text.Length);
+            foreach (char ch in text) b.Append(ch >= 'A' && ch <= 'Z' ? (char)(ch + 32) : ch);
+            return b.ToString();
+        }
         public static string InstallArgsProblem(string path, string args) {
             var parts = PathParts(path);
             string name = parts.Count > 0 ? parts[parts.Count - 1] : "";
@@ -1808,17 +1834,23 @@ namespace SupportMcp {
             bool windows = msi || name.EndsWith(".msu", StringComparison.Ordinal);
             string given = args ?? "";
             foreach (char ch in given) if (ch >= '\u2018' && ch <= '\u201e') return "installer arguments must not contain typographic quotation marks: use plain quotes or none";
-            string lower = given.ToLowerInvariant();
+            foreach (char ch in given) if (ch <= '\u001f' || (ch >= '\u007f' && ch <= '\u009f')) return "installer arguments must not contain control characters or line breaks";
+            if (msi) foreach (char ch in given) if (ch > '\u007f') return "installer arguments for an .msi must be ASCII only: msiexec reads some other letters as ASCII ones";
+            string lower = AsciiLower(given);
             string bare = lower.Replace("\"", "").Replace("'", "").Replace("`", "");
             if (msi && (System.Text.RegularExpressions.Regex.IsMatch(lower, MsiRemovingProperty) || System.Text.RegularExpressions.Regex.IsMatch(bare, MsiRemovingProperty)))
                 return "installer arguments must not remove or change other installed features (REMOVE, ADVERTISE, ADDSOURCE, PATCH): use uninstall_program";
-            return ArgTokenProblem(lower, "\"'`;&|,()", msi, windows) ?? ArgTokenProblem(bare, ";&|,()", msi, windows);
+            string switches = ArgTokenProblem(lower, "\"'`;&|,()", msi, windows) ?? ArgTokenProblem(bare, ";&|,()", msi, windows);
+            if (switches != null) return switches;
+            if (msi && (System.Text.RegularExpressions.Regex.IsMatch(lower, BracedGuid) || System.Text.RegularExpressions.Regex.IsMatch(bare, BracedGuid)))
+                return "installer arguments for an .msi must not hold a product code ({GUID}): a package property could make it remove another product";
+            return null;
         }
         // The switch checks over the words of text. breaks: the characters, besides white space, that end a word.
         static string ArgTokenProblem(string text, string breaks, bool msi, bool windows) {
             var token = new StringBuilder();
             foreach (char ch in text + " ") {
-                if (!(char.IsWhiteSpace(ch) || breaks.IndexOf(ch) >= 0)) { token.Append(ch); continue; }
+                if (!(IsArgSpace(ch) || breaks.IndexOf(ch) >= 0)) { token.Append(ch); continue; }
                 if (token.Length == 0) continue;
                 string t = token.ToString(); token.Length = 0;
                 if (t.Contains("forcerestart") || t.Contains("promptrestart") || t.Contains("warnrestart") || t.Contains("reboot=force")
@@ -1829,6 +1861,10 @@ namespace SupportMcp {
                 }
                 if (msi && (t[0] == '/' || t[0] == '-') && System.Text.RegularExpressions.Regex.IsMatch(t, "^[/-](?:f[pecmsodauv]*(?![a-z0-9])|(?:p|j[um]?|y|z)(?![a-z])|update|advertise)"))
                     return "installer arguments must not repair, patch, advertise or register other products: msiexec only installs this package";
+                if (msi && (t[0] == '/' || t[0] == '-') && System.Text.RegularExpressions.Regex.IsMatch(t, "^[/-](?:i|a|package)(?![a-z])"))
+                    return "installer arguments must not name another package (/i, /package, /a): msiexec only installs this package";
+                if ((t[0] == '/' || t[0] == '-') && ((msi && t.Length >= 2 && t[1] == 'l') || (windows && !msi && System.Text.RegularExpressions.Regex.IsMatch(t, "^[/-](?:extract|log)"))))
+                    return "installer arguments must not write log or extract files (/l, /log, /extract): they would be written anywhere as SYSTEM";
             }
             return null;
         }

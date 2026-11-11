@@ -379,23 +379,37 @@ export function installerProblem(path) {
 // Why these installer arguments are refused, or null: they ask the installer to uninstall, to restart the PC, or
 // (for an .msi, which msiexec runs as SYSTEM) to act on installed state that other rules govern. What an installer
 // does with its other arguments is its own; the PC also screens the text like a raw command (RunScreen).
-//   Refused for any installer: the typographic quotation marks U+2018 to U+201E. They are no quote to the installer,
-//   but they are one to PowerShell and to a person reading the text, so text that holds them is not what it looks like.
-//   (The PC passes the arguments to the installer on a command line it builds itself and puts none of the text in a
-//   script, so this is a second line of defence, not the only one.)
-//   Refused for an .msi: the properties REMOVE=, ADVERTISE=, ADDSOURCE=, COMPADDSOURCE=, FILEADDSOURCE=,
+//   Refused for any installer: control characters (the PC strips them before it checks, so the relay refuses them
+//   rather than check text the PC will not see), and the typographic quotation marks U+2018 to U+201E. They are no
+//   quote to the installer, but they are one to PowerShell and to a person reading the text, so text that holds them
+//   is not what it looks like. (The PC passes the arguments to the installer on a command line it builds itself and
+//   puts none of the text in a script, so this is a second line of defence, not the only one.)
+//   Letters are lower-cased as ASCII only, and white space is the explicit set ARG_SPACE on both sides (JS \s and
+//   .NET's IsWhiteSpace differ on U+FEFF, U+180E and U+0085), so the relay and the PC split the text the same way.
+//   Refused for an .msi: any non-ASCII character (msiexec folds some of them to ASCII letters in a property name, so
+//   MSIPATCHREMOVE can be spelled with a dotless i; all of the arguments are checked, not only names, since quote
+//   tracking is not reliable enough to leave values alone); any braced GUID (a package's own Upgrade-table
+//   properties, such as WIX_UPGRADE_DETECTED= or OLDPRODUCTS=, take product codes and make RemoveExistingProducts
+//   uninstall another product); the properties REMOVE=, ADVERTISE=, ADDSOURCE=, COMPADDSOURCE=, FILEADDSOURCE=,
 //   MSIPATCHREMOVE= and PATCH= (any case, quoted or not, spaces around the "=" or not), which take features off the PC
 //   or apply patches to it: REMOVE=ALL on a product that is already installed uninstalls it, round the uninstall rule
-//   and the protected programs. And the msiexec switches that do something other than install this package: /x and
-//   /uninstall (remove), /f.. (repair or reinstall a named product), /p and /update (patch a product), /j.. and
-//   /advertise (advertise instead of install), /y and /z (register or unregister a module). Left alone: ADDLOCAL,
-//   ADDDEFAULT, REINSTALL and REINSTALLMODE (they add or redo what this package installs, and take nothing off),
-//   /a (an administrative copy), /l (log), /q.., /passive.
+//   and the protected programs; and the msiexec switches that do something other than install this package: /i and
+//   /package (name another package), /a (an administrative copy of one), /x and /uninstall (remove), /f.. (repair or
+//   reinstall a named product), /p and /update (patch a product), /j.. and /advertise (advertise instead of install),
+//   /y and /z (register or unregister a module), and /l.. (a log file written anywhere as SYSTEM). Left alone:
+//   ADDLOCAL, ADDDEFAULT, REINSTALL, REINSTALLMODE, /q.., /passive.
+//   Refused for an .msu (wusa runs as SYSTEM too): /extract and /log, which write files anywhere.
 // Every check runs twice, once with each quote standing for a break and once with the quotes taken out, since a quote in
 // the middle of a name does not break it for the command line (REM""OVE=ALL is REMOVE=ALL, /"f"a is /fa).
 // The PC's Rules.InstallArgsProblem is the same check, and the shared installers cases run on both.
-const MSI_REMOVING_PROPERTY = /(?:^|[\s"'`;&|,()\/-])(?:remove|advertise|addsource|compaddsource|fileaddsource|msipatchremove|patch)["'`\s]*=/;
+const ARG_SPACE = ' \\t\\n\\v\\f\\r\\u0085\\u00a0\\u1680\\u180e\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff';
+const MSI_REMOVING_PROPERTY = new RegExp(`(?:^|[${ARG_SPACE}"'\`;&|,()/-])(?:remove|advertise|addsource|compaddsource|fileaddsource|msipatchremove|patch)["'\`${ARG_SPACE}]*=`);
+const ARG_BREAKS_QUOTED = new RegExp(`[${ARG_SPACE}"'\`;&|,()]+`);
+const ARG_BREAKS_BARE = new RegExp(`[${ARG_SPACE};&|,()]+`);
+const BRACED_GUID = /\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}/;
 const TYPOGRAPHIC_QUOTE = /[\u2018-\u201e]/;
+const ARG_CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
+const asciiLower = (text) => text.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
 function argTokenProblem(tokens, msi, windows) {
   for (const raw of tokens) {
     if (!raw) continue;
@@ -404,6 +418,8 @@ function argTokenProblem(tokens, msi, windows) {
     if (msi && (/^[/-]f[pecmsodauv]*(?![a-z0-9])/.test(raw) || /^[/-](?:p|j[um]?|y|z)(?![a-z])/.test(raw) || /^[/-](?:update|advertise)/.test(raw))) {
       return 'installer arguments must not repair, patch, advertise or register other products: msiexec only installs this package';
     }
+    if (msi && /^[/-](?:i|a|package)(?![a-z])/.test(raw)) return 'installer arguments must not name another package (/i, /package, /a): msiexec only installs this package';
+    if ((msi && /^[/-]l/.test(raw)) || (windows && !msi && /^[/-](?:extract|log)/.test(raw))) return 'installer arguments must not write log or extract files (/l, /log, /extract): they would be written anywhere as SYSTEM';
   }
   return null;
 }
@@ -413,12 +429,19 @@ export function installArgsProblem(path, args) {
   const windows = msi || name.endsWith('.msu');
   const raw = String(args ?? '');
   if (TYPOGRAPHIC_QUOTE.test(raw)) return 'installer arguments must not contain typographic quotation marks: use plain quotes or none';
-  const text = raw.toLowerCase();
+  if (ARG_CONTROL.test(raw)) return 'installer arguments must not contain control characters or line breaks';
+  if (msi && /[^\u0000-\u007f]/.test(raw)) return 'installer arguments for an .msi must be ASCII only: msiexec reads some other letters as ASCII ones';
+  const text = asciiLower(raw);
   const bare = text.replace(/["'`]/g, '');
   if (msi && (MSI_REMOVING_PROPERTY.test(text) || MSI_REMOVING_PROPERTY.test(bare))) {
     return 'installer arguments must not remove or change other installed features (REMOVE, ADVERTISE, ADDSOURCE, PATCH): use uninstall_program';
   }
-  return argTokenProblem(text.split(/[\s"'`;&|,()]+/), msi, windows) ?? argTokenProblem(bare.split(/[\s;&|,()]+/), msi, windows);
+  const switches = argTokenProblem(text.split(ARG_BREAKS_QUOTED), msi, windows) ?? argTokenProblem(bare.split(ARG_BREAKS_BARE), msi, windows);
+  if (switches) return switches;
+  if (msi && (BRACED_GUID.test(text) || BRACED_GUID.test(bare))) {
+    return 'installer arguments for an .msi must not hold a product code ({GUID}): a package property could make it remove another product';
+  }
+  return null;
 }
 
 // ---- the decision -------------------------------------------------------------------

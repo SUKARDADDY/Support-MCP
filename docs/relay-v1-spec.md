@@ -1719,8 +1719,19 @@ breaks, since the PC strips them) must not ask for a restart (`/forcerestart`, `
 `.msi` or `.msu`, an uninstall (`/x`, `/uninstall`). For an `.msi` (msiexec runs it as SYSTEM) `args` must also not remove or change
 other installed state: the properties `REMOVE=`, `ADVERTISE=` and `ADDSOURCE=` (any case, quoted or not, spaces around the `=` or not;
 `REMOVE=ALL` on a product that is already installed would uninstall it round the uninstall rule and the protected programs), and the
-msiexec switches `/f..` (repair), `/p` and `/update` (patch), `/j..` and `/advertise`, `/y` and `/z`. `ADDLOCAL`, `ADDDEFAULT`,
-`REINSTALL`, `REINSTALLMODE`, `/a`, `/l` and `/q..` are left alone: they take nothing off. These are plain errors (not coded) and spend no approval. The PC also runs its
+msiexec switches `/f..` (repair), `/p` and `/update` (patch), `/j..` and `/advertise`, `/y` and `/z`, `/i` and `/package` (another
+package), `/a` (an administrative copy) and `/l..` (a log file written anywhere as SYSTEM). It must also hold no braced GUID
+(`{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}`, any case: a package's own Upgrade-table properties such as `WIX_UPGRADE_DETECTED=` or
+`OLDPRODUCTS=` take product codes and can make msiexec uninstall another product) and no non-ASCII character anywhere (msiexec folds
+some letters, such as a dotless i, to ASCII ones in a property name; values are not exempt, since quote tracking is not reliable
+enough). For an `.msu`, `/extract` and `/log` are refused. For every installer, control characters (the PC strips them before it
+checks, so the relay refuses them instead of checking different text) and the typographic quotes U+2018 to U+201E are refused.
+Letters are lower-cased as ASCII only and white space is one explicit set on both sides (space, U+0009 to U+000D, U+0085, U+00A0,
+U+1680, U+180E, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F, U+3000, U+FEFF), since JavaScript's `\s` and .NET's `IsWhiteSpace`
+differ on some of them. `ADDLOCAL`, `ADDDEFAULT`, `REINSTALL`, `REINSTALLMODE` and `/q..` are left alone: they take nothing off.
+The PC waits for the installer's whole process tree (a kill-on-close Job), not only the first process: the call returns when the
+Job holds no process, and an installer that has not finished within `timeout_s` is reported as not finished and its processes are
+stopped. The exit code is the first process's. These are plain errors (not coded) and spend no approval. The PC also runs its
 raw-command screen over the path and arguments (below), so a restart or shutdown verb, a protected name or the Support app named
 there is refused. An `.msi` runs through `msiexec /i`, an `.msu` through `wusa.exe`, an `.exe` as given.
 
