@@ -1324,8 +1324,10 @@ the restart and program tools (`not_saved_pc`). Bullets say what holds, and what
   arguments, so it would defeat the restart and uninstall rules if it ran anything. It accepts
   only a `.msi`, `.msu` or `.exe` on a local drive that is not in a `Windows` folder and is not named
   as a Windows tool (`shutdown.exe`, `msiexec.exe`, `wusa.exe`, `cmd.exe`, `powershell.exe` and the
-  like, by file name, wherever it sits), and refuses arguments that ask for a restart or, for an
-  `.msi` or `.msu`, an uninstall. It refuses before an approval is asked, on the relay, and again on the
+  like, by file name, wherever it sits) or as an uninstaller (an `.exe` whose name starts with `unins`
+  or holds `uninst`, such as `unins000.exe` or `Uninstall.exe`). It refuses arguments that ask for a
+  restart, and for any installer the uninstall switches `/uninstall`, `/removeonly` and `/x`, after
+  `/`, `-` or `--`. It refuses before an approval is asked, on the relay, and again on the
   PC, where the raw-command screen also reads the path and the arguments. What a vendor's `.exe`
   does with its own other arguments is its own: the checks are a guardrail there, like the screen.
   An uninstall by a program's own `QuietUninstallString` is screened the same way, and the Support

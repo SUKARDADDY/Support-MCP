@@ -245,6 +245,27 @@ test('install_program runs only installers: other files, the Windows folder, sys
   }
 });
 
+test('install_program is not a way round uninstall=never: a vendor .exe told to uninstall, or an uninstaller by name, never reaches the PC', async (t) => {
+  const w = await agentWorld(t);
+  const { sid, frames, session } = await savedPc(w, t);
+  await setRules(w, { ...ALLOW, install: 'allow', uninstall: 'never' });
+  for (const [args, match] of [
+    [{ path: 'C:\\Program Files\\Vendor\\setup.exe', args: '/uninstall /S' }, /must not uninstall/],
+    [{ path: 'C:\\Program Files\\Vendor\\setup.exe', args: '--uninstall' }, /must not uninstall/],
+    [{ path: 'C:\\Program Files\\Vendor\\setup.exe', args: '/s /x' }, /must not uninstall/],
+    [{ path: 'C:\\Program Files\\Vendor\\setup.exe', args: '/removeonly' }, /must not uninstall/],
+    [{ path: 'C:\\Program Files\\Vendor\\unins000.exe', args: '/SILENT' }, /uninstaller/],
+    [{ path: 'C:\\Program Files\\Vendor\\Uninstall.exe', args: '/S' }, /uninstaller/],
+  ]) {
+    const r = await w.tool(TECH, 'install_program', { session_id: sid, ...args });
+    assert.match(r.error, match, JSON.stringify(args));
+    assert.equal(session().approval ?? null, null, `no approval was asked for ${JSON.stringify(args)}`);
+  }
+  assert.equal(frames.length, 0);
+  assert.equal((await w.tool(TECH, 'install_program', { session_id: sid, path: 'C:\\Program Files\\Vendor\\setup.exe', args: '/S' })).ok, true);
+  assert.equal(frames.length, 1);
+});
+
 test('the Support app cannot be closed, uninstalled or written to through its own tools, whatever the rules say', async (t) => {
   const w = await agentWorld(t);
   const { sid, frames } = await savedPc(w, t);

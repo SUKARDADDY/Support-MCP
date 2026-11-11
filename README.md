@@ -524,7 +524,8 @@ database, before anything reaches it. The answer is one of three:
 The built-in agent has the same six tools, follows the same rules, and waits for approval
 the same way. `put_file` and `get_file` are checked against the protected folders only.
 `install_program` runs only installers (`.msi`, `.msu` or `.exe`, not in the Windows folder, never
-a Windows tool such as `shutdown.exe` or `msiexec.exe`) and refuses arguments that restart or uninstall,
+a Windows tool such as `shutdown.exe` or `msiexec.exe`, never an uninstaller such as `unins000.exe`)
+and refuses arguments that restart or uninstall,
 so it is not a way round the restart and uninstall rules.
 
 **The PC enforces them too.** Every check-in answer carries the rules in force for that

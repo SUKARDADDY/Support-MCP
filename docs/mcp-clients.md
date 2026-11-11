@@ -193,7 +193,8 @@ in a session on a saved PC. A one-off link refuses them with `not_saved_pc`.
   (`name`, `pid`, `session`). Take the ids from it.
 - `install_program` takes `{session_id, path, args?, timeout_s?}`: `path` is an installer
   that is already on the PC (send it with `put_file`), `.msi`, `.msu` or `.exe`, not in the Windows
-  folder and never a Windows tool such as `shutdown.exe` or `msiexec.exe`; `args` is at most 1,000
+  folder, never a Windows tool such as `shutdown.exe` or `msiexec.exe` and never an uninstaller
+  such as `unins000.exe` or `Uninstall.exe`; `args` is at most 1,000
   characters with no line breaks, and arguments that restart the PC or uninstall are refused (use
   `restart_pc` and `uninstall_program`). `uninstall_program`
   takes `{session_id, program_id, timeout_s?}`. `timeout_s` is 10 to 600, default 300. Both

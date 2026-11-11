@@ -1798,18 +1798,21 @@ namespace SupportMcp {
             "wmic", "certutil", "bitsadmin", "cmstp", "msbuild", "installutil", "forfiles", "runas", "takeown", "icacls", "cacls", "vssadmin",
             "wevtutil", "wsl", "bash", "logoff", "tsdiscon", "psexec", "psexec64" };
         // Why a file may not be run by install_program, or null: only .msi, .msu and .exe installers, none in the Windows
-        // folder (on any drive) and none named as a system tool.
+        // folder (on any drive), none named as a system tool, and none named as an uninstaller (an .exe whose name starts
+        // with unins or holds uninst, such as unins000.exe or Uninstall.exe, removes a program, round the uninstall rule).
         public static string InstallerProblem(string path) {
             var parts = PathParts(path);
             string name = parts.Count > 0 ? parts[parts.Count - 1] : "";
             if (!(name.EndsWith(".msi", StringComparison.Ordinal) || name.EndsWith(".msu", StringComparison.Ordinal) || name.EndsWith(".exe", StringComparison.Ordinal))) return "install_program runs only .msi, .msu or .exe installers";
             if (parts.Count > 1 && parts[1] == "windows") return "install_program does not run files from the Windows folder";
             if (name.EndsWith(".exe", StringComparison.Ordinal) && Array.IndexOf(SystemTools, name.Substring(0, name.Length - 4)) >= 0) return "install_program does not run " + name + ": it is a Windows tool, not an installer";
+            if (name.EndsWith(".exe", StringComparison.Ordinal) && (name.StartsWith("unins", StringComparison.Ordinal) || name.Contains("uninst"))) return "install_program does not run " + name + ": it is an uninstaller. Use uninstall_program";
             return null;
         }
         // Why these installer arguments are refused, or null: they ask the installer to uninstall or to restart the PC, which
-        // other rules govern. Any installer also refuses control characters (the relay refuses them too, since this PC strips
-        // them before it checks) and the typographic quotation marks U+2018 to U+201E (a quote to PowerShell and to a reader,
+        // other rules govern. Any installer refuses the uninstall switches /uninstall.., /removeonly.. and /x (not /xml), each
+        // with a /, - or -- in front (setup.exe /uninstall, InstallShield's /x and /removeonly). Any installer also refuses
+        // control characters (the relay refuses them too, since this PC strips them before it checks) and the typographic quotation marks U+2018 to U+201E (a quote to PowerShell and to a reader,
         // none to the installer; the arguments never go through PowerShell here, so this is a second line of defence).
         // An .msi or .msu (run as SYSTEM) also refuses any non-ASCII character (msiexec folds some to ASCII letters in a property
         // name), and an .msi any REBOOT= value that starts with F (MSI reads only the first letter, so REBOOT=F is Force).
@@ -1869,9 +1872,11 @@ namespace SupportMcp {
                 string t = token.ToString(); token.Length = 0;
                 if (t.Contains("forcerestart") || t.Contains("promptrestart") || t.Contains("warnrestart") || t.Contains("reboot=force")
                     || ((t[0] == '/' || t[0] == '-') && (t.Substring(1) == "restart" || t.Substring(1) == "reboot"))) return RestartProblem;
-                if (windows && (t[0] == '/' || t[0] == '-')) {
-                    if (t.Substring(1).StartsWith("uninstall", StringComparison.Ordinal)) return "installer arguments must not uninstall a program: use uninstall_program";
-                    if (t.Length >= 2 && t[1] == 'x' && (t.Length == 2 || !(t[2] >= 'a' && t[2] <= 'z'))) return "installer arguments must not uninstall a program: use uninstall_program";
+                if (t[0] == '/' || t[0] == '-') {
+                    // The switch's name after its /, - or --.
+                    string sw = t.StartsWith("--", StringComparison.Ordinal) ? t.Substring(2) : t.Substring(1);
+                    if (sw.StartsWith("uninstall", StringComparison.Ordinal) || sw.StartsWith("removeonly", StringComparison.Ordinal)) return "installer arguments must not uninstall a program: use uninstall_program";
+                    if (sw.Length >= 1 && sw[0] == 'x' && (sw.Length == 1 || !(sw[1] >= 'a' && sw[1] <= 'z'))) return "installer arguments must not uninstall a program: use uninstall_program";
                 }
                 if (msi && (t[0] == '/' || t[0] == '-') && System.Text.RegularExpressions.Regex.IsMatch(t, "^[/-](?:f[pecmsodauv]*(?![a-z0-9])|(?:p|j[um]?|y|z)(?![a-z])|update|advertise)"))
                     return "installer arguments must not repair, patch, advertise or register other products: msiexec only installs this package";

@@ -320,6 +320,22 @@
     {"name":"wusa /extract writes files anywhere","path":"C:\\Temp\\a.msu","args":"/extract:C:\\Temp\\out","problem":true},
     {"name":"wusa /log writes a file anywhere","path":"C:\\Temp\\a.msu","args":"/quiet /log:C:\\Temp\\a.evtx","problem":true},
     {"name":"wusa /Extract in capitals","path":"C:\\Temp\\a.msu","args":"/Extract:C:\\Temp\\out","problem":true},
-    {"name":"wusa /quiet /norestart","path":"C:\\Temp\\a.msu","args":"/quiet /norestart","problem":false}
+    {"name":"wusa /quiet /norestart","path":"C:\\Temp\\a.msu","args":"/quiet /norestart","problem":false},
+    {"name":"an .exe told to uninstall: /uninstall","path":"C:\\Program Files\\Vendor\\setup.exe","args":"/uninstall /S","problem":true},
+    {"name":"an .exe told to uninstall: -uninstall","path":"C:\\Temp\\Setup.exe","args":"-uninstall -silent","problem":true},
+    {"name":"an .exe told to uninstall: --uninstall","path":"C:\\Temp\\Setup.exe","args":"--uninstall","problem":true},
+    {"name":"an .exe told to uninstall: /x","path":"C:\\Temp\\Setup.exe","args":"/s /x","problem":true},
+    {"name":"an .exe told to uninstall: -X in capitals","path":"C:\\Temp\\Setup.exe","args":"-X","problem":true},
+    {"name":"an .exe told to uninstall: --x","path":"C:\\Temp\\Setup.exe","args":"--x","problem":true},
+    {"name":"an .exe told to uninstall: /removeonly","path":"C:\\Temp\\Setup.exe","args":"/s /removeonly","problem":true},
+    {"name":"an .exe told to uninstall: a quoted /\"uninstall\"","path":"C:\\Temp\\Setup.exe","args":"/\"uninstall\" /S","problem":true},
+    {"name":"an .msu told to uninstall: --uninstall","path":"C:\\Temp\\a.msu","args":"--uninstall /kb:1","problem":true},
+    {"name":"an uninstaller by name: unins000.exe","path":"C:\\Program Files\\Vendor\\unins000.exe","args":"/SILENT","problem":true},
+    {"name":"an uninstaller by name: uninst.exe","path":"C:\\Temp\\uninst.exe","args":"/S","problem":true},
+    {"name":"an uninstaller by name: Uninstall.exe in any case","path":"C:\\Program Files\\Vendor\\Uninstall.exe","args":"/S","problem":true},
+    {"name":"an uninstaller by name: a name that holds uninstall","path":"C:\\Temp\\Vendor-Uninstaller.exe","args":"","problem":true},
+    {"name":"a vendor .exe run silent still installs","path":"C:\\Program Files\\Vendor\\setup.exe","args":"/S","problem":false},
+    {"name":"a switch that only starts with x is not /x","path":"C:\\Temp\\Setup.exe","args":"/S /xyz -xml=C:\\a.xml","problem":false},
+    {"name":"a name that only holds install is an installer","path":"C:\\Temp\\app-install.exe","args":"/S","problem":false}
   ]
 }

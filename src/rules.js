@@ -365,20 +365,24 @@ export function localAbsolutePath(path) {
 }
 
 // Why a file may not be run by install_program, or null. Only .msi, .msu and .exe installers, and none in the
-// Windows folder (on any drive) or named as a system tool. The PC checks the same, and its own Windows folder
-// with links resolved besides.
+// Windows folder (on any drive), named as a system tool, or named as an uninstaller: an .exe whose name starts
+// with unins (unins000.exe, uninst.exe) or holds uninst (Uninstall.exe, app-uninstaller.exe) removes a program,
+// round the uninstall rule. The PC checks the same, and its own Windows folder with links resolved besides.
 export function installerProblem(path) {
   const parts = pathParts(path);
   const name = parts.at(-1) ?? '';
   if (!/\.(?:msi|msu|exe)$/.test(name)) return 'install_program runs only .msi, .msu or .exe installers';
   if (parts.length > 1 && parts[1] === 'windows') return 'install_program does not run files from the Windows folder';
   if (name.endsWith('.exe') && SYSTEM_TOOLS.includes(name.slice(0, -4))) return `install_program does not run ${name}: it is a Windows tool, not an installer`;
+  if (name.endsWith('.exe') && (name.startsWith('unins') || name.includes('uninst'))) return `install_program does not run ${name}: it is an uninstaller. Use uninstall_program`;
   return null;
 }
 
 // Why these installer arguments are refused, or null: they ask the installer to uninstall, to restart the PC, or
 // (for an .msi, which msiexec runs as SYSTEM) to act on installed state that other rules govern. What an installer
 // does with its other arguments is its own; the PC also screens the text like a raw command (RunScreen).
+//   Refused for any installer: the uninstall switches /uninstall.., /removeonly.. and /x (not /xml), each with a
+//   /, - or -- in front (setup.exe /uninstall, InstallShield's /x and /removeonly, msiexec's /x).
 //   Refused for any installer: control characters (the PC strips them before it checks, so the relay refuses them
 //   rather than check text the PC will not see), and the typographic quotation marks U+2018 to U+201E. They are no
 //   quote to the installer, but they are one to PowerShell and to a person reading the text, so text that holds them
@@ -419,7 +423,7 @@ function argTokenProblem(tokens, msi, windows) {
   for (const raw of tokens) {
     if (!raw) continue;
     if (/forcerestart|promptrestart|warnrestart|reboot=force/.test(raw) || /^[/-](?:restart|reboot)$/.test(raw)) return RESTART_PROBLEM;
-    if (windows && (/^[/-]uninstall/.test(raw) || /^[/-]x(?![a-z])/.test(raw))) return 'installer arguments must not uninstall a program: use uninstall_program';
+    if (/^(?:--|[/-])(?:uninstall|removeonly)/.test(raw) || /^(?:--|[/-])x(?![a-z])/.test(raw)) return 'installer arguments must not uninstall a program: use uninstall_program';
     if (msi && (/^[/-]f[pecmsodauv]*(?![a-z0-9])/.test(raw) || /^[/-](?:p|j[um]?|y|z)(?![a-z])/.test(raw) || /^[/-](?:update|advertise)/.test(raw))) {
       return 'installer arguments must not repair, patch, advertise or register other products: msiexec only installs this package';
     }
