@@ -2022,9 +2022,12 @@ function decodePrograms(b, action) {
     });
     return { ok: true, installed, running };
   }
+  // A close may also say how many programs it could not close (still_running), and an install or uninstall what
+  // the installer wrote to its error output or what was stopped after it (detail). Both are passed on when present.
   if (action === 'close') {
     if (!Number.isSafeInteger(b.closed) || b.closed < 0) throw new Error('bad closed');
-    return { ok: true, closed: b.closed };
+    return { ok: true, closed: b.closed, ...(Number.isSafeInteger(b.still_running) && b.still_running > 0 ? { still_running: b.still_running } : {}) };
   }
-  return { ok: true, exit_code: Number.isInteger(b.exit_code) ? b.exit_code : null };
+  const detail = typeof b.detail === 'string' && b.detail ? { detail: truncate(b.detail, 300) } : {};
+  return { ok: true, exit_code: Number.isInteger(b.exit_code) ? b.exit_code : null, ...detail };
 }

@@ -198,8 +198,10 @@ in a session on a saved PC. A one-off link refuses them with `not_saved_pc`.
   characters with no line breaks, and arguments that restart the PC or uninstall are refused (use
   `restart_pc` and `uninstall_program`). `uninstall_program`
   takes `{session_id, program_id, timeout_s?}`. `timeout_s` is 10 to 600, default 300. Both
-  return `{ok, exit_code}` and run as SYSTEM, so the PC must be set to full control.
-- `close_program` takes `{session_id, name | pid, force?}` and returns `{ok, closed}`. Without
+  return `{ok, exit_code}`, with a `detail` note when the installer wrote an error or left
+  processes that were stopped, and run as SYSTEM, so the PC must be set to full control.
+- `close_program` takes `{session_id, name | pid, force?}` and returns `{ok, closed}`, with
+  `still_running` when some of them did not close. Without
   `force` it asks the program to close. With it, the program ends at once and unsaved work is
   lost. The Support app's own processes are never closed (`protected_program`).
 

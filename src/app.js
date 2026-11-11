@@ -245,17 +245,17 @@ function makeBackend(env, origin, devTtlMs, actor, workspace, via = null, taskId
     async install_program(args) {
       const r = await cmd(args.session_id, { op: 'programs', action: 'install', path: args.path, args: args.args, timeout_s: args.timeout_s });
       if (r.ok === false) throw new Error(r.error || 'install_program failed');
-      return { ok: true, exit_code: r.exit_code ?? null };
+      return { ok: true, exit_code: r.exit_code ?? null, ...(r.detail ? { detail: r.detail } : {}) };
     },
     async uninstall_program(args) {
       const r = await cmd(args.session_id, { op: 'programs', action: 'uninstall', program_id: args.program_id, timeout_s: args.timeout_s });
       if (r.ok === false) throw new Error(r.error || 'uninstall_program failed');
-      return { ok: true, exit_code: r.exit_code ?? null };
+      return { ok: true, exit_code: r.exit_code ?? null, ...(r.detail ? { detail: r.detail } : {}) };
     },
     async close_program(args) {
       const r = await cmd(args.session_id, { op: 'programs', action: 'close', name: args.name, pid: args.pid, force: args.force });
       if (r.ok === false) throw new Error(r.error || 'close_program failed');
-      return { ok: true, closed: r.closed ?? 0 };
+      return { ok: true, closed: r.closed ?? 0, ...(r.still_running ? { still_running: r.still_running } : {}) };
     },
     // args.action is already normalized by mcp.js; the Session checks it again.
     async screen(args) {

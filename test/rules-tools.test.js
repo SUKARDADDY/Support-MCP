@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { agentWorld, BOSS, TECH, VIEW } from './agent-world.js';
 import { attachedLink } from './people-world.js';
-import { HOURS, asking, enrol, fresh, savedPc, setRules } from './rules-world.js';
+import { HOURS, answerFrame, asking, enrol, fresh, savedPc, setRules } from './rules-world.js';
 import { REFUSAL_CODES, listTools } from '../src/mcp.js';
 import { permissionForTool } from '../src/permissions.js';
 
@@ -85,6 +85,20 @@ test('the delay is brought into 5 to 600 seconds, and a list, an install, an uni
   assert.deepEqual([c1.action, c1.name, c1.pid, c1.force], ['close', 'OUTLOOK.EXE', undefined, true]);
   assert.deepEqual([c2.action, c2.name, c2.pid, c2.force], ['close', undefined, 4120, false]);
   for (const f of [i, u, c1, c2]) assert.ok(f.rules_tag && f.decided_at, f.action);
+});
+
+test("the PC's detail for an install or uninstall, and still_running for a close, reach the caller", async (t) => {
+  const w = await agentWorld(t);
+  const handler = (frame) => frame.type === 'programs'
+    ? { install: { exit_code: 1603, detail: '1 process it started was still running and was stopped' }, uninstall: { exit_code: 0, detail: 'x'.repeat(400) }, close: { closed: 1, still_running: 2 } }[frame.action] ?? answerFrame(frame)
+    : answerFrame(frame);
+  const { sid } = await savedPc(w, t, { handler });
+  await setRules(w, ALLOW);
+  assert.deepEqual(await w.tool(TECH, 'install_program', { session_id: sid, path: 'C:\\Temp\\setup.msi' }), { ok: true, exit_code: 1603, detail: '1 process it started was still running and was stopped' });
+  const u = await w.tool(TECH, 'uninstall_program', { session_id: sid, program_id: 'acrobat' });
+  assert.equal(u.exit_code, 0);
+  assert.ok(u.detail.startsWith('xxx') && u.detail.length <= 301, 'the text from the PC is clipped');
+  assert.deepEqual(await w.tool(TECH, 'close_program', { session_id: sid, name: 'OUTLOOK.EXE' }), { ok: true, closed: 1, still_running: 2 });
 });
 
 test('a bad call is refused with what to fix, before anything is queued', async (t) => {
