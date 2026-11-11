@@ -362,6 +362,23 @@ test('a customer override changes only that customer\'s PCs, rings only them, an
   assert.equal(a.bell.sent.length, 1);
 });
 
+test('a removal that cannot be done is refused before the code is spent', async (t) => {
+  const w = await ready(t);
+  const a = await customerWithPc(w);
+  const b = await customerWithPc(w, 'Bravo Ltd');
+  assert.equal((await save(w, BOSS, a.customer, { restart: 'never' }, 0)).status, 200);
+  const code = await fresh(w);
+  const stale = await w.api(BOSS, 'DELETE', `/rules/${a.customer}`, { rev: 0, code });
+  assert.deepEqual([stale.status, stale.body.error.code], [409, 'stale']);
+  const unknown = await w.api(BOSS, 'DELETE', `/rules/${'z'.repeat(20)}`, { rev: 1, code });
+  assert.deepEqual([unknown.status, unknown.body.error.code], [404, 'not_found']);
+  // Nothing to remove is no change, and spends nothing either.
+  assert.equal((await w.api(BOSS, 'DELETE', `/rules/${b.customer}`, { rev: 0, code })).status, 200);
+  // The code still works.
+  assert.equal((await w.api(BOSS, 'DELETE', `/rules/${a.customer}`, { rev: 1, code })).status, 200);
+  assert.equal((await w.api(BOSS, 'GET', `/rules/${a.customer}`)).body.effective.restart, DEFAULTS.restart);
+});
+
 test('an override is judged with the team\'s rules, may not name a customer that is not there, and goes with its customer', async (t) => {
   const w = await ready(t);
   const a = await customerWithPc(w);

@@ -122,15 +122,24 @@ export function rulesStore(db, team, { defaultTimeZone = '' } = {}) {
     });
   }
 
+  // Read the override a removal is judged against, and refuse what cannot be removed: a customer that does
+  // not exist (404) or a stale rev (409; rev, when given, is the revision the caller read). Both the route
+  // (before it spends the person's code) and the guarded change (on each attempt) call it. Returns the
+  // override's row, or null when there is none.
+  async function checkRemove(slug, customerId, rev = null) {
+    if (!(await customerExists(slug, customerId))) throw new TeamError(404, 'not_found', 'no such customer');
+    const cur = await readRow(slug, customerId);
+    if (rev !== null && (cur?.rev ?? 0) !== rev) throw stale();
+    return cur ?? null;
+  }
+
   // Remove a customer's override, so the customer has the team's rules again. rev, when given, is the
   // revision the caller read. Needs rules.manage. Returns { changed: false } when there was none.
   async function removeOverride(slug, actorIdentity, customerId, rev = null) {
     const actor = normalizeIdentity(actorIdentity);
     return mutate(slug, actor, async () => {
       const ctx = await actorContext(slug, actor, 'rules.manage');
-      if (!(await customerExists(slug, customerId))) throw new TeamError(404, 'not_found', 'no such customer');
-      const cur = await readRow(slug, customerId);
-      if (rev !== null && (cur?.rev ?? 0) !== rev) throw stale();
+      const cur = await checkRemove(slug, customerId, rev);
       if (!cur) return { noop: true, result: { changed: false } };
       const fields = Object.keys(parseStored(cur.doc, { override: true }));
       return {
@@ -150,7 +159,7 @@ export function rulesStore(db, team, { defaultTimeZone = '' } = {}) {
     return results.map((r) => r.id);
   }
 
-  return { listAll, readCustomer, check, save, removeOverride, customerDevices };
+  return { listAll, readCustomer, check, save, checkRemove, removeOverride, customerDevices };
 }
 
 export const rulesFromEnv = (env, team) => rulesStore(env.DB, team, { defaultTimeZone: env.DEFAULT_TIME_ZONE });

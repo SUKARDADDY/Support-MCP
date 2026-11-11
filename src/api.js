@@ -412,6 +412,9 @@ export async function handleApi(request, env, url, { accessCaller, isJsonContent
       const revSent = Object.hasOwn(body, 'rev');
       if (revSent && (!Number.isSafeInteger(body.rev) || body.rev < 0)) throw new TeamError(400, 'bad_request', 'rev must be the revision you read, a whole number from 0');
       if (method === 'DELETE') {
+        // What cannot be removed (no such customer, a stale rev) is refused before the person's code is spent on
+        // it, and removing an override that is not there changes nothing and spends no code.
+        if (!(await rules.checkRemove(slug, customerId, revSent ? body.rev : null))) return json({ removed: { customer_id: customerId } });
         await needFreshCode(env, caller, app, body.code);
         const removed = await rules.removeOverride(slug, caller, customerId, revSent ? body.rev : null);
         if (removed.changed) await ringRules(env, rules, slug, customerId);

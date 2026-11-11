@@ -1636,7 +1636,9 @@ authenticator code in the body (below). While `default` is open a write is 409 `
 Other methods are 405. `rev` must be a whole number from 0; a `PATCH` without it is 400. A `rev` that
 is not the current one is 409 `stale`. A document that fails the checks above, an override that would leave an hour
 rule with no hours from the team or itself, and a customer that does not exist are refused before the code is checked,
-so a code is not spent on a save that cannot happen. A document equal to the stored one changes nothing.
+so a code is not spent on a save that cannot happen. A `DELETE` for a customer that does not exist (404) or with a stale
+`rev` (409) is refused the same way, and a `DELETE` of an override that is not there changes nothing and checks no code.
+A document equal to the stored one changes nothing.
 A save is one guarded change: the log row `rules_changed` (detail `team: <field names>` or `customer <id>: <field names>`;
 never a value), the write, the actor's `rules.manage` and the revisions read all commit together.
 After a change the relay rings the PCs it reaches, best effort: the team's rules ring every PC of the team
