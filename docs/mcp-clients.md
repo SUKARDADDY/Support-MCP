@@ -86,16 +86,19 @@ In `~/.codex/config.toml`:
 ```toml
 [mcp_servers.support-mcp]
 url = "https://support.example.com/mcp"
-tool_timeout_sec = 930
+tool_timeout_sec = 1000
 ```
 
 Then run `codex mcp login support-mcp`. Older Codex versions need
 `experimental_use_rmcp_client = true` for OAuth. `tool_timeout_sec` has to cover
-the longest call: a restart, shutdown, install, uninstall or close can wait up
-to 5 minutes (300 seconds) for a technician's approval in the technician app,
-and then a command can run for up to 600 seconds, the longest `run` timeout,
-plus 15 seconds of slack. 930 seconds is that total. `install_program` and
-`uninstall_program` take the same 600-second limit as `run`.
+the longest call. A restart, shutdown, install, uninstall or close can wait up
+to 5 minutes (300 seconds) for a technician's approval in the technician app.
+Once approved, it can wait up to 60 seconds for the PC to finish a command
+already running. Then a command can run for up to 600 seconds, the longest
+`run` timeout. The relay adds 15 seconds of slack for the answer and 15 seconds
+for the PC to check in for newer rules. 990 seconds is that total, and 1000
+leaves room for the network. `install_program` and `uninstall_program` take the
+same 600-second limit as `run`.
 
 **Cursor**
 

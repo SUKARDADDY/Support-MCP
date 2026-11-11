@@ -66,7 +66,7 @@ technician approval for actions the rules hold. This ends Stage 1.
 - Version 1.0.0 ends Stage 1. The README, the security model and `docs/development.md` no longer say a saved PC stays off
   real customers' unattended machines. They say what is enforced and what is not.
 - `rules.manage` needs an authenticator, like the other management permissions.
-- Codex needs `tool_timeout_sec = 930` (was 630): a held action can wait 5 minutes, then a command can run 10 minutes.
+- Codex needs `tool_timeout_sec = 1000` (was 630): a held action can wait 5 minutes for approval and a minute for a busy PC, then a command can run 10 minutes.
 - The hourly run spends 9 of its 50 subrequests on update rings.
 
 ### Security

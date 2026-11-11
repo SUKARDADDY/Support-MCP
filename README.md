@@ -1020,12 +1020,13 @@ deploy without Windows. You need Windows only to change the app: see
    ```
 
    Codex, in `~/.codex/config.toml`. `tool_timeout_sec` has to cover a 5-minute
-   approval plus the longest `run` timeout, 930 seconds:
+   approval, a minute's wait for a busy PC and the longest `run` timeout, 1000
+   seconds (see [docs/mcp-clients.md](docs/mcp-clients.md)):
    ```toml
    [mcp_servers.support-mcp]
    url = "https://support.example.com/mcp"
    http_headers_helper = "/path/to/Support-MCP/cf/mcp-headers.sh"
-   tool_timeout_sec = 930
+   tool_timeout_sec = 1000
    ```
 
    For another workspace, use `https://support.example.com/w/<slug>/mcp` with
