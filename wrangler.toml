@@ -45,6 +45,10 @@ MAIL_PROVIDER = ""
 MAIL_FROM = ""
 SIGNIN_IDLE_HOURS = "12"
 SIGNIN_MAX_DAYS = "14"
+# The time zone a team's business hours use until the team sets its own: an IANA name as
+# Intl lists it, such as "Asia/Jerusalem". Empty, or a name that is not a zone, means UTC.
+# A change reaches PCs at their next check-in.
+DEFAULT_TIME_ZONE = ""
 # Updates for saved PCs (docs/development.md, "Releases"). RELEASE_SIGNATURE and
 # RELEASE_SIGNED_AT come from scripts/sign-release.mjs at each deploy (pass them
 # with --var); with either empty, no PC is offered an update. UPDATE_ROLLOUT
@@ -97,8 +101,8 @@ class_name = "Registry"
 name = "AGENT_TASK"
 class_name = "AgentTask"
 
-# One hourly run (src/sweep.js): it raises "missing" for saved PCs not seen for 7 days
-# and deletes notifications older than 30 days. A free account allows a few Cron
+# One hourly run (src/sweep.js): it raises "missing" for saved PCs not seen for 7 days,
+# rings connected PCs that are due an update, and deletes notifications older than 30 days. A free account allows a few Cron
 # Triggers in all, so check how many it already uses. If you deploy with a copy
 # of this file, give the copy the same trigger, or the run never happens.
 [triggers]

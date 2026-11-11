@@ -17,6 +17,7 @@ export const PERMISSIONS = Object.freeze([
   'sessions.control',
   'sessions.end',
   'sessions.unattended',
+  'rules.manage',
 ]);
 
 export const ADMIN_ROLE = 'admin';
@@ -44,16 +45,17 @@ export const BUILTIN_ROLES = Object.freeze({
 
 // Permissions that need a second factor when the caller is signed in as
 // themselves in a browser, or through OAuth consent: controlling a session,
-// managing the team, managing saved PCs and custom fields, and connecting to a
-// PC without asking the person at it. A role that
+// managing the team, managing saved PCs and custom fields, connecting to a
+// PC without asking the person at it, and changing the team's rules. A role that
 // holds any of them makes its members enrol an authenticator (factorRequired
 // in src/auth.js), and the browser sign-in and the OAuth consent page ask for a
 // code before they act on that role. Access logins and service tokens are
 // exempt: this is a rule for the sign-in layer (src/auth.js). That includes
 // devices.manage and fields.manage, so a person whose role holds either must
-// enrol an authenticator even though the team API itself admits only Access
-// logins today.
-export const FACTOR_PERMISSIONS = Object.freeze(['sessions.control', 'members.manage', 'roles.manage', 'devices.manage', 'fields.manage', UNATTENDED_PERMISSION]);
+// enrol an authenticator: the technician app reaches the team API for saved PCs
+// with its OAuth sign-in, and that sign-in has to carry the factor. Saving rules
+// asks for more, on every path: a fresh code in the request itself (src/api.js).
+export const FACTOR_PERMISSIONS = Object.freeze(['sessions.control', 'members.manage', 'roles.manage', 'devices.manage', 'fields.manage', UNATTENDED_PERMISSION, 'rules.manage']);
 export const needsSecondFactor = (permission) => FACTOR_PERMISSIONS.includes(permission);
 
 export const ROLE_ID_RE = /^[a-z0-9-]{1,40}$/;
@@ -82,6 +84,14 @@ const TOOL_PERMISSIONS = Object.freeze({
   run: 'sessions.control',
   put_file: 'sessions.control',
   get_file: 'sessions.control',
+  // The tools the team's rules govern: each acts on the PC, so each takes sessions.control. What the rules allow
+  // is decided by the Session, per action (src/rules.js).
+  restart_pc: 'sessions.control',
+  shutdown_pc: 'sessions.control',
+  list_programs: 'sessions.control',
+  install_program: 'sessions.control',
+  uninstall_program: 'sessions.control',
+  close_program: 'sessions.control',
   screenshot: 'sessions.control',
   click: 'sessions.control',
   move_mouse: 'sessions.control',

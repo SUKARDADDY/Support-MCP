@@ -28,11 +28,11 @@ function screens(list) {
 const pic = (word) => `${JPEG}${btoa(word.padEnd(9, '_')).replace(/=+$/, '').padEnd(12, 'A')}`;
 
 // ---- the tools ------------------------------------------------------------------------------------
-test('tools/list has 31 tools, the four new ones with the code-first contract in their descriptions', async (t) => {
+test('tools/list has 37 tools, the four new ones with the code-first contract in their descriptions', async (t) => {
   const w = await agentWorld(t);
   const tools = (await w.rpc(BOSS, 'tools/list')).body.result.tools;
-  assert.equal(tools.length, 31);
-  assert.equal(listTools().length, 31);
+  assert.equal(tools.length, 37);
+  assert.equal(listTools().length, 37);
   for (const name of NEW_TOOLS) assert.ok(tools.some((x) => x.name === name), name);
   const by = Object.fromEntries(tools.map((x) => [x.name, x]));
   assert.deepEqual(by.session_participants.inputSchema.required, ['session_id', 'action']);
@@ -46,8 +46,8 @@ test('tools/list has 31 tools, the four new ones with the code-first contract in
   // A caller who is not a team member (open mode) is no driver, and the description says so.
   assert.match(by.session_create.description, /The caller becomes the driver when they are a team member \(not in open mode\)/);
   for (const name of ['session_participants', 'session_handover', 'escalation']) assert.match(by[name].description, /second_factor/, name);
-  // The other 27 keep their names and the 27 old inputs.
-  assert.equal(tools.filter((x) => !NEW_TOOLS.includes(x.name)).length, 27);
+  // The others are the 27 old tools and the six the team's rules govern (test/rules-tools.test.js).
+  assert.equal(tools.filter((x) => !NEW_TOOLS.includes(x.name)).length, 33);
 });
 
 test('each of the four tools needs sessions.control: a Viewer, a stranger and open mode are refused', async (t) => {

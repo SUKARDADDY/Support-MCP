@@ -139,7 +139,7 @@ export async function agentWorld(t, opts = {}) {
   // A saved PC that has joined the session a task opened, with a pump to answer it.
   async function joinPc(pc, handler = null) {
     const sid = w.pointer(pc.id).id;
-    const welcome = await w.agent(sid, pc.key, { type: 'hello', machine: 'M1', user: 'dana', control: 'full', caps: ['screen', 'lanes'], version: '0.6.0' });
+    const welcome = await w.agent(sid, pc.key, { type: 'hello', machine: 'M1', user: 'dana', control: 'full', caps: ['screen', 'lanes'], version: '1.0.0' });
     const p = pump({ sid, key: pc.key, generation: welcome.body.generation, handler });
     t.after(() => p.stop());
     return { sid, ...p };

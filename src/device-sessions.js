@@ -10,7 +10,7 @@
 // Everything here is best effort except createSession: a doorbell that is not
 // connected, a Registry that is busy or a Session that is already gone must
 // never fail the team change that called it. The PC's check-in is the fallback.
-import { registryName } from './registry.js';
+import { RING_LIST_MAX, registryName } from './registry.js';
 
 const CODE_ALPHABET = 'abcdefghijklmnopqrstuvwxyz234567'; // RFC4648 base32, lowercased
 
@@ -80,6 +80,22 @@ export function deviceHooks(env, { devTtlMs = 0 } = {}) {
       } catch (_) {
         return false;
       }
+    },
+
+    // Ring a list of PCs (a customer's rules changed, an update is due), RING_LIST_MAX to a call. Only a
+    // connected doorbell rings, and with `max` no more than that many PCs are rung, taken in the order given.
+    // Returns how many doorbells were rung; best effort, so a Registry that cannot be reached is 0.
+    async ringMany(slug, deviceIds, { max = null } = {}) {
+      let rang = 0;
+      for (let i = 0; i < deviceIds.length; i += RING_LIST_MAX) {
+        if (max !== null && rang >= max) break;
+        try {
+          const r = await post(registry(slug), '/ring', { device_ids: deviceIds.slice(i, i + RING_LIST_MAX), ...(max !== null ? { max: max - rang } : {}) });
+          const { count } = await r.json();
+          if (Number.isInteger(count)) rang += count;
+        } catch (_) { /* the PC's own check-in is the fallback */ }
+      }
+      return rang;
     },
 
     // Ring every doorbell in the workspace (a stop).
@@ -173,6 +189,12 @@ export function deviceHooks(env, { devTtlMs = 0 } = {}) {
     },
     async handover(slug, sid, body) {
       return sessionCall(session(sid), '/handover', { ...body, workspace: slug });
+    },
+
+    // A call to a Session's /approvals: list, answer or cancel the waiting approval. Its JSON answer, or null when
+    // the Session could not be reached.
+    async approvals(slug, sid, body) {
+      return sessionCall(session(sid), '/approvals', { ...body, workspace: slug });
     },
 
     // The Session's last full screenshot for `actor`: { status, body }, or null when it cannot be reached.

@@ -42,6 +42,15 @@ describe('strings', () => {
       expect(hasKey(`event.${e}.help`)).toBe(true);
     }
     for (const k of ['declined', 'nobody', 'busy', 'owner_ended', 'ended_early']) expect(hasKey(`connect.${k}`)).toBe(true);
+    // The rules: five actions, five values, seven days, and a sentence for every code the rules and approvals refuse with.
+    for (const a of ['restart', 'shutdown', 'install', 'uninstall', 'close_program']) for (const part of ['action', 'action_help']) expect(hasKey(`rules.${part === 'action' ? `action_${a}` : `action_${a}_help`}`), `${part} ${a}`).toBe(true);
+    for (const v of ['allow', 'approve', 'approve_in_hours', 'outside_hours', 'never']) expect(hasKey(`rules.value_${v}`), v).toBe(true);
+    for (const d of ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']) expect(hasKey(`day.${d}`), d).toBe(true);
+    for (const c of ['rule_never', 'business_hours', 'declined', 'approval_timeout', 'approval_unavailable', 'busy', 'rules_stale', 'protected_program', 'protected_folder', 'use_tool', 'needs_full_control', 'not_found', 'needs_update', 'not_saved_pc']) expect(hasKey(`refuse.${c}`), c).toBe(true);
+    for (const k of ['approval_requested']) {
+      expect(hasKey(`event.${k}.name`)).toBe(true);
+      expect(hasKey(`event.${k}.help`)).toBe(true);
+    }
   });
 
   test('plain prose: no em dashes, no uppercase-only labels, no raw HTML', () => {

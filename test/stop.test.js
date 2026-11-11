@@ -70,7 +70,7 @@ test('a stopped workspace answers no tool call, tells a non-member nothing, and 
   }
   assert.equal((await w.tool('stranger@example.com', 'session_list')).error, 'you are not a member of this team');
   assert.equal((await w.tool(VIEW, 'device_connect', { device_id: pc.id })).error, 'your role does not allow sessions.control', 'the role check comes first');
-  assert.equal((await w.rpc(BOSS, 'tools/list')).body.result.tools.length, 31, 'tools/list is static and still answers');
+  assert.equal((await w.rpc(BOSS, 'tools/list')).body.result.tools.length, 37, 'tools/list is static and still answers');
   assert.equal(w.pointer(pc.id), null, 'no session was started');
   await w.api(BOSS, 'DELETE', '/stop', {});
   assert.equal((await w.tool(BOSS, 'device_connect', { device_id: pc.id })).state, 'waiting');
@@ -198,7 +198,7 @@ test('EMERGENCY_STOP refuses every tool call and every connect, whoever asks, bu
   assert.equal((await w.tool('stranger@example.com', 'session_list')).error, message, 'whoever asks');
   assert.equal(w.pointer(pc.id), null);
   assert.equal(w.sessionCalls.length, 0);
-  assert.equal((await w.rpc(BOSS, 'tools/list')).body.result.tools.length, 31, 'tools/list is static and still answers');
+  assert.equal((await w.rpc(BOSS, 'tools/list')).body.result.tools.length, 37, 'tools/list is static and still answers');
   // The PC wire still answers its check-in (it must learn the session is gone).
   assert.equal((await w.hello(pc.key)).status, 200);
 });

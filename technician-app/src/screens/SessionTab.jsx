@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { connectDevice, messageOf, refusalText } from '../api.js';
+import { codedText, connectDevice, messageOf, refusalText } from '../api.js';
 import { Icon } from '../components/Icon.jsx';
 import { useApp } from '../context.jsx';
 import { useAccountMe } from '../hooks.js';
@@ -11,7 +11,7 @@ import { EscalateDialog } from './EscalateDialog.jsx';
 import { HandOverDialog } from './HandOverDialog.jsx';
 import { InviteDialog } from './InviteDialog.jsx';
 
-const KNOWN_KINDS = ['created', 'consumed', 'attached', 'hello', 'detached', 'declined', 'driver', 'ended', 'screen', 'run', 'put_file', 'get_file', 'control'];
+const KNOWN_KINDS = ['created', 'consumed', 'attached', 'hello', 'detached', 'declined', 'driver', 'ended', 'screen', 'run', 'put_file', 'get_file', 'control', 'approval', 'rules'];
 
 // A session with a PC, or a one-off link's: its screen (the agent's last picture during a task,
 // otherwise a fresh one every few seconds while you are the driver, and for a watcher the last
@@ -20,7 +20,7 @@ const KNOWN_KINDS = ['created', 'consumed', 'attached', 'hello', 'detached', 'de
 // controls. Everything from the PC (the picture, step details, notes, log text) and the people's
 // names are untrusted and shown as text.
 export function SessionTab({ tab, active = true }) {
-  const { core, tuning, me: shownMe, account: shown, endTab, closeTab, leaveTab, toast, isShown, updateTab, devices, visible, titleOf, registerTab, markEnded, markStance } = useApp();
+  const { core, tuning, me: shownMe, account: shown, endTab, closeTab, leaveTab, toast, isShown, updateTab, devices, visible, titleOf, registerTab, markEnded, markStance, requestApproval } = useApp();
   // This tab's person is the one of its own account, which is not the shown account's when the tab is hidden.
   const me = useAccountMe(core, tab.account, shown?.id, shownMe);
   const can = (permission) => me.permissions.includes(permission);
@@ -138,6 +138,13 @@ export function SessionTab({ tab, active = true }) {
     }
   }
 
+  // An action the team's rules sent for approval, as the status shows it. The tab on screen opens the review once for each
+  // approval (App leaves out one a dialog has shown), and says so here while it waits, with a way back to it.
+  const waiting = s.status?.approval ?? null;
+  const mayApprove = can('sessions.unattended');
+  const review = (auto) => requestApproval({ account: tab.account, sessionId: s.sessionId, deviceId: tab.deviceId ?? null, deviceName: name, approvalId: waiting?.id ?? null, auto });
+  useEffect(() => { if (waiting && mayApprove && active && visible && s.sessionId) review(true); }, [waiting?.id, mayApprove, active, visible]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const canTakeOver = can('sessions.unattended') && s.attached && !s.isDriver && !!driver && s.role !== 'invited';
   const canHandOver = can('sessions.control') && s.attached && s.isDriver && !s.taskLive;
   const driving = s.role === 'driver' && !s.ended;
@@ -238,6 +245,12 @@ export function SessionTab({ tab, active = true }) {
           <div className="acts"><button type="button" className="btn btn-sec btn-sm" disabled={busyPeople} onClick={() => people(() => s.people.cancelOffer())}>{t('people.cancel_offer')}</button></div>
         </div>
       ) : null}
+      {waiting ? (
+        <div className="offer" role="status">
+          <p>{mayApprove ? t('approval.waiting_tab', { summary: waiting.summary }) : t('approval.waiting_other', { summary: waiting.summary })}</p>
+          {mayApprove ? <div className="acts"><button type="button" className="btn btn-pri btn-sm" onClick={() => review(false)}>{t('approval.review')}</button></div> : null}
+        </div>
+      ) : null}
       {peopleError ? <p className="err people-err" role="alert">{peopleError}</p> : null}
       {s.participants.length && !s.ended ? (
         <section className="roster" aria-label={t('people.label')}>
@@ -285,7 +298,7 @@ export function SessionTab({ tab, active = true }) {
                       <span>{a.source === 'step' ? a.verb : a.source === 'note' ? t('session.note') : KNOWN_KINDS.includes(a.kind) ? t(`activity.${a.kind}`) : a.kind}</span>
                       <span className="t">{formatClock(a.ts)}</span>
                     </p>
-                    {a.detail ? <p className="tl-d">{a.detail}</p> : null}
+                    {a.detail ? <p className="tl-d">{a.source === 'step' && !a.ok ? codedText(a.detail) : a.detail}</p> : null}
                   </li>
                 ))}
               </ol>
@@ -293,7 +306,7 @@ export function SessionTab({ tab, active = true }) {
             {s.task && !s.taskLive && s.task.summary ? <p className="tl-end"><b>{t('session.summary')}</b> {s.task.summary}</p> : null}
             {s.task && !s.taskLive && cost ? <p className="tl-end cost">{cost.cap === null ? t('session.cost_final_nocap', { spent: cost.spent }) : t('session.cost_final', { spent: cost.spent, cap: cost.cap })}</p> : null}
             {s.task && !s.taskLive && s.task.state && s.task.state !== 'running' ? <p className="hint">{t('session.task_over', { state: t(`task.${s.task.state}`) })}</p> : null}
-            {s.task && !s.taskLive && s.task.state && s.task.state !== 'done' && s.task.end_reason ? <p className="hint">{t('session.task_end_reason', { reason: s.task.end_reason })}</p> : null}
+            {s.task && !s.taskLive && s.task.state && s.task.state !== 'done' && s.task.end_reason ? <p className="hint">{t('session.task_end_reason', { reason: codedText(s.task.end_reason) })}</p> : null}
           </aside>
         ) : null}
       </div>

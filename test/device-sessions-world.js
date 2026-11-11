@@ -33,7 +33,7 @@ globalThis.fetch = async (url, init) => {
 };
 const b64url = (u8) => btoa(String.fromCharCode(...u8)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const enc = (o) => b64url(new TextEncoder().encode(JSON.stringify(o)));
-async function accessToken(who) {
+export async function accessToken(who) {
   const input = `${enc({ alg: 'RS256', kid: 'k1', typ: 'JWT' })}.${enc({ aud: AUD, iss: `https://${TEAM}`, exp: Math.floor(Date.now() / 1000) + 600, email: who })}`;
   const sig = new Uint8Array(await crypto.subtle.sign('RSASSA-PKCS1-v1_5', kp.privateKey, new TextEncoder().encode(input)));
   return `${input}.${b64url(sig)}`;
@@ -200,7 +200,7 @@ export async function world(t, { time = 1_800_000_000_000, env: extra = {}, memb
     return { status: r.status, body: json };
   }
   // A saved PC, paired for real. Returns { id, key }.
-  async function addPc({ name = 'Till', access = 'ask', control = 'full', version = '0.6.0', status = 'active' } = {}) {
+  async function addPc({ name = 'Till', access = 'ask', control = 'full', version = '1.0.0', status = 'active' } = {}) {
     if (status === 'pending') {
       const out = await devs.requestJoin({ protocol: 1, workspace: 'default', name, access, control, app_version: version });
       return { id: out.device_id, key: out.key };
@@ -224,9 +224,9 @@ export async function world(t, { time = 1_800_000_000_000, env: extra = {}, memb
     return ws;
   };
   // Connect, as `who`, and run the PC side up to the hello. Returns { sid, welcome }.
-  async function attach(pc, who = BOSS, { control = 'full', caps = ['screen', 'lanes'] } = {}) {
+  async function attach(pc, who = BOSS, { control = 'full', caps = ['screen', 'lanes'], version = '1.0.0' } = {}) {
     const started = await tool(who, 'device_connect', { device_id: pc.id });
-    const welcome = await agent(started.session_id, pc.key, { type: 'hello', machine: 'M1', user: 'dana', control, caps, version: '0.6.0' });
+    const welcome = await agent(started.session_id, pc.key, { type: 'hello', machine: 'M1', user: 'dana', control, caps, version });
     return { sid: started.session_id, started, welcome };
   }
   return {

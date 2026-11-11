@@ -814,3 +814,37 @@ test('a sign-in cookie is ignored on the team API and MCP, so default\'s first a
   const access = await r.api('tech@example.com', 'POST', '/members', { identity: 'tech@example.com', role_id: 'admin' });
   assert.equal(access.status, 201, JSON.stringify(access.body));
 });
+
+// ---- the rules routes and the deploy-time route refuse service tokens ----------------------------------------
+test('a service token holding the admin role may read the rules but is refused every write, before its body is read', async () => {
+  const r = await withAdmin();
+  assert.equal((await r.api(BOSS, 'POST', '/members', { identity: BOT, role_id: 'admin' })).status, 201);
+  assert.equal((await r.api(BOT, 'GET', '/rules')).status, 200);
+  const customer = 'a'.repeat(20);
+  for (const [method, path, body] of [['PATCH', '/rules', { doc: {}, rev: 0, code: '123456' }], ['PATCH', `/rules/${customer}`, { doc: {}, rev: 0, code: '123456' }], ['DELETE', `/rules/${customer}`, { code: '123456' }]]) {
+    const out = await r.api(BOT, method, path, body);
+    assert.deepEqual([out.status, out.body.error.code], [403, 'forbidden'], `${method} ${path}`);
+  }
+  // The same body from a person is looked at: this one has no authenticator.
+  assert.equal((await r.api(BOSS, 'PATCH', '/rules', { doc: {}, rev: 0, code: '123456' })).body.error.code, 'second_factor');
+});
+
+test('ring-updates admits a person in DEPLOYMENT_ADMINS and no one else, a service token named there included', async () => {
+  const r = relay({ DEPLOYMENT_ADMINS: `${BOSS},${BOT}` });
+  const send = async (who, { method = 'POST', json = true, headers = {} } = {}) => {
+    const h = { ...(json ? { 'content-type': 'application/json' } : {}), ...headers };
+    if (who) h['cf-access-jwt-assertion'] = await as(who);
+    const res = await r.handler.fetch(new Request(`${HOST}/api/v1/deployment/ring-updates`, { method, headers: h, body: method === 'POST' ? '{}' : undefined }), r.env);
+    return { status: res.status, body: await res.json() };
+  };
+  // No bundle and no release here, so a pass has nothing to ring: the answer is the admission.
+  assert.deepEqual(await send(BOSS), { status: 200, body: { rung: 0, teams_left: 0, next: null } });
+  for (const who of [BOT, 'outsider@example.com']) assert.deepEqual([(await send(who)).status, (await send(who)).body.error.code], [403, 'forbidden'], who);
+  assert.equal((await send(null)).status, 403, 'no Access login');
+  assert.equal((await send(BOSS, { method: 'GET' })).status, 405);
+  assert.equal((await send(BOSS, { json: false })).status, 415);
+  assert.equal((await send(BOSS, { headers: { origin: 'https://evil.example' } })).status, 403);
+  const empty = relay({ DEPLOYMENT_ADMINS: '' });
+  const res = await empty.handler.fetch(new Request(`${HOST}/api/v1/deployment/ring-updates`, { method: 'POST', headers: { 'content-type': 'application/json', 'cf-access-jwt-assertion': await as(BOSS) }, body: '{}' }), empty.env);
+  assert.equal(res.status, 403, 'with nobody named, nobody may');
+});

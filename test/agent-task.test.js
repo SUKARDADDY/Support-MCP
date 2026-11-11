@@ -61,7 +61,7 @@ test('OpenAI requests: store false, service tier default, one call at a time, st
     assert.equal(c.headers.authorization, `Bearer ${OPENAI_KEY}`);
     assert.ok(!JSON.stringify(c.body).includes('CANARY'), 'the key is not in the body');
     assert.match(c.body.instructions, /untrusted/);
-    assert.deepEqual(tools(c), ['session_status', 'run', 'put_file', 'get_file', 'screenshot', 'click', 'move_mouse', 'drag', 'scroll', 'type_text', 'press_key', 'wait', 'zoom', 'ui_tree', 'ui_act', 'note', 'finish']);
+    assert.deepEqual(tools(c), ['session_status', 'run', 'put_file', 'get_file', 'restart_pc', 'shutdown_pc', 'list_programs', 'install_program', 'uninstall_program', 'close_program', 'screenshot', 'click', 'move_mouse', 'drag', 'scroll', 'type_text', 'press_key', 'wait', 'zoom', 'ui_tree', 'ui_act', 'note', 'finish']);
     for (const tool of c.body.tools) {
       assert.deepEqual([tool.type, tool.strict, tool.parameters.additionalProperties], ['function', true, false], tool.name);
       assert.deepEqual([...tool.parameters.required].sort(), Object.keys(tool.parameters.properties).sort(), `${tool.name}: every property is required`);

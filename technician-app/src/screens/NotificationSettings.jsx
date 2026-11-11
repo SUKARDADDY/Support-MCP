@@ -6,7 +6,7 @@ import { t } from '../i18n/index.js';
 
 export const EVENTS = ['task_finished', 'task_problem', 'session_declined', 'device_online', 'device_missing', 'device_waiting', 'escalation_opened', 'escalation_claimed'];
 
-// Which of the eight events you can switch you hear about, which PCs you watch for "came online", and whether
+// Which of the eight events you can switch you hear about (an action waiting for your approval is always on, and shown so), which PCs you watch for "came online", and whether
 // this PC shows Windows notifications at all.
 export function NotificationSettings() {
   const { core, account, devices, toast } = useApp();
@@ -62,6 +62,10 @@ export function NotificationSettings() {
             <span><span className="t-name">{t(`event.${ev}.name`)}</span><span className="t-help">{t(`event.${ev}.help`)}</span></span>
           </label>
         ))}
+        <div className="toggle always" data-event="approval_requested">
+          <input type="checkbox" checked disabled readOnly aria-labelledby="ev-approval-name" aria-describedby="ev-approval-help" />
+          <span><span className="t-name" id="ev-approval-name">{t('event.approval_requested.name')}</span><span className="t-help" id="ev-approval-help">{t('event.approval_requested.help')}</span></span>
+        </div>
         {failed ? <p className="err" role="alert">{failed}</p> : null}
       </section>
       <section className="panel">

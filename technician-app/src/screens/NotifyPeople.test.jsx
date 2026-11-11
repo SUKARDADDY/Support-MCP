@@ -138,7 +138,7 @@ describe('the notification list', () => {
 });
 
 describe('notification settings', () => {
-  test('the two queue events can be switched, and invites and offers have no switch', async () => {
+  test('the two queue events can be switched, and invites, offers and approvals have no switch', async () => {
     const user = userEvent.setup();
     const fake = fakeCore();
     renderApp(fake);
@@ -148,7 +148,11 @@ describe('notification settings', () => {
     const sent = await screen.findByRole('checkbox', { name: /Something was sent to the queue/ });
     expect(sent).toBeChecked();
     expect(screen.getByRole('checkbox', { name: /Your queue item was claimed/ })).toBeChecked();
-    expect(screen.getByText('Invites to a session and offers of control always reach you. They have no switch.')).toBeInTheDocument();
+    expect(screen.getByText('Invites to a session, offers of control and actions waiting for your approval always reach you. They have no switch.')).toBeInTheDocument();
+    // An action waiting for your approval is listed as always on: checked, and no way to switch it off.
+    const approval = screen.getByRole('checkbox', { name: /An action waits for your approval/ });
+    expect(approval).toBeChecked();
+    expect(approval).toBeDisabled();
     expect(screen.queryByRole('checkbox', { name: /invite/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('checkbox', { name: /offer/i })).not.toBeInTheDocument();
     await user.click(sent);

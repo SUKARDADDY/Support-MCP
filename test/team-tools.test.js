@@ -14,9 +14,10 @@ const it = (name, fn) => test(name, { skip }, fn);
 const NEW = ['people_list', 'session_participants', 'session_handover', 'escalation'];
 const MODE_TEXT = /this team uses the built-in agent/;
 
-test('the built-in agent\'s tools are exactly what they were: the new tools are not among them', () => {
+test('the built-in agent\'s tools are the old ones and the six rule-governed ones: the four team tools are not among them', () => {
   assert.deepEqual([...AGENT_TOOL_NAMES].sort(), [
-    'click', 'drag', 'finish', 'get_file', 'move_mouse', 'note', 'press_key', 'put_file', 'run', 'screenshot', 'scroll', 'session_status', 'type_text', 'ui_act', 'ui_tree', 'wait', 'zoom',
+    'click', 'close_program', 'drag', 'finish', 'get_file', 'install_program', 'list_programs', 'move_mouse', 'note', 'press_key', 'put_file', 'restart_pc', 'run', 'screenshot', 'scroll',
+    'session_status', 'shutdown_pc', 'type_text', 'ui_act', 'ui_tree', 'uninstall_program', 'wait', 'zoom',
   ]);
   for (const name of NEW) {
     assert.equal(AGENT_TOOL_NAMES.has(name), false, name);
@@ -24,8 +25,8 @@ test('the built-in agent\'s tools are exactly what they were: the new tools are 
   }
   // No description the agent is shown points at them either.
   for (const t of agentTools()) assert.doesNotMatch(`${t.description} ${JSON.stringify(t.schema)}`, /people_list|session_participants|session_handover|escalation/, t.name);
-  // They are listed to every MCP connection, though: 27 old tools and the four.
-  assert.equal(listTools().length, 31);
+  // They are listed to every MCP connection, though: 27 old tools, the four, and the six the team's rules govern.
+  assert.equal(listTools().length, 37);
 });
 
 test('the mode gate lets a team on the built-in agent only read the queue, close an item and claim a ticket, and nothing else of the four', () => {

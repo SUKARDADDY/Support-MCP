@@ -353,10 +353,15 @@ apply to only one client say which.
   `put_file` and `get_file` run as SYSTEM and screen control can click Yes on a
   UAC prompt, so a separate SYSTEM permission would not hold. Give
   `sessions.control` only to people you would trust as an administrator of the
-  customer's PC.
+  customer's PC. On a saved PC the team's rules narrow five actions and the
+  protected folders (see [Rules and approvals](#rules-and-approvals)), but a raw
+  `run` and the screen tools stay administrator-level, so the rules are not a
+  reason to hand out `sessions.control` more widely.
 - **Saved PCs and pairing.** A workspace keeps customers, sites, saved PCs and
-  custom fields in D1, every row keyed by workspace, and none of it is read
-  when the relay decides who may do what. These rules hold:
+  custom fields in D1, every row keyed by workspace. The relay reads none of the
+  text in them to decide who may do what. It reads one thing from them: the
+  customer a PC's site belongs to, so it can find that customer's rules (see
+  [Rules and approvals](#rules-and-approvals)). These rules hold:
   - *A typed code is longer than a pasted one.* A technician's pairing code is 10
     characters from a 32-letter alphabet without 0, 1, I and O (50 random bits),
     shown as `ABCDE-FGH23`. It works once and dies after 10 minutes. The owner
@@ -487,9 +492,11 @@ apply to only one client say which.
     a session footer. It runs a command, takes a screenshot or opens a file only in
     a session that its own record at the relay points at, as "Connecting to a saved
     PC" below describes. It also installs new versions of itself, but only releases
-    signed with the project's release key, below. Technicians can now connect to a
-    saved PC, but Stage 1 stays off real customers' unattended PCs until the
-    release that enforces rules about who may connect and when.
+    signed with the project's release key, below. Since 1.0.0 it also holds the
+    team's rules for the PC, checks every action against them and refuses what
+    they forbid, as [Rules and approvals](#rules-and-approvals) describes. A
+    saved-PC session can only be started on a PC that runs 1.0.0 or later, so none
+    reaches a PC that cannot enforce them.
   - *Updates come signed, and only forward.* A release note (version, the exe's
     SHA-256 and size, and a date) is signed with an ECDSA P-256 key that is kept
     offline in a secrets manager and read into the signer only at deploy time. It
@@ -698,8 +705,9 @@ apply to only one client say which.
     They never hold a code, a key, typed text or a screenshot. A session's own log
     keeps what a session's log always kept.
   - *What is still open.* Owner messages and screenshot storage are later releases.
-    Stage 1 stays off real customers' unattended PCs until the release that
-    enforces rules about who may connect and when.
+    The team's rules limit five actions and protected folders, not everything a
+    session can do: [Rules and approvals](#rules-and-approvals) lists what they
+    leave open.
 - **Who is on a session, and who drives it.** A driver can invite a colleague to watch a live
   session, offer them control, and send the session to the team's queue. None of this widens
   anyone's access, and these rules hold:
@@ -858,7 +866,7 @@ apply to only one client say which.
   an address was invited.
 - **A second factor for roles that can control sessions or manage the team.**
   A role that holds `sessions.control`, `sessions.unattended`, `members.manage`, `roles.manage`,
-  `devices.manage` or `fields.manage`, and a deployment admin, must enrol an authenticator app (TOTP, RFC 6238: SHA-1,
+  `devices.manage`, `fields.manage` or `rules.manage`, and a deployment admin, must enrol an authenticator app (TOTP, RFC 6238: SHA-1,
   30 seconds, six digits, one step either side). `authorizeSignIn` in
   `src/auth.js` refuses a sign-in that has not passed a code with "a second
   factor is required" for those permissions, and 2c calls the same check. Anyone
@@ -887,7 +895,13 @@ apply to only one client say which.
   OAuth consent page ask for a code before they act on that role. Access
   callers and service tokens are exempt, and the team API admits only Access
   logins today, so these two permissions add the enrolment requirement for
-  signed-in people before they add any new action.
+  signed-in people before they add any new action. Two actions ask for more, on every
+  path and for an Access login too: saving or removing the team's rules
+  (`rules.manage`), and approving an action the rules hold (`sessions.unattended`). Each
+  needs a fresh six-digit code from the person's own authenticator in the request. It goes
+  through the same record of used steps as a sign-in (`last_step`), so a code that signed
+  someone in, or approved one action, cannot save rules or approve another. A recovery code
+  is not accepted there. A wrong code counts toward the same lock.
 - **Browser sign-in cookies.** The cookie `__Host-smcp` is `Secure`, `HttpOnly`,
   `SameSite=Lax`, `Path=/` and has no `Domain`. Its value is 32 random bytes;
   the database holds only the SHA-256. A sign-in ends after `SIGNIN_IDLE_HOURS`
@@ -1176,7 +1190,11 @@ apply to only one client say which.
   and PowerShell version the client reports are cut to 100, 100 and 40
   characters. On the WebSocket only the first `hello` on each socket counts.
   An app `hello` writes an `attached` row with the reported rights and a
-  `hello` row.
+  `hello` row. On a saved PC the restart, shutdown and program tools write `power`
+  and `programs` rows, a refusal by the rules writes a `rules` row with the code, and an
+  approval writes `approval` rows for the request, who approved it and how it ended.
+  A program tool's row holds the installer path, the program id or name, and an
+  installer's arguments (cut), so do not put a secret in them.
 - **Screenshots and typed text go to your model provider.** A screenshot is
   returned to the operator's AI agent, and so is the text of a UI tree. Whatever
   is on the customer's screen when you take one, and whatever you tell the
@@ -1210,9 +1228,13 @@ apply to only one client say which.
   someone else takes over its session (when its starter hands the session over, it stops
   quietly instead, with no "needs attention"), when the person at the PC ends it, when the
   starter, the workspace or the operator stops it, or when the starter stops watching
-  (unless the task was started with `keep_working`). There are no approvals by default.
-  This stays Stage 1: not on real customers' unattended PCs until the release that
-  enforces the saved-PC rules.
+  (unless the task was started with `keep_working`). It is held to the team's rules like
+  any caller: a restart, shutdown, install, uninstall or close that the rules hold waits,
+  up to 5 minutes, for a technician's approval, and one the rules never allow is refused.
+  Its system prompt says a refusal is the team's decision and that it must not work round
+  one with `run`, but that is guidance for a model, not a boundary: see the limits of the
+  rules in [Rules and approvals](#rules-and-approvals). Stopping or pausing a task cancels
+  the approval it is waiting for.
 - **A team's AI provider key stays inside the task object.** It is sealed with AES-GCM
   under `AUTH_SECRET` with the workspace as associated data, shown only as its last four
   characters, and opened only inside `AgentTask` objects (a task's steps and a model
@@ -1232,11 +1254,13 @@ apply to only one client say which.
   PC reports about itself and the custom field text of any record. Treat it as untrusted text that may try to steer
   the operator's AI agent. That agent can have a shell on the operator's own
   machine, so do not run it with tool calls auto-approved.
-- **The window shows, it does not enforce.** The window shows that support is
-  connected and working, and the consent dialog says what access is granted. It
-  does not stop an operator acting in bad faith: under full control commands run
-  as SYSTEM or as the signed-in user with administrator rights, and what they
-  change stays changed. The PowerShell agent's
+- **The window shows, and the rules enforce part of it.** The window shows that support is
+  connected and working, and the consent dialog says what access is granted. The window
+  itself stops nothing. On a saved PC the team's rules do stop five actions and
+  protected folders when they go through the tools, as [Rules and approvals](#rules-and-approvals) says. They do not stop
+  an operator acting in bad faith with a raw `run` or the screen tools: under full
+  control commands run as SYSTEM or as the signed-in user with administrator rights, and
+  what they change stays changed. The PowerShell agent's
   cleanup covers only its own folder, logon entry and scheduled tasks, and the
   app's covers its service, task, folder and registry value. Neither undoes files an operator wrote,
   software it installed or settings it changed.
@@ -1247,6 +1271,183 @@ apply to only one client say which.
   "If your antivirus removes the file, tell support." Anyone can ask the
   customer to run an unsigned program, so tell the customer who you are before
   you send the link.
+
+## Rules and approvals
+
+A team's rules say what anyone, a person or an AI agent, may do to a saved PC. They exist
+because `sessions.control` is administrator-level and a team may want some actions to need a
+second person. They apply to saved PCs only: a one-off link has no rules, and its app refuses
+the restart and program tools (`not_saved_pc`). Bullets say what holds, and what does not.
+
+- **What a rule is.** A team has one document, and a customer can override fields of it for
+  the PCs of its sites. It holds a time zone, business hours, five actions (`restart`,
+  `shutdown`, `install`, `uninstall`, `close_program`), each `allow`, `approve`,
+  `approve_in_hours`, `outside_hours` or `never`, a list of protected programs and a list of
+  protected folders (at most 50 entries each, 100 and 260 characters). With nothing saved the
+  four system actions are `approve`, `close_program` is `allow`, nothing is protected and
+  there are no business hours. A field a customer sets replaces the team's whole field. An
+  hour rule with no business hours behind it is refused when saved, and counts as `never` if
+  the hours are removed later, so a gap never loosens a rule.
+- **The order of checks.** Both sides run the same cases, in this order: the action's own
+  `never`, full control, protected programs and folders, then the value. A restart, shutdown,
+  install or uninstall needs a PC set to full control (`needs_full_control`), because an
+  installer and a restart act as the system. A close works under limited support, but only
+  on the signed-in user's own programs. A protected program is checked for a close and an
+  uninstall, a protected folder for `put_file`, `get_file` and an installer's path. A protected
+  folder cannot be a whole drive (refused when saved). Closing a program by name judges the name
+  without its folder, trailing dots and spaces and `.exe`, on both sides.
+  `test/fixtures/rules-cases.json` holds the cases, and both the Worker's tests and the app's
+  native tests run them, so the two cannot drift apart unseen.
+- **Where each check runs.** The relay's Session object reads the rules in force for the PC
+  from D1 on every guarded command, never from a cache, and decides before the command takes
+  its lane: refuse with a code, allow, or wait for an approval. The decision is made again
+  on the PC. Every guarded frame carries `rules_tag` (a hash of the relay's rules),
+  `decided_at` (the relay's time) and, when a technician approved it, `approved_by`. The PC
+  keeps the rules it got with its last check-in in `device.json`, checks every frame against
+  them, and refuses what they forbid even if the relay sent it. A frame whose `rules_tag`
+  differs from the PC's makes the PC check in at once and wait up to 15 seconds for the
+  answer; without one it refuses `rules_stale`. So a rule change takes effect on the next
+  action, not at the PC's next scheduled check-in.
+- **What the PC adds.** It expands Windows short names (`PROGRA~1`) and follows links and
+  junctions before it compares a folder, so a protected folder is not reached by another name
+  for it. It never closes a process of session 0 or a critical Windows process whatever the
+  rules say. It never closes a process of the Support app itself (any process that runs a file
+  from the app's folders, so the helper, the tray and the corner windows are covered), never
+  uninstalls the app's own entry, and adds the app's install folder to the protected folders
+  for the file tools and installers, and the app's names to what its raw-command screen refuses.
+  So a tool cannot end or tamper with the support app that enforces the rules. It screens a raw
+  `run` command (below). A restart starts with the rules on
+  disk, and a PC that never had an answer uses the defaults. An answer it cannot read keeps the last good rules and marks them stale, and a
+  guarded action is then refused (`rules_stale`) until a good answer comes. The relay does the
+  same when it cannot read the rules for a restart, a shutdown, a program tool or a file.
+- **One tool is not a way round another.** `install_program` runs as SYSTEM with free
+  arguments, so it would defeat the restart and uninstall rules if it ran anything. It accepts
+  only a `.msi`, `.msu` or `.exe` on a local drive that is not in a `Windows` folder and is not named
+  as a Windows tool (`shutdown.exe`, `msiexec.exe`, `wusa.exe`, `cmd.exe`, `powershell.exe` and the
+  like, by file name, wherever it sits). It also refuses what looks like an uninstaller: an `.exe`
+  whose name starts with `unins` or holds `uninst` (`unins000.exe`, `Uninstall.exe`), an `.exe` in a
+  folder whose name starts with `uninst` (`Mozilla Firefox\uninstall\helper.exe`), and a short 8.3
+  name with a `~` and a digit (`VENDOR~1.EXE`), which would hide the real name. The name check also
+  refuses the setup of an uninstaller tool, such as `UninstallToolSetup.exe` or
+  `iobit-uninstaller-setup.exe`; send such a setup through `run` or install it by hand. For any
+  installer it refuses arguments that ask for a restart, the uninstall switches `/uninst..`
+  (`/uninstall`, InstallShield's `/uninst`), `/removeonly` and `/action=uninstall` after `/`, `-` or
+  `--`, a first argument that is the word `uninstall` or `remove` (winget, choco, vs_installer), and
+  `/x`. For an `.exe`, `/x` counts only alone or followed by `"` or `{`, so `/x64`, `-x86` and a hotfix's
+  `/x:folder` pass. For any installer it also refuses the msiexec properties that remove or patch
+  (`REMOVE=`, `PATCH=` and the like) and `REBOOT=F..`, since an `.exe` can hand them to msiexec
+  (InstallShield's `/v"REMOVE=ALL"`, and `/v/x` counts as `/x`). It refuses before an approval is asked, on the relay, and again on the
+  PC, where the raw-command screen also reads the path and the arguments. What a vendor's `.exe`
+  does with its own other arguments is its own: the checks are a guardrail there, like the screen.
+  An uninstall by a program's own `QuietUninstallString` is screened the same way, and the Support
+  app's entry is never uninstalled. `put_file` into the app's folder, and `get_file` of its
+  record, are refused. `close_program` skips the app's processes.
+- **A change of the rules that apply to a PC is guarded like a change of rules.** Moving an active
+  PC to a site under another customer, or off its site, swaps the customer override that applies to
+  it, which `devices.manage` alone must not do. So that move needs `rules.manage`, a person and a
+  fresh authenticator code, writes `rules_changed` next to `device_changed` (the PC and the two
+  customers' ids, never a value), and rings the PC. A move inside a customer changes nothing that
+  applies, and a PC still waiting for approval has no rules yet, so those need only `devices.manage`.
+  No other path changes it: a site cannot change customer, a customer or site that still has PCs
+  cannot be removed, a pairing code only places a new PC, and the technician app has no way to
+  change a PC's site. Removing a customer's override is already a rules save.
+- **What is not enforced.** These stay open, and the rules are no substitute for trusting the
+  people who hold `sessions.control`:
+  - *Raw `run` commands.* They are not limited by the rules beyond a screen on the PC. The
+    screen refuses a command that names a protected program or folder, and one whose verb
+    restarts, shuts down, installs, uninstalls or closes a program (`Restart-Computer`,
+    `shutdown`, `msiexec`, `wusa`, `taskkill`, `Stop-Process` and the like) when that action is
+    not `allow`, with the code `use_tool`. A command runs as a script file, and the screen reads
+    its text for simple words. Anyone who writes a different command (another verb, an encoded
+    string, a script that builds the name) gets past it. It is a guardrail, not a boundary.
+    The built-in agent is told not to do this, which a model may ignore.
+  - *The screen tools.* `click`, `type_text`, `press_key`, `ui_act`, UAC prompts and the rest
+    are not checked against the rules. Someone who can see and click can open Windows Settings
+    and uninstall a program, or press Restart.
+  - *A protected name as the rules write it.* A protected program matches by name, trimmed,
+    lower case, without trailing dots and spaces and without `.exe`. A close is judged by the process name and an uninstall by the
+    name `list_programs` shows, so list both forms when they differ. A close by `pid` or an
+    uninstall by `program_id` is judged by the name the PC finds, but a program may have more
+    than one name.
+  - *Files outside the file tools.* The protected folders limit `put_file`, `get_file` and an
+    installer's path, and nothing else. A raw command that reads or writes one without naming
+    it in a way the screen reads, or the screen tools, is not stopped. The same holds for the
+    Support app's folder and processes: the tools and the screen refuse them, a raw command that
+    avoids the screen can still end the app (as SYSTEM it can do anything), and the app
+    then no longer enforces anything.
+  - *Force.* A restart or shutdown closes running programs without asking, so unsaved work is
+    lost, and a forced close ends a program at once. The rules say whether the action may happen,
+    not how much it costs the person at the PC.
+- **The rules are not signed.** A release is signed with an offline key and the PC checks the
+  signature. The rules are not: the relay sends them, with a hash for comparison that is not a
+  signature, and the PC trusts them. So a relay that is compromised, or a person holding
+  `rules.manage`, changes what every PC allows, and a relay can make the PC accept an action
+  the team never approved by naming a technician in `approved_by`. The PC checks that an action
+  which needs approval carries an `approved_by`, and not who that is or whether they approved.
+  Keep `rules.manage` to admins (it is theirs by default), and watch the team log.
+- **Business hours follow the team's time zone and the relay's clock.** The relay turns the
+  hours into exact UTC spans for the next 8 days and sends them with the rules, so the PC needs
+  no time zone data. It keeps the relay's time (`server_time` plus the seconds since, on its own
+  stopwatch), not its wall clock, so setting the PC's clock changes nothing. A frame's
+  `decided_at` is the time hour rules are judged at, but only when it is within 60 seconds of
+  the PC's own reckoning. A restart or shutdown with a delay is judged over the whole wait, from
+  `decided_at` to `decided_at + delay_s`: a rule that refuses it during business hours refuses it
+  when any part of the wait is inside them, and one that asks for approval during business hours
+  asks when any part is, so an action decided outside the hours cannot land inside them. A
+  relay that withholds the delay from a frame cannot loosen it: the PC reads `delay_s` from the
+  frame it runs. Past the 8 days every moment counts as business hours, the stricter
+  side, until the PC gets a fresh answer. The zone is the team's, else `DEFAULT_TIME_ZONE`,
+  else UTC, so a customer in another time zone has the team's hours unless its override names
+  its own.
+- **Approvals are the team's control over its technicians, not the customer's consent.** An
+  action set to `approve` (or `approve_in_hours` inside business hours) waits up to 5 minutes
+  for a technician. The person at the PC is never asked and sees nothing for the action: the
+  corner window's "connected" notice is all there is, and they agreed to the session itself, or
+  the PC is set to any time. These rules hold:
+  - *Who can answer.* A person (never a service token) whose role holds `sessions.unattended`,
+    through the technician app's route only. It is not on the team API for an Access login and
+    not an MCP tool, so text on a customer's screen cannot answer it. The permission needs its
+    second factor on the app's sign-in. The person who asked can approve their own request when
+    they hold the permission, which admins do.
+  - *The code.* An approval needs a fresh code from the approver's own authenticator, once
+    (see the second factor above). A wrong code leaves the approval waiting. A denial needs no
+    code, because it can only stop an action. The route reads that the approval is still waiting
+    before it checks a code, so a code is not spent on one that has gone.
+  - *Who is told.* The requester and every member holding `sessions.unattended` get an
+    `approval_requested` notification, which cannot be switched off. A request from a caller
+    nobody can approve for, a service token or a team where no member holds the permission
+    (open mode included), is refused at once as `approval_unavailable`, not left to time out.
+  - *What an approval covers.* It is bound by a hash to that exact action on that PC in that
+    session. When it is given the command starts again from the top: the session, the driver,
+    the PC's attachment and the rules are all read again, so a rule that changed during the wait
+    applies, and an approval for another action is refused (`declined`). If the command lane is
+    taken at that moment, the approved command waits for it, up to 60 seconds, instead of losing
+    the approval; if the lane stays busy the call ends `busy` and says the approval was used.
+  - *When it ends without an answer.* One approval waits at a time in a session, and a second
+    is `busy`. It is cancelled by a handover or take-over (it was asked for the old driver), the
+    end of the session, and Stop or Pause of the built-in agent that asked. An object restart
+    drops it unsent. It is never carried out later.
+- **Saving rules is guarded.** The team API route needs `rules.manage`, a person (a service
+  token is refused whatever its role) and a fresh authenticator code, and the technician app
+  uses the same route. A document that does not pass, a stale `rev` or a customer that does not
+  exist is refused before the code is checked, so a code is not spent on a save that cannot
+  happen. Two admins who read the same version cannot both save: the second gets `409 stale`.
+  The save, its log row and the check that the actor still holds `rules.manage` commit
+  together, as for every team change. It then rings the PCs it reaches, best effort: a PC that
+  misses the ring takes the rules at its next check-in, and a command makes it check in at once.
+- **The log names fields, never values.** The team log row `rules_changed` holds the names of
+  the fields a save changed and the customer's id, never a program name or a folder path. A
+  session's own log holds the refusal code and the action's detail, which can include an
+  installer path or a program name.
+- **Releases and update rings.** An older PC cannot enforce any of this, so a saved-PC session
+  needs a PC on 1.0.0 or later and an older one updates itself first. A session that was already
+  live on an older PC when 1.0.0 was deployed keeps the old app, which has no rules: the relay
+  checks its tools, the PC does not, until it ends. The release steps say to end those sessions. A deploy does not make a
+  connected PC check in, so the relay rings the PCs that are due an update: the hourly run does
+  it, and a deployment admin can call `POST /api/v1/deployment/ring-updates` right after a
+  deploy (it goes through the teams with a cursor, so a loop that follows it ends). The route takes an Access login that is a person listed in `DEPLOYMENT_ADMINS`. A
+  ring is only the existing doorbell, which carries no authority (above): a forged one only
+  makes a PC check in.
 
 ## Unsigned app
 

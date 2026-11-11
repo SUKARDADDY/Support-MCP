@@ -274,14 +274,19 @@ test('a paired PC is listed without its hashes; a technician sets its site and f
   assert.equal(/key_hash|confirm_hash/.test(list), false);
   // The technician moves and labels it. Switching it to any time needs sessions.unattended, which only the admin holds.
   await err(r.api(TECH, 'PATCH', `/devices/${paired.device_id}`, { access: 'any' }), 403, 'permission_denied');
-  const patched = (await ok(r.api(BOSS, 'PATCH', `/devices/${paired.device_id}`, { site_id: null, fields: { [field.id]: 'T-9' }, access: 'any' }))).body.device;
-  assert.deepEqual([patched.site_id, patched.fields, patched.access, patched.control, patched.name], [null, { [field.id]: 'T-9' }, 'any', 'limited', 'Till']);
+  // Taking it off its site changes the rules that apply to it (its customer's override goes), so devices.manage is not enough:
+  // it needs rules.manage and a fresh authenticator code (test/rules-api.test.js covers the move itself).
+  await err(r.api(TECH, 'PATCH', `/devices/${paired.device_id}`, { site_id: null }), 403, 'permission_denied');
+  await err(r.api(BOSS, 'PATCH', `/devices/${paired.device_id}`, { site_id: null }), 400, 'bad_request');
+  const second = (await ok(r.api(TECH, 'POST', '/sites', { name: 'Branch', customer_id: customer.id }), 201)).body.site;
+  const patched = (await ok(r.api(BOSS, 'PATCH', `/devices/${paired.device_id}`, { site_id: second.id, fields: { [field.id]: 'T-9' }, access: 'any' }))).body.device;
+  assert.deepEqual([patched.site_id, patched.fields, patched.access, patched.control, patched.name], [second.id, { [field.id]: 'T-9' }, 'any', 'limited', 'Till']);
   const log = (await ok(r.api(BOSS, 'GET', '/audit?limit=500'))).body.rows;
   const changed = log.filter((x) => x.kind === 'device_changed');
   assert.equal(changed.length, 1);
   assert.deepEqual([changed[0].actor], [BOSS]);
   assert.match(changed[0].detail, /access ask to any/);
-  assert.match(changed[0].detail, /site .* to none/);
+  assert.match(changed[0].detail, new RegExp(`site ${site.id} to ${second.id}`));
   assert.equal(changed[0].detail.includes('T-9'), false, 'a field value is not logged');
   // The PC's own hello still works, and shows the technician's access change.
   const hello = await ok(r.pc('hello', { protocol: 1 }, { authorization: `Bearer ${paired.key}` }));

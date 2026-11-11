@@ -11,8 +11,8 @@
 // Every change goes through the team store's guarded change (mutate), so the log
 // row commits with the change and the actor's permission is checked again at
 // commit, as for member writes. The only unlogged writes are a PC's check-in
-// details (at most every 5 minutes, or once a minute when one changed) and purging expired
-// codes and waiting PCs. A log detail holds names and ids, never a code, a key
+// details (at most every 5 minutes, or once a minute when one changed, or every 2 seconds
+// when its version changed) and purging expired codes and waiting PCs. A log detail holds names and ids, never a code, a key
 // or a field value.
 //
 // Watching a saved PC's session and moving its driver follow one rule (sessionRule, below), and the
@@ -34,6 +34,7 @@ import { UNATTENDED_PERMISSION } from './permissions.js';
 import { compareVersions, validVersion } from './release.js';
 import { deviceHooks } from './device-sessions.js';
 import { notifyStore } from './notify.js';
+import { effectiveFromRows, hoursUtc, rulesTag } from './rules.js';
 
 export const ID_RE = /^[a-z2-7]{20}$/;
 // smd1.<workspace>.<device id>.<secret>. A mismatch is 401 device_unknown.
@@ -52,9 +53,12 @@ export const CHECK_IN_REFRESH_MS = 5 * MINUTE_MS;
 // Even a changed value is written at most this often, so a PC cannot flip its
 // details to force a write on every check-in.
 export const CHECK_IN_CHANGE_MS = MINUTE_MS;
+// A changed app_version is written after this much quiet instead, so a PC that just updated shows
+// its new version at once (the update ring would otherwise be told it is still old).
+export const CHECK_IN_VERSION_MS = 2000;
 
-// The first release that picks up a session from the check-in and the doorbell.
-export const MIN_SESSION_VERSION = '0.6.0';
+// The first release that enforces the team's rules, and so the first a saved-PC session may connect to.
+export const MIN_SESSION_VERSION = '1.0.0';
 // A saved-PC session waits this long for the PC to pick it up and its person to
 // answer (a 330-second check-in without the doorbell, plus 180), then lasts 24
 // hours from the first hello. The pointer's expires_at is the latest the
@@ -168,6 +172,27 @@ function validId(v, field) {
   return v;
 }
 
+// Every column of devices (migrations 0004 and 0005), named so the check-in's join cannot let a
+// column of another table take a device column's name. test/devices.test.js fails when a migration
+// adds one that is not here.
+export const DEVICE_COLUMNS = Object.freeze([
+  'workspace', 'id', 'site_id', 'status', 'name', 'access', 'control', 'owner_contact', 'os', 'machine', 'app_version', 'protocol',
+  'key_hash', 'confirm_hash', 'expires_at', 'paired_at', 'paired_by', 'approved_by', 'last_seen', 'fields', 'session',
+]);
+// The team's rules row and the row of the PC's site's customer, joined to a device row, the rules columns
+// aliased. The check-in and the Session read the rules that reach a PC with this one shape.
+const RULES_COLUMNS = `s.customer_id AS site_customer_id,
+    tr.doc AS team_rules_doc, tr.rev AS team_rules_rev,
+    cr.doc AS customer_rules_doc, cr.rev AS customer_rules_rev`;
+const RULES_JOINS = `FROM devices d
+  LEFT JOIN sites s ON s.workspace = d.workspace AND s.id = d.site_id
+  LEFT JOIN rules tr ON tr.workspace = d.workspace AND tr.customer_id = ''
+  LEFT JOIN rules cr ON cr.workspace = d.workspace AND s.customer_id <> '' AND cr.customer_id = s.customer_id
+  WHERE d.workspace = ? AND d.id = ?`;
+const AUTHENTICATE_SQL = `SELECT ${DEVICE_COLUMNS.map((c) => `d.${c} AS ${c}`).join(', ')},
+    ${RULES_COLUMNS}
+  ${RULES_JOINS}`;
+
 // A device for the team API. The key hash and the confirm hash never leave the
 // store; a waiting PC shows when its request ends, not its six digits.
 const deviceOut = (r) => ({
@@ -201,11 +226,12 @@ const recordOut = ({ workspace, ...r }) => ({ ...r, fields: JSON.parse(r.fields)
 
 // deps: the team store (src/workspace.js), whose guarded change this builds on.
 // opts.authSecret is AUTH_SECRET: without one of MIN_SECRET_LENGTH characters
-// the pairing routes answer 503 unavailable.
+// the pairing routes answer 503 unavailable. opts.defaultTimeZone is DEFAULT_TIME_ZONE, the zone of
+// rules that name none.
 // opts.hooks reaches the Durable Objects (src/device-sessions.js): ringing a PC's
 // doorbell, making, ending and taking over a session. Without it the store
 // changes the database and touches nothing else.
-export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
+export function deviceStore(db, team, { authSecret = '', hooks = null, defaultTimeZone = '' } = {}) {
   const { mutate, actorContext, actorHas, actorUnchanged, and, lit } = team;
   const q = (sql, ...params) => db.prepare(sql).bind(...params);
   const notify = notifyStore(db, team);
@@ -378,7 +404,11 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
               [`NOT EXISTS (SELECT 1 FROM pairing_codes WHERE workspace = ? AND site_id = ?${liveCodes})`, [slug, id, now]],
             ),
         ),
-        change: ([cond, params]) => [q(`DELETE FROM ${table} WHERE workspace = ? AND id = ? AND ${cond}`, slug, id, ...params)],
+        // A customer's rules go with it, ahead of the delete: the guard reads the customer's row.
+        change: ([cond, params]) => [
+          ...(entity === 'customer' ? [q(`DELETE FROM rules WHERE workspace = ? AND customer_id = ? AND ${cond}`, slug, id, ...params)] : []),
+          q(`DELETE FROM ${table} WHERE workspace = ? AND id = ? AND ${cond}`, slug, id, ...params),
+        ],
         result: { id },
       };
     });
@@ -484,7 +514,13 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
   // mode, its owner's contact (the owner's control level and name stay the
   // owner's), or approval of a waiting PC with the six-digit number its owner
   // reads out. Approval is its own request: it is not mixed with other changes.
-  async function updateDevice(slug, actorIdentity, id, body) {
+  //
+  // A change of site that changes the PC's customer swaps the customer override of the rules that apply to it,
+  // so on an active PC it is a change of rules: the caller (src/api.js) checks rules.manage and a fresh
+  // authenticator code first (siteMoveChangesRules says when) and passes { rulesCleared: true }. A store call that
+  // would make such a move without it is refused, so no path moves a PC between customers on devices.manage alone.
+  // The move is logged as device_changed and rules_changed, and the PC is rung.
+  async function updateDevice(slug, actorIdentity, id, body, { rulesCleared = false } = {}) {
     const actor = normalizeIdentity(actorIdentity);
     const hasSite = Object.hasOwn(body, 'site_id');
     const hasFields = Object.hasOwn(body, 'fields');
@@ -544,6 +580,12 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
       const sets = [];
       const values = [];
       const siteChanges = hasSite && siteId !== cur.site_id;
+      // The customers of the old and the new site, read once for the check and the log.
+      const [fromCustomer, toCustomer] = siteChanges && cur.status === 'active' ? await Promise.all([customerOf(slug, cur.site_id), customerOf(slug, siteId)]) : [null, null];
+      const rulesChange = siteChanges && cur.status === 'active' && fromCustomer !== toCustomer;
+      if (rulesChange && !rulesCleared) {
+        throw new TeamError(409, 'rules_change', 'moving an active PC to another customer, or to no site, changes the rules that apply to it: it needs rules.manage and a fresh authenticator code');
+      }
       if (siteChanges) { changed.push(`site ${cur.site_id ?? 'none'} to ${siteId ?? 'none'}`); sets.push('site_id = ?'); values.push(siteId); }
       const accessChanges = hasAccess && access !== cur.access;
       if (accessChanges) { changed.push(`access ${cur.access} to ${access}`); sets.push('access = ?'); values.push(access); }
@@ -553,11 +595,17 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
       if (merge.ids.length) { changed.push(...merge.ids.map((f) => `field ${f}`)); sets.push('fields = json_patch(fields, ?)'); values.push(merge.patch); }
       if (!changed.length) return { noop: true, result: deviceOut(cur) };
       // A changed access mode is something the PC acts on, so it is rung.
-      ring = accessChanges;
+      ring = accessChanges || rulesChange;
       return {
-        entries: [{ kind: 'device_changed', detail: `${id} ${changed.join(', ')}` }],
+        entries: [
+          { kind: 'device_changed', detail: `${id} ${changed.join(', ')}` },
+          ...(rulesChange ? [{ kind: 'rules_changed', detail: `device ${id}: site ${cur.site_id ?? 'none'} to ${siteId ?? 'none'}, customer ${fromCustomer ?? 'none'} to ${toCustomer ?? 'none'}` }] : []),
+        ],
         guard: and(
           base,
+          // The customer's rules follow the PC, so the permission is held at commit and the PC is still approved.
+          rulesChange ? actorHas(slug, actor, 'rules.manage') : lit(true),
+          rulesChange ? ["EXISTS (SELECT 1 FROM devices WHERE workspace = ? AND id = ? AND status = 'active')", [slug, id]] : lit(true),
           // The permission is held at commit too, not only when it was read.
           accessChanges && access === 'any' ? actorHas(slug, actor, UNATTENDED_PERMISSION) : lit(true),
           siteId ? rowExists('sites', slug, siteId) : lit(true),
@@ -576,6 +624,29 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
     });
     if (ring) await hooks?.ring(slug, id);
     return out;
+  }
+
+  // The customer a site belongs to, or null (no site, or a site that is gone). A site never changes customer.
+  async function customerOf(slug, siteId) {
+    if (!siteId) return null;
+    return (await q('SELECT customer_id FROM sites WHERE workspace = ? AND id = ?', slug, siteId).first())?.customer_id ?? null;
+  }
+
+  // Whether the site change in a PATCH of a PC would change the rules that apply to it: the PC is active and the
+  // new site is under another customer than the old one (or either is no site). The caller then asks for
+  // rules.manage and a fresh code before updateDevice. Anything that is not a plain site change answers false
+  // and is left to updateDevice to refuse. A site that does not exist is refused here, before a code is spent.
+  async function siteMoveChangesRules(slug, id, body) {
+    if (!Object.hasOwn(body, 'site_id') || Object.hasOwn(body, 'approve')) return false;
+    let siteId = null;
+    if (body.site_id !== null) {
+      if (typeof body.site_id !== 'string' || !ID_RE.test(body.site_id)) return false;
+      siteId = body.site_id;
+    }
+    const cur = await q('SELECT status, site_id FROM devices WHERE workspace = ? AND id = ?', slug, id).first();
+    if (!cur || cur.status !== 'active' || cur.site_id === siteId) return false;
+    if (siteId && !(await count('sites', slug, ' AND id = ?', siteId))) throw new TeamError(400, 'unknown_site', 'no such site');
+    return (await customerOf(slug, cur.site_id)) !== (await customerOf(slug, siteId));
   }
 
   // A technician removes a saved PC, waiting or not. Its key ends with its row.
@@ -804,8 +875,10 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
   // The device a key opens, or null. A wrong secret, an unknown id, a removed
   // device and a waiting PC past its 24 hours are all the same null. The secret
   // is hashed and compared in constant time even when the id is unknown.
+  // One query reads the device and the rules that reach it: the team's row and the row of its
+  // site's customer, aliased so no rules column can overwrite a device column.
   async function authenticate(key) {
-    const row = await q('SELECT * FROM devices WHERE workspace = ? AND id = ?', key.workspace, key.id).first();
+    const row = await q(AUTHENTICATE_SQL, key.workspace, key.id).first();
     const given = await sha256Hex(key.secret);
     const match = timingSafeEqual(row ? row.key_hash : ZERO_HASH, given);
     if (!row || !match) return null;
@@ -817,9 +890,11 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
   }
 
   // A PC checks in. What it reports is written at most every 5 minutes, or every
-  // minute when a value changed. Unlogged, like the callers table. Returns the
-  // device for the PC and, for the relay's own use (the update offer), the
-  // version it runs: the one this request reports, else the stored one.
+  // minute when a value changed, except a new app_version, which is written after 2
+  // seconds. Unlogged, like the callers table. Returns the device for the PC and, for
+  // the relay's own use (the update offer), the version it runs: the one this request
+  // reports, else the stored one. For an active PC it also returns `rules`, the rules
+  // that reach it (src/rules.js), from the row already loaded: no further query.
   async function checkInFull(key, body) {
     const dev = await authenticate(key);
     if (!dev) throw unknownDevice();
@@ -829,19 +904,46 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
     }
     const now = Date.now();
     const next = { os: dev.os, machine: dev.machine, app_version: dev.app_version, ...report };
-    const changed = ['os', 'machine', 'app_version'].some((f) => next[f] !== dev[f]) || dev.protocol !== 1;
+    const versionChanged = next.app_version !== dev.app_version;
+    const changed = next.os !== dev.os || next.machine !== dev.machine || dev.protocol !== 1;
     // last_seen is the time of the last write, so it also holds concurrent check-ins to the same limit.
+    // app_version = the stored one is the guard for a version change: of two check-ins that saw the old
+    // version, the first to write wins and the other writes nothing.
     const minAge = changed ? CHECK_IN_CHANGE_MS : CHECK_IN_REFRESH_MS;
     if (now - dev.last_seen >= minAge) {
-      await q('UPDATE devices SET os = ?, machine = ?, app_version = ?, protocol = 1, last_seen = ? WHERE workspace = ? AND id = ? AND key_hash = ? AND last_seen <= ?',
-        next.os, next.machine, next.app_version, now, key.workspace, key.id, dev.key_hash, now - minAge).run();
+      await q('UPDATE devices SET os = ?, machine = ?, app_version = ?, protocol = 1, last_seen = ? WHERE workspace = ? AND id = ? AND key_hash = ? AND last_seen <= ? AND app_version = ?',
+        next.os, next.machine, next.app_version, now, key.workspace, key.id, dev.key_hash, now - minAge, dev.app_version).run();
+    } else if (versionChanged && now - dev.last_seen >= CHECK_IN_VERSION_MS) {
+      await q('UPDATE devices SET app_version = ?, last_seen = ? WHERE workspace = ? AND id = ? AND key_hash = ? AND last_seen <= ? AND app_version = ?',
+        next.app_version, now, key.workspace, key.id, dev.key_hash, now - CHECK_IN_VERSION_MS, dev.app_version).run();
     }
     // The session the PC should pick up, from the row already loaded: no further query.
     const live = dev.status === 'active' ? livePointer(dev, now) : null;
     const session = live ? { id: live.id, by: live.by, team: live.team, ask: live.ask, expires_at: live.expires_at } : null;
-    return { device: pcOut(dev), app_version: next.app_version, session };
+    return { device: pcOut(dev), app_version: next.app_version, session, rules: dev.status === 'active' ? await rulesAnswer(dev, now) : null };
+  }
+
+  // What a hello says of the rules for an active PC: the effective document, its tag, the business-hour
+  // spans for the next 8 days and the relay's clock, from the row authenticate read.
+  async function rulesAnswer(dev, now) {
+    const doc = effectiveFromRows(
+      dev.team_rules_doc === null ? null : { doc: dev.team_rules_doc, rev: dev.team_rules_rev },
+      dev.customer_rules_doc === null ? null : { doc: dev.customer_rules_doc, rev: dev.customer_rules_rev },
+      { defaultTimeZone },
+    );
+    return { doc, tag: await rulesTag(doc), ...hoursUtc(doc, now), server_time: Math.floor(now / 1000) };
   }
   const checkIn = async (key, body) => (await checkInFull(key, body)).device;
+
+  // The rules in force for a saved PC right now, read fresh (never cached): { rules, tag, hours, rev }, with the
+  // business-hour spans for the next 8 days, or null for a PC that does not exist in this workspace. One query:
+  // the device, its site, the team's row and its customer's row. A Session calls this for every guarded command.
+  async function rulesFor(slug, deviceId, now = Date.now()) {
+    const row = await q(`SELECT d.id AS id, ${RULES_COLUMNS} ${RULES_JOINS}`, slug, deviceId).first();
+    if (!row) return null;
+    const a = await rulesAnswer(row, now);
+    return { rules: a.doc, tag: a.tag, hours: { hours_utc: a.hours_utc, hours_until: a.hours_until }, rev: a.doc.rev };
+  }
 
   // The owner's changes from the PC itself: name, access, control. Logged as
   // device_changed by "pc <id>". A waiting PC may not (403 pending).
@@ -1213,13 +1315,13 @@ export function deviceStore(db, team, { authSecret = '', hooks = null } = {}) {
     connect, sessionEnded, pinSessionEnd,
     listRecords, getRecord, addRecord, updateRecord, removeRecord,
     listFields, addField, updateField, removeField,
-    listDevices, getDevice, liveSession, updateDevice, removeDevice,
+    listDevices, getDevice, liveSession, updateDevice, siteMoveChangesRules, removeDevice,
     createPairingCode, listPairingCodes, revokePairingCode,
-    redeemCode, requestJoin, authenticate, checkIn, checkInFull, updateOwn, leave,
+    redeemCode, requestJoin, authenticate, checkIn, checkInFull, rulesFor, updateOwn, leave,
   };
 }
 
 // The device store for this deployment, from the Worker env.
 // opts.devTtlMs is the dev session-length override of the MCP address that called.
 export const devicesFromEnv = (env, team = teamFromEnv(env), { devTtlMs = 0 } = {}) =>
-  deviceStore(env.DB, team, { authSecret: env.AUTH_SECRET, hooks: deviceHooks(env, { devTtlMs }) });
+  deviceStore(env.DB, team, { authSecret: env.AUTH_SECRET, hooks: deviceHooks(env, { devTtlMs }), defaultTimeZone: env.DEFAULT_TIME_ZONE });

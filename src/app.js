@@ -8,7 +8,7 @@ import { verifyAccessJwt, jwksKeyResolver, localBypassAllowed, callerIdentity } 
 import { handleRpc, parseToolOptions } from './mcp.js';
 import { VERSION } from './version.js';
 import { permissionForTool } from './permissions.js';
-import { DEFAULT_WORKSPACE, TeamError, teamFromEnv } from './workspace.js';
+import { DEFAULT_WORKSPACE, TeamError, identityKind, normalizeIdentity, parseDeploymentAdmins, teamFromEnv } from './workspace.js';
 import { registryName } from './registry.js';
 import { fail, handleApi, intParam, readBody } from './api.js';
 import { handleDevice } from './device-api.js';
@@ -16,7 +16,7 @@ import { ID_RE, devicesFromEnv, linkCode, livePointer, parseDeviceKey } from './
 import { deviceHooks, newCode } from './device-sessions.js';
 import { agentService } from './agent.js';
 import { agentStoreFromEnv } from './agent-store.js';
-import { sweep } from './sweep.js';
+import { RING_ROUTE_IDLE_MS, RING_ROUTE_SUBREQUESTS, ringUpdates, sweep } from './sweep.js';
 import { sessionPeople } from './session-people.js';
 import { escalationService } from './escalations.js';
 import { WAIT_MAX_S, notifyStore, waitForFeed } from './notify.js';
@@ -132,8 +132,9 @@ function installPage(query, hasCode) {
 // that does not exist.
 // via is "agent" when the built-in agent makes the call as its starter: the Session's
 // log row says so, and the actor stays the starter for every check. taskId (agent calls only,
-// never an argument of a tool) is written on a session its device_connect makes.
-function makeBackend(env, origin, devTtlMs, actor, workspace, via = null, taskId = null) {
+// never an argument of a tool) is written on a session its device_connect makes. oauthCaller (an OAuth caller's token)
+// is passed on with each command, so the Session can read that person's standing again before it sends an approved one.
+function makeBackend(env, origin, devTtlMs, actor, workspace, via = null, taskId = null, oauthCaller = null) {
   const sessionStub = (sid) => {
     if (sid === undefined || sid === null || sid === '') throw new Error('session_id is required; call session_list to find it');
     if (!/^[0-9a-f]{64}$/.test(String(sid))) throw new Error('session_id must be the 64 hex characters from session_create or session_list');
@@ -142,7 +143,9 @@ function makeBackend(env, origin, devTtlMs, actor, workspace, via = null, taskId
   async function cmd(sid, body) {
     const r = await sessionStub(sid).fetch('https://do/command', {
       method: 'POST',
-      body: JSON.stringify({ ...body, actor, workspace, ...(via ? { via } : {}) }),
+      body: JSON.stringify({ ...body, actor, workspace, ...(via ? { via } : {}), ...(via === 'agent' && taskId ? { task_id: taskId } : {}),
+        // An OAuth caller's account and the authenticator their grant was made with, for the check the Session makes again when an approved command is sent.
+        ...(oauthCaller ? { oauth: { user_id: oauthCaller.userId, factor: oauthCaller.factor ?? null } } : {}) }),
     });
     return r.json();
   }
@@ -157,6 +160,11 @@ function makeBackend(env, origin, devTtlMs, actor, workspace, via = null, taskId
       throw e instanceof TeamError ? new Error(`${e.code}: ${e.message}`) : e;
     }
   };
+  async function power(args, action) {
+    const r = await cmd(args.session_id, { op: 'power', action, delay_s: args.delay_s });
+    if (r.ok === false) throw new Error(r.error || `${action}_pc failed`);
+    return { ok: true, at: r.at };
+  }
   return {
     async session_create(args, caps = {}) {
       const windowsMode = normalizeWindowsMode(args.windows_mode ?? 'app');
@@ -194,7 +202,7 @@ function makeBackend(env, origin, devTtlMs, actor, workspace, via = null, taskId
     },
     async session_status(args) {
       const tail = args.log_tail == null ? 20 : args.log_tail;
-      const r = await sessionStub(args.session_id).fetch(`https://do/status?log_tail=${encodeURIComponent(tail)}&workspace=${workspace}`);
+      const r = await sessionStub(args.session_id).fetch(`https://do/status?log_tail=${encodeURIComponent(tail)}&workspace=${workspace}&rules=1`);
       const out = await r.json();
       // The Session knows the people by their identities; the team knows their names.
       if (Array.isArray(out.participants) && out.participants.length) out.participants = await people().named(workspace, out.participants);
@@ -219,6 +227,35 @@ function makeBackend(env, origin, devTtlMs, actor, workspace, via = null, taskId
       const r = await cmd(args.session_id, { op: 'get_file', path: args.path, offset: args.offset, length: args.length });
       if (r.ok === false) throw new Error(r.error || 'get_file failed');
       return { data_b64: r.data_b64, size: r.size, eof: r.eof };
+    },
+    // The tools the team's rules govern. The Session decides each against the rules in force for the PC, asks for a
+    // technician's approval when they say so, and refuses with an error that starts with a code (src/session.js).
+    // restart_pc and shutdown_pc answer before the PC acts.
+    async restart_pc(args) {
+      return power(args, 'restart');
+    },
+    async shutdown_pc(args) {
+      return power(args, 'shutdown');
+    },
+    async list_programs(args) {
+      const r = await cmd(args.session_id, { op: 'programs', action: 'list' });
+      if (r.ok === false) throw new Error(r.error || 'list_programs failed');
+      return { installed: r.installed ?? [], running: r.running ?? [] };
+    },
+    async install_program(args) {
+      const r = await cmd(args.session_id, { op: 'programs', action: 'install', path: args.path, args: args.args, timeout_s: args.timeout_s });
+      if (r.ok === false) throw new Error(r.error || 'install_program failed');
+      return { ok: true, exit_code: r.exit_code ?? null, ...(r.detail ? { detail: r.detail } : {}) };
+    },
+    async uninstall_program(args) {
+      const r = await cmd(args.session_id, { op: 'programs', action: 'uninstall', program_id: args.program_id, timeout_s: args.timeout_s });
+      if (r.ok === false) throw new Error(r.error || 'uninstall_program failed');
+      return { ok: true, exit_code: r.exit_code ?? null, ...(r.detail ? { detail: r.detail } : {}) };
+    },
+    async close_program(args) {
+      const r = await cmd(args.session_id, { op: 'programs', action: 'close', name: args.name, pid: args.pid, force: args.force });
+      if (r.ok === false) throw new Error(r.error || 'close_program failed');
+      return { ok: true, closed: r.closed ?? 0, ...(r.still_running ? { still_running: r.still_running } : {}) };
     },
     // args.action is already normalized by mcp.js; the Session checks it again.
     async screen(args) {
@@ -731,7 +768,7 @@ async function runMcp(request, env, url, origin, devTtlMs, workspace, actor, oau
     }
     if (mode === 'agent') throw new Error(`${mark}this team uses the built-in agent`);
   };
-  const backend = authorizedBackend(makeBackend(env, origin, devTtlMs, actor, workspace), env, actor, toolName, workspace, oauthCaller, { gate });
+  const backend = authorizedBackend(makeBackend(env, origin, devTtlMs, actor, workspace, null, null, oauthCaller), env, actor, toolName, workspace, oauthCaller, { gate });
   const { status, body } = await handleRpc(msg, backend, options);
   if (body === null) return new Response(null, { status });
   return json(body, status);
@@ -813,6 +850,42 @@ async function handleApp(request, env, url, origin, devTtlMs, workspace, rest, o
   }
 }
 
+// POST /api/v1/deployment/ring-updates: ring the connected PCs that the release this relay serves is due for,
+// across every team, right after a deploy (the hourly run does the same for what it reaches). Only a person whose
+// Access login is in DEPLOYMENT_ADMINS may: a service token is refused whatever it is named, as is every
+// other login. Body { after } (a team name, from the last answer's next; none for the first call). Answers
+// { rung, teams_left, next }; while next is not null, call again with after set to it. The teams are taken in
+// name order from the one after the cursor, so the calls end even when some PCs cannot update.
+const RING_UPDATES_PATH = '/api/v1/deployment/ring-updates';
+async function handleRingUpdates(request, env, url, appBundle) {
+  if (request.headers.has('origin')) return fail(403, 'forbidden', 'cross-site requests are refused');
+  if (request.method !== 'POST') return fail(405, 'method_not_allowed', 'use POST', { allow: 'POST' });
+  if (!isJsonContentType(request)) return fail(415, 'unsupported_media_type', 'send content-type: application/json');
+  const caller = await accessCaller(request, env, url);
+  if (!caller) return fail(403, 'forbidden', 'Cloudflare Access did not admit this request');
+  const who = normalizeIdentity(caller);
+  if (identityKind(who) !== 'person' || !parseDeploymentAdmins(env.DEPLOYMENT_ADMINS).has(who)) {
+    return fail(403, 'forbidden', 'only a deployment admin may ring PCs for an update');
+  }
+  let after = '';
+  try {
+    const text = await request.text();
+    const body = text.trim() ? JSON.parse(text) : {};
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new Error('not an object');
+    if (Object.hasOwn(body, 'after') && body.after !== null) {
+      if (typeof body.after !== 'string' || (body.after !== '' && !/^[a-z0-9-]{1,40}$/.test(body.after))) throw new Error('bad after');
+      after = body.after;
+    }
+  } catch (_) {
+    return fail(400, 'bad_request', 'send {} or { "after": <the next of the last answer> }');
+  }
+  try {
+    return json(await ringUpdates(env, Date.now(), appBundle, { budget: RING_ROUTE_SUBREQUESTS, idleMs: RING_ROUTE_IDLE_MS, after }), 200, noStore);
+  } catch (_) {
+    return fail(503, 'unavailable', 'could not ring the PCs; try again', { 'retry-after': '1' });
+  }
+}
+
 // An OAuth route that cannot reach the database or KV answers 503, not a crash.
 async function oauthRoute(serve) {
   try {
@@ -837,7 +910,7 @@ export function createHandler(agentText, appBundle = null, options = {}) {
   return {
     // The hourly Cron Trigger (wrangler.toml): PCs missing for 7 days, and old notifications.
     async scheduled(event, env, ctx) {
-      const run = sweep(env).catch(() => {});
+      const run = sweep(env, Date.now(), appBundle).catch(() => {});
       if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(run);
       await run;
     },
@@ -885,6 +958,7 @@ export function createHandler(agentText, appBundle = null, options = {}) {
           waitUntil: ctx && typeof ctx.waitUntil === 'function' ? (promise) => ctx.waitUntil(promise) : undefined,
         });
       }
+      if (p === RING_UPDATES_PATH) return handleRingUpdates(request, env, url, appBundle);
       if (p === '/api' || p.startsWith('/api/')) return handleApi(request, env, url, { accessCaller, isJsonContentType, origin });
       // A PC pairs and checks in here with its own key. Public: outside Access.
       if (p.startsWith('/device/')) return handleDevice(request, env, url, { isLoopback, isJsonContentType, appBundle });

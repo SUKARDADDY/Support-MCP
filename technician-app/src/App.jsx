@@ -9,10 +9,12 @@ import { tabKeyDown, useInterval, usePageVisible } from './hooks.js';
 import { same } from './session.js';
 import { t } from './i18n/index.js';
 import { AddDevice } from './screens/AddDevice.jsx';
+import { ApprovalDialog } from './screens/ApprovalDialog.jsx';
 import { Devices } from './screens/Devices.jsx';
 import { Notifications } from './screens/Notifications.jsx';
 import { OneOffLink } from './screens/OneOffLink.jsx';
 import { Queue } from './screens/Queue.jsx';
+import { Rules } from './screens/Rules.jsx';
 import { SessionTab } from './screens/SessionTab.jsx';
 import { Settings } from './screens/Settings.jsx';
 import { SignIn } from './screens/SignIn.jsx';
@@ -62,6 +64,9 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   const [queueCount, setQueueCount] = useState(0); // items in the queue nobody has claimed
   const [queueTick, setQueueTick] = useState(0); // counts the queue notices that arrived, so the Queue screen reads its list again
   const [linkOpen, setLinkOpen] = useState(false);
+  // Approvals to review, oldest first: { key, account, sessionId, deviceId, deviceName }. The first one of the shown account is on screen.
+  const [approvals, setApprovals] = useState([]);
+  const seenApprovals = useRef(new Set()); // "<account>:<approval id>" of every approval a dialog has shown
   const [titles, setTitles] = useState(loadTitles); // task id -> first line of the instructions this app sent
   const [toastText, setToastText] = useState(null);
   const [relayDown, setRelayDown] = useState(false);
@@ -118,6 +123,29 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     return () => { live = false; };
   }, [core, accountId]);
   const can = useCallback((permission) => me.permissions.includes(permission), [me]);
+  const meRef = useRef(me);
+  meRef.current = me;
+
+  // ---- approvals: an action the team's rules send to a technician ----------------------------
+  // A notice (the feed, or a click on the Windows notification) and a session tab that sees one waiting both ask for it to
+  // be reviewed. One review per session at a time; the dialog reads the approval from the relay itself. `auto` (a tab that
+  // saw it in the status) leaves out an approval a dialog has shown already, so closing the dialog does not bring it back.
+  const requestApproval = useCallback(({ account: acc, sessionId, deviceId = null, deviceName = '', approvalId = null, auto = false }) => {
+    if (!acc || !sessionId) return;
+    if (auto && approvalId && seenApprovals.current.has(`${acc}:${approvalId}`)) return;
+    setApprovals((cur) => (cur.some((x) => x.account === acc && x.sessionId === sessionId) ? cur : [...cur, { key: `${acc}:${sessionId}:${Date.now()}`, account: acc, sessionId, deviceId, deviceName }]));
+  }, []);
+  const approvalSeen = useCallback((acc, id) => { seenApprovals.current.add(`${acc}:${id}`); }, []);
+  const closeApproval = useCallback((key) => setApprovals((cur) => cur.filter((x) => x.key !== key)), []);
+  const answeredApproval = useCallback((entry, { approval, approved, shown }) => {
+    if (shown) {
+      toast(approved ? t('approval.approved_toast', { name: entry.deviceName || approval.device_name || '' }) : t('approval.denied_toast'));
+    } else {
+      // The dialog went with the team that was shown; there is nothing left to review for it.
+      closeApproval(entry.key);
+    }
+  }, [toast, closeApproval]);
+  const shownApproval = approvals.find((x) => x.account === accountId) ?? null;
 
   // ---- the queue's badge: the items nobody has claimed ----------------------------------
   // Read when the app starts and when the relay says the queue changed (a notification). While the Queue screen
@@ -354,6 +382,14 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
         refreshQueueRef.current?.(acc);
         setQueueTick((n) => n + 1);
       }
+      // An approval asked for is reviewed at once, by someone who may answer it (another team's is held until that team is shown).
+      if (isLive) {
+        for (const i of fresh) {
+          if (i.event !== 'approval_requested' || !i.session_id) continue;
+          if (guard.isShown(acc) && !meRef.current.permissions.includes('sessions.unattended')) continue;
+          requestApprovalRef.current?.({ account: acc, sessionId: i.session_id, deviceId: i.device_id ?? null });
+        }
+      }
       setNotifications((cur) => [...cur, ...fresh].slice(-100));
       if (isLive) setUnread((n) => n + fresh.length);
     });
@@ -367,6 +403,11 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
   const openTarget = useCallback(async (n) => {
     const acc = n.account ?? accountId;
     if (acc && acc !== accountId) setActive(acc);
+    // An approval notice opens the review of what waits on its session.
+    if (n.event === 'approval_requested' && n.session_id) {
+      requestApproval({ account: acc, sessionId: n.session_id, deviceId: n.device_id ?? null });
+      return;
+    }
     // A queue notice opens the Queue.
     if (n.event === 'escalation_opened' || n.event === 'escalation_claimed') {
       if (guard.isShown(acc)) setView('queue');
@@ -410,9 +451,11 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
       }
     }
     if (n.device_id && guard.isShown(acc)) { setSelectedId(n.device_id); setView('devices'); }
-  }, [accountId, tabs, core, deviceData.devices, openSessionTab, setActive, showTab, guard, updateTab]);
+  }, [accountId, tabs, core, deviceData.devices, openSessionTab, setActive, showTab, guard, updateTab, requestApproval]);
   const openTargetRef = useRef(null);
   openTargetRef.current = openTarget;
+  const requestApprovalRef = useRef(null);
+  requestApprovalRef.current = requestApproval;
 
   const go = useCallback((next) => {
     setView(next);
@@ -425,8 +468,8 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
     devices: deviceData.devices, places: deviceData.places, devicesState: deviceData, reloadDevices,
     selectedId, select, conns, connect, cancelConnect, dismissConnect,
     sessionTabFor, tabForSession, isShown: guard.isShown, showTab, endTab, closeTab, leaveTab, markStance, updateTab, openSessionTab, go, openLink: () => setLinkOpen(true), queueCount, queueTick, refreshQueue, reportOpen,
-    toast, copyText, notifications, openTarget, now, theme, setTheme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded,
-  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, tabForSession, showTab, endTab, closeTab, leaveTab, markStance, updateTab, openSessionTab, go, queueCount, queueTick, refreshQueue, reportOpen, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded]); // eslint-disable-line react-hooks/exhaustive-deps
+    toast, copyText, notifications, openTarget, now, theme, setTheme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded, requestApproval, approvalSeen,
+  }), [core, appInfo, accounts, account, setActive, loadAccounts, can, me, deviceData, reloadDevices, selectedId, select, conns, connect, cancelConnect, dismissConnect, sessionTabFor, tabForSession, showTab, endTab, closeTab, leaveTab, markStance, updateTab, openSessionTab, go, queueCount, queueTick, refreshQueue, reportOpen, toast, copyText, notifications, openTarget, now, theme, tuning, visible, rememberTask, titleOf, registerTab, startAgentTask, markEnded, requestApproval, approvalSeen]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (accounts === null) return <div className="app" role="status"><p className="hint">{t('common.loading')}</p></div>;
 
@@ -478,6 +521,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
                 {queueCount ? <span className="count" aria-label={t('nav.queue_open', { count: queueCount })}>{queueCount}</span> : null}
               </button>
             ) : null}
+            {can('devices.view') ? <button type="button" aria-current={screen === 'rules' ? 'page' : undefined} onClick={() => go('rules')}><Icon name="shield" />{t('nav.rules')}</button> : null}
             <span className="grow" />
             <button type="button" aria-current={screen === 'notifications' ? 'page' : undefined} onClick={() => go('notifications')}>
               <Icon name="bell" />{t('nav.notifications')}
@@ -490,6 +534,7 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
               {screen === 'devices' ? <Devices /> : null}
               {screen === 'add' ? <AddDevice /> : null}
               {screen === 'queue' ? <Queue key={account.id} /> : null}
+              {screen === 'rules' ? <Rules key={account.id} /> : null}
               {screen === 'notifications' ? <Notifications /> : null}
               {screen === 'settings' ? <Settings /> : null}
             </div>
@@ -503,6 +548,17 @@ export function App({ core = realCore, tuning: tuningIn = NO_TUNING }) {
           </main>
         </div>
         {linkOpen ? <OneOffLink onClose={() => setLinkOpen(false)} /> : null}
+        {shownApproval ? (
+          <ApprovalDialog
+            key={shownApproval.key}
+            account={shownApproval.account}
+            sessionId={shownApproval.sessionId}
+            deviceName={shownApproval.deviceName}
+            onSeen={(id) => approvalSeen(shownApproval.account, id)}
+            onAnswered={(result) => answeredApproval(shownApproval, result)}
+            onClose={() => closeApproval(shownApproval.key)}
+          />
+        ) : null}
         <div className={`toast${toastText ? ' show' : ''}`} role="status" aria-live="polite">{toastText}</div>
       </div>
     </AppContext.Provider>

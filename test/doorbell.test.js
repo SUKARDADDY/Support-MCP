@@ -191,6 +191,37 @@ test('a ring reaches one PC, or every PC for a stop, and the Registry sends noth
   assert.deepEqual(await post({ all: true }), { rang: true });
 });
 
+test('a list of PCs is rung where connected, and at most `max` of them, in the order given', async (t) => {
+  const w = await world(t);
+  const { registry, ctx } = w.registryFor('registry');
+  const ids = ['a', 'b', 'c', 'd'].map((c) => c.repeat(20));
+  const bells = ids.map((id) => socket([`dev:${id}`]));
+  ctx.sockets.push(bells[0], bells[2], bells[3]); // b has no doorbell
+  const post = async (body) => (await registry.fetch(new Request('https://do/ring', { method: 'POST', body: JSON.stringify(body) }))).json();
+  assert.deepEqual(await post({ device_ids: ids }), { rang: true, count: 3 });
+  assert.deepEqual(bells.map((b) => b.sent.length), [1, 0, 1, 1]);
+  assert.deepEqual(await post({ device_ids: [...ids, ids[0], 'not an id'], max: 2 }), { rang: true, count: 2 }, 'the first two with a doorbell; a repeat or a bad id counts for nothing');
+  assert.deepEqual(bells.map((b) => b.sent.length), [2, 0, 2, 1]);
+  assert.deepEqual(await post({ device_ids: [] }), { rang: false, count: 0 });
+  assert.deepEqual(await post({ device_ids: ['b'.repeat(20)] }), { rang: false, count: 0 });
+});
+
+test('the count of a list ring is PCs, not sockets: a PC with two doorbells open is rung on both and counted once', async (t) => {
+  const w = await world(t);
+  const { registry, ctx } = w.registryFor('registry');
+  const ids = ['a', 'b', 'c'].map((c) => c.repeat(20));
+  const twice = [socket([`dev:${ids[0]}`]), socket([`dev:${ids[0]}`])];
+  const once = socket([`dev:${ids[1]}`]);
+  ctx.sockets.push(...twice, once);
+  const post = async (body) => (await registry.fetch(new Request('https://do/ring', { method: 'POST', body: JSON.stringify(body) }))).json();
+  assert.deepEqual(await post({ device_ids: ids }), { rang: true, count: 2 });
+  assert.deepEqual([...twice, once].map((b) => b.sent.length), [1, 1, 1], 'every doorbell was rung');
+  assert.deepEqual(await post({ device_ids: ids, max: 1 }), { rang: true, count: 1 }, 'max counts PCs too');
+  // A socket that cannot be sent to does not count its PC.
+  twice.forEach((b) => { b.send = () => { throw new Error('closed'); }; });
+  assert.deepEqual(await post({ device_ids: [ids[0], ids[1]] }), { rang: true, count: 1 });
+});
+
 test('closing or an error on a doorbell takes it out of the online list', async (t) => {
   const w = await world(t);
   const { registry, ctx } = w.registryFor('registry');

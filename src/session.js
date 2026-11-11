@@ -15,7 +15,8 @@
 //
 // An app client that reports the `lanes` cap runs two lanes at once: `cmd`
 // (run, put_file, get_file) and `screen` (screen and control frames). An older
-// client without it keeps one lane and cannot do screen work.
+// client without it keeps one lane and cannot do screen work. The `cmd` lane also takes the `power` and
+// `programs` frames of restart_pc, shutdown_pc and the program tools, on a saved PC only.
 //
 // A saved-PC session (created with a device_id) is a third kind. It starts in
 // `waiting` (the PC must pick it up and the person at it answer within 510 s),
@@ -41,6 +42,16 @@
 // memory only (this.frame), never in storage, replaced by no zoom, and dropped when the
 // session ends or the object is evicted.
 //
+// On a saved PC, the team's rules (src/rules.js) are enforced here before a command is queued. For each
+// guarded command (restart_pc, shutdown_pc, install_program, uninstall_program, close_program, put_file,
+// get_file) the Session reads the rules in force for that PC from the database, every time and never cached,
+// and decides: refuse with a code, allow, or wait for a technician's approval. The decision is made before the
+// command lane is taken, so a waiting approval blocks nothing else. Every guarded frame carries rules_tag (the
+// PC compares it with its own), decided_at (the relay's time of the decision, Unix seconds) and, when a
+// technician approved it, approved_by. One approval waits at a time. It is kept in this object's storage and
+// in memory, answered through /approvals (src/approvals.js checks who may answer), and cancelled by a handover,
+// a take-over, the end of the session or the built-in agent's Stop or Pause. An object restart drops it unsent.
+//
 // A session belongs to the team workspace that created it (`workspace`, stored
 // at create; a session without one is in "default"). Operator calls to
 // /status, /command and /end name their workspace, and a call from another
@@ -48,8 +59,15 @@
 // that name none (the download page, consume, the app) skip the check.
 
 import { registryName } from './registry.js';
-import { teamFromEnv } from './workspace.js';
-import { ID_RE, devicesFromEnv } from './devices.js';
+import { identityKind, normalizeIdentity, teamFromEnv } from './workspace.js';
+import { ID_RE, MIN_SESSION_VERSION, devicesFromEnv } from './devices.js';
+import { notifyStore } from './notify.js';
+import { accountStore } from './accounts.js';
+import { assertPersonActive, assertSecondFactor } from './oauth.js';
+import { agentStoreFromEnv } from './agent-store.js';
+import { UNATTENDED_PERMISSION } from './permissions.js';
+import { compareVersions, validVersion } from './release.js';
+import { REFUSALS, decide, installArgsProblem, installerProblem, isAppProgramId, localAbsolutePath, powerDelay } from './rules.js';
 import { OPERATOR_END_REASONS } from './device-sessions.js';
 import { VERSION_PATTERN } from './version.js';
 import {
@@ -78,7 +96,25 @@ const POLL_PARK_MS = 25 * 1000; // app mode: a long poll with nothing to send en
 const REDELIVER_MS = 5 * 1000; // app mode: a frame already sent is not sent again sooner than this
 const SCREEN_WAIT_MS = 30 * 1000; // screen frame: base wait for the app's result
 const CONTROL_WAIT_MS = 120 * 1000; // request_full_control: UAC and the customer's dialogs
-const LANE_OF = { run: 'cmd', put_file: 'cmd', get_file: 'cmd', screen: 'screen', control: 'screen' };
+const LANE_OF = { run: 'cmd', put_file: 'cmd', get_file: 'cmd', power: 'cmd', programs: 'cmd', screen: 'screen', control: 'screen' };
+const APPROVAL_MS = 5 * 60 * 1000; // a technician has this long to answer an approval
+const CATCH_UP_MS = 15 * 1000; // the PC may spend this long on a check-in before it decides a frame that carries a rules tag (Rules.CatchUpMs)
+const LANE_STEP_MS = 100; // how often a waiting approved command looks at its lane
+const LANE_WAIT_MS = 60 * 1000; // an approved command waits this long for a busy lane before it gives the approval up
+const PROGRAM_NAME_MAX = 260;
+const PROGRAMS_TTL_MS = 10 * 60 * 1000; // how long a list_programs result stands in for the PC's programs
+const CONTROL_TEXT = /[\u0000-\u001f\u007f]/;
+// Refusals the rules do not make: the codes of the other checks of the tools (src/mcp.js REFUSAL_CODES).
+const EXTRA_REFUSALS = {
+  declined: 'a technician declined this action',
+  approval_timeout: 'no technician answered within 5 minutes',
+  approval_unavailable: 'nobody can approve this here',
+  busy: 'the PC is busy with another command',
+  rules_stale: 'the team\'s rules could not be read; try again',
+  not_found: 'no such approval',
+  not_saved_pc: 'this tool works only in a session on a saved PC, and the team\'s rules apply there only',
+  needs_update: `this PC runs an older Support app than ${MIN_SESSION_VERSION}; it updates itself, then connect again`,
+};
 const NO_SCREEN_PS = 'the PowerShell fallback has no screen access';
 const NO_SCREEN_OLD = 'this support app is too old for screen control';
 const NO_SCREEN_CONSENT = 'the customer has not approved screen control for this session';
@@ -118,6 +154,8 @@ export class Session {
     this.env = env;
     this.sql = ctx.storage.sql;
     this.pending = new Map(); // uuid -> {resolve, tag}
+    this.held = new Set(); // approved commands not yet sent: from the technician's answer to the send, so a cancel reaches them (see holdApproved)
+    this.laneWaitMs = LANE_WAIT_MS; // how long an approved command waits for a busy lane (a test may shorten it)
     this.httpCommands = { cmd: null, screen: null }; // app mode: per lane, {frame, tag, sent_at} waiting for its result
     this.httpPoll = null; // app mode: the parked long poll, if any, {resolve, timer, busy}
     this.gen = 0; // the driver generation (see applyDriver); read with the driver
@@ -127,6 +165,8 @@ export class Session {
     this.frame = null; // the last full screenshot { rev, at, mime, data }, in memory only: never in storage
     this.frameRev = 0;
     this.over = false; // the session ended: no picture is kept after that
+    this.approval = undefined; // the waiting approval { rec, resolve, timer } (undefined: not read yet, null: none); memory only, see loadDriver
+    this.programs = { byId: new Map(), byPid: new Map(), at: 0 }; // names from the last list_programs result: for the rules' name checks and the approval summary
     this.stopCheckedAt = 0; // when a poll last read whether the workspace is stopped
     this.sql.exec(`CREATE TABLE IF NOT EXISTS log(ts INTEGER, kind TEXT, detail TEXT)`);
   }
@@ -292,6 +332,7 @@ export class Session {
       if (p === '/watch') return await this.doWatch(url);
       if (p === '/people') return await this.doPeople(request);
       if (p === '/handover') return await this.doHandover(request);
+      if (p === '/approvals') return await this.doApprovals(request);
       if (p === '/frame') return await this.doFrame(url);
     } catch (e) {
       return Response.json({ ok: false, error: String(e && e.message ? e.message : e) }, { status: 500 });
@@ -496,13 +537,34 @@ export class Session {
       : !!(await this.currentSocket());
     // An ended session has no people: its roster, offer and picture go with it.
     const over = s.get('state') === 'ended';
-    return Response.json(statusBody(s, rows, attached, {
+    const body = statusBody(s, rows, attached, {
       participants: over ? [] : this.roster(), offer: over ? null : this.offerView(), frame_rev: this.frame ? this.frame.rev : null, frame_at: this.frame ? this.frame.at : null,
-    }));
+    });
+    // A saved PC also shows the approval waiting on it and, when asked (session_status), the rules in force.
+    if (s.get('device_id')) {
+      body.approval = over ? null : this.approvalView();
+      if (!over && url.searchParams.get('rules') === '1') body.rules = await this.rulesView();
+    }
+    return Response.json(body);
   }
 
   async doCommand(request) {
-    const b = await request.json();
+    return this.command(await request.json(), null);
+  }
+
+  // One command from a technician (or the built-in agent as its starter). `approved` is set only when this call
+  // already waited for a technician's approval and got it: { hash, by }. The command then starts again from the
+  // top, so the state, the driver, the actor, the PC's attachment and the rules are all read again after the wait.
+  async command(b, approved) {
+    try {
+      return await this.commandOnce(b, approved);
+    } finally {
+      // The approved record lives until the command is sent or refused, however many times it started over.
+      if (approved?.held) this.held.delete(approved.held);
+    }
+  }
+
+  async commandOnce(b, approved) {
     if (await this.otherWorkspace(b.workspace)) return Response.json({ ok: false, error: 'session ended' });
     await this.expireIfDue();
     const state = await this.get('state');
@@ -518,6 +580,9 @@ export class Session {
     // and the actor stays that person for every check.
     const who = b.actor && b.via === 'agent' ? `${b.actor} via agent` : b.actor;
     const lane = Object.hasOwn(LANE_OF, b.op) ? LANE_OF[b.op] : null;
+    // The tools the team's rules govern need a saved PC: a one-off link session runs the older app, which has none of them.
+    const ruled = b.op === 'power' || b.op === 'programs';
+    if (ruled && !this.device) return codedRefusal('not_saved_pc', EXTRA_REFUSALS.not_saved_pc);
     if (lane === 'screen' && (await this.get('windows_mode', 'powershell')) !== 'app') {
       return Response.json({ ok: false, error: NO_SCREEN_PS });
     }
@@ -532,9 +597,53 @@ export class Session {
     if (lane === 'screen' && !lanesClient) return Response.json({ ok: false, error: NO_SCREEN_OLD });
     if (lane === 'screen' && !caps.includes('screen')) return Response.json({ ok: false, error: NO_SCREEN_CONSENT });
     const tag = isHttp ? `http${await this.get('http_generation')}` : null;
+    // The rules: decide before the lane is taken. A command that needs a technician's approval waits here, and
+    // starts again from the top once it has it.
+    let guard = null;
+    let prepared = null;
+    if (ruled) {
+      const version = await this.get('version', null);
+      if (!validVersion(version) || compareVersions(version, MIN_SESSION_VERSION) < 0) return codedRefusal('needs_update', EXTRA_REFUSALS.needs_update);
+      prepared = await this.prepareRuled(b);
+      if (prepared.error) return Response.json({ ok: false, error: prepared.error });
+      if (prepared.refuse) {
+        this.logRow('rules', `refused ${b.op === 'power' ? b.action : `programs ${b.action}`}: ${prepared.refuse}`, who);
+        return codedRefusal(prepared.refuse, prepared.text);
+      }
+    }
+    if (this.device && (ruled || ['run', 'put_file', 'get_file'].includes(b.op))) {
+      const g = await this.guardCommand(b, prepared, { control, lane, isHttp, who, approved });
+      if (g.response) return g.response;
+      if (g.approved) return this.command(b, g.approved);
+      guard = g;
+    }
+    // An approved command is sent only to someone who may still send it, for a task that still runs, and only if
+    // nothing cancelled it since the technician said yes. The last await is here: the lane check below follows
+    // at once.
+    if (approved) {
+      const stale = await this.recheckRequester(b);
+      if (stale) return stale;
+      const gone = this.heldRefusal(approved.held);
+      if (gone) return gone;
+    }
     // From this check to the reservation below there is no await, so two
     // concurrent calls can't both take the same lane.
-    if (isHttp && this.httpCommands[lane]) return Response.json({ ok: false, error: 'agent busy; wait for the current operation' });
+    if (isHttp && this.httpCommands[lane]) {
+      // A command a technician has approved waits for its lane, up to laneWaitMs, instead of throwing the approval
+      // away. It then starts over (the state, the rules and the lane are all read again), with the wait spent. The
+      // wait is part of the approved record, so a cancel (the agent's Pause or Stop, a handover, a take-over, the
+      // end of the session) ends it at once.
+      if (approved && !approved.waited) {
+        const free = await this.laneFree(lane, this.laneWaitMs, approved.held);
+        const gone = this.heldRefusal(approved.held);
+        if (gone) return gone;
+        if (free) return this.command(b, { ...approved, waited: true });
+      }
+      if (approved) {
+        return codedRefusal('busy', `${approved.by}'s approval was used: the PC stayed busy with another command for ${Math.round(this.laneWaitMs / 1000)} seconds, so this one did not run. Ask again, and a technician must approve it again`);
+      }
+      return ruled ? codedRefusal('busy', 'agent busy; wait for the current operation') : Response.json({ ok: false, error: 'agent busy; wait for the current operation' });
+    }
 
     const id = crypto.randomUUID();
     let frame;
@@ -576,6 +685,10 @@ export class Session {
       frame = { type: 'get_file', id, lane, path: String(b.path ?? ''), offset: off, length: len };
       waitMs = 60 * 1000 + RESULT_SLACK_MS;
       this.logRow('get_file', `${frame.path} (@${off}+${len})`, who);
+    } else if (ruled) {
+      frame = { type: b.op, id, lane, ...prepared.fields };
+      waitMs = prepared.waitMs;
+      this.logRow(b.op, prepared.log, who);
     } else if (b.op === 'screen') {
       try { action = normalizeAction(b.action); } catch (e) { return Response.json({ ok: false, error: e.message }); }
       // These two work only through the SYSTEM service, so a normal-mode app never sees them.
@@ -593,6 +706,14 @@ export class Session {
       this.logRow('control', 'request_full_control', who);
     }
 
+    // What the PC needs to hold the relay's decision against its own rules (src/agent-app.cs).
+    if (guard?.tag) {
+      // The PC may spend up to CATCH_UP_MS on a check-in before it decides this frame, so the relay waits that much longer.
+      waitMs += CATCH_UP_MS;
+      frame.rules_tag = guard.tag;
+      frame.decided_at = Math.floor(guard.at / 1000);
+      if (guard.approvedBy) frame.approved_by = guard.approvedBy;
+    }
     let target = ws;
     if (isHttp) {
       this.httpCommands[lane] = { frame, tag, sent_at: null };
@@ -605,7 +726,366 @@ export class Session {
       this.holdFrame(action, out);
       return Response.json(out);
     }
+    if (b.op === 'programs' && b.action === 'list' && result.ok) this.rememberPrograms(result);
     return Response.json(result);
+  }
+
+  // ---- the team's rules, and the approvals they ask for ---------------------------------
+  // A restart_pc, shutdown_pc, list_programs, install_program, uninstall_program or close_program command as the
+  // frame fields it becomes, or { error }. Numbers outside their range are brought into it, as for run. Returns
+  // { fields, ruleAction, program, path, log, summary, waitMs, hash }: ruleAction is the rule that governs it
+  // (none for a list), program and path are what the rules' name and folder checks compare, summary is what an
+  // approver reads, built here from the frame and never from text the caller supplies apart from the action's
+  // own arguments, and hash binds an approval to exactly this action on this PC.
+  async prepareRuled(b) {
+    const num = (v, def, lo, hi) => {
+      const n = v === undefined || v === null ? NaN : Number(v);
+      return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.floor(n))) : def;
+    };
+    const plain = (v, max) => truncate(String(v).replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim(), max);
+    const out = { fields: null, ruleAction: null, program: undefined, path: undefined, log: '', summary: '', waitMs: 60 * 1000 + RESULT_SLACK_MS };
+    if (b.op === 'power') {
+      if (b.action !== 'restart' && b.action !== 'shutdown') return { error: 'action must be restart or shutdown' };
+      const delay = powerDelay(b.delay_s);
+      out.fields = { action: b.action, delay_s: delay };
+      out.ruleAction = b.action;
+      out.log = `${b.action} in ${delay} s`;
+      out.summary = `${b.action === 'restart' ? 'Restart' : 'Shut down'} the PC in ${delay} seconds`;
+    } else if (b.action === 'list') {
+      out.fields = { action: 'list' };
+      out.log = 'list';
+    } else if (b.action === 'install') {
+      // The same checks as the PC's, before a technician is asked: a path it would refuse, a file that is not an
+      // installer, or arguments that restart or uninstall are refused here and spend no approval.
+      const path = localAbsolutePath(b.path) ?? '';
+      if (!path || path.length > 1000 || CONTROL_TEXT.test(path)) return { error: 'path is required: the absolute path of the installer on the PC, such as C:\\Temp\\setup.exe' };
+      if (b.args !== undefined && b.args !== null && (typeof b.args !== 'string' || b.args.length > 1000 || CONTROL_TEXT.test(b.args))) return { error: 'args must be text of at most 1000 characters, with no line breaks' };
+      const args = typeof b.args === 'string' ? b.args.trim() : '';
+      const installer = installerProblem(path) ?? installArgsProblem(path, args);
+      if (installer) return { error: installer };
+      const timeout = num(b.timeout_s, 300, 10, 600);
+      out.fields = { action: 'install', path, ...(args ? { args } : {}), timeout_s: timeout };
+      out.ruleAction = 'install';
+      out.path = path;
+      out.waitMs = timeout * 1000 + RESULT_SLACK_MS;
+      out.log = `install ${truncate(path, 300)}${args ? ` ${truncate(args, 100)}` : ''}`;
+      out.summary = `Install ${plain(path, 200)}${args ? ` with arguments ${plain(args, 200)}` : ''}`;
+    } else if (b.action === 'uninstall') {
+      const id = typeof b.program_id === 'string' ? b.program_id.trim() : '';
+      if (!id || id.length > 200) return { error: 'program_id is required: an id from list_programs' };
+      if (isAppProgramId(id)) return { refuse: 'protected_program', text: 'the Support app is never uninstalled through its own tools' };
+      const timeout = num(b.timeout_s, 300, 10, 600);
+      const name = this.knownProgram('byId', id);
+      out.fields = { action: 'uninstall', program_id: id, timeout_s: timeout };
+      out.ruleAction = 'uninstall';
+      out.program = name ?? id;
+      out.waitMs = timeout * 1000 + RESULT_SLACK_MS;
+      out.log = `uninstall ${truncate(id, 200)}`;
+      out.summary = `Uninstall ${name ? plain(name, 200) : `the program with id ${plain(id, 100)}`}`;
+    } else if (b.action === 'close') {
+      const hasName = b.name !== undefined && b.name !== null && b.name !== '';
+      const hasPid = b.pid !== undefined && b.pid !== null;
+      if (hasName === hasPid) return { error: 'give either name or pid of the program to close' };
+      if (hasName && (typeof b.name !== 'string' || !b.name.trim() || b.name.length > PROGRAM_NAME_MAX)) return { error: `name must be a program name of at most ${PROGRAM_NAME_MAX} characters` };
+      if (hasPid && (!Number.isSafeInteger(b.pid) || b.pid <= 0)) return { error: 'pid must be a process id from list_programs' };
+      if (b.force !== undefined && b.force !== null && typeof b.force !== 'boolean') return { error: 'force must be true or false' };
+      const force = b.force === true;
+      const known = hasPid ? this.knownProgram('byPid', b.pid) : undefined;
+      out.fields = { action: 'close', ...(hasName ? { name: b.name.trim() } : { pid: b.pid }), force };
+      out.ruleAction = 'close_program';
+      out.program = hasName ? b.name.trim() : known;
+      out.log = `close ${hasName ? truncate(b.name.trim(), 100) : `pid ${b.pid}`}${force ? ' (force)' : ''}`;
+      out.summary = `Close ${hasName ? plain(b.name, 100) : known ? `${plain(known, 100)} (process ${b.pid})` : `process ${b.pid}`}${force ? ', forced: unsaved work is lost' : ''}`;
+    } else {
+      return { error: 'action must be list, install, uninstall or close' };
+    }
+    out.hash = await sha256Hex(JSON.stringify([await this.get('sid', null), await this.get('device_id', null), out.ruleAction, out.fields]));
+    return out;
+  }
+
+  // The rules' answer to a command on a saved PC, before its lane is taken. Reads the rules in force for the PC
+  // from the database every time. Returns { response } to refuse (or fail), { approved } when the call waited for
+  // a technician and got the go (the command then starts over), or { tag, at, approvedBy? } to send it. A
+  // restart, shutdown, install, uninstall, close, put_file and get_file are decided; a raw run is not (the PC
+  // screens it) but carries the tag; a list carries nothing and reads nothing.
+  async guardCommand(b, prepared, { control, lane, isHttp, who, approved }) {
+    if (b.op === 'programs' && b.action === 'list') return {};
+    const slug = await this.get('workspace', DEFAULT_WORKSPACE);
+    const decided = b.op !== 'run';
+    let read = null;
+    try {
+      read = await devicesFromEnv(this.env).rulesFor(slug, await this.get('device_id', null));
+    } catch (_) { /* handled below */ }
+    if (!read) return decided ? { response: codedRefusal('rules_stale', EXTRA_REFUSALS.rules_stale) } : {};
+    const at = Date.now();
+    const base = { tag: read.tag, at };
+    if (!decided) return base;
+    const ruleAction = prepared ? prepared.ruleAction : b.op;
+    const verdict = decide(read.rules, ruleAction, {
+      nowMs: at, hours: read.hours, control: control === 'full' ? 'full' : 'limited', program: prepared?.program,
+      path: prepared ? prepared.path : String(b.path ?? ''),
+      // A restart or shutdown that waits is judged over the whole wait, not only at this moment.
+      delay_s: b.op === 'power' ? prepared.fields.delay_s : undefined,
+    });
+    if (verdict.refuse) {
+      this.logRow('rules', `refused ${prepared ? prepared.log : b.op}: ${verdict.refuse}`, who);
+      return { response: codedRefusal(verdict.refuse, verdict.text ?? REFUSALS[verdict.refuse]) };
+    }
+    if (!verdict.approve) return base;
+    // Approved already by this very call: the checks above ran again, on today's rules, and this still needs it.
+    if (approved) {
+      return approved.hash === prepared.hash ? { ...base, approvedBy: approved.by }
+        : { response: codedRefusal('declined', 'the approval was for a different action') };
+    }
+    // A command that cannot be sent anyway does not spend a technician's approval.
+    if (isHttp && this.httpCommands[lane]) return { response: codedRefusal('busy', 'agent busy; wait for the current operation') };
+    const asked = await this.requestApproval(b, prepared, who);
+    return asked.response ? asked : { approved: asked.approved };
+  }
+
+  // Ask the people who may approve, and wait up to APPROVAL_MS for the answer. One approval waits per session; a
+  // second request is busy. Nobody can approve for a caller that is not a person (a service token) or in a team
+  // where no member holds sessions.unattended (open mode included): approval_unavailable, at once.
+  async requestApproval(b, prepared, who) {
+    const slug = await this.get('workspace', DEFAULT_WORKSPACE);
+    const actor = sameIdentity(b.actor);
+    const unavailable = (text) => ({ response: codedRefusal('approval_unavailable', text) });
+    if (identityKind(actor) !== 'person') return unavailable('this caller is not a team member, so nobody can approve for it');
+    const notify = notifyStore(this.env.DB, teamFromEnv(this.env));
+    let holders;
+    try {
+      holders = await notify.holders(slug, UNATTENDED_PERMISSION);
+    } catch (_) {
+      return unavailable('could not look up who can approve; try again');
+    }
+    if (!holders.length) return unavailable(`no member of this team holds ${UNATTENDED_PERMISSION}, so nobody can approve`);
+    // From here to the record there is no await: the one-at-a-time check and the driver check hold.
+    if (this.approval) return { response: codedRefusal('busy', 'another action is waiting for approval on this session') };
+    if (this.driver && actor !== this.driver) return { response: Response.json({ ok: false, error: `${this.driver} is driving this session` }) };
+    const now = Date.now();
+    const rec = {
+      id: hex32().slice(0, 32), hash: prepared.hash, action: prepared.ruleAction, summary: prepared.summary, actor,
+      via: b.via === 'agent' ? 'agent' : null, task_id: typeof b.task_id === 'string' ? truncate(b.task_id, 64) : null,
+      created_at: now, expires_at: now + this.ttlMs(APPROVAL_MS), device_id: await this.get('device_id', null), device_name: await this.get('device_name', ''),
+    };
+    const waiting = new Promise((resolve) => {
+      const timer = setTimeout(() => this.finishApproval(rec.id, { refuse: 'approval_timeout', text: EXTRA_REFUSALS.approval_timeout }), rec.expires_at - now);
+      this.approval = { rec, resolve, timer };
+    });
+    this.logRow('approval', `requested: ${rec.summary}`, who);
+    try {
+      await this.setMany({ approval: rec });
+      const name = rec.device_name;
+      const sid = await this.get('sid', null);
+      const asker = rec.via === 'agent' ? `${actor}'s agent` : actor;
+      const what = {
+        device_id: rec.device_id, session_id: sid, title: 'Approval needed',
+        body: `${asker} asks to: ${rec.summary}${name ? ` on ${name}` : ''}. Approve or deny it in the app.`,
+        dedupe: `approval:${rec.id}`,
+      };
+      // The holders were just read as active people, so only the asker, when not one of them, is looked up.
+      const rows = [
+        ...(holders.includes(actor) ? [] : await notify.direct(slug, 'approval_requested', actor, what)),
+        ...notify.directKnown('approval_requested', holders, what),
+      ];
+      await notify.write(slug, rows);
+    } catch (_) {
+      // Nobody could be told, so nobody could answer: refuse now instead of waiting for nothing.
+      this.finishApproval(rec.id, { refuse: 'approval_unavailable', text: 'could not tell the technicians; try again' });
+    }
+    const outcome = await waiting;
+    if (outcome.approved) {
+      this.logRow('approval', `approved by ${outcome.approver}: ${rec.summary}`, who);
+      return { approved: { hash: rec.hash, by: outcome.approver, held: outcome.held } };
+    }
+    if (outcome.ended) return { response: Response.json({ ok: false, error: 'session ended' }) };
+    this.logRow('approval', `${outcome.refuse}: ${rec.summary}`, who);
+    return { response: codedRefusal(outcome.refuse, outcome.text ?? EXTRA_REFUSALS[outcome.refuse]) };
+  }
+
+  // Wait until the lane has no command waiting for its result, up to about ms. True when it is free. The wait is
+  // counted in steps, not timed, so a test with a frozen clock still ends.
+  // `held` (the approved record) ends the wait early when it is cancelled.
+  async laneFree(lane, ms, held = null) {
+    for (let left = Math.ceil(ms / LANE_STEP_MS); this.httpCommands[lane]; left--) {
+      if (left <= 0 || held?.cancelled) return false;
+      await new Promise((resolve) => {
+        if (held) held.wake = resolve;
+        setTimeout(resolve, LANE_STEP_MS);
+      });
+    }
+    return !held?.cancelled;
+  }
+
+  // ---- an approved command before it is sent ---------------------------------------------------------------
+  // A technician's yes does not end the command's wait: it may still wait for its lane, and it starts over from
+  // the top. From the moment of the answer to the send (or the refusal) the command has a record in this.held, so
+  // the cancels that stop a waiting approval stop it as well: the agent's Pause or Stop (for its own task), a
+  // handover or take-over, and the end of the session. The record is made in the same step that resolves the
+  // approval, with no await in between, so no cancel can fall in a gap.
+  holdApproved(rec) {
+    const held = { task_id: rec.task_id, via: rec.via, actor: rec.actor, cancelled: null, ended: false, wake: null };
+    this.held.add(held);
+    return held;
+  }
+
+  // Cancel the approved commands (all of them, or those of one agent task) with a reason, and wake any that wait for a lane.
+  cancelHeld(why, taskId = null, { ended = false } = {}) {
+    for (const h of this.held) {
+      if (taskId !== null && h.task_id !== taskId) continue;
+      // The first reason stays, and a command whose session ended stays ended: a later cancel (a task's stop) must
+      // not turn "session ended" back into "declined".
+      h.cancelled ??= why;
+      h.ended = h.ended || ended;
+      h.wake?.();
+    }
+  }
+
+  // The refusal for an approved command whose record was cancelled, or null.
+  heldRefusal(held) {
+    if (!held?.cancelled) return null;
+    if (held.ended) return Response.json({ ok: false, error: 'session ended' });
+    return codedRefusal('declined', `the approval was cancelled: ${held.cancelled}`);
+  }
+
+  // The requester's standing now, read from the database, just before an approved command is sent. The router
+  // checked it when the command was asked for, which may be minutes ago. A command goes only to a person who is
+  // still a member holding sessions.control, whose sign-in is not disabled, in a workspace and a relay that are
+  // not stopped. The same checks the router makes for the kind of caller it was: an OAuth caller (b.oauth, set by the
+  // router) must still exist, be enabled and be invited (assertPersonActive), and the authenticator their grant was made
+  // with must still be theirs (assertSecondFactor, for sessions.control). The built-in agent's task must still be running
+  // (not paused, not ended) and have been started by this person, whose account must still be active; it needs no second
+  // factor here, since the person passed it when starting the task (the router makes the same exception for `person`).
+  // An Access login has no grant to check. Fails closed: a database that cannot answer refuses. Returns a refusal or null.
+  async recheckRequester(b) {
+    const slug = await this.get('workspace', DEFAULT_WORKSPACE);
+    const actor = sameIdentity(b.actor);
+    const no = (why) => codedRefusal('declined', `the approval was cancelled: ${why}`);
+    if (String(this.env.EMERGENCY_STOP ?? '') !== '') return no('this relay was stopped by its operator');
+    // assertPersonActive says one thing for a person who is gone; any other error is the database failing.
+    const gone = async (userId) => {
+      try {
+        await assertPersonActive(this.env, team, { userId, email: actor });
+        return null;
+      } catch (e) {
+        if (e?.message === 'you are not a member of this team') return no(`${actor} is no longer an active member of this team`);
+        throw e;
+      }
+    };
+    let team;
+    try {
+      team = teamFromEnv(this.env);
+      const a = await team.authorize(slug, actor, 'sessions.control', { membersOnly: true });
+      if (!a.ok) return no(a.reason === 'not_member' ? `${actor} is no longer a member of this team` : `${actor}'s role no longer allows sessions.control`);
+      const accounts = accountStore(this.env.DB, { secret: this.env.AUTH_SECRET });
+      const user = await accounts.userByEmail(actor);
+      if (user?.disabled_at) return no(`${actor}'s account was disabled`);
+      if ((await team.stopState(slug)).stopped) return no('the workspace was stopped');
+      if (b.oauth) {
+        if (!user || user.id !== b.oauth.user_id) return no(`${actor}'s account is no longer the one that signed in`);
+        const left = await gone(user.id);
+        if (left) return left;
+        try {
+          await assertSecondFactor(this.env, { userId: user.id, factor: b.oauth.factor ?? null }, 'sessions.control');
+        } catch (e) {
+          if (String(e?.message).startsWith('a second factor is required')) return no(`${actor}'s authenticator changed; connect the client again and enter the authenticator code`);
+          throw e;
+        }
+      }
+      if (b.via === 'agent') {
+        const task = typeof b.task_id === 'string' ? await agentStoreFromEnv(this.env, team).getTask(slug, b.task_id) : null;
+        if (!task || task.ended_at !== null) return no('the agent task ended');
+        if (task.state !== 'running') return no(`the agent task is ${task.state}`);
+        if (sameIdentity(task.started_by) !== actor) return no('the agent task was started by someone else');
+        if (task.started_by_user) {
+          const owner = await accounts.userById(task.started_by_user);
+          if (!owner || owner.disabled_at) return no('the account that started the agent task was disabled');
+          const left = await gone(task.started_by_user);
+          if (left) return left;
+        }
+      }
+    } catch (_) {
+      return no('could not check that the requester may still do this; try again');
+    }
+    return null;
+  }
+
+  // The waiting approval is over, one way: { approved, approver } or { refuse, text } or { ended }. Nothing happens
+  // for an approval that is not the one waiting, so an answer that comes twice, or after a timeout, is a no-op.
+  finishApproval(id, outcome) {
+    const a = this.approval;
+    if (!a || a.rec.id !== id) return false;
+    clearTimeout(a.timer);
+    this.approval = null;
+    this.setMany({ approval: null }).catch(() => {});
+    // The answer and the record of the approved command are made together, so a cancel cannot fall between them.
+    a.resolve(outcome.approved ? { ...outcome, held: this.holdApproved(a.rec) } : outcome);
+    return true;
+  }
+
+  // Cancel the waiting approval because something it depended on changed (control moved, the agent was stopped).
+  // `taskId` limits it to what that agent task asked for. It also reaches a command already approved that has not
+  // been sent yet (see holdApproved).
+  cancelApproval(why, taskId = null) {
+    if (this.approval && (taskId === null || this.approval.rec.task_id === taskId)) {
+      this.finishApproval(this.approval.rec.id, { refuse: 'declined', text: `the approval was cancelled: ${why}` });
+    }
+    this.cancelHeld(why, taskId);
+  }
+
+  approvalView() {
+    const a = this.approval;
+    if (!a || a.rec.expires_at <= Date.now()) return null;
+    const { id, summary, actor, via, action, created_at, expires_at, device_id, device_name } = a.rec;
+    return { id, summary, actor, via, action, created_at, expires_at, device_id, device_name };
+  }
+
+  // The approval's routes, for the relay (src/approvals.js), which has checked who is asking: list the waiting
+  // approval, answer it (the approver is named by the relay), or cancel it (the built-in agent was stopped or paused).
+  async doApprovals(request) {
+    const b = await request.json().catch(() => ({}));
+    const gone = await this.peopleGate(b);
+    if (gone) return gone;
+    if (!this.device) return refusal('not_found', 'approvals are for saved PCs');
+    const lapsed = this.approval && this.approval.rec.expires_at <= Date.now();
+    if (lapsed) this.finishApproval(this.approval.rec.id, { refuse: 'approval_timeout', text: EXTRA_REFUSALS.approval_timeout });
+    if (b.op === 'list') return Response.json({ ok: true, approvals: this.approval ? [this.approvalView()] : [] });
+    if (b.op === 'answer') {
+      if (!this.approval || this.approval.rec.id !== b.id) return refusal('not_found', 'that approval is not waiting: it was answered or cancelled, or it timed out');
+      const approver = sameIdentity(b.approver);
+      if (typeof b.approve !== 'boolean' || !approver) return refusal('bad_request', 'approve (true or false) and the approver are required');
+      this.finishApproval(b.id, b.approve ? { approved: true, approver } : { refuse: 'declined', text: `${approver} declined this action` });
+      return Response.json({ ok: true, approved: b.approve });
+    }
+    if (b.op === 'cancel') {
+      this.cancelApproval(typeof b.why === 'string' ? truncate(b.why, 100) : 'it was withdrawn', typeof b.task_id === 'string' ? b.task_id : null);
+      return Response.json({ ok: true });
+    }
+    return refusal('bad_request', 'op must be list, answer or cancel');
+  }
+
+  // A name from the last list_programs result, or undefined when the list is older than PROGRAMS_TTL_MS: a pid is reused
+  // and a program is removed, so an old list must not stand in for what is on the PC now. The PC decides again by what it finds.
+  knownProgram(kind, key) {
+    return Date.now() - this.programs.at < PROGRAMS_TTL_MS ? this.programs[kind].get(key) : undefined;
+  }
+
+  // The names in a list_programs result, kept in memory for the rules' name checks and the approval summary.
+  rememberPrograms(result) {
+    const byId = new Map();
+    const byPid = new Map();
+    for (const p of result.installed ?? []) byId.set(p.id, p.name);
+    for (const r of result.running ?? []) byPid.set(r.pid, r.name);
+    this.programs = { byId, byPid, at: Date.now() };
+  }
+
+  // The rules in force for this saved PC, as session_status shows them, or null when they cannot be read.
+  async rulesView() {
+    try {
+      return (await devicesFromEnv(this.env).rulesFor(await this.get('workspace', DEFAULT_WORKSPACE), await this.get('device_id', null)))?.rules ?? null;
+    } catch (_) {
+      return null;
+    }
   }
 
   // Keep the picture a screen action returned, for the people watching, if it is a full screenshot: a
@@ -689,6 +1169,16 @@ export class Session {
       this.driver = (await this.get('driver', null)) || null;
       this.gen = (await this.get('driver_gen', 0)) || 0;
       this.device = !!(await this.get('device_id', null));
+    }
+    if (this.approval === undefined) {
+      // A stored approval with nobody waiting on it: the object restarted, and the call that asked is gone. It is
+      // dropped unsent, never carried out later.
+      this.approval = null;
+      const stored = await this.get('approval', null);
+      if (stored) {
+        await this.setMany({ approval: null });
+        this.logRow('approval', `dropped unsent: the session restarted (${truncate(String(stored.summary ?? ''), 120)})`, stored.actor);
+      }
     }
     if (this.people === undefined) {
       const s = await this.ctx.storage.get(['participants', 'offer', 'accepting', 'handed_over', 'driver_since', 'created_at']);
@@ -916,6 +1406,8 @@ export class Session {
     p.accepting = null;
     p.handed_over = kind === 'take_over' ? null : { from: previous, to: next, at: now };
     p.driver_since = now;
+    // A waiting approval was asked for the old driver.
+    this.cancelApproval('control of the session moved');
     this.driver = next;
     this.gen = Number.isInteger(gen) && gen > this.gen ? gen : this.gen + 1;
     await this.setMany({ driver: next, driver_gen: this.gen });
@@ -1260,6 +1752,7 @@ export class Session {
         p.offer = null;
         p.accepting = null;
         p.handed_over = null;
+        this.cancelApproval('the session was taken over');
         this.gen = to;
         await this.setMany({ driver_gen: to });
         await this.savePeople();
@@ -1277,9 +1770,11 @@ export class Session {
   }
 
   async markEnded(reason, actor = null, { quiet = false } = {}) {
-    // Nothing is kept of the screen once the session is over.
+    // Nothing is kept of the screen once the session is over, and nothing waits for an approval.
     this.over = true;
     this.frame = null;
+    if (this.approval) this.finishApproval(this.approval.rec.id, { ended: true });
+    this.cancelHeld('the session ended', null, { ended: true });
     const device = await this.get('device_id', null);
     await this.setMany({
       state: 'ended',
@@ -1413,6 +1908,12 @@ export class Session {
   }
 }
 
+// A refusal of a command by the rules or the approval: ok false, the code, and an error that starts with it
+// ("<code>: <text>"), which is how the tools show it.
+function codedRefusal(code, text) {
+  return Response.json({ ok: false, code, error: `${code}: ${text}` });
+}
+
 // A refusal from /people, /handover or /frame: the relay turns `code` into the tool's error code.
 function refusal(code, error) {
   return Response.json({ ok: false, code, error });
@@ -1492,6 +1993,11 @@ function decodeHttpResult(b, frame) {
       timed_out: b.timed_out === true,
     };
   }
+  if (op === 'power') {
+    if (!Number.isSafeInteger(b.at) || b.at < 0) throw new Error('bad at');
+    return { ok: true, at: b.at };
+  }
+  if (op === 'programs') return decodePrograms(b, frame.action);
   if (op === 'put_file') {
     if (!Number.isSafeInteger(b.bytes) || b.bytes < 0 || b.bytes > PUT_B64_MAX) throw new Error('bad bytes');
     return { ok: true, bytes: b.bytes };
@@ -1500,4 +2006,34 @@ function decodeHttpResult(b, frame) {
     throw new Error('bad file result');
   }
   return { ok: true, data_b64: b.data_b64, size: b.size, eof: b.eof };
+}
+
+// The result of a programs frame. A list is checked entry by entry and its text clipped: it comes from the PC.
+function decodePrograms(b, action) {
+  if (action === 'list') {
+    const rows = (v, max) => {
+      if (!Array.isArray(v) || v.length > max) throw new Error('bad list');
+      return v;
+    };
+    const text = (v, n) => truncate(typeof v === 'string' ? v : '', n);
+    const installed = rows(b.installed, 2000).map((p) => {
+      if (!p || typeof p !== 'object' || typeof p.id !== 'string' || !p.id) throw new Error('bad program');
+      return { id: truncate(p.id, 200), name: text(p.name, PROGRAM_NAME_MAX), version: text(p.version, 100), publisher: text(p.publisher, PROGRAM_NAME_MAX) };
+    });
+    const running = rows(b.running, 2000).map((r) => {
+      if (!r || typeof r !== 'object' || !Number.isSafeInteger(r.pid)) throw new Error('bad process');
+      return { name: text(r.name, PROGRAM_NAME_MAX), pid: r.pid, session: Number.isSafeInteger(r.session) ? r.session : null };
+    });
+    return { ok: true, installed, running };
+  }
+  // A close may also say how many programs it could not close (still_running), and an install or uninstall what
+  // the installer wrote to its error output or what was stopped after it (detail). Both are passed on when present.
+  if (action === 'close') {
+    if (!Number.isSafeInteger(b.closed) || b.closed < 0) throw new Error('bad closed');
+    return { ok: true, closed: b.closed, ...(Number.isSafeInteger(b.still_running) && b.still_running > 0 ? { still_running: b.still_running } : {}) };
+  }
+  // The note is the PC's text: control characters other than tabs and line breaks become spaces.
+  const note = typeof b.detail === 'string' ? b.detail.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, ' ').trim() : '';
+  const detail = note ? { detail: truncate(note, 300) } : {};
+  return { ok: true, exit_code: Number.isInteger(b.exit_code) ? b.exit_code : null, ...detail };
 }

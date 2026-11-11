@@ -5,12 +5,13 @@ import { formatAgo, taskBody } from '../format.js';
 import { t } from '../i18n/index.js';
 import { NotificationSettings } from './NotificationSettings.jsx';
 
-// The things the relay tells you about: eight you can switch off, and an invite to a session or an offer of control, which always arrive. Titles and bodies repeat text from the PC (a PC's
+// The things the relay tells you about: eight you can switch off, and an invite to a session, an offer of control or an action waiting for your approval, which always arrive. Titles and bodies repeat text from the PC (a PC's
 // name, a task's note), so they are shown as text. A "waiting for approval" body comes from a
 // join request that anyone can send before the PC is approved, so it is labelled as the PC's own words.
 // What the button on a notification says, by what it opens.
 function openLabel(n) {
   if (n.event === 'escalation_opened' || n.event === 'escalation_claimed') return 'notify.open_queue';
+  if (n.event === 'approval_requested' && n.session_id) return 'notify.review_approval';
   if (n.event === 'session_invited' && n.session_id) return 'notify.join_session';
   if (n.event === 'control_offered' && n.session_id) return 'notify.open_session';
   if (n.task_id) return 'notify.open_task';
