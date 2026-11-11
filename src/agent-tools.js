@@ -9,6 +9,7 @@
 // and the agent's own tools. Team settings are never a tool.
 import { listTools } from './mcp.js';
 import { auditText, normalizeAction } from './screen.js';
+import { powerDelay } from './rules.js';
 
 export const SUMMARY_MAX = 600;
 export const NOTE_MAX = 400;
@@ -107,7 +108,8 @@ export function stepDetail(name, args) {
   if (name === 'get_file') return cut(a.path, 120);
   if (name === 'session_status' || name === 'list_programs') return '';
   // The tools the team's rules govern: what they act on, never anything the PC sent back.
-  if (name === 'restart_pc' || name === 'shutdown_pc') return `in ${Number.isInteger(a.delay_s) ? a.delay_s : 30} s`;
+  // The delay the relay will use, not the one asked for.
+  if (name === 'restart_pc' || name === 'shutdown_pc') return `in ${powerDelay(a.delay_s)} s`;
   if (name === 'install_program') return cut(a.path, 120);
   if (name === 'uninstall_program') return cut(a.program_id, 120);
   if (name === 'close_program') return `${a.name ? cut(a.name, 100) : `pid ${cut(a.pid, 12)}`}${a.force === true ? ' (force)' : ''}`;

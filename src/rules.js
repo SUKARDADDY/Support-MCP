@@ -28,6 +28,12 @@ export const DAYS = Object.freeze(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'su
 export const LIST_MAX = 50;
 export const PROGRAM_MAX = 100;
 export const FOLDER_MAX = 260;
+// The seconds before a restart or shutdown happens: delay_s as a whole number brought into 5 to 600, or 30 when
+// it is not a number. The relay judges, sends, logs and shows a power action with this one value.
+export function powerDelay(v) {
+  const n = v === undefined || v === null ? NaN : Number(v);
+  return Number.isFinite(n) ? Math.min(600, Math.max(5, Math.floor(n))) : 30;
+}
 // The span of business hours the relay resolves ahead, in seconds.
 export const HOURS_HORIZON_S = 8 * 86400;
 const DAY_MS = 86_400_000;

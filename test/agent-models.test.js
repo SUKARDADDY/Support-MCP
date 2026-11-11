@@ -161,6 +161,7 @@ test('a step record shows the verb and a short detail, and never typed text', ()
   // The tools the team's rules govern show what they act on, and an installer's arguments never.
   assert.equal(stepDetail('restart_pc', { delay_s: 60 }), 'in 60 s');
   assert.equal(stepDetail('shutdown_pc', {}), 'in 30 s');
+  assert.deepEqual([stepDetail('restart_pc', { delay_s: 1 }), stepDetail('shutdown_pc', { delay_s: 99999 }), stepDetail('restart_pc', { delay_s: 90.7 })], ['in 5 s', 'in 600 s', 'in 90 s'], 'the delay the relay uses');
   assert.equal(stepDetail('list_programs', {}), '');
   assert.equal(stepDetail('install_program', { path: 'C:\\setup.msi', args: '/password=hunter2' }), 'C:\\setup.msi');
   assert.equal(stepDetail('uninstall_program', { program_id: 'app-1' }), 'app-1');

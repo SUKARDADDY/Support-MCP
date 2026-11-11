@@ -67,7 +67,7 @@ import { assertPersonActive, assertSecondFactor } from './oauth.js';
 import { agentStoreFromEnv } from './agent-store.js';
 import { UNATTENDED_PERMISSION } from './permissions.js';
 import { compareVersions, validVersion } from './release.js';
-import { REFUSALS, decide, installArgsProblem, installerProblem, isAppProgramId, localAbsolutePath } from './rules.js';
+import { REFUSALS, decide, installArgsProblem, installerProblem, isAppProgramId, localAbsolutePath, powerDelay } from './rules.js';
 import { OPERATOR_END_REASONS } from './device-sessions.js';
 import { VERSION_PATTERN } from './version.js';
 import {
@@ -746,7 +746,7 @@ export class Session {
     const out = { fields: null, ruleAction: null, program: undefined, path: undefined, log: '', summary: '', waitMs: 60 * 1000 + RESULT_SLACK_MS };
     if (b.op === 'power') {
       if (b.action !== 'restart' && b.action !== 'shutdown') return { error: 'action must be restart or shutdown' };
-      const delay = num(b.delay_s, 30, 5, 600);
+      const delay = powerDelay(b.delay_s);
       out.fields = { action: b.action, delay_s: delay };
       out.ruleAction = b.action;
       out.log = `${b.action} in ${delay} s`;
