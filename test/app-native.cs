@@ -1951,8 +1951,9 @@ public static class AppTests {
                 var d = ConsentDialog.Open(true); loaded(d);
                 var allow = button(d, "Allow");
                 // The first render of this window can take longer than ArmMs on a machine without a GPU, so restart the arm
-                // time and press at once: the press lands inside it however slow the machine is.
-                armStarted = d.ArmStarted; d.RestartArm();
+                // time (the dialog's private stopwatch) and press at once: the press lands inside it however slow the machine is.
+                var shown = (Stopwatch)typeof(ConsentDialog).GetField("shown", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance).GetValue(d);
+                armStarted = shown.IsRunning; shown.Restart();
                 Press(allow); pump(); early = d.Allowed || d.Decided.WaitOne(0) || !allow.IsVisible;
                 cornerOpen = IsWindowEnabled(cornerHandle);
                 Thread.Sleep(ConsentDialog.ArmMs); pump();

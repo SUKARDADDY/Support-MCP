@@ -3980,10 +3980,6 @@ namespace SupportMcp {
         // answer it. Don't allow works at once.
         public const int ArmMs = 500;
         readonly Stopwatch shown = new Stopwatch();
-        // For tests: whether the arm time has started, and a restart of it, so a test can press Allow inside the first
-        // ArmMs by construction instead of racing the first render on a slow machine.
-        internal bool ArmStarted { get { return shown.IsRunning; } }
-        internal void RestartArm() { shown.Restart(); }
         ConsentDialog(Palette p, string headingText, string message, bool administrator, bool holds) {
             this.holds = holds;
             const double CardWidth = 440, Pad = 20;
