@@ -1940,16 +1940,20 @@ public static class AppTests {
         // be closed until the app finishes it. It is modeless: the corner window, with End session, stays enabled throughout.
         // Allow does nothing in its first 500 ms. Don't allow closes it at once. As the app's own confirm (no UAC), Allow closes it.
         {
-            bool cornerOpen = false, cornerHeld = false, early = true, allowHeld = false, closeRefused = false, finished = false, denyClosed = false, confirmClosed = false;
+            bool cornerOpen = false, cornerHeld = false, armStarted = false, early = true, allowHeld = false, closeRefused = false, finished = false, denyClosed = false, confirmClosed = false;
             var t = new Thread(delegate() {
                 Action pump = delegate { for (int i = 0; i < 10; i++) { Application.DoEvents(); System.Windows.Threading.Dispatcher.CurrentDispatcher.Invoke(System.Windows.Threading.DispatcherPriority.Background, new Action(delegate { })); Thread.Sleep(25); } };
                 Func<System.Windows.DependencyObject, string, System.Windows.Controls.Button> button = delegate(System.Windows.DependencyObject w, string text) { return Find<System.Windows.Controls.Button>(w, delegate(System.Windows.Controls.Button b) { return text.Equals(b.Content); }); };
                 var corner = new SupportWindow(Palette.Detect(), false, false, null); corner.Show(); pump();
                 IntPtr cornerHandle = new System.Windows.Interop.WindowInteropHelper(corner).Handle;
-                var d = ConsentDialog.Open(true);
-                // Loaded comes asynchronously: wait for it, so only the time guards Allow, and press at once after it.
-                for (int i = 0; i < 400 && !d.IsLoaded; i++) { System.Windows.Threading.Dispatcher.CurrentDispatcher.Invoke(System.Windows.Threading.DispatcherPriority.Background, new Action(delegate { })); Thread.Sleep(5); }
+                // Loaded comes asynchronously: wait for it, so only the time guards Allow.
+                Action<ConsentDialog> loaded = delegate(ConsentDialog w) { for (int i = 0; i < 400 && !w.IsLoaded; i++) { System.Windows.Threading.Dispatcher.CurrentDispatcher.Invoke(System.Windows.Threading.DispatcherPriority.Background, new Action(delegate { })); Thread.Sleep(5); } };
+                var d = ConsentDialog.Open(true); loaded(d);
                 var allow = button(d, "Allow");
+                // The first render of this window can take longer than ArmMs on a machine without a GPU, so restart the arm
+                // time (the dialog's private stopwatch) and press at once: the press lands inside it however slow the machine is.
+                var shown = (Stopwatch)typeof(ConsentDialog).GetField("shown", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance).GetValue(d);
+                armStarted = shown.IsRunning; shown.Restart();
                 Press(allow); pump(); early = d.Allowed || d.Decided.WaitOne(0) || !allow.IsVisible;
                 cornerOpen = IsWindowEnabled(cornerHandle);
                 Thread.Sleep(ConsentDialog.ArmMs); pump();
@@ -1962,12 +1966,13 @@ public static class AppTests {
                 var n = ConsentDialog.Open(true); pump();
                 Press(button(n, "Don't allow")); pump();
                 denyClosed = !n.IsVisible && !n.Allowed && n.Decided.WaitOne(0); n.Finish();
-                var c = ConsentDialog.Open(false); pump(); Thread.Sleep(ConsentDialog.ArmMs);
+                var c = ConsentDialog.Open(false); loaded(c); pump(); Thread.Sleep(ConsentDialog.ArmMs);
                 Press(button(c, "Allow")); pump();
                 confirmClosed = !c.IsVisible && c.Allowed && c.Decided.WaitOne(0); c.Finish();
                 corner.CloseQuietly(); pump();
             }); t.SetApartmentState(ApartmentState.STA); t.Start(); t.Join();
             Assert(cornerOpen && cornerHeld, "The corner window stays enabled while the question is open and while it waits for UAC");
+            Assert(armStarted, "The arm time starts when the question appears");
             Assert(!early, "Allow does nothing right after the question appears");
             Assert(allowHeld, "Allow before UAC keeps the question open and says that Windows asks now");
             Assert(closeRefused && finished, "The question cannot be closed while UAC asks, only finished by the app");
