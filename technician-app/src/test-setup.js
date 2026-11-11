@@ -1,6 +1,10 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach } from 'vitest';
-import { cleanup } from '@testing-library/react';
+import { cleanup, configure } from '@testing-library/react';
+
+// The screens load in steps, and a loaded machine (CI, or the review running both suites at once)
+// can take longer than the 1 s default to show them. Waiting longer changes no result.
+configure({ asyncUtilTimeout: 4000 });
 
 // Each test starts with no saved tabs, theme or account choice.
 beforeEach(() => localStorage.clear());
