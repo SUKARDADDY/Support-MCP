@@ -889,6 +889,8 @@ mod tests {
         let dir = PathBuf::from(format!("/tmp/smcp-svc-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // On a Mac /tmp is a link to /private/tmp, and root's file code never follows links.
+        let dir = std::fs::canonicalize(&dir).unwrap();
         let os = fake_os();
         let helpers = Helpers::new();
         let data = dir.join("data");
