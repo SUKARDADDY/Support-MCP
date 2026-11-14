@@ -899,8 +899,9 @@ What differs:
   starts with `macos-` but whose `os` does not start with `macOS `, or the other way round (a Windows hello carries no `os`), is
   400 `agent and os disagree` and attaches nothing.
 - The relay forwards `block_input`, `send_sas` and the `control` frame (`request_full_control`) as it does to any app, and the
-  Mac refuses them: `block_input is not available on a Mac`, `send_sas is not available on a Mac`, and `a Mac cannot raise its control in a session: ...`. The relay itself refuses `as:"system"` under limited control and any install path that
-  is not a Windows installer path.
+  Mac refuses them: `block_input is not available on a Mac`, `send_sas is not available on a Mac`, and `a Mac cannot raise its control in a session: ...`. The relay itself refuses `as:"system"` under limited control.
+  `install_program` and `uninstall_program` on a saved Mac follow the Mac's checks ([Programs on a Mac](#programs-on-a-mac)): the
+  relay picks them when the stored `agent` from the hello starts with `macos-`.
 - The rules a Mac receives are its own platform's ([What a PC is told](#what-a-pc-is-told)).
 
 ### One-off links for Macs
@@ -1832,7 +1833,9 @@ component, since a POSIX path has no drive), and a drive-letter path is never in
 `/Applications/Support.app` or `/Library/Application Support/SupportMCP` is `protected_folder` whatever the lists say, as the Windows
 app's own folder is. `/` itself is refused as a protected folder (`not the whole disk`). The Mac cases are the `decide_posix` array of
 `test/fixtures/rules-cases.json`: the relay runs them in `test/rules.test.js`, and the Windows app's `decide` and `installers`
-arrays are unchanged and are the only ones it reads. Which folders reach which PC is in [What a PC is told](#what-a-pc-is-told).
+arrays are unchanged and are the only ones it reads. Names are compared in NFC as well as without case, and `/private/var`,
+`/private/tmp` and `/private/etc` are the same as `/var`, `/tmp` and `/etc` (on a Mac those are links to them), so a folder written
+either way covers both spellings. Which folders reach which PC is in [What a PC is told](#what-a-pc-is-told).
 
 `install_program` runs installers, never another tool by another name. Before anyone is asked, on the relay and again on the PC
 (`installerProblem`, `installArgsProblem`, the shared `installers` cases of `rules-cases.json`): `path` must be a local absolute
@@ -1865,6 +1868,47 @@ ask the Job how many processes remain, `detail` says so. These are plain errors 
 raw-command screen over the path and arguments (below), so a restart or shutdown verb, a protected name or the Support app named
 there is refused. An `.msi` runs through `msiexec /i`, an `.msu` through `wusa.exe`, an `.exe` as given.
 
+#### Programs on a Mac
+
+A session whose stored `agent` (from the hello, which must agree with the `os`) starts with `macos-` gets the Mac's checks for
+`install_program` and `uninstall_program`; any other client gets the Windows ones above, unchanged. The relay checks, before anyone
+is asked (`localAbsolutePath(path, 'mac')`, `installerProblemMac`, `installArgsProblemMac`, the shared `installers_posix` cases of
+`rules-cases.json`, which the Mac client runs too): `path` is a path from `/` with no `..` part, no NUL and at most 1,000
+characters, of a `.pkg` or `.mpkg` package, a `.dmg` disk image or a `.zip` (any case), not inside `/System`, `/usr`, `/bin`,
+`/sbin` or `/Library/Apple` (compared as a Mac path, so `//System` and `/SYSTEM` count); and `args` is empty. The folder check of
+`decide` then runs on the path as for Windows, so `/Applications/Support.app` and Support's data folder are refused there.
+`uninstall_program` takes `program_id` `bundle:<bundle id>` (from `list_programs`). `bundle:io.github.sukardaddy.supportmcp` and
+the join app's `bundle:io.github.sukardaddy.supportmcp.join` are `protected_program` on any PC (`isAppProgramId`), and so is any
+`bundle:com.apple.` id on a Mac. A protected program matches the app's name from the last `list_programs`, as on Windows, or its
+bundle id (without `bundle:`), so `Rectangle` and `com.knollsoft.Rectangle` both protect Rectangle and the relay refuses before an
+approval is spent. `decide` itself is unchanged: the Session calls it once per name.
+
+On the Mac, as root (full control only):
+
+- **Install.** The path is resolved (`realpath`, NFC) and checked again by the same rules, and against the protected folders with
+  links resolved. The file is copied, without following a link, into a new folder only root can open under
+  `/Library/Application Support/SupportMCP/staging/`, and only that copy is used from then on. Gatekeeper must accept it, or the
+  call is refused with Gatekeeper's reason: `spctl --assess --type install` for a package, `spctl --assess --type execute` for an
+  app. A package runs through `installer -pkg <copy> -target /`. A disk image is attached with `hdiutil attach -nobrowse -readonly
+  -noautoopen -mountrandom` into a root-only folder (one that asks to accept a license is refused) and always detached. A `.zip` is
+  expanded with `ditto -x -k` into the staging folder, after a check of the zip's own directory: no absolute name, no `..`, no
+  name twice, no entry inside a link of the zip, and local headers that match the directory. A disk image or zip must hold
+  exactly one app at its top and no package, or (a disk image only) exactly one package and no app, which is then checked by
+  Gatekeeper and run; anything else is refused with what was found. The app must be a real folder, not a link, and no link
+  inside it may lead out of it, followed through the app's own links. It is copied with `ditto` into the staging folder, given to
+  root with no write for others and no setuid or setgid bit, checked by Gatekeeper there, and moved into `/Applications` in one
+  step: swapped with an older copy (`renamex_np` with `RENAME_SWAP`, and swapped back if what came out is not the folder that was
+  checked), or put there only if nothing is there (`RENAME_EXCL`). The old copy goes with the staging folder. An app whose name or
+  bundle id is Support's, the join app's or a protected program's, or that would replace one of those or one of Apple's apps, is
+  refused. A file with a second hard link is refused, and so is an installer over 16 GB. The answer is `{ok:true, exit_code,
+  detail}`: `exit_code` is the installer's code (0 for an app copied in), and `detail` says what was installed where.
+- **Uninstall.** Only an app in `/Applications` (or a plain folder in it) with that bundle id. It is asked to quit, and ended after
+  10 seconds. The app is then moved to `/Library/Application Support/SupportMCP/removed/<bundle id>-<time>/`, which only root can
+  open, and the service deletes such folders after 7 days. Then `pkgutil --forget` runs for each package receipt that lists at
+  least one file and all of whose files sit inside that app (whole path parts, from the receipt's volume and install location).
+  The answer is `{ok:true, exit_code:0, detail}`: `detail` says where the app went and that support files in each person's
+  `~/Library` stay.
+
 ### The tools
 
 `restart_pc`, `shutdown_pc`, `install_program`, `uninstall_program` and `close_program` act on the PC, and
@@ -1877,8 +1921,8 @@ refused as for `run`. `list_programs` is not decided and carries no tag.
 |---|---|---|---|
 | `restart_pc`, `shutdown_pc` | `session_id`, `delay_s?` (5 to 600, default 30; a value outside is clamped) | `{ok:true, at}`: `at` is when the action will happen, Unix seconds. The answer comes before the PC acts. A second one while one waits is `busy` | `restart`, `shutdown` |
 | `list_programs` | `session_id` | `{installed:[{id,name,version,publisher}], running:[{name,pid,session}]}` | none |
-| `install_program` | `session_id`, `path` (absolute, at most 1,000 characters, an installer), `args?` (at most 1,000), `timeout_s?` (10 to 600, default 300) | `{ok:true, exit_code}` | `install`, and the folder check on `path` |
-| `uninstall_program` | `session_id`, `program_id` (from `list_programs`, at most 200), `timeout_s?` | `{ok:true, exit_code}` | `uninstall`, and the program check |
+| `install_program` | `session_id`, `path` (absolute, at most 1,000 characters, an installer: `.msi`, `.msu` or `.exe` on Windows, `.pkg`, `.mpkg`, `.dmg` or `.zip` on a Mac), `args?` (at most 1,000; none on a Mac), `timeout_s?` (10 to 600, default 300) | `{ok:true, exit_code}`, with `detail` on a Mac | `install`, and the folder check on `path` |
+| `uninstall_program` | `session_id`, `program_id` (from `list_programs`, at most 200; `bundle:<bundle id>` on a Mac), `timeout_s?` | `{ok:true, exit_code}`, with `detail` on a Mac | `uninstall`, and the program check (name or bundle id on a Mac) |
 | `close_program` | `session_id`, `name` or `pid` (one of the two), `force?` (boolean, default false) | `{ok:true, closed}` | `close_program`, and the program check |
 
 An error result is `isError` text that starts with a code, then a sentence: `<code>: <sentence>`. Codes:
@@ -2307,8 +2351,8 @@ text content item, not JSON-RPC errors.
 | `get_file` | `session_id`, `path`, `offset?`, `length?` | data_b64, size, eof |
 | `restart_pc`, `shutdown_pc` | `session_id`, `delay_s?` (5 to 600, default 30) | `{ok:true, at}` (Unix seconds), answered before the PC acts. Saved PCs only; follows the team's rules and may wait up to 5 minutes for an approval. See [Rules and approvals](#the-tools) |
 | `list_programs` | `session_id` | `{installed:[{id,name,version,publisher}], running:[{name,pid,session}]}`. Saved PCs only; the rules never refuse it |
-| `install_program` | `session_id`, `path`, `args?`, `timeout_s?` (10 to 600, default 300) | `{ok:true, exit_code}`. Saved PCs only; follows the rules |
-| `uninstall_program` | `session_id`, `program_id`, `timeout_s?` | `{ok:true, exit_code}`. Saved PCs only; follows the rules |
+| `install_program` | `session_id`, `path`, `args?` (Windows only), `timeout_s?` (10 to 600, default 300) | `{ok:true, exit_code}`. Saved PCs only; follows the rules. A Mac takes a `.pkg`, `.mpkg`, `.dmg` or `.zip` |
+| `uninstall_program` | `session_id`, `program_id`, `timeout_s?` | `{ok:true, exit_code}`. Saved PCs only; follows the rules. A Mac's ids are `bundle:<bundle id>` |
 | `close_program` | `session_id`, `name` or `pid`, `force?` | `{ok:true, closed}`. Saved PCs only; follows the rules |
 | `session_end` | `session_id` | `{ended:true}`; sends `end` to agent first |
 | `device_list` | `site?` (an id), `status?` (`active` or `pending`), `after?` (an id) | `{devices:[...], next, untrusted_text}`: the team's device shape plus `online` (true while the PC's doorbell is connected; false when the Registry cannot be read), from one Registry request per call. Names, contacts and custom field values come from people and are untrusted data |

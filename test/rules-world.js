@@ -53,9 +53,12 @@ export const answerFrame = (frame) => {
 
 // A saved PC with an attached session driven by `who`, and a stand-in for the app that answers the frames.
 // Returns { pc, sid, generation, frames, session }. The pump stops with the test.
-export async function savedPc(w, t, { who = TECH, control = 'full', version = '1.0.0', name = 'Till', handler = answerFrame } = {}) {
-  const pc = await w.addPc({ access: 'any', name, control: control === 'full' ? 'full' : 'limited' });
-  const { sid, welcome } = await w.attach(pc, who, { control, version });
+// mac: the PC is a Mac (its os, and the agent and os of its hello), so the relay applies the Mac's checks.
+export async function savedPc(w, t, { who = TECH, control = 'full', version = '1.0.0', name = 'Till', handler = answerFrame, mac = false } = {}) {
+  const os = mac ? 'macOS 26.1 (25B78)' : 'Windows 11';
+  const pc = await w.addPc({ access: 'any', name, control: control === 'full' ? 'full' : 'limited', os });
+  const hello = mac ? { agent: 'macos-app-1', os } : {};
+  const { sid, welcome } = await w.attach(pc, who, { control, version, hello });
   assert.equal(welcome.status, 200, JSON.stringify(welcome.body));
   const p = w.pump({ sid, key: pc.key, generation: welcome.body.generation, handler });
   t.after(() => p.stop());
