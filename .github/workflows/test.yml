@@ -30,6 +30,46 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm test
 
+  # The Mac client's platform-neutral Rust core (mac-agent/, docs/development.md, "Mac agent core"). It runs on the
+  # same self-hosted Linux runner as the relay tests, under the same fork guard. The toolchain is pinned here and in
+  # mac-agent/rust-toolchain.toml: change both together. `cargo test --locked` runs the unit tests, the shared rules
+  # cases and the note vectors. The end-to-end script then pairs the core's client with the real relay under
+  # `wrangler dev` (local D1, DEV_SKIP_ACCESS=1 on loopback) and drives it over MCP.
+  mac-agent-core:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, support-mcp]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      # rustup comes first when the runner has none (a minimal install, no default toolchain), then the one pinned
+      # version with the minimal profile and clippy. Nothing is installed system-wide.
+      - name: Install the pinned Rust toolchain
+        run: |
+          if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install 1.99.1 --profile minimal --component clippy
+          # No `rustup default`: the runner's user may have its own, and mac-agent/rust-toolchain.toml picks 1.99.1.
+          (cd mac-agent && rustc --version && cargo --version)
+          cc --version | head -n 1
+      # The relay's one npm package, which `wrangler dev` bundles for the end-to-end run.
+      - run: npm ci --ignore-scripts
+      - name: Test the core
+        working-directory: mac-agent
+        run: cargo test --locked
+      - name: Lint the core
+        working-directory: mac-agent
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Run the end-to-end test against the real relay
+        run: node mac-agent/e2e/run.mjs
+
   # Runs on our self-hosted Windows VM runner with the .NET Framework v4 compiler.
   # It builds the app from source against the pinned .NET Framework 4.5.2 reference
   # assemblies, runs the native tests, and checks that the exe committed in

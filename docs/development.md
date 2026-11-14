@@ -650,6 +650,44 @@ team will still see the PC until they remove it. Finally, start a one-off
 full-control session on a paired PC and check both work and clean up
 independently.
 
+### Mac agent core
+
+`mac-agent/` is the Mac client's Rust workspace. Its first member, `core` (crate
+`support-core`), holds everything that does not touch macOS: the relay's wire for a saved
+Mac (pair, check in, the doorbell), the long-poll session client with its two lanes, the
+team's rules and the raw-command screen, the signed release note, the key-name parser and
+the screen maths. It talks to the operating system only through a `Platform` trait. The
+Mac app (a later member) supplies the real one. The core's own fake runs commands with
+`sh -c` and serves one fixed JPEG, so all of it runs on Linux.
+
+The toolchain is pinned in `mac-agent/rust-toolchain.toml` and in the `mac-agent-core` job
+of `.github/workflows/test.yml`. Change both together. Every dependency is pinned with
+`=`, and `Cargo.lock` is committed, so `--locked` is the rule. Install Rust with rustup
+in your home folder (`rustup toolchain install 1.99.1 --profile minimal --component clippy`).
+
+```sh
+cd mac-agent
+cargo test --locked                           # unit tests, the shared rules cases, the note vectors
+cargo clippy --locked --all-targets -- -D warnings
+cd .. && npm ci --ignore-scripts && node mac-agent/e2e/run.mjs
+```
+
+`cargo test` reads `test/fixtures/rules-cases.json` at test time and runs every `decide`
+case except the two marked `"scope":"relay"` (the relay compares short names and relative
+paths as plain strings, which the Mac never sees), and every `decide_posix` case. The
+timing tests use tokio's paused clock and a scripted relay; the doorbell tests use a real
+WebSocket on loopback with short timings. `core/tests/data/vectors.json` holds the Mac
+release notes, version orderings and rules tags the relay's own code makes. Regenerate it
+with `node mac-agent/core/tests/data/make-vectors.mjs` after changing `src/release.js` or
+`src/rules.js`. It signs with a key made on the spot and thrown away.
+
+`mac-agent/e2e/run.mjs` builds `support-core-e2e`, starts the real relay under `wrangler
+dev` on a free loopback port with a local database and `DEV_SKIP_ACCESS=1`, and removes
+its own state folder at the end. It makes a pairing code through the team API, lets the
+client pair and check in as an active macOS saved PC, then calls MCP over HTTP: connect,
+`run`, a 1 MB `put_file` and `get_file`, `screenshot`, the Mac's own refusals, a power
+action, and `session_end`. It exits non-zero on the first failed check.
+
 ### OAuth locally
 
 `test/oauth.test.js` drives the real router and the real library with an
