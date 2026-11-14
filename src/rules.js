@@ -173,6 +173,10 @@ function parseList(v, field, { max, check }) {
 const FOLDER_RE = /^[A-Za-z]:[\\/]/;
 // An absolute POSIX path (a Mac's): one leading /, not the // of a network path.
 const isPosixPath = (text) => /^\/(?!\/)/.test(text);
+// A path to compare as a Mac path: any that starts with /. A Mac reads // and /// as /, so they must never
+// fall to the Windows parser, which would split a backslash in a Mac name. A Windows protected folder
+// always has a drive letter, so no Windows path that starts with / can match one either way.
+const isMacPath = (text) => /^\//.test(text);
 function checkFolder(text) {
   if (isPosixPath(text)) {
     // A Mac folder: / is the only separator, and < > " | ? * are legal in a name. Never the whole disk.
@@ -329,7 +333,7 @@ const processKey = (name) => {
 // drops from a name dropped here too. Short names (PROGRA~1) and links stay as written. A Mac path has
 // its own rules (posixParts).
 function pathParts(path) {
-  if (isPosixPath(String(path).trim())) return posixParts(path);
+  if (isMacPath(String(path).trim())) return posixParts(path);
   const parts = [];
   for (const raw of String(path).replace(/^\\\\\?\\/, '').split(/[\\/]+/)) {
     if (raw === '' || raw === '.') continue;
@@ -378,7 +382,7 @@ export const isAppProgram = (name) => APP_PROGRAM.test(processKey(name));
 export function isAppPath(path) {
   const p = pathParts(path);
   // The Mac app and its data folder, from the root (a POSIX path has no drive part).
-  if (isPosixPath(String(path).trim())) {
+  if (isMacPath(String(path).trim())) {
     return (p[0] === 'applications' && p[1] === 'support.app') || (p[0] === 'library' && p[1] === 'application support' && p[2] === 'supportmcp');
   }
   return p.length >= 3 && p[1].startsWith('program files') && (p[2] === 'supportmcp' || p[2].startsWith('supportmcp-'));
