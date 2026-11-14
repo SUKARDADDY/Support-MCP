@@ -620,6 +620,9 @@ struct Shared {
     accepted: String,
     failed_updates: Vec<String>,
     session: Option<RunningSession>,
+    /// The session the person at the Mac ended. A pointer to it is not followed again (the relay may still name it
+    /// until its `end` arrives), so ending a session never starts it over.
+    ended_by_owner: String,
 }
 
 struct RunningSession {
@@ -667,6 +670,7 @@ impl DeviceService {
             accepted: cfg.accepted_session.clone().unwrap_or_default(),
             failed_updates: vec![],
             session: None,
+            ended_by_owner: String::new(),
         };
         Ok(Arc::new(DeviceService {
             link: DeviceLink::new(&cfg.origin)?,
@@ -710,6 +714,28 @@ impl DeviceService {
     pub fn stop(&self) {
         self.stop.set();
         self.wake.notify_one();
+    }
+
+    /// This Mac's access now ("ask" or "any"), as the last check-in left it.
+    pub fn access(&self) -> String {
+        self.shared.lock().unwrap().access.clone()
+    }
+
+    /// This Mac's control now ("full" or "limited"). A check-in can lower it and never raises it.
+    pub fn control(&self) -> String {
+        self.shared.lock().unwrap().control.clone()
+    }
+
+    /// The person at the Mac ends the live session (End session in the menu bar or the corner window). The session
+    /// sends `end` with the reason `owner`, and a pointer to the same session is not followed again. False when no
+    /// session is running.
+    pub fn end_session(&self) -> bool {
+        let mut s = self.shared.lock().unwrap();
+        let Some(running) = s.session.as_ref().filter(|r| !r.done.is_finished()) else { return false };
+        let (id, stop) = (running.id.clone(), running.stop.clone());
+        s.ended_by_owner = id;
+        stop.set();
+        true
     }
 
     pub fn stop_signal(&self) -> Arc<Stop> {
@@ -810,7 +836,7 @@ impl DeviceService {
         }
         let Some(p) = pointer else { return };
         let mut s = self.shared.lock().unwrap();
-        if s.session.as_ref().is_some_and(|r| r.id == p.id) {
+        if s.session.as_ref().is_some_and(|r| r.id == p.id) || s.ended_by_owner == p.id {
             return;
         }
         // A pointer to another session replaces the old one: the old session is over on the relay's side.
@@ -1363,6 +1389,39 @@ mod tests {
         drop(sock);
         assert!(back >= Duration::from_millis(40) && back < Duration::from_millis(180), "after a ring the wait is the minimum, not 200 ms: {back:?}");
         bell.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_session_the_person_ended_is_not_started_again_by_the_same_pointer() {
+        // A relay that never answers: the session keeps retrying its hello until it is stopped.
+        let cfg = DeviceConfig {
+            origin: "http://127.0.0.1:9".into(),
+            key: "k".into(),
+            identity: Identity { os: os_string("26.1", "25B78"), machine: "M".into(), app_version: "1.0.0".into() },
+            access: "any".into(),
+            control: "full".into(),
+            accepted_session: None,
+            doorbell: DoorbellConfig::default(),
+        };
+        let platform = Arc::new(crate::platform::FakePlatform::new(crate::wire::Control::Full));
+        let svc = DeviceService::new(cfg, platform, Arc::new(NoHooks), crate::clock::SystemClock::new(), None).unwrap();
+        assert_eq!((svc.access(), svc.control()), ("any".to_string(), "full".to_string()));
+        assert!(!svc.end_session(), "no session is running");
+        let pointer = SessionPointer { id: "a".repeat(64), by: "Dana".into(), team: "T".into(), ask: false, expires_at: i64::MAX / 2 };
+        svc.consider_session(Some(pointer.clone())).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(svc.end_session(), "the running session is ended");
+        let done = svc.shared.lock().unwrap().session.take().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), done.done).await.expect("the session ends").unwrap();
+        // The relay still names it (its end may not have arrived): the Mac does not pick it up again.
+        svc.consider_session(Some(pointer)).await;
+        assert!(svc.shared.lock().unwrap().session.is_none());
+        // A new session is followed as usual.
+        let other = SessionPointer { id: "b".repeat(64), by: "Dana".into(), team: "T".into(), ask: false, expires_at: i64::MAX / 2 };
+        svc.consider_session(Some(other)).await;
+        assert!(svc.shared.lock().unwrap().session.is_some());
+        svc.stop();
+        assert!(svc.end_session());
     }
 
     #[tokio::test]
