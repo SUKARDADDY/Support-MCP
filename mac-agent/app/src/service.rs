@@ -29,6 +29,7 @@ use crate::safe_files;
 use crate::server::{Api, BoxFuture, HelperError, Helpers, Server};
 use crate::setup;
 use crate::state::{self, DeviceState};
+use crate::update::{self, Updater};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use serde_json::{json, Map, Value};
@@ -37,11 +38,12 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use support_core::clock::SystemClock;
-use support_core::device::{DeviceConfig, DeviceLink, DeviceService, DoorbellConfig, Hooks, Identity};
+use support_core::device::{DeviceConfig, DeviceLink, DeviceResult, DeviceService, DoorbellConfig, Hooks, Identity};
 use support_core::exec::{self, RunOutput};
 use support_core::files::FileChunk;
 use support_core::keys::KeyCombo;
 use support_core::platform::{Desktop, InstallRequest, Platform, RunRequest, ScreenOutput, UninstallRequest, ASK_MARGIN_MS, ASK_MS};
+use support_core::release::MacNote;
 use support_core::session::Target;
 use support_core::stop::Stop;
 use support_core::wire::{Control, Frame, HostInfo, ScreenAction};
@@ -85,6 +87,14 @@ pub trait Os: Send + Sync + 'static {
     fn file_as_user(&self, uid: u32, op: &FileOp, input: &[u8]) -> Result<Value, String>;
     /// Starts the last step of an uninstall (the jobs, the files, the permissions), detached from this service.
     fn uninstall_finish(&self) -> Result<(), String>;
+    /// The update steps that need macOS (pkgutil, codesign, launchctl). None anywhere else.
+    fn update_system(&self) -> Arc<dyn update::System> {
+        Arc::new(update::Unsupported)
+    }
+    /// Where updates work, for the data folder `data`.
+    fn update_places(&self, data: &std::path::Path) -> update::Places {
+        update::Places { data: data.to_path_buf(), apps: self.apps_dir(), watch_plist: PathBuf::from(crate::paths::WATCH_PLIST) }
+    }
 }
 
 /// The session's state on this Mac that the platform and the hooks share.
@@ -489,6 +499,8 @@ pub struct Service {
     /// One setup or uninstall at a time.
     busy: tokio::sync::Mutex<()>,
     runtime: tokio::runtime::Handle,
+    /// Self-update: offers, the switch, and this version's trial.
+    pub updater: Arc<Updater>,
 }
 
 struct ServiceHooks {
@@ -501,6 +513,7 @@ impl Service {
         let history = state::load_history(&dir);
         let control = saved.as_ref().map(|s| s.control.clone()).unwrap_or_else(|| "limited".into());
         let platform = MacPlatform::new(os.clone(), helpers, &control, dir.clone());
+        let updater = Updater::new(os.update_places(&dir), support_core::VERSION, os.update_system());
         Arc::new(Service {
             os,
             dir,
@@ -510,7 +523,34 @@ impl Service {
             device: Mutex::new(None),
             busy: tokio::sync::Mutex::new(()),
             runtime,
+            updater,
         })
+    }
+
+    pub fn add_history(&self, line: &str) {
+        let mut h = self.history.lock().unwrap();
+        h.push(line.to_string());
+        support_core::device::trim_history(&mut h);
+        let _ = state::save_history(&self.dir, &h);
+    }
+
+    /// Whether a session runs, or the person is being asked about one: an update never cuts it.
+    pub fn session_busy(&self) -> bool {
+        self.platform.live.lock().unwrap().count > 0 || self.device().is_some_and(|d| d.session_running())
+    }
+
+    /// The update steps before the first check-in: an open trial is taken up (src/update.rs `Updater::prepare`), and a
+    /// trial of a Mac that never checks in (not set up, removed or expired) commits at once.
+    pub fn prepare_update(&self) {
+        if let Some(line) = self.updater.prepare() {
+            self.add_history(&line);
+        }
+        let idle = self.state.lock().unwrap().as_ref().is_none_or(|s| s.finished());
+        if idle {
+            if let Some(line) = self.updater.commit_now() {
+                self.add_history(&line);
+            }
+        }
     }
 
     fn save(&self) {
@@ -628,6 +668,9 @@ impl Service {
         let _one = self.busy.lock().await;
         let os = self.os.clone();
         tokio::task::spawn_blocking(move || os.verify_admin(&auth, peer)).await.map_err(|_| NOT_ADMIN.to_string())??;
+        if self.updater.uninstall_busy() {
+            return Err("Support is finishing an update. Try again in a few minutes.".into());
+        }
         self.stop_device().await;
         // Leave the team: a 200 or a 401 both mean this Mac is gone from the list.
         let saved = self.state.lock().unwrap().clone();
@@ -664,11 +707,25 @@ impl Hooks for ServiceHooks {
     }
     fn history(&self, line: &str) {
         if let Some(svc) = self.svc.upgrade() {
-            let mut h = svc.history.lock().unwrap();
-            h.push(line.to_string());
-            support_core::device::trim_history(&mut h);
-            let _ = state::save_history(&svc.dir, &h);
+            svc.add_history(line);
         }
+    }
+    fn update_offered(&self, note: &MacNote) {
+        let Some(svc) = self.svc.upgrade() else { return };
+        let weak = self.svc.clone();
+        let busy: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || weak.upgrade().is_none_or(|s| s.session_busy()));
+        let _ = svc.updater.offer(note, busy);
+    }
+    fn failed_updates(&self) -> Vec<String> {
+        self.svc.upgrade().map(|s| s.updater.failed()).unwrap_or_default()
+    }
+    fn checked_in(&self, result: DeviceResult, status: u16) -> Option<u64> {
+        let svc = self.svc.upgrade()?;
+        let step = svc.updater.trial_pass(result, status);
+        if let Some(line) = step.line {
+            svc.add_history(&line);
+        }
+        step.soon
     }
     fn state(&self, st: &str) {
         if let Some(svc) = self.svc.upgrade() {
@@ -762,6 +819,8 @@ pub async fn run(os: Arc<dyn Os>, inspector: Arc<dyn Inspector>, dir: PathBuf, o
     });
     let helpers = Helpers::new();
     let svc = Service::new(os, helpers.clone(), dir, tokio::runtime::Handle::current());
+    let prep = svc.clone();
+    let _ = tokio::task::spawn_blocking(move || prep.prepare_update()).await;
     let listener = crate::server::bind(std::path::Path::new(crate::paths::SOCKET_DIR), std::path::Path::new(crate::paths::SOCKET_PATH), owner)?;
     let api: Arc<dyn Api> = svc.clone();
     let server = Server::new(inspector, api, helpers, crate::paths::BINARY_PATH);

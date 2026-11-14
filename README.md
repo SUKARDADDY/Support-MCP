@@ -678,6 +678,73 @@ A saved PC and a one-off support session are separate. A one-off session uses
 its own service, folder and pipe, and removes itself when it ends. Uninstalling a
 saved PC does not touch it.
 
+### Saved Macs
+
+A Mac with Apple silicon and macOS 14 or later can be a saved PC too, with the
+same pairing, approval, access modes and rules as Windows. The Mac app is native
+(Rust, in `mac-agent/`) and has its own version line, starting at 1.1.0, apart
+from the relay's version.
+
+**Install.** Download `Support-<version>.pkg` from the setup page's "On a Mac"
+section or from the GitHub release tagged `mac-v<version>`. The app is signed
+with the project's own certificate, not an Apple Developer ID, so macOS blocks
+the first open of a downloaded package: choose **Open Anyway** in System
+Settings, Privacy & Security, once. You can check the certificate against the
+fingerprint in [SECURITY.md](SECURITY.md#the-mac-apps). The package puts
+`Support.app` in /Applications, starts a root service (a LaunchDaemon) and a
+helper in each signed-in session (a LaunchAgent), and puts Support in the menu
+bar. Choose **Set up Support…** there, paste the setup link, name the Mac and
+choose how the team connects (ask each time, or any time) and how much it can do.
+Setup asks for an administrator's password. From Terminal it is:
+
+```sh
+sudo /Applications/Support.app/Contents/MacOS/support setup --link <setup link> \
+  --name <name> --access ask|any --control full|limited
+```
+
+**Full or limited control.** Limited runs commands and opens files as the person
+who allowed the session, only while they are signed in. Full control also runs
+commands as root (`run` with `as: "system"`), works at the login window, and can
+install and uninstall programs. A check-in can lower full control to limited,
+never raise it.
+
+**Permissions.** macOS lets only a person at the Mac grant two switches in System
+Settings, Privacy & Security: **Screen Recording** (screenshots) and
+**Accessibility** (mouse, keyboard, `ui_tree` and `ui_act`). The setup window has
+a button for each. macOS restarts Support after the first. Until both are on, a
+screen command fails with an error that names the missing permission, and
+commands and files still work.
+
+**Restart and shut down.** `restart_pc` is refused while FileVault is on, since
+the Mac would wait at the FileVault password and not come back to the team.
+`shutdown_pc` works either way.
+
+**One-off links.** A one-off support link works for a Mac without a saved
+install. The link's page has an "On a Mac" section with `Support-<version>.zip`,
+which holds `Support Join.app`. The person opens it, sees the team's server and
+the session, and allows it. It runs as that person, asks for no administrator
+password and installs nothing. At the end it resets its own Screen Recording and
+Accessibility permissions and offers to move itself to the Trash.
+
+**Updates.** A saved Mac updates itself as a Windows PC does: only to a release
+whose note is signed with the project's release key, never to an older or failed
+version, and never during a session. The note names the package on GitHub, and
+the Mac downloads it only from there (at most 40 MiB), checks its size and
+SHA-256, and takes the new app only when it is signed by the same certificate as
+the one that runs, so the two permissions stay granted. The new version runs on a
+4-minute trial. If it cannot start or the relay refuses it, the Mac goes back to
+the old version and never tries that one again. The menu bar's history says
+which. A Mac takes an update at its next check-in (6 hours with the doorbell up,
+5 minutes without); the relay's update rings are for Windows only. An update
+replaces the app and nothing else.
+
+**Uninstall.** Choose **Uninstall Support…** in the menu bar, or run
+`sudo /Applications/Support.app/Contents/MacOS/support uninstall`. It asks for an
+administrator's password, leaves the team, ends the live session, and removes
+the service, the helpers, the app, root's data folder, the package receipt and
+Support's two permissions. During the few minutes an update is on trial, it says
+to try again in a few minutes.
+
 ## Working together
 
 A technician, or their AI client, can bring a colleague into a live session, hand control over, and send a

@@ -24,6 +24,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '../..');
 const agent = resolve(here, '..');
 const checks = [];
+// The version the client reports: the core crate's (the Mac app's own version line).
+const CORE_VERSION = /^version = "([^"]+)"/m.exec(readFileSync(join(agent, 'core/Cargo.toml'), 'utf8'))[1];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function check(name, ok, detail = '') {
@@ -126,7 +128,7 @@ async function main() {
 
   const list = await call('device_list');
   const mac = (list.data.devices ?? list.data).find((d) => d.id === deviceId);
-  check('device_list shows the Mac as macOS, active, online and at the client version', !!mac && mac.os === 'macOS 26.1 (25B78)' && mac.status === 'active' && mac.online === true && mac.app_version === '1.0.0', JSON.stringify(mac));
+  check('device_list shows the Mac as macOS, active, online and at the client version', !!mac && mac.os === 'macOS 26.1 (25B78)' && mac.status === 'active' && mac.online === true && mac.app_version === CORE_VERSION, JSON.stringify(mac));
 
   const connected = await call('device_connect', { device_id: deviceId });
   check('device_connect starts a session', !connected.isError && /^[0-9a-f]{64}$/.test(connected.data.session_id ?? ''), JSON.stringify(connected));

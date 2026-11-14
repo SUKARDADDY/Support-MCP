@@ -5,6 +5,46 @@ All notable changes to Support-MCP are listed here. The format follows
 [Semantic Versioning](https://semver.org). Version 1.0.0 ended Stage 1: it is the
 first release that enforces a team's rules on saved PCs.
 
+The Mac app has its own version line, apart from the relay's. Its entries are headed
+"Mac" and its releases are tagged `mac-v<version>`. Every other entry is the relay's
+version, which the Windows app and the technician app share, tagged `v<version>`.
+
+## [Mac 1.1.0] - Unreleased
+
+The first release of the Mac app, a native client of the relay's protocol 1 for Apple silicon Macs with macOS 14 or
+later. It starts at 1.1.0 so it passes the relay's 1.0.0 minimum for sessions. The relay stays at 1.0.0: this
+release adds two Worker secrets and no migration, and a Windows PC's answers and downloads are byte for byte as
+before.
+
+### Added
+
+- A Mac can be a saved PC: the same pairing, approval, access modes, control and rules as Windows. It runs a root
+  service and a helper in each signed-in session, and the menu bar shows its state and history. Agents use the same
+  tools: screenshots, input, `ui_tree` and `ui_act` through macOS Accessibility, `run` in zsh (as the person, or as
+  root under full control), files, restart (refused while FileVault is on) and shutdown, and listing, closing,
+  installing and uninstalling programs (`.pkg`, `.dmg` or `.zip`, checked by Gatekeeper; a removed app is kept for 7
+  days). Setup and uninstall need an administrator's password.
+- One-off support links work on a Mac through `Support Join.app` (`Support-<version>.zip`), a separate app that runs
+  as the person, joins only its own relay, and resets its permissions at the end.
+- A signed Mac release: a six-line note under `support-mcp-mac-release 1` with the package's GitHub URL, set with the
+  Worker secrets `MAC_RELEASE_NOTE` and `MAC_RELEASE_SIGNATURE` and signed with `scripts/sign-release.mjs --product
+  mac`. The relay offers it only to PCs whose `os` starts with `macOS `, under the same stages and `UPDATE_ROLLOUT`.
+  `/install` gets an "On a Mac" section. Rules carry each platform's own protected folders.
+- Self-update on a Mac, as on Windows: only a release signed with the project's key, newer and not failed before,
+  never during a session. The package comes only from GitHub (at most 40 MiB, checked against the note's size and
+  SHA-256), and the new app must be signed by the same certificate as the running one, so macOS keeps its
+  permissions. A 4-minute trial commits it or puts the old app back, and a failed version is never tried again.
+- `.github/workflows/mac-release.yml` builds, signs and publishes `Support-<version>.pkg` and `Support-<version>.zip`
+  on a `mac-v*` tag, in the `mac-release` environment. Releases are signed with a self-signed certificate, whose
+  fingerprint is in SECURITY.md.
+- CI builds the Mac app on a GitHub-hosted macOS runner and runs a real update there: an update and commit, a
+  refusal for another signer, and a rollback of a version that cannot start.
+
+### Changed
+
+- `docs/development.md` says that the Windows app is built and tested on the self-hosted `laptop-win` runner, as
+  `test.yml` has it, not on `windows-latest`.
+
 ## [1.0.0] - 2026-11-11
 
 Enforced rules: what anyone may do to a saved PC is limited by the team's rules, checked by the relay and by the PC, with
