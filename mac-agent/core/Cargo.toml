@@ -32,6 +32,8 @@ sha2 = "=0.10.9"
 p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "std"] }
 rand = "=0.9.5"
 url = "=2.5.8"
+# NFC for comparing Mac path names (already in the tree through url).
+icu_normalizer = "=2.4.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.191"

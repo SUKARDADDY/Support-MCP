@@ -414,10 +414,12 @@ fn is_posix(text: &str) -> bool {
 }
 
 /// A path as lower-case components: / the same as \, repeated and trailing separators dropped, . and .. resolved
-/// (never above the drive, but a POSIX path has no drive, so .. may take away its first component), the \\?\ prefix
-/// dropped, and the trailing dots and spaces Windows drops dropped too. Links stay as written.
+/// (never above the drive), the \\?\ prefix dropped, and the trailing dots and spaces Windows drops dropped too.
+/// Links stay as written. A Mac path has its own rules (posix_parts).
 pub fn path_parts(path: &str) -> Vec<String> {
-    let floor = if is_posix(path.trim()) { 0 } else { 1 };
+    if is_posix(path.trim()) {
+        return posix_parts(path);
+    }
     let mut parts: Vec<String> = Vec::new();
     let body = path.strip_prefix("\\\\?\\").unwrap_or(path);
     for raw in body.split(['\\', '/']) {
@@ -425,7 +427,7 @@ pub fn path_parts(path: &str) -> Vec<String> {
             continue;
         }
         if raw == ".." {
-            if parts.len() > floor {
+            if parts.len() > 1 {
                 parts.pop();
             }
             continue;
@@ -434,6 +436,26 @@ pub fn path_parts(path: &str) -> Vec<String> {
         if !name.is_empty() {
             parts.push(name);
         }
+    }
+    parts
+}
+
+/// A Mac path as components, as the relay reads it (src/rules.js posixParts). Only / separates: a backslash, a
+/// trailing dot or a trailing space is part of a Mac name, so "..\\x" and "x." are names, never a step up or another
+/// spelling of "x". There is no drive, so .. may take away the first component. Names are compared in NFC and lower
+/// case, as the Mac's usual case-insensitive disk does.
+fn posix_parts(path: &str) -> Vec<String> {
+    let nfc = icu_normalizer::ComposingNormalizerBorrowed::new_nfc();
+    let mut parts: Vec<String> = Vec::new();
+    for raw in path.trim().split('/') {
+        if raw.is_empty() || raw == "." {
+            continue;
+        }
+        if raw == ".." {
+            parts.pop();
+            continue;
+        }
+        parts.push(nfc.normalize(raw).to_lowercase());
     }
     parts
 }
