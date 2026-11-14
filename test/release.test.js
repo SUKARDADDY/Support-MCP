@@ -10,10 +10,10 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VERSION } from '../src/version.js';
-import { fixtureBundle, signNote, throwawayKey, verifies } from './release-fixture.js';
+import { MAC_URL, MAC_VERSION, fixtureBundle, macRelease, signNote, throwawayKey, verifies } from './release-fixture.js';
 import {
-  NOTE_HEADER, TECHNICIAN_NOTE_HEADER, buildNote, buildTechnicianNote, bundleDigest, compareVersions, groupOf, isPrerelease, offerAtCheckIn, offerOnRefusal,
-  parseNote, parseReleaseSettings, parseRollout, parseTechnicianNote, releaseFrom, scheduledStage, validVersion,
+  MAC_NOTE_HEADER, NOTE_HEADER, TECHNICIAN_NOTE_HEADER, buildMacNote, buildNote, buildTechnicianNote, bundleDigest, compareVersions, groupOf, isMacOs, isPrerelease, macReleaseFrom, offerAtCheckIn, offerOnRefusal,
+  parseMacNote, parseNote, parseReleaseSettings, parseRollout, parseTechnicianNote, releaseFrom, scheduledStage, validVersion,
 } from '../src/release.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -380,6 +380,168 @@ test('sign-release --product technician signs an installer under its own header 
     assert.match(node('sign-release.mjs', ['--product', 'technician', '--pub', pub], pem).stderr, /needs --file/);
     assert.match(node('sign-release.mjs', ['--file', installer, '--pub', pub], pem).stderr, /--file is for --product technician/);
     assert.notEqual(node('sign-release.mjs', ['--product', 'other', '--file', installer], pem).status, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- the Mac's release -------------------------------------------------------------------------
+test('isMacOs: only an os that starts with "macOS "', () => {
+  for (const os of ['macOS 26.1 (25B78)', 'macOS 14.0 (23A344)', 'macOS Tahoe']) assert.equal(isMacOs(os), true, os);
+  for (const os of ['Windows 11 Pro', 'Windows 7 Professional', 'macOS', 'macOSX 14', 'MACOS 26', ' macOS 26', 'Mac OS X', '', null, undefined, 26, ['macOS 26']]) assert.equal(isMacOs(os), false, String(os));
+});
+
+test('the Mac note is exactly six LF lines under its own header, and the parser takes nothing else', () => {
+  const values = { version: '1.2.0', sha256: SHA, size: 9_000_000, released: 1794000000, url: MAC_URL };
+  const note = buildMacNote(values);
+  assert.equal(MAC_NOTE_HEADER, 'support-mcp-mac-release 1');
+  assert.equal(note, `support-mcp-mac-release 1\nversion 1.2.0\nsha256 ${SHA}\nsize 9000000\nreleased 1794000000\nurl ${MAC_URL}\n`);
+  assert.equal(note.split('\n').length - 1, 6);
+  assert.deepEqual(parseMacNote(note), values);
+  const bad = [
+    note.slice(0, -1), // no final LF
+    note.replace(/\n/g, '\r\n'), // CRLF
+    `${note}extra 1\n`, // a seventh line
+    note.replace(/url [^\n]*\n/, ''), // the url missing: the Windows note's five lines
+    note.replace(`sha256 ${SHA}\nsize 9000000`, `size 9000000\nsha256 ${SHA}`), // wrong order
+    note.replace(SHA, SHA.toUpperCase()),
+    note.replace('size 9000000', 'size 09000000'),
+    note.replace('size 9000000', 'size 41943041'), // over 40 MiB
+    note.replace('support-mcp-mac-release 1', 'support-mcp-mac-release 2'),
+    note.replace('support-mcp-mac-release 1', NOTE_HEADER), // a Windows header
+    note.replace('version 1.2.0', 'version 1.2'),
+    note.replace('url https://github.com/', 'url http://github.com/'),
+    note.replace('url https://github.com/', 'url https://example.com/'),
+    note.replace('url https://github.com/', 'url https://github.com.evil.example/'),
+    note.replace('url https://github.com/', 'url https://github.com@evil.example/'),
+    note.replace(`Support-${MAC_VERSION}.pkg`, `Support-${MAC_VERSION}.pkg?x=1`),
+    note.replace(`Support-${MAC_VERSION}.pkg`, `Support-${MAC_VERSION}.pkg#x`),
+    note.replace(`Support-${MAC_VERSION}.pkg`, 'Support x.pkg'),
+    note.replace('example/support-mcp', 'example/../support-mcp'),
+    note.replace(`Support-${MAC_VERSION}.pkg`, `${'a'.repeat(300)}.pkg`),
+    note.replace(`Support-${MAC_VERSION}.pkg`, 'Supportz\u00e9.pkg'),
+  ];
+  for (const text of bad) assert.equal(parseMacNote(text), null, JSON.stringify(text));
+  assert.throws(() => buildMacNote({ ...values, url: 'https://example.com/x.pkg' }));
+  assert.throws(() => buildMacNote({ ...values, size: 41_943_041 }));
+  // The Windows and technician parsers refuse a Mac note, and the Mac parser refuses theirs.
+  assert.equal(parseNote(note), null);
+  assert.equal(parseTechnicianNote(note), null);
+  assert.equal(parseMacNote(buildNote(values)), null);
+  assert.equal(parseMacNote(buildTechnicianNote(values)), null);
+  // The Windows note is as it was.
+  assert.equal(buildNote(values), `${NOTE_HEADER}\nversion 1.2.0\nsha256 ${SHA}\nsize 9000000\nreleased 1794000000\n`);
+});
+
+test('a signature over a Windows note does not verify as a Mac note, though every value matches', () => {
+  const key = throwawayKey();
+  const values = { version: '1.2.0', sha256: SHA, size: 9_000_000, released: 1794000000, url: MAC_URL };
+  const windowsSignature = signNote(key, buildNote(values));
+  assert.ok(verifies(key.xy, buildNote(values), windowsSignature));
+  assert.ok(!verifies(key.xy, buildMacNote(values), windowsSignature));
+});
+
+test('macReleaseFrom reads the two Worker secrets, and anything missing or malformed is no release', () => {
+  const key = throwawayKey();
+  const m = macRelease(key, { version: '1.2.0', signedAt: 1794000000 });
+  const release = macReleaseFrom(m.env);
+  assert.deepEqual(release, { version: '1.2.0', note: m.note, signature: m.signature, signedAt: 1794000000, url: m.url });
+  assert.ok(verifies(key.xy, release.note, release.signature), 'what the Mac is passed verifies');
+  assert.deepEqual(macReleaseFrom({ ...m.env, MAC_RELEASE_NOTE: ` ${m.env.MAC_RELEASE_NOTE}\n`, MAC_RELEASE_SIGNATURE: ` ${m.signature} ` }), release, 'padding is trimmed');
+  const b64 = (text) => Buffer.from(text).toString('base64');
+  const bad = [
+    {}, null, undefined,
+    { MAC_RELEASE_NOTE: m.env.MAC_RELEASE_NOTE }, { MAC_RELEASE_SIGNATURE: m.signature },
+    { ...m.env, MAC_RELEASE_NOTE: '' }, { ...m.env, MAC_RELEASE_SIGNATURE: '' }, { ...m.env, MAC_RELEASE_SIGNATURE: 'abc' },
+    { ...m.env, MAC_RELEASE_NOTE: m.note }, // the note itself, not its base64
+    { ...m.env, MAC_RELEASE_NOTE: b64('not a note\n') },
+    { ...m.env, MAC_RELEASE_NOTE: b64(buildNote({ version: '1.2.0', sha256: SHA, size: 9, released: 1794000000 })) }, // a Windows note
+    { ...m.env, MAC_RELEASE_NOTE: b64(m.note.replace('size 9000000', 'size 99999999999')) },
+    { ...m.env, MAC_RELEASE_NOTE: b64(`${m.note}url https://github.com/a/b\n`) },
+    { ...m.env, MAC_RELEASE_NOTE: `${m.env.MAC_RELEASE_NOTE}${m.env.MAC_RELEASE_NOTE}` },
+    { ...m.env, MAC_RELEASE_NOTE: 'A'.repeat(4000) },
+    { ...m.env, MAC_RELEASE_NOTE: 123 },
+  ];
+  for (const env of bad) assert.equal(macReleaseFrom(env), null, JSON.stringify(env)?.slice(0, 80));
+});
+
+test('the offer rules hold for a Mac release: its own version, its own signing time, the same stages', async () => {
+  const now = 1_794_000_000_000;
+  const release = { version: '1.2.0', note: 'n', signature: 's', signedAt: now / 1000 - 72 * 3600 };
+  const pc = (extra = {}) => ({ status: 'active', workspace: 'default', id: 'a'.repeat(20), app_version: '1.0.0', ...extra });
+  const group = await groupOf('1.2.0', 'default', 'a'.repeat(20));
+  // The default expects the Windows release's VERSION, so a Mac release is offered only when its version is passed.
+  assert.equal(await offerAtCheckIn(release, pc(), '', now), false);
+  assert.equal(await offerAtCheckIn(release, pc(), '', now, '1.2.0'), true);
+  assert.equal(await offerAtCheckIn(release, pc({ app_version: '1.2.0' }), '', now, '1.2.0'), false, 'at the release');
+  assert.equal(await offerAtCheckIn(release, pc({ status: 'pending' }), '', now, '1.2.0'), false);
+  assert.equal(await offerAtCheckIn(release, pc(), 'pause', now, '1.2.0'), false);
+  // The stage counts from the Mac note's own date.
+  const fresh = { ...release, signedAt: now / 1000 };
+  assert.equal(await offerAtCheckIn(fresh, pc(), '', now, '1.2.0'), group < 10, `stage 10, group ${group}`);
+  // A Mac prerelease needs a pinned rollout, and is offered on a refusal only the same way.
+  const pre = { ...release, version: '1.3.0-rc.1' };
+  assert.equal(await offerAtCheckIn(pre, pc(), '', now, '1.3.0-rc.1'), false);
+  assert.equal(await offerAtCheckIn(pre, pc(), '100', now, '1.3.0-rc.1'), true);
+  assert.equal(offerOnRefusal(release, '', '1.2.0'), true);
+  assert.equal(offerOnRefusal(release, ''), false, 'not the Windows version');
+  assert.equal(offerOnRefusal(release, 'pause', '1.2.0'), false);
+  assert.equal(offerOnRefusal(pre, '', '1.3.0-rc.1'), false);
+});
+
+test('sign-release --product mac signs a six-line note with a throwaway key and names the assets', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'support-mcp-sign-mac-'));
+  try {
+    const pub = join(dir, 'release-key.pub');
+    const pem = node('release-key.mjs', [pub]).stdout;
+    const pkg = join(dir, `Support-${MAC_VERSION}.pkg`);
+    const bytes = Buffer.concat([Buffer.from('xar!'), Buffer.from('mac package fixture')]);
+    writeFileSync(pkg, bytes);
+    const out = join(dir, 'out');
+    const before = Math.floor(Date.now() / 1000);
+    const signed = node('sign-release.mjs', ['--product', 'mac', '--file', pkg, '--version', MAC_VERSION, '--url', MAC_URL, '--pub', pub, '--out', out], pem);
+    assert.equal(signed.status, 0, signed.stderr);
+    const [noteLine, sigLine, blank, ...rest] = signed.stdout.split('\n');
+    const encoded = /^MAC_RELEASE_NOTE=([A-Za-z0-9+/]+=*)$/.exec(noteLine)?.[1];
+    const signature = /^MAC_RELEASE_SIGNATURE=([A-Za-z0-9+/]{86}==)$/.exec(sigLine)?.[1];
+    assert.ok(encoded && signature, signed.stdout);
+    assert.equal(blank, '');
+    const note = rest.join('\n');
+    assert.equal(Buffer.from(encoded, 'base64').toString(), note, 'the first secret is the note in base64');
+    assert.equal(note.split('\n').length - 1, 6, 'six lines');
+    const values = parseMacNote(note);
+    assert.deepEqual({ ...values, released: 0 }, { version: MAC_VERSION, sha256: createHash('sha256').update(bytes).digest('hex'), size: bytes.length, released: 0, url: MAC_URL });
+    assert.ok(values.released >= before && values.released <= Math.floor(Date.now() / 1000) + 1);
+    assert.equal(parseNote(note), null, 'not a Windows note');
+    assert.ok(verifies(readFileSync(pub, 'utf8').trim(), note, signature));
+    // What the relay reads from the two secrets is the same note and signature.
+    const release = macReleaseFrom({ MAC_RELEASE_NOTE: encoded, MAC_RELEASE_SIGNATURE: signature });
+    assert.deepEqual([release.note, release.signature, release.signedAt], [note, signature, values.released]);
+    assert.deepEqual(readdirSync(out).sort(), [`Support-${MAC_VERSION}.note`, `Support-${MAC_VERSION}.note.sig`, `Support-${MAC_VERSION}.pkg`]);
+    assert.deepEqual(readFileSync(join(out, `Support-${MAC_VERSION}.pkg`)), bytes);
+    assert.equal(readFileSync(join(out, `Support-${MAC_VERSION}.note`), 'utf8'), note);
+    assert.equal(readFileSync(join(out, `Support-${MAC_VERSION}.note.sig`), 'utf8'), `${signature}\n`);
+
+    // Another key signs nothing; a bad package, name or url, a missing --file or --url, and --url for another product all fail.
+    const wrong = throwawayKey().privateKey.export({ format: 'pem', type: 'pkcs8' });
+    const refused = node('sign-release.mjs', ['--product', 'mac', '--file', pkg, '--version', MAC_VERSION, '--url', MAC_URL, '--pub', pub], wrong);
+    assert.notEqual(refused.status, 0);
+    assert.match(refused.stderr, /does not match/);
+    assert.equal(refused.stdout, '');
+    const run = (args) => node('sign-release.mjs', ['--product', 'mac', '--pub', pub, ...(args.includes('--version') ? [] : ['--version', MAC_VERSION]), ...args], pem);
+    const notPkg = join(dir, `Support-${MAC_VERSION}.txt`);
+    writeFileSync(notPkg, 'plain text');
+    assert.match(run(['--file', notPkg, '--url', MAC_URL]).stderr, /not a macOS installer package/);
+    const misnamed = join(dir, 'Support-9.9.9.pkg');
+    writeFileSync(misnamed, bytes);
+    assert.match(run(['--file', misnamed, '--url', MAC_URL]).stderr, /does not carry version/);
+    for (const url of ['https://example.com/a/releases/download/v${V}/Support-${V}.pkg', 'https://github.com/a/b/releases/download/v9.9.9/Support-9.9.9.pkg', 'https://github.com/a/b/releases/download/v1.0.0/Support-1.0.0.pkg', 'http://github.com/a/b/releases/download/v${V}/Support-${V}.pkg', 'https://github.com/a/b/releases/download/v${V}/Support-${V}.pkg?x=1']) {
+      assert.notEqual(run(['--file', pkg, '--url', url.replaceAll('${V}', MAC_VERSION)]).status, 0, url);
+    }
+    assert.match(run(['--file', pkg]).stderr, /needs --version <semver>, --file <package> and --url/);
+    assert.match(run(['--url', MAC_URL]).stderr, /needs --version <semver>, --file <package> and --url/);
+    assert.match(node('sign-release.mjs', ['--file', pkg, '--version', MAC_VERSION, '--url', MAC_URL, '--pub', pub], pem).stderr, /--file is for --product/);
+    assert.notEqual(node('sign-release.mjs', ['--version', MAC_VERSION, '--url', MAC_URL, '--pub', pub], pem).status, 0, '--url is for --product mac');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

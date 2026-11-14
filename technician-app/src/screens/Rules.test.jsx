@@ -180,11 +180,18 @@ describe('editing the team\'s rules', () => {
     expect(await screen.findByText(/Mars\/Base is not a time zone/)).toBeInTheDocument();
     await user.clear(screen.getByLabelText('Time zone'));
     await user.type(screen.getByLabelText('Add a protected folder'), 'Customer Data{Enter}');
-    expect(await screen.findByText('Customer Data is not a full path. Write it like C:\\Customer Data.')).toBeInTheDocument();
+    expect(await screen.findByText('Customer Data is not a full path. Write it like C:\\Customer Data on Windows or /Users/ariel/Customer Data on a Mac.')).toBeInTheDocument();
     // A whole drive is refused too: it would stop every file and installer on the PC.
     await user.clear(screen.getByLabelText('Add a protected folder'));
     await user.type(screen.getByLabelText('Add a protected folder'), 'C:\\{Enter}');
-    expect(await screen.findByText('C:\\ is a whole drive. Protect a folder on it, like C:\\Customer Data.')).toBeInTheDocument();
+    expect(await screen.findByText('C:\\ is a whole drive or disk. Protect a folder on it, like C:\\Customer Data or /Users/ariel/Customer Data.')).toBeInTheDocument();
+    // A Mac folder is accepted where it is a clean absolute path, and refused with its own message where it is not.
+    await user.clear(screen.getByLabelText('Add a protected folder'));
+    await user.type(screen.getByLabelText('Add a protected folder'), '/a/../b{Enter}');
+    expect(await screen.findByText('/a/../b is not a valid Mac folder. Write it like /Users/ariel/Customer Data, with no . or .. parts.')).toBeInTheDocument();
+    await user.clear(screen.getByLabelText('Add a protected folder'));
+    await user.type(screen.getByLabelText('Add a protected folder'), '/Users/ariel/Documents{Enter}');
+    expect(await screen.findByText('/Users/ariel/Documents')).toBeInTheDocument();
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(savesOf(fake)).toEqual([]);
   });

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { ACTIONS, DEFAULT_DOC, changedFields, effective, hoursSummary, problemWith, teamDoc, timeZones } from './rules.js';
+import { ACTIONS, DEFAULT_DOC, changedFields, effective, folderProblem, hoursSummary, problemWith, teamDoc, timeZones } from './rules.js';
 
 const HOURS = { mon: ['08:00', '18:00'], tue: ['08:00', '18:00'], wed: ['08:00', '18:00'], fri: ['08:00', '13:00'] };
 
@@ -65,6 +65,20 @@ describe('the rules the screens work with', () => {
     // A whole drive would refuse every file and installer of the PC.
     for (const root of ['C:\\', 'c:/', 'D:\\\\']) expect(problemWith({ ...ok, protected_folders: [root] }, ok)).toMatchObject({ key: 'rules.err_folder_root' });
     expect(problemWith({ ...ok, protected_programs: Array.from({ length: 51 }, (_, i) => `p${i}`) }, ok)).toMatchObject({ key: 'rules.err_list_long' });
+  });
+
+  test('a protected folder may be a Mac path, as the relay accepts it', () => {
+    const ok = { ...DEFAULT_DOC };
+    const with_ = (folder) => problemWith({ ...ok, protected_folders: [folder] }, ok);
+    for (const good of ['/Users/ariel/Documents', '/Volumes/My Data', ' /Users/ariel/Customer Data ', '/Data']) expect(with_(good), good).toBeNull();
+    for (const bad of ['Users/x', '~/Documents', '//server/share', '///x', '\\Users\\x']) expect(with_(bad), bad).toMatchObject({ key: 'rules.err_folder' });
+    for (const bad of ['/a/../b', '/a/./b', '/..', '/a\u0000b']) expect(with_(bad), bad).toMatchObject({ key: 'rules.err_folder_posix' });
+    expect(with_('/')).toMatchObject({ key: 'rules.err_folder_root' });
+    // A drive path is checked as it was.
+    expect(with_('C:\\Data')).toBeNull();
+    expect(with_('C:\\')).toMatchObject({ key: 'rules.err_folder_root' });
+    expect(folderProblem('/Users/ariel/Documents')).toBeNull();
+    expect(folderProblem('Users/x')).toMatchObject({ key: 'rules.err_folder', vars: { path: 'Users/x' } });
   });
 
   test('business hours read as a line, with days that follow each other with the same times grouped', () => {

@@ -4,13 +4,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
-  DEFAULT_RULES, REFUSALS, RulesError, decide, effectiveRules, hoursUtc, installArgsProblem, installerProblem, isTimeZone, parseRules, parseStored, pathInside, resolveTimeZone, rulesTag,
+  DEFAULT_RULES, REFUSALS, RulesError, decide, effectiveRules, hoursUtc, installArgsProblem, installerProblem, isAppPath, isTimeZone, parseRules, parseStored, pathInside, resolveTimeZone, rulesTag,
 } from '../src/rules.js';
 
 const cases = JSON.parse(readFileSync(new URL('./fixtures/rules-cases.json', import.meta.url), 'utf8'));
 
 test('the shared file has the cases the plan names', () => {
   assert.ok(cases.decide.length >= 60);
+  assert.ok(cases.decide_posix.length >= 20);
   for (const k of ['decide', 'hours', 'effective', 'validate', 'installers']) assert.ok(cases[k].length > 5, k);
   assert.equal(new Set(Object.values(cases).filter(Array.isArray).flat().map((c) => c.name)).size, Object.values(cases).filter(Array.isArray).flat().length, 'case names are unique');
 });
@@ -25,6 +26,63 @@ for (const c of cases.decide) {
     assert.deepEqual(hoursUtc(c.rules, (c.hours_until - 8 * 86400) * 1000), { hours_utc: c.hours_utc, hours_until: c.hours_until });
   });
 }
+
+// The Mac's cases: the same shape, run here and by the Mac client. The Windows PC reads only "decide" and "installers".
+for (const c of cases.decide_posix) {
+  test(`decide (posix): ${c.name}`, () => {
+    const ctx = { nowMs: c.now * 1000, hours: { hours_utc: c.hours_utc, hours_until: c.hours_until }, ...c.args };
+    const got = decide(c.rules, c.action, ctx);
+    if (c.expect.outcome === 'refuse') assert.deepEqual(got, { refuse: c.expect.code, text: REFUSALS[c.expect.code] });
+    else assert.deepEqual(got, { [c.expect.outcome]: true });
+    for (const f of c.rules.protected_folders) assert.doesNotThrow(() => parseRules({ protected_folders: [f] }), f);
+  });
+}
+
+test('a protected folder may be a Mac path: one leading /, no . or .. part, not the whole disk, still 260 characters at most', () => {
+  const folders = (list) => parseRules({ protected_folders: list }).protected_folders;
+  assert.deepEqual(folders(['/Users/ariel/Documents']), ['/Users/ariel/Documents']);
+  assert.deepEqual(folders(['/Volumes/My Data', 'C:\\Data', '/Users/ariel/Ünï cødé', '/a/b?c*d']), ['/Volumes/My Data', 'C:\\Data', '/Users/ariel/Ünï cødé', '/a/b?c*d'], 'a Mac name may hold ? and *, which a Windows one may not');
+  assert.deepEqual(folders(['/Data', '/data']), ['/Data'], 'the same folder twice, by case');
+  assert.deepEqual(folders([`/${'a'.repeat(259)}`]).length, 1);
+  const refused = [
+    ['Users/x', /absolute local paths/],
+    ['~/Documents', /absolute local paths/],
+    ['/a/../b', /\. or \.\. parts/],
+    ['/a/./b', /\. or \.\. parts/],
+    ['/..', /\. or \.\. parts/],
+    ['//server/share', /absolute local paths/],
+    ['///x', /absolute local paths/],
+    ['/', /whole disk/],
+    ['/ ', /whole disk/],
+    ['/a\u0000b', /control characters/],
+    ['/a\nb', /control characters/],
+    [`/${'a'.repeat(260)}`, /1 to 260/],
+    ['\\Users\\x', /absolute local paths/],
+  ];
+  for (const [folder, message] of refused) {
+    assert.throws(() => parseRules({ protected_folders: [folder] }), (e) => e instanceof RulesError && message.test(e.message), JSON.stringify(folder));
+  }
+  // The Windows rules are as they were.
+  for (const folder of ['C:\\', 'D:/', 'C:\\a\\..\\b', 'C:\\a?b']) assert.throws(() => parseRules({ protected_folders: [folder] }), RulesError, folder);
+});
+
+test('pathInside and isAppPath on Mac paths: case-folded, .. resolved from the root, nothing shared with Windows names', () => {
+  assert.equal(pathInside('/Users/ariel/Docs', '/users/ARIEL/docs/a/b.txt'), true);
+  assert.equal(pathInside('/Users/ariel/Docs', '/Users/ariel/Docs2/a.txt'), false);
+  assert.equal(pathInside('/Data', '/x/../data/a.txt'), true, 'a .. may take away the first part of a Mac path');
+  assert.equal(pathInside('/Data', '/../data/a.txt'), true, 'and above the root it stays at the root');
+  assert.equal(pathInside('/Data', 'C:\\Data\\a.txt'), false);
+  assert.equal(pathInside('C:\\Data', '/Data/a.txt'), false);
+  for (const path of ['/Applications/Support.app', '/Applications/Support.app/Contents/MacOS/support', '/applications/support.app/x', '/Library/Application Support/SupportMCP', '/Library/Application Support/SupportMCP/staging/x', '/x/../Applications/Support.app/y']) {
+    assert.equal(isAppPath(path), true, path);
+  }
+  for (const path of ['/Applications', '/Applications/Other.app/x', '/Applications/Support.app.bak/x', '/Library/Application Support/Other', '/Library/Application Support', '/Users/a/Library/Application Support/SupportMCP', 'Applications/Support.app', '/']) {
+    assert.equal(isAppPath(path), false, path);
+  }
+  // The Windows rule is as it was, and a drive path never reads as a Mac one.
+  assert.equal(isAppPath('C:\\Program Files\\SupportMCP\\support.exe'), true);
+  assert.equal(isAppPath('C:\\Applications\\Support.app\\x'), false);
+});
 
 for (const c of cases.installers) {
   test(`installer: ${c.name}`, () => {

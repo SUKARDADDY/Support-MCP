@@ -60,6 +60,30 @@ test('the hourly run rings connected, active PCs below the release that were not
   assert.equal(due.bell.sent.length, before + 1);
 });
 
+test('a Mac is never rung: update rings are Windows-only, so the Windows release is not what rings it', async (t) => {
+  const { w, handler, pc, team } = await ringWorld(t);
+  const setOs = (p, os) => w.db.sqlite.prepare('UPDATE devices SET os = ? WHERE id = ?').run(os, p.id);
+  const windows = pc('default', 1);
+  setOs(windows, 'Windows 11 Pro');
+  const unknown = pc('default', 2); // no os reported yet: counts as Windows, as today
+  const mac = pc('default', 3);
+  setOs(mac, 'macOS 26.1 (25B78)');
+  // A team with nothing but a Mac is not even looked at: no call to its Registry.
+  team('macs');
+  const lone = pc('macs', 4, { prefix: 'm' });
+  setOs(lone, 'macOS 14.0 (23A344)');
+  await handler.scheduled({}, w.env, { waitUntil: () => {} });
+  assert.deepEqual(rungOf([windows, unknown, mac, lone]).sort(), [windows.id, unknown.id].sort());
+  assert.equal(w.registryCalls.filter((c) => c.path === '/ring').length, 1, 'one call, for the team with a Windows PC');
+  // The route that rings after a deploy leaves a Mac alone too, and a Mac with the Mac settings set is still not rung.
+  Object.assign(w.env, { MAC_RELEASE_NOTE: Buffer.from('x').toString('base64'), MAC_RELEASE_SIGNATURE: Buffer.alloc(64, 1).toString('base64') });
+  w.advance(HOUR);
+  const before = mac.bell.sent.length + lone.bell.sent.length;
+  await ringUpdates(w.env, w.now(), bundle);
+  assert.equal(mac.bell.sent.length + lone.bell.sent.length, before);
+  assert.equal(windows.bell.sent.length, 2, 'the Windows PC is rung again');
+});
+
 test('no rings without a release, under EMERGENCY_STOP, with the rollout paused or at 0, and none for a team the rollout has not reached', async (t) => {
   for (const [label, opts, bundleToUse] of [
     ['no signature', { env: { RELEASE_SIGNATURE: '' } }, bundle],

@@ -31,7 +31,7 @@
 import { MIN_SECRET_LENGTH, base32Encode, hmacHex, randomBytes, randomToken, sha256Hex, timingSafeEqual } from './crypto.js';
 import { TeamError, normalizeIdentity, teamFromEnv } from './workspace.js';
 import { UNATTENDED_PERMISSION } from './permissions.js';
-import { compareVersions, validVersion } from './release.js';
+import { compareVersions, isMacOs, validVersion } from './release.js';
 import { deviceHooks } from './device-sessions.js';
 import { notifyStore } from './notify.js';
 import { effectiveFromRows, hoursUtc, rulesTag } from './rules.js';
@@ -158,6 +158,16 @@ function textValue(v, field, spec) {
   if ((spec.multiline ? MULTILINE_CHARS : CONTROL_CHARS).test(t)) throw bad(`${field} must not contain control characters`);
   if (spec.required && !t) throw bad(`${field} is required`);
   return t;
+}
+
+// The os a request body reports, checked as a check-in checks it, or '' for none or a bad one. The 426
+// answer loads no row, so a body's own os is all it has to tell a Mac by.
+export function reportedOs(body) {
+  try {
+    return Object.hasOwn(body, 'os') ? textValue(body.os, 'os', BUILTIN_FIELDS.device.os) : '';
+  } catch (_) {
+    return '';
+  }
 }
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -920,17 +930,22 @@ export function deviceStore(db, team, { authSecret = '', hooks = null, defaultTi
     // The session the PC should pick up, from the row already loaded: no further query.
     const live = dev.status === 'active' ? livePointer(dev, now) : null;
     const session = live ? { id: live.id, by: live.by, team: live.team, ask: live.ask, expires_at: live.expires_at } : null;
-    return { device: pcOut(dev), app_version: next.app_version, session, rules: dev.status === 'active' ? await rulesAnswer(dev, now) : null };
+    return { device: pcOut(dev), app_version: next.app_version, os: next.os, session, rules: dev.status === 'active' ? await rulesAnswer(dev, now) : null };
   }
 
   // What a hello says of the rules for an active PC: the effective document, its tag, the business-hour
-  // spans for the next 8 days and the relay's clock, from the row authenticate read.
+  // spans for the next 8 days and the relay's clock, from the row authenticate read. The protected
+  // folders are cut to the PC's own platform before the tag is made: a Mac gets only the paths that
+  // start with /, any other PC only the rest, so a folder of one platform never reaches the other.
+  // The stored os decides, here and for the Session alike, so the tag is the same on both sides.
   async function rulesAnswer(dev, now) {
-    const doc = effectiveFromRows(
+    const full = effectiveFromRows(
       dev.team_rules_doc === null ? null : { doc: dev.team_rules_doc, rev: dev.team_rules_rev },
       dev.customer_rules_doc === null ? null : { doc: dev.customer_rules_doc, rev: dev.customer_rules_rev },
       { defaultTimeZone },
     );
+    const mac = isMacOs(dev.os);
+    const doc = { ...full, protected_folders: full.protected_folders.filter((f) => f.startsWith('/') === mac) };
     return { doc, tag: await rulesTag(doc), ...hoursUtc(doc, now), server_time: Math.floor(now / 1000) };
   }
   const checkIn = async (key, body) => (await checkInFull(key, body)).device;
@@ -939,7 +954,7 @@ export function deviceStore(db, team, { authSecret = '', hooks = null, defaultTi
   // business-hour spans for the next 8 days, or null for a PC that does not exist in this workspace. One query:
   // the device, its site, the team's row and its customer's row. A Session calls this for every guarded command.
   async function rulesFor(slug, deviceId, now = Date.now()) {
-    const row = await q(`SELECT d.id AS id, ${RULES_COLUMNS} ${RULES_JOINS}`, slug, deviceId).first();
+    const row = await q(`SELECT d.id AS id, d.os AS os, ${RULES_COLUMNS} ${RULES_JOINS}`, slug, deviceId).first();
     if (!row) return null;
     const a = await rulesAnswer(row, now);
     return { rules: a.doc, tag: a.tag, hours: { hours_utc: a.hours_utc, hours_until: a.hours_until }, rev: a.doc.rev };
