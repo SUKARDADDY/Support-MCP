@@ -302,8 +302,10 @@ pub(crate) mod tests {
         r
     }
 
-    fn rand_name() -> u128 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    // A counter, not the clock: tests run in parallel, and two could read the same time and share a file.
+    fn rand_name() -> usize {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     #[test]
