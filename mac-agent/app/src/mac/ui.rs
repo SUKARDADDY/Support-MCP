@@ -117,17 +117,22 @@ struct Ui {
     _timer: Option<Retained<NSTimer>>,
 }
 
+/// Whether a modal alert is up, so a timer must not touch the windows.
+pub(super) fn modal() -> bool {
+    MODAL.with(|m| m.get())
+}
+
 thread_local! {
     static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
     /// Set while a modal alert runs, so the timer does not re-enter.
     static MODAL: Cell<bool> = const { Cell::new(false) };
 }
 
-fn s(text: &str) -> Retained<NSString> {
+pub(super) fn s(text: &str) -> Retained<NSString> {
     NSString::from_str(text)
 }
 
-fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
+pub(super) fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
 }
 
@@ -164,7 +169,7 @@ fn send(r: UiRequest) {
 }
 
 /// A modal alert, with the timer held off while it runs. Returns the index of the button clicked.
-fn alert(mtm: MainThreadMarker, title: &str, text: &str, buttons: &[&str]) -> usize {
+pub(super) fn alert(mtm: MainThreadMarker, title: &str, text: &str, buttons: &[&str]) -> usize {
     MODAL.with(|m| m.set(true));
     let a = NSAlert::new(mtm);
     a.setMessageText(&s(title));
@@ -253,7 +258,7 @@ fn rebuild_menu(ui: &mut Ui) {
     item.setMenu(Some(&menu));
 }
 
-fn label(mtm: MainThreadMarker, text: &str, frame: NSRect, size: f64, bold: bool) -> Retained<NSTextField> {
+pub(super) fn label(mtm: MainThreadMarker, text: &str, frame: NSRect, size: f64, bold: bool) -> Retained<NSTextField> {
     let l = NSTextField::wrappingLabelWithString(&s(text), mtm);
     l.setFrame(frame);
     let font = if bold { NSFont::boldSystemFontOfSize(size) } else { NSFont::systemFontOfSize(size) };
@@ -269,7 +274,7 @@ fn button(mtm: MainThreadMarker, target: &Target, title: &str, tag: isize, frame
     b
 }
 
-fn panel(mtm: MainThreadMarker, frame: NSRect, style: NSWindowStyleMask) -> Retained<NSPanel> {
+pub(super) fn panel(mtm: MainThreadMarker, frame: NSRect, style: NSWindowStyleMask) -> Retained<NSPanel> {
     // A fresh panel; it is kept in the UI state, so it is not released on close.
     let p = NSPanel::initWithContentRect_styleMask_backing_defer(NSPanel::alloc(mtm), frame, style, NSBackingStoreType::Buffered, false);
     // SAFETY: the UI state owns the window.
@@ -557,7 +562,7 @@ thread_local! {
 
 // ---- actions and the timer --------------------------------------------------------------------------------------
 
-fn open_url(text: &str) {
+pub(super) fn open_url(text: &str) {
     if let Some(url) = NSURL::URLWithString(&s(text)) {
         NSWorkspace::sharedWorkspace().openURL(&url);
     }
@@ -624,7 +629,7 @@ fn action(tag: isize) {
     }
 }
 
-fn prompt_accessibility() {
+pub(super) fn prompt_accessibility() {
     use objc2_core_foundation::{CFBoolean, CFDictionary, CFString, CFType};
     // SAFETY: a framework constant.
     let key: &CFString = unsafe { objc2_application_services::kAXTrustedCheckOptionPrompt };

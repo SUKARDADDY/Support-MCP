@@ -131,10 +131,12 @@ jobs:
           security find-identity -p codesigning "$keychain"
           echo "keychain=$keychain" >> "$GITHUB_OUTPUT"
           echo "sha1=$sha1" >> "$GITHUB_OUTPUT"
-      - name: Build and sign Support.app and the package
+      - name: Build and sign Support.app, the package and Support Join.app
         env:
           SUPPORT_SIGN_IDENTITY: ${{ steps.identity.outputs.sha1 }}
           SUPPORT_SIGN_KEYCHAIN: ${{ steps.identity.outputs.keychain }}
+          # The one relay Support Join may join. A release passes the production address; CI uses a stand-in.
+          SUPPORT_JOIN_RELAY_ORIGIN: https://support.example.com
         run: mac-agent/packaging/build.sh "$RUNNER_TEMP/support-package"
       - name: Check the architecture, the signature and the package
         env:
@@ -173,16 +175,48 @@ jobs:
           test -f "$out/expanded/Support-component.pkg/Payload/Library/LaunchDaemons/io.github.sukardaddy.supportmcp.device.plist"
           test -f "$out/expanded/Support-component.pkg/Payload/Library/LaunchAgents/io.github.sukardaddy.supportmcp.helper.plist"
           test -x "$out/expanded/Support-component.pkg/Scripts/postinstall"
+          # Support Join.app, the one-off app: the same checks, with its own bundle id and executable.
+          join="$out/Support Join.app"
+          test "$(lipo -archs "$join/Contents/MacOS/support-join")" = "arm64"
+          codesign --verify --strict --verbose=2 "$join"
+          jreq="$(codesign -d -r- "$join" 2>&1)"
+          echo "$jreq"
+          echo "$jreq" | grep -F "identifier \"io.github.sukardaddy.supportmcp.join\""
+          echo "$jreq" | grep -Ei "certificate (leaf|root) = H\"$SHA1\""
+          if echo "$jreq" | grep -q "cdhash"; then echo "ad-hoc designated requirement" >&2; exit 1; fi
+          jdetails="$(codesign -d --verbose=4 "$join" 2>&1)"
+          echo "$jdetails" | grep -F "Authority=Support CI throwaway"
+          echo "$jdetails" | grep -F "flags=0x10000(runtime)"
+          if echo "$jdetails" | grep -q "Signature=adhoc"; then echo "ad-hoc signature" >&2; exit 1; fi
+          jent="$(codesign -d --entitlements - --xml "$join" 2>/dev/null || true)"
+          if echo "$jent" | grep -q "<key>"; then echo "unexpected entitlements: $jent" >&2; exit 1; fi
+          # Only the join app registers the supportmcp link scheme, and each bundle has its own id.
+          test "$(plutil -extract CFBundleIdentifier raw "$join/Contents/Info.plist")" = "io.github.sukardaddy.supportmcp.join"
+          test "$(plutil -extract CFBundleExecutable raw "$join/Contents/Info.plist")" = "support-join"
+          test "$(plutil -extract CFBundleURLTypes.0.CFBundleURLSchemes.0 raw "$join/Contents/Info.plist")" = "supportmcp"
+          if plutil -extract CFBundleURLTypes raw "$app/Contents/Info.plist" > /dev/null 2>&1; then echo "the saved app registers a URL scheme" >&2; exit 1; fi
+          test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")" = "io.github.sukardaddy.supportmcp"
+          test ! -e "$out/expanded/Support-component.pkg/Payload/Applications/Support Join.app"
+          # The zip is what the support page offers: it unpacks to one signed app that still verifies.
+          zipfile="$(ls "$out"/Support-*.zip)"
+          rm -rf "$out/unzipped"
+          ditto -x -k "$zipfile" "$out/unzipped"
+          test -d "$out/unzipped/Support Join.app"
+          test "$(ls "$out/unzipped" | wc -l | tr -d ' ')" = "1"
+          codesign --verify --strict --verbose=2 "$out/unzipped/Support Join.app"
+          codesign -d -r- "$out/unzipped/Support Join.app" 2>&1 | grep -Ei "certificate (leaf|root) = H\"$SHA1\""
       - name: Delete the throwaway keychain
         if: always()
         run: |
           if [ -n "${{ steps.identity.outputs.keychain }}" ]; then security delete-keychain "${{ steps.identity.outputs.keychain }}" || true; fi
-      - name: Upload the package
+      - name: Upload the package and the join app
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: support-mac-pkg
-          path: ${{ runner.temp }}/support-package/Support-*.pkg
+          path: |
+            ${{ runner.temp }}/support-package/Support-*.pkg
+            ${{ runner.temp }}/support-package/Support-*.zip
           if-no-files-found: error
 
   # Runs on our self-hosted Windows VM runner with the .NET Framework v4 compiler.

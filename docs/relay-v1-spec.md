@@ -84,7 +84,8 @@ work in the request path; use the WebSocket Hibernation API
 |---|---|---|
 | `GET /healthz` | public | `{"ok":true,"service":"support-mcp","stage":"relay-v1","version":"<release>"}` (`stage` names this API generation, `version` the release, see [Versions](development.md#versions-and-releases)) |
 | `GET /j/<code>` | public | **GET only, https only.** The code is consumed only for a request whose `User-Agent` contains `PowerShell/` (`irm` sends `WindowsPowerShell/5.1.x` or `PowerShell/7.x`). Code valid+unused → 200 `text/plain` agent script with placeholders filled, code consumed; else 404 `text/plain` `Write-Host 'This support link is invalid or expired.'` (runnable, harmless). Any other `User-Agent` (a chat link preview, a browser) → 200 `text/plain`, `Cache-Control: no-store`, a one-line `Write-Host` telling the reader to paste the command into PowerShell, and the Durable Object is **not** touched. Over plain `http:` on any host except `localhost` / `127.0.0.1` → 200 `text/plain` `Write-Host` line asking for the https link, code **not** consumed. Any other method → 405 `text/plain` (harmless one-liner, `Allow: GET`) and the code is **not** consumed. Malformed percent-encoding → the same harmless 404 script, never 500. The `User-Agent` test keeps previews from burning the code. It is not a security control, since any client can send the header. |
-| `GET /j/<code>?client=app` | public | The downloaded app. `legacy` is an alias for `app`; any other `client` value → 404. **https only**: over plain `http:` on any host except `localhost` / `127.0.0.1` → 403 `text/plain`, code **not** consumed. `GET` serves the download page (200 `text/html`, `Cache-Control: no-store`, `Referrer-Policy: same-origin`, a CSP with `default-src 'none'` and `form-action 'self'`) and **never consumes the code**, however often the page is opened or refreshed. Only a `POST` from the page's button consumes it. If the request has an `Origin` header it must equal the relay's own origin exactly. If it has none (IE11 on Windows 7 can omit it on a same-origin form POST), its `Referer` must start with `<origin>/j/`, which the page's `Referrer-Policy: same-origin` keeps on the click. A foreign `Origin`, a foreign or missing `Referer` without an `Origin`, or neither header → 403, code unused. A first valid `POST` returns 200 `application/octet-stream` with `Content-Disposition: attachment; filename="remote-support-<sid8>.exe"`: the compiled app followed by the session configuration (below). The code is single use: a repeat after the download shows "Check your downloads" (409), an expired or ended one shows "This support link has expired" (410). A code made for a `powershell` session shows the expired page and stays unused. `HEAD` and every other method → 405 (`Allow: GET, POST`). |
+| `GET /j/<code>?client=app` | public | The downloaded app. `legacy` is an alias for `app`; any other `client` value → 404. **https only**: over plain `http:` on any host except `localhost` / `127.0.0.1` → 403 `text/plain`, code **not** consumed. `GET` serves the download page (200 `text/html`, `Cache-Control: no-store`, `Referrer-Policy: same-origin`, a CSP with `default-src 'none'` and `form-action 'self'`) and **never consumes the code**, however often the page is opened or refreshed. Only a `POST` from the page's button consumes it. If the request has an `Origin` header it must equal the relay's own origin exactly. If it has none (IE11 on Windows 7 can omit it on a same-origin form POST), its `Referer` must start with `<origin>/j/`, which the page's `Referrer-Policy: same-origin` keeps on the click. A foreign `Origin`, a foreign or missing `Referer` without an `Origin`, or neither header → 403, code unused. The pending page also has an "On a Mac" section (below). A first valid `POST` returns 200 `application/octet-stream` with `Content-Disposition: attachment; filename="remote-support-<sid8>.exe"`: the compiled app followed by the session configuration (below). The code is single use: a repeat after the download shows "This support link was already used", with the next step for Windows and for a Mac (409), an expired or ended one shows "This support link has expired" (410). A code made for a `powershell` session shows the expired page and stays unused. `HEAD` and every other method → 405 (`Allow: GET, POST`). |
+| `POST /j/<code>/redeem` | public | The Mac join app's call ([below](#one-off-links-for-macs)). It uses the code up as the page's button does, but answers JSON instead of a file. Matched before the code check. **https only** (403 `https_required` on plain `http:` except loopback), 405 on other methods, **403 on any `Origin` header**, 415 unless `Content-Type: application/json`, 403 unless `X-Support-Client: macos-app-1`, 400 on a body that is not a JSON object, 404 `invalid` for a code that is not 16 characters of `a-z2-7`. A code made for `powershell` is `wrong-client` (409) and stays unused. Every answer is `Cache-Control: no-store`. `{"preview":true}` changes nothing and answers `{ok:true,label,origin}` for a code that is still pending. Otherwise a first call answers 200 `{ok:true,sid,key,origin,startup_expires_at,startup_ms}` with `startup_ms` as in the app's footer, and a repeat is 409 `not-pending`, an expired code 410 `expired`. Failures are `{ok:false,reason}` with the Session's reasons. |
 | `POST /agent?sid=<sid>` + `Authorization: Bearer smd1...` | device key | The same transport for a saved PC's session ([below](#saved-pc-sessions)). The Worker checks the key against the database on every request and lets the PC into one session only: the one its record points at (`session.id` equal to `sid`), else 401. It sends no `X-Attach-Key`, and none is forwarded. Any `Authorization` header selects this path. Everything else in the next row applies. |
 | `POST /agent?sid=<sid>` + `X-Attach-Key: <key>` | attach key | The app's transport, JSON in and out; below. 403 over plain `http:` on any host except `localhost` / `127.0.0.1`, 403 on any `Origin` header or a `key` query param, 405 on other methods, 415 on a non-JSON body, 413 over 750,000 characters (checked against `Content-Length` before the body is read, and again after it is read when there is no `Content-Length`), 401 on a bad sid, bad key, a `powershell` session or a session that is still `pending`, 409 on a stale generation, 410 when the session has ended. |
 | `GET /install[?code=<code>\|?workspace=<slug>]`, `POST /install[...]` | public | The setup download for a saved PC ([below](#the-install-page-install)). `GET` shows the page and never downloads. `POST` from the page returns `support-setup.exe` with a device footer. A saved PC downloads its updates here too, with the same `POST`. Not under any Access app |
@@ -889,16 +890,39 @@ What differs:
 - `os` is always `macOS <ProductVersion> (<BuildVersion>)`, cut to 100 characters. The relay tells a Mac by it
   ([Updates for a Mac](#updates-for-a-mac)) and shows it as the PC's system in `device_list` and the technician app.
 - Its session hello is `{"type":"hello","machine":"<ComputerName>","user":"<console user or empty>","ps":"",
-  "agent":"macos-app-1","version":"<app version>","elevated":<true when the service runs as root>,
+  "os":"macOS <version> (<build>)","agent":"macos-app-1","version":"<app version>","elevated":<true when the service runs as root>,
   "caps":["screen","lanes","uia"(,"full")],"control":"full"|"normal"}`. `screen`, `lanes` and `uia` are always there once the Mac
   is set up, so the caps never change in a session (a new hello would fail the commands in flight). When no screen helper is
   running or a permission is missing, the Mac answers the screen frame itself with an error that says what to allow in System
   Settings, Accessibility for `ui_tree` and `ui_act` included. `full` is added only when its control is `full`.
+  The relay holds two signals for a platform, the hello's `agent` and the `os` text, and they must agree: a hello whose `agent`
+  starts with `macos-` but whose `os` does not start with `macOS `, or the other way round (a Windows hello carries no `os`), is
+  400 `agent and os disagree` and attaches nothing.
 - The relay forwards `block_input`, `send_sas` and the `control` frame (`request_full_control`) as it does to any app, and the
-  Mac refuses them: `block_input is not available on a Mac`, `send_sas is not available on a Mac`, and `full control is chosen
-  when Support is set up on this Mac`. The relay itself refuses `as:"system"` under limited control and any install path that
+  Mac refuses them: `block_input is not available on a Mac`, `send_sas is not available on a Mac`, and `a Mac cannot raise its control in a session: ...`. The relay itself refuses `as:"system"` under limited control and any install path that
   is not a Windows installer path.
 - The rules a Mac receives are its own platform's ([What a PC is told](#what-a-pc-is-told)).
+
+### One-off links for Macs
+
+A one-off link serves a Mac and a Windows PC alike: `session_create` takes no new argument, and `/j/<code>?client=app`
+shows one page. Its "On a Mac" section (English and Hebrew) offers the join app's .zip (the Mac release note's `url` with
+`.pkg` replaced by `.zip`; no link when there is no Mac release or the url does not end in `.pkg`), a
+`supportmcp://join?code=<code>` button, the code in large type, and a line saying it needs an Apple silicon Mac with macOS 14
+or later. The join app is `Support Join.app` (bundle id `io.github.sukardaddy.supportmcp.join`), separate from the saved
+Mac's app, so its permissions never mix with it.
+
+- The app calls `POST /j/<code>/redeem` ([HTTP surface](#http-surface)). It first sends `{"preview":true}` to show the
+  person the relay and the session's label, then `{}` to use the code up. The Session stores that the code was used up
+  through this route (`consumed_via: redeem`) and the redeem asks for `windows_mode: app`, so the existing key check on
+  `/agent` and the wrong-client guard apply as they do to the downloaded exe. A code used up by the button cannot be
+  redeemed, and the other way round.
+- The session runs as the app of a link session: `X-Attach-Key`, caps `screen`, `lanes`, `uia`, `control: "normal"`. It never
+  has full control and never an administrator password or a root service. `power` and `programs` are refused with
+  `not_saved_pc`, `request_full_control` with the Mac's own error.
+- **Decline.** A link session of a Mac accepts `{"type":"decline","reason":"declined"}` in `consumed` (before the hello) and in
+  `attached`, when the code was used up through redeem or the stored `agent` starts with `macos-`. The session ends with reason
+  `declined`. A Windows link session still gets 400.
 
 ## Sign-in (`/auth/*` and `/account`)
 
@@ -1297,7 +1321,7 @@ sent before `hello`, answered `{"type":"end"}`, and the session ends with that
 reason. After a `hello` only `nobody` and `busy` are taken: a PC that restarts during a
 limited session and finds its user signed out sends `nobody`, and one that finds
 several Remote Desktop users to choose from sends `busy`. Anything else (another
-reason, `declined` after a `hello`, on a link session) is 400.
+reason, `declined` after a `hello`) is 400, and so is any decline on a Windows link session. A Mac's link session is the exception: [below](#one-off-links-for-macs).
 A `hello` with `control: "full"` for a PC the record says is limited is 403 and
 changes nothing. `welcome` adds `"driver":"<identity>"`. Every poll answer for a
 saved-PC session, whether idle, a command frame or an end, carries `"driver"`, so the corner
@@ -2275,7 +2299,7 @@ text content item, not JSON-RPC errors.
 
 | Tool | Args | Returns (text content, JSON) |
 |---|---|---|
-| `session_create` | `label?` string, `windows_mode?` (`app` default, `powershell`; deprecated aliases `legacy`, `standard`) | `app`: `{session_id, windows_mode, download_url, one_liner, code_expires_at}` with `download_url` = `<origin>/j/<code>?client=app` and one-liner = `Start-Process '<download_url>'`. `powershell`: `{session_id, windows_mode, one_liner, code_expires_at}` with one-liner = `irm <origin>/j/<code> \| iex`. An unknown mode is a tool error and creates nothing. |
+| `session_create` | `label?` string, `windows_mode?` (`app` default, `powershell`; deprecated aliases `legacy`, `standard`) | `app`: `{session_id, windows_mode, download_url, one_liner, code_expires_at}` with `download_url` = `<origin>/j/<code>?client=app` and one-liner = `Start-Process '<download_url>'`. The same link serves a Mac: its page offers Support Join, which redeems the code ([One-off links for Macs](#one-off-links-for-macs)); `session_status` `client_agent` starts with `macos-` for a Mac. `powershell`: `{session_id, windows_mode, one_liner, code_expires_at}` with one-liner = `irm <origin>/j/<code> \| iex`. An unknown mode is a tool error and creates nothing. |
 | `session_list` | — | sessions from the caller's workspace's Registry with state + expires_at + machine |
 | `session_status` | `session_id`, `log_tail?` (default 20) | state, `windows_mode` (`app` or `powershell`), machine, user, expires_at, startup_expires_at, attached now?, `client_version` (the `version` of the last hello when it sent a valid one, else its `agent` string), `client_agent` (the `agent` string of the last hello, or `null`; it names the protocol generation), last log rows; `app` sessions add `elevated` (`true`, `false`, or `null` when the app did not report it), `control` (`full`, `normal` or `null`), `caps` (array), `desktop` (`default`, `secure`, `unknown` or `null`), `paused_until` and `input_blocked_until` (Unix ms while in the future, else `null`); a saved PC's session adds `device_id`, `driver`, `approval` (an action waiting for approval, or `null`) and `rules` (the effective rules for the PC) |
 | `run` | `session_id`, `command`, `timeout_s?`, `as?` (`user` default; `system` needs full control and is refused otherwise) | exit_code (null if timed out), stdout, stderr, timed_out |
@@ -2655,7 +2679,7 @@ never update themselves.
 10. App mode: `session_create` with no `windows_mode` returns a `download_url`.
     Opening or refreshing that page leaves `session_status.state` at `pending`.
     The button downloads `remote-support-<sid8>.exe` once, the state becomes
-    `consumed`, a second click shows "Check your downloads", and the app attaches
+    `consumed`, a second click shows "This support link was already used", and the app attaches
     over `/agent` after the customer clicks Allow and then Yes in the UAC prompt (the service's `hello` says `control: full`), or Allow in the fallback dialog (`control: normal`). `windows_mode: "legacy"` and
     `"standard"` behave as `app` and `powershell`.
 

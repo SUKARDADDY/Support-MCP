@@ -605,8 +605,8 @@ impl<T: Transport> Client<T> {
 
 /// Says no to a session before any hello: the person declined, nobody was there to ask, or the Mac was busy. Returns
 /// true when the relay took it (200) or the session is already gone (a 4xx). False on no answer or a server error, so
-/// the caller sends it again while the pointer stays. Only a saved Mac's session accepts this today (a one-off link's
-/// decline arrives with PR 5).
+/// the caller sends it again while the pointer stays. A saved Mac's session takes it before the hello. A one-off link
+/// session takes it too, with the reason `declined` only, once its code was used up through the redeem route.
 pub async fn send_decline<T: Transport>(transport: &T, reason: &str) -> bool {
     match transport.post(&json!({ "type": "decline", "reason": reason }), REQUEST_TIMEOUT).await {
         Ok(reply) => reply.status == 200 || (400..500).contains(&reply.status),
@@ -799,7 +799,14 @@ mod tests {
 
     impl Platform for Stub {
         fn info(&self) -> HostInfo {
-            HostInfo { machine: "Neo".into(), user: "ariel".into(), elevated: false, control: Control::Normal, uia: false }
+            HostInfo {
+                machine: "Neo".into(),
+                user: "ariel".into(),
+                os: "macOS 26.1 (25B78)".into(),
+                elevated: false,
+                control: Control::Normal,
+                uia: false,
+            }
         }
         fn run(&self, req: &RunRequest, _stop: &Stop) -> Result<RunOutput, String> {
             self.runs.fetch_add(1, Ordering::SeqCst);

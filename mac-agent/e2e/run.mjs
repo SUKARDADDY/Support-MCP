@@ -6,7 +6,9 @@
 // applies the migrations, adds the first member, seeds one rules row and makes a pairing code through the team API.
 // The client pairs and checks in as active with a fake platform (commands run with `sh -c`, files are real, the screen
 // is one fixed JPEG). Then this script does what a technician's AI does, over MCP on HTTP: device_connect, run,
-// put_file and get_file of 1 MB, screenshot, the Mac's own refusals, a power action and session_end. Any failed check
+// put_file and get_file of 1 MB, screenshot, the Mac's own refusals, a power action and session_end. Then the one-off
+// link for a Mac: session_create, the redeem route's refusals, the core's redeem client joining with Auth::Attach, a
+// command, the Windows button on a fresh code, and "Don't allow" on a second session. Any failed check
 // exits non-zero. The relay and the client are always stopped and the run's folder removed.
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
@@ -41,15 +43,17 @@ async function until(what, fn, ms = 60_000, step = 200) {
 
 let relay = null;
 let client = null;
+let joiners = [];
 let prepared = null;
 let protectedDir = null;
+let bin = null;
 
 async function main() {
   // 1. The client binary.
   const cargo = process.env.CARGO || 'cargo';
   const build = spawnSync(cargo, ['build', '--locked', '--bin', 'support-core-e2e'], { cwd: agent, stdio: 'inherit' });
   if (build.status !== 0) throw new Error('cargo build failed');
-  const bin = join(agent, 'target', 'debug', 'support-core-e2e');
+  bin = join(agent, 'target', 'debug', 'support-core-e2e');
 
   // 2. The relay.
   prepared = prepareConfig(root);
@@ -180,7 +184,7 @@ async function main() {
   const cad = await call('press_key', { session_id: sid, keys: 'ctrl+alt+Delete' });
   check('ctrl+alt+Delete is refused by the Mac', JSON.stringify(cad).includes('Ctrl+Alt+Del is not available on a Mac.'), JSON.stringify(cad));
   const full = await call('request_full_control', { session_id: sid });
-  check('request_full_control is refused by the Mac', JSON.stringify(full).includes('full control is chosen when Support is set up on this Mac'), JSON.stringify(full));
+  check('request_full_control is refused by the Mac', JSON.stringify(full).includes('a Mac cannot raise its control in a session'), JSON.stringify(full));
 
   // The rules, on the Mac: restart is allowed by the seeded rules and the fake platform records it; a command that
   // restarts is sent to the tool; a link into a protected folder is caught by the Mac though the relay sees only the
@@ -210,10 +214,94 @@ async function main() {
   check('the client saw the session end', !!event('session_ended'));
   await until('the client to exit', () => exitCode !== null, 30_000);
   check('and exits cleanly', exitCode === 0, `exit ${exitCode}`);
+
+  // 5. A one-off link for a Mac: the same session_create link, the redeem route and the core's join client.
+  const create = async (args = {}) => {
+    const made = await call('session_create', { label: 'e2e join', ...args });
+    if (made.isError) throw new Error(`session_create failed: ${JSON.stringify(made)}`);
+    const code = /\/j\/([a-z2-7]{16})/.exec(made.data.download_url ?? made.data.one_liner ?? '')?.[1];
+    if (!code) throw new Error(`no code in ${JSON.stringify(made.data)}`);
+    return { sid: made.data.session_id, code, url: made.data.download_url };
+  };
+  const redeemRaw = (code, { headers, body = '{}' } = {}) => fetch(`${base}/j/${code}/redeem`, {
+    method: 'POST', headers: headers ?? { 'content-type': 'application/json', 'x-support-client': 'macos-app-1' }, body,
+  });
+  const joinClient = (code, ...extra) => {
+    const events = [];
+    const child = spawn(bin, ['--origin', base, '--join', code, ...extra], { stdio: ['ignore', 'pipe', 'inherit'] });
+    createInterface({ input: child.stdout }).on('line', (line) => {
+      try { events.push(JSON.parse(line)); } catch (_) { console.log(`join client: ${line}`); }
+    });
+    const joiner = { events, child, exit: null, saw: (name) => events.find((e) => e.event === name) };
+    child.on('exit', (code2) => { joiner.exit = code2; });
+    joiners.push(joiner);
+    return joiner;
+  };
+
+  const one = await create();
+  const page = await (await fetch(one.url)).text();
+  check('the one-off page has an On a Mac section with the code and the join link', page.includes('On a Mac') && page.includes(`supportmcp://join?code=${one.code}`), page.slice(0, 200));
+  // A web page cannot redeem, and nothing here uses the code up.
+  for (const [name, status, opts] of [
+    ['an Origin header', 403, { headers: { 'content-type': 'application/json', 'x-support-client': 'macos-app-1', origin: base } }],
+    ['a form content type', 415, { headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-support-client': 'macos-app-1' } }],
+    ['no client header', 403, { headers: { 'content-type': 'application/json' } }],
+    ['a body that is not JSON', 400, { body: 'nope' }],
+  ]) {
+    const r = await redeemRaw(one.code, opts);
+    check(`redeem refuses ${name}`, r.status === status, `${r.status} ${await r.text()}`);
+  }
+  const preview = await redeemRaw(one.code, { body: '{"preview":true}' });
+  const previewBody = await preview.json();
+  check('a preview shows the label and uses nothing up', preview.status === 200 && previewBody.label === 'e2e join' && previewBody.origin === base, JSON.stringify(previewBody));
+  const poweshell = await create({ windows_mode: 'powershell' });
+  const wrong = await redeemRaw(poweshell.code);
+  check('a code made for powershell is refused as the wrong client', wrong.status === 409 && (await wrong.json()).reason === 'wrong-client');
+
+  const joined = joinClient(one.code);
+  await until('the join client to attach', () => joined.saw('connected') || joined.saw('error') || (joined.exit !== null && { exit: joined.exit }), 60_000);
+  check('the core client previews, redeems with the code and connects', !!joined.saw('preview') && joined.saw('preview').label === 'e2e join' && joined.saw('redeemed')?.sid === one.sid && !!joined.saw('connected'), JSON.stringify(joined.events));
+  check('the key never reaches the client\'s output', !JSON.stringify(joined.events).includes('"key"'));
+  const again = await redeemRaw(one.code);
+  check('a second redeem of the same code is not-pending', again.status === 409 && (await again.json()).reason === 'not-pending');
+  const status1 = await until('the one-off session to attach', async () => {
+    const st = await call('session_status', { session_id: one.sid });
+    return st.data.state === 'attached' ? st.data : null;
+  }, 30_000, 300);
+  check('the relay sees a Mac link session with normal control and the lanes', status1.control === 'normal' && status1.client_agent === 'macos-app-1' && status1.windows_mode === 'app' && status1.caps.includes('lanes'), JSON.stringify(status1));
+  const hi = await call('run', { session_id: one.sid, command: 'echo one-off' });
+  check('run "echo one-off" returns its output', hi.data.stdout?.trim() === 'one-off' && hi.data.exit_code === 0, JSON.stringify(hi));
+  const sys = await call('run', { session_id: one.sid, command: 'echo x', as: 'system' });
+  check('as:"system" is refused on a one-off Mac session', sys.isError || JSON.stringify(sys).includes('needs full control'), JSON.stringify(sys));
+  const full2 = await call('request_full_control', { session_id: one.sid });
+  check('request_full_control answers that a link session cannot', JSON.stringify(full2).includes('a Mac cannot raise its control in a session'), JSON.stringify(full2));
+  const shot2 = await call('screenshot', { session_id: one.sid });
+  check('a screenshot works on the one-off session', !!shot2.image, JSON.stringify(shot2.data));
+  const end1 = await call('session_end', { session_id: one.sid });
+  check('session_end ends the one-off session', !end1.isError, JSON.stringify(end1));
+  await until('the join client to exit', () => joined.exit !== null, 30_000);
+  check('and the join client sees the end and exits cleanly', joined.exit === 0 && joined.saw('session_end')?.how === 'relay', JSON.stringify(joined.events));
+
+  // "Don't allow" on a second session ends it as declined.
+  const second = await create();
+  const declined = joinClient(second.code, '--decline');
+  await until('the decline to be sent', () => declined.saw('declined') || declined.saw('error') || declined.exit !== null, 30_000);
+  check('the join client says Don\'t allow and the relay took it', declined.saw('declined')?.sent === true, JSON.stringify(declined.events));
+  const st2 = await call('session_status', { session_id: second.sid });
+  check('a Mac decline ends the session as declined', st2.data.state === 'ended' && st2.data.ended_reason === 'declined', JSON.stringify(st2.data));
+
+  // The Windows button still works on a fresh code, and the code is then used up for the Mac route.
+  const third = await create();
+  const exe = await fetch(third.url, { method: 'POST', headers: { origin: base } });
+  const exeBytes = Buffer.from(await exe.arrayBuffer());
+  check('the Windows download button still returns the exe on a fresh code', exe.status === 200 && exe.headers.get('content-type') === 'application/octet-stream' && exeBytes.subarray(0, 2).toString() === 'MZ', `${exe.status}`);
+  const afterExe = await redeemRaw(third.code);
+  check('a code the button used up cannot be redeemed', afterExe.status === 409 && (await afterExe.json()).reason === 'not-pending');
 }
 
 async function cleanup() {
   if (client && client.exitCode === null) client.kill('SIGKILL');
+  for (const j of joiners) if (j.child.exitCode === null) j.child.kill('SIGKILL');
   if (relay) relay.stop();
   await sleep(500);
   if (prepared) prepared.cleanup();

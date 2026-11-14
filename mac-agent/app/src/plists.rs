@@ -82,6 +82,38 @@ pub fn info_plist(version: &str) -> String {
     ]))
 }
 
+/// The join app's Info.plist (`Support Join.app`, committed as Info-join.plist). A bundle id of its own, so its Screen
+/// Recording and Accessibility grants are its own. Only this bundle registers the `supportmcp` link scheme, so the saved
+/// app never receives a link. It is a normal windowed app (a Dock icon and a menu with Paste), not a menu bar one.
+pub fn join_info_plist(version: &str) -> String {
+    xml(&P::Dict(vec![
+        ("CFBundleDevelopmentRegion", s("en")),
+        ("CFBundleDisplayName", s(paths::JOIN_APP_NAME)),
+        ("CFBundleExecutable", s(paths::JOIN_EXECUTABLE)),
+        ("CFBundleIdentifier", s(paths::JOIN_BUNDLE_ID)),
+        ("CFBundleInfoDictionaryVersion", s("6.0")),
+        ("CFBundleName", s(paths::JOIN_APP_NAME)),
+        ("CFBundlePackageType", s("APPL")),
+        ("CFBundleShortVersionString", s(version)),
+        (
+            "CFBundleURLTypes",
+            P::Arr(vec![P::Dict(vec![
+                ("CFBundleTypeRole", s("Viewer")),
+                ("CFBundleURLName", s(paths::JOIN_BUNDLE_ID)),
+                ("CFBundleURLSchemes", P::Arr(vec![s(paths::JOIN_URL_SCHEME)])),
+            ])]),
+        ),
+        ("CFBundleVersion", s(version)),
+        ("LSArchitecturePriority", P::Arr(vec![s("arm64")])),
+        ("LSMinimumSystemVersion", s("14.0")),
+        ("LSRequiresNativeExecution", P::Bool(true)),
+        ("NSHighResolutionCapable", P::Bool(true)),
+        ("NSScreenCaptureUsageDescription", s("Support Join shows your screen to your support team during a session you allow.")),
+        ("NSSupportsAutomaticTermination", P::Bool(false)),
+        ("NSSupportsSuddenTermination", P::Bool(false)),
+    ]))
+}
+
 /// The LaunchDaemon: `support device-service` as root, started at boot and kept alive.
 pub fn daemon_plist() -> String {
     xml(&P::Dict(vec![
@@ -127,6 +159,7 @@ mod tests {
     #[test]
     fn the_committed_packaging_files_are_the_generated_ones() {
         assert_eq!(packaging("Info.plist"), info_plist("@VERSION@"));
+        assert_eq!(packaging("Info-join.plist"), join_info_plist("@VERSION@"));
         assert_eq!(packaging(&format!("{}.plist", paths::DAEMON_LABEL)), daemon_plist());
         assert_eq!(packaging(&format!("{}.plist", paths::AGENT_LABEL)), agent_plist());
         assert_eq!(packaging("entitlements.plist"), entitlements_plist());
@@ -156,6 +189,28 @@ mod tests {
         assert_eq!(args, vec![paths::BINARY_PATH, "helper"]);
 
         assert!(read(&entitlements_plist()).is_empty(), "the app asks for no entitlement");
+    }
+
+    #[test]
+    fn only_the_join_bundle_has_the_link_scheme_and_an_id_of_its_own() {
+        let read = |text: &str| plist::Value::from_reader_xml(text.as_bytes()).unwrap().into_dictionary().unwrap();
+        let join = read(&join_info_plist("1.2.3"));
+        assert_eq!(join["CFBundleIdentifier"].as_string(), Some("io.github.sukardaddy.supportmcp.join"));
+        assert_eq!(join["CFBundleExecutable"].as_string(), Some("support-join"));
+        assert_eq!(join["CFBundleShortVersionString"].as_string(), Some("1.2.3"));
+        assert_eq!(join["LSMinimumSystemVersion"].as_string(), Some("14.0"));
+        assert_eq!(join["LSArchitecturePriority"].as_array().unwrap().len(), 1);
+        assert!(!join.contains_key("LSUIElement"), "a windowed app, with a Dock icon and a menu");
+        let urls = join["CFBundleURLTypes"].as_array().unwrap();
+        assert_eq!(urls.len(), 1);
+        let schemes: Vec<_> =
+            urls[0].as_dictionary().unwrap()["CFBundleURLSchemes"].as_array().unwrap().iter().map(|v| v.as_string().unwrap()).collect();
+        assert_eq!(schemes, vec!["supportmcp"]);
+        // The saved app registers no scheme, so a link can never reach the root-backed app.
+        let saved = read(&info_plist("1.2.3"));
+        assert!(!saved.contains_key("CFBundleURLTypes") && !saved.contains_key("CFBundleDocumentTypes"));
+        assert_ne!(saved["CFBundleIdentifier"], join["CFBundleIdentifier"]);
+        assert_ne!(saved["CFBundleExecutable"], join["CFBundleExecutable"]);
     }
 
     #[test]

@@ -158,7 +158,7 @@ test('page views and refreshes preserve pairing; only the download form consumes
   assert.equal(f.values.get('state'), 'consumed');
   const repeated = await handler.fetch(post(), f.env);
   assert.equal(repeated.status, 409);
-  assert.match(await repeated.text(), /Check your downloads/);
+  assert.match(await repeated.text(), /This support link was already used/);
   const revisit = await handler.fetch(new Request(url), f.env);
   assert.equal(revisit.status, 409);
   assert.match(await revisit.text(), /remote-support-aaaaaaaa.exe/);
@@ -724,4 +724,266 @@ test('the setup page and its download carry no vendor branding', async () => {
   assert.ok(!html.toLowerCase().includes(brand));
   const body = Buffer.from(await (await handler.fetch(new Request(`${INSTALL}?code=ABCDE-FGH23`, { method: 'POST', headers: { origin: ORIGIN } }), {})).arrayBuffer());
   assert.ok(!body.toString('latin1').toLowerCase().includes(brand));
+});
+
+// ---- one-off links for Macs: POST /j/<code>/redeem ------------------------------------------------------------------
+const CODE16 = 'abcdefghijklmnop';
+const REDEEM = `${ORIGIN}/j/${CODE16}/redeem`;
+const MAC_HEADERS = { 'content-type': 'application/json', 'x-support-client': 'macos-app-1' };
+const macPost = (handler, f, { url = REDEEM, headers = MAC_HEADERS, body = '{}', method = 'POST' } = {}) =>
+  handler.fetch(new Request(url, { method, headers, ...(method === 'POST' ? { body } : {}) }), f.env);
+const macHello = (extra = {}) => ({ type: 'hello', machine: 'Neo', user: 'ariel', ps: '', agent: 'macos-app-1', os: 'macOS 26.1 (25B78)', caps: ['screen', 'uia', 'lanes'], control: 'normal', ...extra });
+
+test('redeem gives the session and its key once, as JSON that is never stored, and a repeat is not-pending', async () => {
+  const f = fixture(), handler = newHandler();
+  await f.req('/create', { sid: SID, windows_mode: 'app' });
+  const r = await macPost(handler, f);
+  assert.equal(r.status, 200);
+  assert.equal(r.headers.get('cache-control'), 'no-store');
+  assert.match(r.headers.get('content-type'), /application\/json/);
+  const out = await r.json();
+  assert.deepEqual(Object.keys(out).sort(), ['key', 'ok', 'origin', 'sid', 'startup_expires_at', 'startup_ms']);
+  assert.equal(out.ok, true);
+  assert.equal(out.sid, SID);
+  assert.match(out.key, /^[0-9a-f]{64}$/);
+  assert.equal(out.origin, ORIGIN);
+  assert.ok(Number.isSafeInteger(out.startup_ms) && out.startup_ms > 2 * HOUR - 60000 && out.startup_ms <= 2 * HOUR);
+  assert.ok(Math.abs(out.startup_expires_at - (Date.now() + out.startup_ms)) < 5000);
+  assert.equal(f.values.get('state'), 'consumed');
+  assert.equal(f.values.get('key_hash').length, 64);
+  assert.notEqual(f.values.get('key_hash'), out.key);
+  // The key opens the session as it does for the exe.
+  assert.equal((await f.req('/agent', macHello(), out.key)).status, 200);
+  const again = await macPost(handler, f);
+  assert.equal(again.status, 409);
+  assert.deepEqual(await again.json(), { ok: false, reason: 'not-pending' });
+});
+
+test('redeem refuses what a web page could send, and what is not the Mac app, before the code is used', async () => {
+  const f = fixture(), handler = newHandler();
+  await f.req('/create', { sid: SID, windows_mode: 'app' });
+  const refused = [
+    ['a form body type', 415, { headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-support-client': 'macos-app-1' } }],
+    ['text/plain', 415, { headers: { 'content-type': 'text/plain', 'x-support-client': 'macos-app-1' } }],
+    ['no content type', 415, { headers: { 'x-support-client': 'macos-app-1' } }],
+    ['no client header', 403, { headers: { 'content-type': 'application/json' } }],
+    ['another client header', 403, { headers: { ...MAC_HEADERS, 'x-support-client': 'windows-app-1' } }],
+    ['the same origin', 403, { headers: { ...MAC_HEADERS, origin: ORIGIN } }],
+    ['a foreign origin', 403, { headers: { ...MAC_HEADERS, origin: 'https://other.example' } }],
+    ['origin null', 403, { headers: { ...MAC_HEADERS, origin: 'null' } }],
+    ['a body that is not JSON', 400, { body: 'nope' }],
+    ['a JSON array', 400, { body: '[]' }],
+    ['a JSON string', 400, { body: '"x"' }],
+    ['GET', 405, { method: 'GET' }],
+    ['PUT', 405, { method: 'PUT' }],
+  ];
+  for (const [name, status, opts] of refused) {
+    const r = await macPost(handler, f, opts);
+    assert.equal(r.status, status, name);
+    assert.equal(r.headers.get('cache-control'), 'no-store', name);
+    assert.equal((await r.json()).ok, false, name);
+    assert.equal(f.values.get('state'), 'pending', `${name} leaves the code unused`);
+  }
+  // A code that is not 16 characters of a-z2-7, or percent-encoded, never reaches the Session.
+  for (const bad of ['short', 'ABCDEFGHIJKLMNOP', 'abcdefghijklmno1', '%61bcdefghijklmnop']) {
+    const r = await macPost(handler, f, { url: `${ORIGIN}/j/${bad}/redeem` });
+    assert.equal(r.status, 404, bad);
+    assert.equal(f.values.get('state'), 'pending');
+  }
+  // Plain http on a real host is refused, loopback is not.
+  const http = await macPost(handler, f, { url: `http://support.example.com/j/${CODE16}/redeem` });
+  assert.equal(http.status, 403);
+  assert.equal(f.values.get('state'), 'pending');
+  assert.equal((await macPost(handler, f, { url: `http://127.0.0.1:8787/j/${CODE16}/redeem` })).status, 200);
+});
+
+test('redeem refuses a code made for powershell, and a used or expired one, with the Session\'s reasons', async () => {
+  const handler = newHandler();
+  const ps = fixture();
+  await ps.req('/create', { sid: SID, windows_mode: 'powershell' });
+  const wrong = await macPost(handler, ps);
+  assert.equal(wrong.status, 409);
+  assert.deepEqual(await wrong.json(), { ok: false, reason: 'wrong-client' });
+  assert.equal(ps.values.get('state'), 'pending');
+  const old = fixture();
+  await old.req('/create', { sid: SID, windows_mode: 'app' });
+  old.values.set('code_expires_at', Date.now() - 1);
+  const expired = await macPost(handler, old);
+  assert.equal(expired.status, 410);
+  assert.deepEqual(await expired.json(), { ok: false, reason: 'expired' });
+  // A session that does not exist (never created) is not pending either.
+  const none = fixture();
+  assert.equal((await macPost(handler, none)).status, 409);
+});
+
+test('redeem uses the code up for the Windows button too: one code, one client, whichever comes first', async () => {
+  const handler = newHandler();
+  const a = fixture();
+  await a.req('/create', { sid: SID, windows_mode: 'app' });
+  assert.equal((await macPost(handler, a)).status, 200);
+  const page = await handler.fetch(new Request(`${ORIGIN}/j/${CODE16}?client=app`, { method: 'POST', headers: { origin: ORIGIN } }), a.env);
+  assert.equal(page.status, 409, 'a code used by redeem cannot also download the exe');
+  assert.match(await page.text(), /already used/);
+
+  const b = fixture();
+  await b.req('/create', { sid: SID, windows_mode: 'app' });
+  const exe = await handler.fetch(new Request(`${ORIGIN}/j/${CODE16}?client=app`, { method: 'POST', headers: { origin: ORIGIN } }), b.env);
+  assert.equal(exe.status, 200);
+  assert.equal(exe.headers.get('content-type'), 'application/octet-stream');
+  const second = await macPost(handler, b);
+  assert.equal(second.status, 409, 'a code used by the button cannot also be redeemed');
+  assert.equal((await second.json()).reason, 'not-pending');
+});
+
+test('redeem with preview shows the label and uses nothing up', async () => {
+  const f = fixture(), handler = newHandler();
+  await f.req('/create', { sid: SID, windows_mode: 'app', label: 'Mrs Cohen laptop' });
+  for (let i = 0; i < 3; i++) {
+    const r = await macPost(handler, f, { body: '{"preview":true}' });
+    assert.equal(r.status, 200);
+    assert.deepEqual(await r.json(), { ok: true, label: 'Mrs Cohen laptop', origin: ORIGIN });
+    assert.equal(f.values.get('state'), 'pending');
+  }
+  // Same guards as the redeem itself.
+  assert.equal((await macPost(handler, f, { body: '{"preview":true}', headers: { ...MAC_HEADERS, origin: ORIGIN } })).status, 403);
+  const used = await macPost(handler, f);
+  assert.equal(used.status, 200);
+  const after = await macPost(handler, f, { body: '{"preview":true}' });
+  assert.equal(after.status, 409);
+  const ps = fixture();
+  await ps.req('/create', { sid: SID, windows_mode: 'powershell', label: 'x' });
+  assert.equal((await macPost(handler, ps, { body: '{"preview":true}' })).status, 409);
+});
+
+test('a Mac link session can decline, before and after its hello, and a Windows link session cannot', async () => {
+  const handler = newHandler();
+  // Redeemed, then declined before any hello.
+  const a = fixture();
+  await a.req('/create', { sid: SID, windows_mode: 'app' });
+  const { key } = await (await macPost(handler, a)).json();
+  assert.equal((await a.req('/agent', { type: 'decline', reason: 'nobody' }, key)).status, 400, 'only declined');
+  assert.equal(a.values.get('state'), 'consumed');
+  const done = await a.req('/agent', { type: 'decline', reason: 'declined' }, key);
+  assert.equal(done.status, 200);
+  assert.deepEqual(await done.json(), { type: 'end' });
+  assert.equal(a.values.get('state'), 'ended');
+  assert.equal(a.values.get('ended_reason'), 'declined');
+  assert.ok(a.logs.some((l) => l.kind === 'declined'));
+  assert.equal((await a.req('/agent', macHello(), key)).status, 410);
+
+  // Attached with a macos- hello, then declined.
+  const b = fixture();
+  await b.req('/create', { sid: SID, windows_mode: 'app' });
+  const consumed = await (await b.req('/consume', { windows_mode: 'app' })).json();
+  assert.equal((await b.req('/agent', { type: 'decline', reason: 'declined' }, consumed.key)).status, 400, 'the button path has no Mac signal before the hello');
+  assert.equal((await b.req('/agent', macHello(), consumed.key)).status, 200);
+  assert.equal((await b.req('/agent', { type: 'decline', reason: 'declined' }, consumed.key)).status, 200);
+  assert.equal(b.values.get('ended_reason'), 'declined');
+
+  // A Windows link session: refused in consumed and in attached, and the session carries on.
+  const w = fixture();
+  await w.req('/create', { sid: SID, windows_mode: 'app' });
+  const win = await (await w.req('/consume', { windows_mode: 'app' })).json();
+  assert.equal((await w.req('/agent', { type: 'decline', reason: 'declined' }, win.key)).status, 400);
+  assert.equal((await w.req('/agent', { type: 'hello', machine: 'POS', user: 'pos', ps: '5.1', agent: 'windows-app-1' }, win.key)).status, 200);
+  for (const reason of ['declined', 'nobody', 'busy']) assert.equal((await w.req('/agent', { type: 'decline', reason }, win.key)).status, 400, reason);
+  assert.equal(w.values.get('state'), 'attached');
+  assert.equal(w.values.get('ended_reason'), undefined);
+});
+
+test('a hello must agree with itself: macos- goes with a macOS os, and nothing else does', async () => {
+  const f = fixture();
+  await f.req('/create', { sid: SID, windows_mode: 'app' });
+  const { key } = await (await f.req('/consume', { windows_mode: 'app' })).json();
+  const bad = [
+    ['macos- with no os', macHello({ os: undefined })],
+    ['macos- with a Windows os', macHello({ os: 'Windows 11 Pro' })],
+    ['macos- with a lookalike', macHello({ os: 'macOS' })],
+    ['macos- with a number as os', macHello({ os: 12 })],
+    ['a Windows agent that says macOS', { type: 'hello', agent: 'windows-app-1', os: 'macOS 26.1 (25B78)' }],
+    ['no agent that says macOS', { type: 'hello', os: 'macOS 14.0 (23A344)' }],
+  ];
+  for (const [name, hello] of bad) {
+    const r = await f.req('/agent', hello, key);
+    assert.equal(r.status, 400, name);
+    assert.equal(f.values.get('state'), 'consumed', `${name} attaches nothing`);
+  }
+  assert.equal((await f.req('/agent', { type: 'hello', agent: 'windows-app-1', os: 'Windows 11 Pro' }, key)).status, 200);
+  const g = fixture();
+  await g.req('/create', { sid: SID, windows_mode: 'app' });
+  const mac = await (await g.req('/consume', { windows_mode: 'app' })).json();
+  assert.equal((await g.req('/agent', macHello(), mac.key)).status, 200);
+  assert.equal(g.values.get('agent'), 'macos-app-1');
+});
+
+test('the one-off page has an On a Mac section in both languages, and the Windows part is unchanged', async () => {
+  const handler = newHandler();
+  const f = fixture();
+  await f.req('/create', { sid: SID, windows_mode: 'app' });
+  const url = `${ORIGIN}/j/${CODE16}?client=app`;
+  const without = await (await handler.fetch(new Request(url), f.env)).text();
+  assert.ok(!without.includes('.zip'), 'no Mac release, no download link');
+  assert.ok(without.includes(`href="supportmcp://join?code=${CODE16}"`));
+  const key = throwawayKey();
+  const env = { ...f.env, ...macRelease(key).env };
+  const page = await handler.fetch(new Request(url), env);
+  assert.equal(page.status, 200);
+  const html = await page.text();
+  assert.ok(html.includes(`href="${MAC_URL.replace(/\.pkg$/, '.zip')}"`), 'the .zip link');
+  assert.ok(!html.includes(MAC_URL), 'never the .pkg');
+  assert.ok(html.includes('On a Mac') && html.includes('ב-Mac'));
+  assert.ok(html.includes('Needs an Apple silicon Mac with macOS 14 or later.'));
+  assert.ok(html.includes('נדרש Mac עם שבב Apple ו-macOS 14 ומעלה.'));
+  assert.ok(html.includes('abcd efgh ijkl mnop'), 'the code in large type');
+  assert.ok(html.includes(`href="supportmcp://join?code=${CODE16}"`));
+  // Everything the Windows page said is still there, byte for byte, ahead of the Mac part.
+  const windowsPart = html.slice(0, html.indexOf('<h2 style="margin-top:28px">On a Mac'));
+  assert.ok(windowsPart.includes('<form method="post" action="/j/abcdefghijklmnop?client=app">'));
+  assert.ok(windowsPart.includes('If your antivirus removes the file, tell support.'));
+  assert.equal((html.match(/<form/g) || []).length, 1);
+  assert.ok(!/<script|src=|<link|@import|url\(/.test(html));
+  assert.match(page.headers.get('content-security-policy'), /default-src 'none'/);
+  // The page never consumes the code, with or without a Mac release.
+  assert.equal(f.values.get('state'), 'pending');
+});
+
+test('a Mac release whose url is not a .pkg gives no download link, and only a pending page offers the Mac section', async () => {
+  const handler = newHandler();
+  const f = fixture();
+  await f.req('/create', { sid: SID, windows_mode: 'app' });
+  const odd = macRelease(throwawayKey(), { url: 'https://github.com/example/support-mcp/releases/download/v1.1.0/Support.dmg' });
+  const html = await (await handler.fetch(new Request(`${ORIGIN}/j/${CODE16}?client=app`), { ...f.env, ...odd.env })).text();
+  assert.ok(!html.includes('.dmg') && !html.includes('.zip'));
+  assert.ok(html.includes('On a Mac'));
+  await macPost(handler, f);
+  const used = await handler.fetch(new Request(`${ORIGIN}/j/${CODE16}?client=app`), { ...f.env, ...macRelease(throwawayKey()).env });
+  assert.equal(used.status, 409);
+  assert.ok(!(await used.text()).includes('supportmcp://'));
+});
+
+test('the used-code page fits a Windows PC and a Mac, in both languages', async () => {
+  const handler = newHandler();
+  for (const how of ['exe', 'redeem']) {
+    const f = fixture();
+    await f.req('/create', { sid: SID, windows_mode: 'app' });
+    if (how === 'exe') await handler.fetch(new Request(`${ORIGIN}/j/${CODE16}?client=app`, { method: 'POST', headers: { origin: ORIGIN } }), f.env);
+    else await macPost(handler, f);
+    const page = await handler.fetch(new Request(`${ORIGIN}/j/${CODE16}?client=app`), f.env);
+    assert.equal(page.status, 409, how);
+    const html = await page.text();
+    assert.ok(html.includes('This support link was already used'), how);
+    assert.ok(html.includes('remote-support-aaaaaaaa.exe'), how);
+    assert.ok(html.includes('Support Join'), how);
+    assert.ok(html.includes('הקישור כבר נוצל'), how);
+    assert.ok(!html.includes('<form'), how);
+  }
+});
+
+test('session_create and session_status say what a Mac needs to know', async () => {
+  const f = fixture(), handler = newHandler();
+  const list = await (await handler.fetch(new Request('http://127.0.0.1/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) }), f.env)).json();
+  const text = (name) => list.result.tools.find((t) => t.name === name).description;
+  assert.match(text('session_create'), /A Mac uses the same link/);
+  assert.match(text('session_create'), /Support Join/);
+  assert.match(text('session_status'), /client_agent[^.]*macos-[^.]*Mac/);
 });
