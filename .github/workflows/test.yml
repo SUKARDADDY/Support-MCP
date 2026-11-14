@@ -70,6 +70,121 @@ jobs:
       - name: Run the end-to-end test against the real relay
         run: node mac-agent/e2e/run.mjs
 
+  # The Mac app (mac-agent/app, docs/development.md, "Mac app"), on a GitHub-hosted macos-15 runner (Apple silicon),
+  # never on one of ours. Only pull requests from this repository and pushes to main. It runs the workspace's tests
+  # on macOS, lints for macOS, makes a throwaway self-signed code signing identity in a temporary keychain, builds and
+  # signs Support.app and Support-<version>.pkg with it, checks that the binary is arm64 only, that the signature is
+  # that certificate's (not ad hoc) and passes `codesign --verify --strict`, and that the package refuses Intel and
+  # macOS before 14. The package is uploaded as an artifact. The identity's key is deleted with the keychain.
+  mac-agent-macos:
+    if: >-
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The same pinned toolchain as mac-agent/rust-toolchain.toml, with the Apple silicon target.
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component clippy --target aarch64-apple-darwin
+          (cd mac-agent && rustc --version && cargo --version)
+      - name: Test the workspace on macOS
+        working-directory: mac-agent
+        run: cargo test --locked
+      - name: Lint for macOS
+        working-directory: mac-agent
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Make a throwaway code signing identity
+        id: identity
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/signing"
+          mkdir -p "$work"
+          keychain="$work/support-ci.keychain-db"
+          pass="$(/usr/bin/openssl rand -hex 24)"
+          cat > "$work/cert.cnf" <<'CNF'
+          [req]
+          distinguished_name = dn
+          prompt = no
+          x509_extensions = ext
+          [dn]
+          CN = Support CI throwaway
+          [ext]
+          basicConstraints = critical, CA:false
+          keyUsage = critical, digitalSignature
+          extendedKeyUsage = critical, codeSigning
+          subjectKeyIdentifier = hash
+          CNF
+          /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 2 -config "$work/cert.cnf" -keyout "$work/key.pem" -out "$work/cert.pem"
+          /usr/bin/openssl pkcs12 -export -inkey "$work/key.pem" -in "$work/cert.pem" -name "Support CI throwaway" -out "$work/identity.p12" -passout "pass:$pass"
+          security create-keychain -p "$pass" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$pass" "$keychain"
+          security import "$work/identity.p12" -k "$keychain" -P "$pass" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pass" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm -f "$work/key.pem" "$work/identity.p12"
+          sha1="$(/usr/bin/openssl x509 -in "$work/cert.pem" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')"
+          security find-identity -p codesigning "$keychain"
+          echo "keychain=$keychain" >> "$GITHUB_OUTPUT"
+          echo "sha1=$sha1" >> "$GITHUB_OUTPUT"
+      - name: Build and sign Support.app and the package
+        env:
+          SUPPORT_SIGN_IDENTITY: ${{ steps.identity.outputs.sha1 }}
+          SUPPORT_SIGN_KEYCHAIN: ${{ steps.identity.outputs.keychain }}
+        run: mac-agent/packaging/build.sh "$RUNNER_TEMP/support-package"
+      - name: Check the architecture, the signature and the package
+        env:
+          SHA1: ${{ steps.identity.outputs.sha1 }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/support-package"
+          app="$out/Support.app"
+          archs="$(lipo -archs "$app/Contents/MacOS/support")"
+          echo "lipo -archs: $archs"
+          test "$archs" = "arm64"
+          codesign --verify --strict --verbose=2 "$app"
+          requirement="$(codesign -d -r- "$app" 2>&1)"
+          echo "$requirement"
+          echo "$requirement" | grep -F "identifier \"io.github.sukardaddy.supportmcp\""
+          # A self-signed certificate is its own root, so the requirement may name it as the leaf or the root.
+          echo "$requirement" | grep -Ei "certificate (leaf|root) = H\"$SHA1\""
+          if echo "$requirement" | grep -q "cdhash"; then echo "ad-hoc designated requirement" >&2; exit 1; fi
+          details="$(codesign -d --verbose=4 "$app" 2>&1)"
+          echo "$details" | grep -F "Authority=Support CI throwaway"
+          echo "$details" | grep -F "flags=0x10000(runtime)"
+          if echo "$details" | grep -q "Signature=adhoc"; then echo "ad-hoc signature" >&2; exit 1; fi
+          # No entitlement at all.
+          entitlements="$(codesign -d --entitlements - --xml "$app" 2>/dev/null || true)"
+          if echo "$entitlements" | grep -q "<key>"; then echo "unexpected entitlements: $entitlements" >&2; exit 1; fi
+          pkg="$(ls "$out"/Support-*.pkg)"
+          rm -rf "$out/expanded"
+          pkgutil --expand-full "$pkg" "$out/expanded"
+          grep -F 'hostArchitectures="arm64"' "$out/expanded/Distribution"
+          grep -F '<os-version min="14.0"/>' "$out/expanded/Distribution"
+          test "$(plutil -extract 0.BundleIsRelocatable raw "$out/components.plist")" = "false"
+          packaged="$out/expanded/Support-component.pkg/Payload/Applications/Support.app"
+          test "$(lipo -archs "$packaged/Contents/MacOS/support")" = "arm64"
+          codesign --verify --strict "$packaged"
+          codesign -d -r- "$packaged" 2>&1 | grep -Ei "certificate (leaf|root) = H\"$SHA1\""
+          test -f "$out/expanded/Support-component.pkg/Payload/Library/LaunchDaemons/io.github.sukardaddy.supportmcp.device.plist"
+          test -f "$out/expanded/Support-component.pkg/Payload/Library/LaunchAgents/io.github.sukardaddy.supportmcp.helper.plist"
+          test -x "$out/expanded/Support-component.pkg/Scripts/postinstall"
+      - name: Delete the throwaway keychain
+        if: always()
+        run: |
+          if [ -n "${{ steps.identity.outputs.keychain }}" ]; then security delete-keychain "${{ steps.identity.outputs.keychain }}" || true; fi
+      - name: Upload the package
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: support-mac-pkg
+          path: ${{ runner.temp }}/support-package/Support-*.pkg
+          if-no-files-found: error
+
   # Runs on our self-hosted Windows VM runner with the .NET Framework v4 compiler.
   # It builds the app from source against the pinned .NET Framework 4.5.2 reference
   # assemblies, runs the native tests, and checks that the exe committed in
