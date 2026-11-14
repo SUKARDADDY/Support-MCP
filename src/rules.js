@@ -326,19 +326,36 @@ const processKey = (name) => {
 
 // A path as lower-case components: / the same as \, repeated and trailing separators dropped, . and ..
 // resolved (never above the drive), the \\?\ prefix dropped, and the trailing dots and spaces Windows
-// drops from a name dropped here too. Short names (PROGRA~1) and links stay as written.
+// drops from a name dropped here too. Short names (PROGRA~1) and links stay as written. A Mac path has
+// its own rules (posixParts).
 function pathParts(path) {
+  if (isPosixPath(String(path).trim())) return posixParts(path);
   const parts = [];
-  // A POSIX path has no drive part, so .. may take away its first component too.
-  const floor = isPosixPath(String(path).trim()) ? 0 : 1;
   for (const raw of String(path).replace(/^\\\\\?\\/, '').split(/[\\/]+/)) {
     if (raw === '' || raw === '.') continue;
     if (raw === '..') {
-      if (parts.length > floor) parts.pop();
+      if (parts.length > 1) parts.pop();
       continue;
     }
     const name = raw.replace(/[. ]+$/, '').toLowerCase();
     if (name) parts.push(name);
+  }
+  return parts;
+}
+
+// A Mac path as components. Only / separates: a backslash, a trailing dot or a trailing space is part of a
+// Mac name, so "..\\x" and "x." are names, never a step up or another spelling of "x". There is no drive, so
+// .. may take away the first component. Names are compared in NFC and lower case, as the Mac's usual
+// case-insensitive disk does, so a decomposed or upper-case spelling of a protected folder still matches.
+function posixParts(path) {
+  const parts = [];
+  for (const raw of String(path).trim().split('/')) {
+    if (raw === '' || raw === '.') continue;
+    if (raw === '..') {
+      parts.pop();
+      continue;
+    }
+    parts.push(raw.normalize('NFC').toLowerCase());
   }
   return parts;
 }
