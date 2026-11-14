@@ -1,0 +1,1276 @@
+{
+ "public_key_xy_b64": "divDIrIULOcM94TxACJB0Dq+fuBVScDYJMplkKgBYin98yxk11JZ7A8C1vfEepmEHEzjuLP79QtOiYdDQa1phA==",
+ "notes": {
+  "valid": {
+   "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
+   "signature": "UlJVyXPyDbZuStyE5sP4FHqhckOHBgIwTniZSDXdS/SQvtcNN2HLbifO1hwjFbB87ym4GhAqAuIR7jurCdBxfQ==",
+   "relay_accepts": true
+  },
+  "prerelease": {
+   "note": "support-mcp-mac-release 1\nversion 2.0.0-rc.1\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v2.0.0-rc.1/Support-2.0.0-rc.1.pkg\n",
+   "signature": "eYanAck6ccQ6k1UscKp8AmoVtP2vCYMlVKgJPKvSqtdYOeG+K/qNIs5JgIBQpMr4T01bx5tA8xcH/Do5/m8q0g==",
+   "relay_accepts": true
+  },
+  "windows_header": {
+   "note": "support-mcp-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
+   "signature": "Icmc+Ox46133d8zRrKbIOja1uCNONTIBTvyX+hRU5pMAFRMySC9nBKEPF39uK0HtXd5SVulHPVlE4lHIFFW5qw==",
+   "relay_accepts": false
+  },
+  "technician_header": {
+   "note": "support-mcp-technician-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
+   "signature": "dnMdsoejGuz9nVPGXaRF4uY2lK0pwESe5lkJyxsxlEjt/KQ48LvfoBsu9wbcx1K64sBCaApY8jlRcW8LuRCTyQ==",
+   "relay_accepts": false
+  },
+  "five_lines": {
+   "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\n",
+   "signature": "3URukko+2dgTdWf8XNpW9CgqwRLXEq7lPD/dYwLFNmjz/ZP4SME1TBqwo8m50ppqenUjfQrPYmrLZEi9RlJdAA==",
+   "relay_accepts": false
+  },
+  "no_final_lf": {
+   "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg",
+   "signature": "ftWJk59lWakU6d+fU8Y3YkZrzJcnpHli25soNFv4oOWpctCD0aldeOK5J3KJOxrN7U+uJZlcAKZHL07LLW/Juw==",
+   "relay_accepts": false
+  },
+  "crlf": {
+   "note": "support-mcp-mac-release 1\r\nversion 1.2.3\r\nsha256 abababababababababababababababababababababababababababababababab\r\nsize 12345678\r\nreleased 1794000000\r\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\r\n",
+   "signature": "aEFXXl+7H7irIzpXzoj6g7JZTA00VurtAepJWo6c6HVduk9RtNkHwPEWDeCOhYlgk5PTv5ATnfiAV7iYkq1K9Q==",
+   "relay_accepts": false
+  },
+  "extra_line": {
+   "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\nextra 1\n",
+   "signature": "1azzMLPzh6FX6hg8c3FA/tqa4qKK7/cnNdSUPoVQxMU4Q4j3ipRcoCzBxdr3+Pns4u/DP9nZl5+ClR6iOo9cBw==",
+   "relay_accepts": false
+  },
+  "swapped_lines": {
+   "note": "support-mcp-mac-release 1\nsha256 abababababababababababababababababababababababababababababababab\nversion 1.2.3\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
+   "signature": "996nf2dU708ToNL2+QyUGr07HCj87h4jw0+LPL1vytCTpebnn/BfV1GpZGRg7kPpm4CLs+BBytXhfSDy3pkSPw==",
+   "relay_accepts": false
+  },
+  "uppercase_hex": {
+   "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
+   "signature": "zM5k1gC9C8UxvBn+5ndG2Dq93wstZp8Z6YrheY6fEUp5AjCFVFwHRKpxvEoOlv1SJElNl9ngLW9DqKiOG8GIlA==",
+   "relay_accepts": false
+  },
+  "leading_zero_size": {
+   "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 012345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
+   "signature": "CbS6M4AMo+kwrw/oenKds0B9IKbpHVZ262I+dwMlQSe/DDhXHEGEPbwcfYM4FRXgggLpFLMyQ6oE4fB1PXO9Dg==",
+   "relay_accepts": false
+  },
+  "zero_size": {
+   "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 0\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
+   "signature": "GcE+DejAZPJIf59aF7JXAC7/ccVL5f8HT23nUIzSiZwDp4optfMqal33jmLydvMSu1baoVBx6j5amUfC6bx41Q==",
+   "relay_accepts": false
+  },
+  "size_over_40_mib": {
+   "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 41943041\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
+   "signature": "iEShTt3F9b34RJ8HLsMtZy+TQa80PMG3wcQqQr8jDl/m3qekLL+mL8B7awnGVH/3IaHZuMYowuwAOmRMxazZTQ==",
+   "relay_accepts": false
+  },
+  "size_at_40_mib": {
+   "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 41943040\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
+   "signature": "BapTcsThvSSS4ae4jzJhqZvO2afh0XoMdVnIyrVY3GEeJFfwBpr3sku4wfeEs02RXYacEtU9Yub/2e38X0qosQ==",
+   "relay_accepts": true
+  },
+  "bad_version": {
+   "note": "support-mcp-mac-release 1\nversion 1.2\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
+   "signature": "3I3qTKv5zQCaV0iHPaoSQHcAthZEQvu8PlGrLp5XaYLssRX1jwOc80rN/T1h5HMAm7+D5h5AnYwhsqXKFp8SRg==",
+   "relay_accepts": false
+  },
+  "url_http": {
+   "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl http://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
+   "signature": "MR4NqqnNgCbgGV5AFRo/TZ7b5yaGrjpJBs06W9cmbaKaKo9HBejYbzIcWi7CMcieiTmPXDW0SgGNfxcM/Axi1Q==",
+   "relay_accepts": false
+  },
+  "url_other_host": {
+   "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://example.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
+   "signature": "B4rDikNB/vtNtnD3eum7JgVRJhHWIWgZgIDwXlR9oRAIHR7pgBQnNU4weUD3BsoBNmZi9qKoFyLwaqbcK2LhoA==",
+   "relay_accepts": false
+  },
+  "url_query": {
+   "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg?x=1\n",
+   "signature": "z6hA+y9WInEv6CXgW8s/xoVukbieUaq/wjWPezuGM06CG5NV4E625hFFAH3Q0ByxUj4hOzgpaAaH+AtLoHQ3FQ==",
+   "relay_accepts": false
+  },
+  "url_fragment": {
+   "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg#x\n",
+   "signature": "P6ztdJox7ulZ/6mZuzGvQh+rthvWzvA18uFyxtUEEP31EGB4DATO5dx2am1VKHUV2UQITyy3GmTRaBKGD6v5EQ==",
+   "relay_accepts": false
+  },
+  "url_dotdot": {
+   "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/../releases/download/v1.2.3/Support-1.2.3.pkg\n",
+   "signature": "pn4pLSQIpSpF4EwNF/dCIQXNAdoVXpDUUTkxKxakHaRtgCUr33fsM6BU/3BHEYC28K17Kbsg0WaZyjYwe3AgDA==",
+   "relay_accepts": false
+  },
+  "url_space": {
+   "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support 1.2.3.pkg\n",
+   "signature": "WFujkYBb017hcjaLYT/aIaMyJHjz1PxHZ7Dd2g0f8zZQr6Bnv3FQ/PrO3JtWnC6DozW4rCH7LQXw7LAFEQOhbg==",
+   "relay_accepts": false
+  },
+  "url_too_long": {
+   "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pkg\n",
+   "signature": "Kpgs8cpganOWLsnGzkp8yP9WipDeFg7W04zIMc1ImyF5QTIxHtewpfS6/c+QmlI6NkX23mQIYfQHm7i9eFfqsw==",
+   "relay_accepts": false
+  },
+  "non_ascii": {
+   "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Suppört-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
+   "signature": "s6ao0z/bJjo7zCXuqIpI2cjPyyci5BAUGIgQm0xSbdx1BKIxsLUc8yDeizEKMSujD/UbGgFtZngJDjSwHQu86Q==",
+   "relay_accepts": false
+  },
+  "over_1024_bytes": {
+   "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
+   "signature": "Ql2J8JIP+zbKKmueKKacZklqCDJReHTx0HupA/FD4BG7+87UGjPWRUp9MWEFQCS2IupVAjDd3qxZ5ycCvF2IsA==",
+   "relay_accepts": false
+  }
+ },
+ "versions": {
+  "sorted": [
+   "0.9.9",
+   "1.0.0-alpha",
+   "1.0.0-alpha.1",
+   "1.0.0-alpha.beta",
+   "1.0.0-beta",
+   "1.0.0-beta.2",
+   "1.0.0-beta.11",
+   "1.0.0-rc.1",
+   "1.0.0",
+   "1.0.1",
+   "1.2.0",
+   "1.10.0",
+   "2.0.0",
+   "2.0.0+build.5"
+  ],
+  "validity": [
+   [
+    "1.2.3",
+    true
+   ],
+   [
+    "1.2",
+    false
+   ],
+   [
+    "01.2.3",
+    false
+   ],
+   [
+    "1.02.3",
+    false
+   ],
+   [
+    "1.2.3-",
+    false
+   ],
+   [
+    "1.2.3-01",
+    false
+   ],
+   [
+    "1.2.3-0a",
+    true
+   ],
+   [
+    "1.2.3-a.b.1",
+    true
+   ],
+   [
+    "1.2.3-a..b",
+    false
+   ],
+   [
+    "1.2.3+001",
+    true
+   ],
+   [
+    "1.2.3+",
+    false
+   ],
+   [
+    "1.2.3+a..b",
+    false
+   ],
+   [
+    "1.2.3+a+b",
+    false
+   ],
+   [
+    "v1.2.3",
+    false
+   ],
+   [
+    "1.2.3 ",
+    false
+   ],
+   [
+    "",
+    false
+   ],
+   [
+    "x",
+    false
+   ],
+   [
+    "1.2.3-rc.1+build.7",
+    true
+   ],
+   [
+    "111111111111111111111111111111111.0.0",
+    false
+   ],
+   [
+    "1.2.3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    false
+   ],
+   [
+    "1.2.3-a_b",
+    false
+   ]
+  ]
+ },
+ "tags": [
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "approve",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": []
+   },
+   "tag": "9676fa0f3b222068"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "allow",
+    "shutdown": "approve",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": []
+   },
+   "tag": "1b62a7f8376d719e"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "never",
+    "shutdown": "approve",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": []
+   },
+   "tag": "0cdd1256e71d7d6f"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "never",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": []
+   },
+   "tag": "b1b645181bd5f255"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "approve",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "never",
+    "protected_programs": [],
+    "protected_folders": []
+   },
+   "tag": "fcdc5eb0eb07f236"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "banana",
+    "shutdown": "approve",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": []
+   },
+   "tag": "ee7663afc3b5afd7"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "approve",
+    "install": "approve",
+    "uninstall": null,
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": []
+   },
+   "tag": "b8b9390a8bd5eb2a"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve_in_hours",
+    "shutdown": "approve",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": []
+   },
+   "tag": "3500ed6b25f7c761"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "outside_hours",
+    "shutdown": "approve",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": []
+   },
+   "tag": "e13cf6021a34abb7"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "outside_hours",
+    "shutdown": "outside_hours",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": []
+   },
+   "tag": "5c6499f6c07d2c48"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "outside_hours",
+    "shutdown": "approve_in_hours",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": []
+   },
+   "tag": "d9d943243de5f576"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "outside_hours",
+    "shutdown": "approve",
+    "install": "approve",
+    "uninstall": "approve_in_hours",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": []
+   },
+   "tag": "d17db2b15a46959e"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "approve",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [
+     "Outlook.exe",
+     "Microsoft Office"
+    ],
+    "protected_folders": []
+   },
+   "tag": "9f683d8988f738fa"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "allow",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": []
+   },
+   "tag": "07d3ad895f78893e"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "approve",
+    "install": "allow",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": []
+   },
+   "tag": "9fd09c52b0148db3"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "approve",
+    "install": "approve",
+    "uninstall": "allow",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": []
+   },
+   "tag": "5937a128d5e6218d"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "approve",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "never",
+    "protected_programs": [
+     "Outlook.exe",
+     "Microsoft Office"
+    ],
+    "protected_folders": []
+   },
+   "tag": "5cb034b8f0ca8d9d"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "approve",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "approve",
+    "protected_programs": [
+     "Outlook.exe",
+     "Microsoft Office"
+    ],
+    "protected_folders": []
+   },
+   "tag": "c75e43a8e9ad8ef6"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "approve",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": [
+     "C:\\Data"
+    ]
+   },
+   "tag": "b4cda48b625457ae"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "approve",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": [
+     "C:\\Data\\"
+    ]
+   },
+   "tag": "3bc712697bdbdbec"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "approve",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": [
+     "C:\\"
+    ]
+   },
+   "tag": "4b130c4e2b019b14"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "approve",
+    "install": "allow",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": [
+     "C:\\Data"
+    ]
+   },
+   "tag": "c1663d9b612f4263"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "approve",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": [
+     "C:\\Program Files\\Secret"
+    ]
+   },
+   "tag": "131a99ebc74ae4b4"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "America/New_York",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "outside_hours",
+    "shutdown": "approve",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": []
+   },
+   "tag": "1c2786942fb404fd"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "approve",
+    "install": "allow",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": [
+     "/Users/ariel/Customer Data",
+     "/Volumes/Data"
+    ]
+   },
+   "tag": "75b32b434b6ac763"
+  },
+  {
+   "doc": {
+    "rev": 3,
+    "time_zone": null,
+    "hours": null,
+    "restart": "allow",
+    "shutdown": "never",
+    "install": "approve",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [
+     "Café \"Bar\"",
+     "tab\there",
+     "emoji 😀",
+     "back\\slash"
+    ],
+    "protected_folders": [
+     "/Users/a/Docs & <Stuff>",
+     "/Volumes/Über"
+    ]
+   },
+   "tag": "f37deb9700798ff1"
+  }
+ ]
+}

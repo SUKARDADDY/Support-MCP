@@ -1,0 +1,6 @@
+# One pinned toolchain for every build of the Mac agent, here and in CI (.github/workflows/test.yml).
+# Change it in both places together.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["clippy"]
