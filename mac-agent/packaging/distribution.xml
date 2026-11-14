@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The product archive's distribution (productbuild). Apple silicon and macOS 14 or later only (call 4): Installer
+     refuses any other Mac before it changes anything. @VERSION@ is replaced by build.sh. -->
+<installer-gui-script minSpecVersion="2">
+    <title>Support</title>
+    <options customize="never" require-scripts="true" rootVolumeOnly="true" hostArchitectures="arm64"/>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="14.0"/>
+        </allowed-os-versions>
+    </volume-check>
+    <installation-check script="appleSiliconOnly()"/>
+    <script>
+    <![CDATA[
+    function appleSiliconOnly() {
+        if (system.sysctl('hw.optional.arm64') == 1) { return true; }
+        my.result.type = 'Fatal';
+        my.result.title = 'Support needs a Mac with Apple silicon';
+        my.result.message = 'Support runs on Macs with Apple silicon and macOS 14 or later.';
+        return false;
+    }
+    ]]>
+    </script>
+    <choices-outline>
+        <line choice="default">
+            <line choice="io.github.sukardaddy.supportmcp.pkg"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="io.github.sukardaddy.supportmcp.pkg" visible="false">
+        <pkg-ref id="io.github.sukardaddy.supportmcp.pkg"/>
+    </choice>
+    <pkg-ref id="io.github.sukardaddy.supportmcp.pkg" version="@VERSION@" onConclusion="none">Support-component.pkg</pkg-ref>
+</installer-gui-script>

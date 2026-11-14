@@ -1,0 +1,21 @@
+#!/bin/sh
+# Runs as root after the payload is in place: starts the service, and the helper for the person at the console. The
+# login window loads its helper by itself the next time it shows. Nothing here sets Support up: that is the setup
+# link, pasted in Support's window or given to `sudo support setup`.
+set -u
+DAEMON=/Library/LaunchDaemons/io.github.sukardaddy.supportmcp.device.plist
+AGENT=/Library/LaunchAgents/io.github.sukardaddy.supportmcp.helper.plist
+LABEL_DEVICE=io.github.sukardaddy.supportmcp.device
+LABEL_HELPER=io.github.sukardaddy.supportmcp.helper
+
+# launchd loads only property lists that root owns and nobody else can write.
+/usr/sbin/chown root:wheel "$DAEMON" "$AGENT"
+/bin/chmod 644 "$DAEMON" "$AGENT"
+
+/bin/launchctl bootstrap system "$DAEMON" 2>/dev/null || /bin/launchctl kickstart -k "system/$LABEL_DEVICE"
+
+uid=$(/usr/bin/stat -f %u /dev/console)
+if [ -n "$uid" ] && [ "$uid" != 0 ]; then
+    /bin/launchctl bootstrap "gui/$uid" "$AGENT" 2>/dev/null || /bin/launchctl kickstart -k "gui/$uid/$LABEL_HELPER" || true
+fi
+exit 0
