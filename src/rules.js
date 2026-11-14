@@ -171,8 +171,16 @@ function parseList(v, field, { max, check }) {
 }
 
 const FOLDER_RE = /^[A-Za-z]:[\\/]/;
+// An absolute POSIX path (a Mac's): one leading /, not the // of a network path.
+const isPosixPath = (text) => /^\/(?!\/)/.test(text);
 function checkFolder(text) {
-  if (!FOLDER_RE.test(text)) throw bad('protected_folders entries must be absolute local paths such as C:\\Data');
+  if (isPosixPath(text)) {
+    // A Mac folder: / is the only separator, and < > " | ? * are legal in a name. Never the whole disk.
+    if (text.split('/').some((part) => part === '.' || part === '..')) throw bad('protected_folders entries must not contain . or .. parts');
+    if (pathParts(text).length < 1) throw bad('protected_folders entries must be a folder, not the whole disk; name the folder to protect, such as /Users/ariel/Customer Data');
+    return;
+  }
+  if (!FOLDER_RE.test(text)) throw bad('protected_folders entries must be absolute local paths such as C:\\Data or /Users/ariel/Documents');
   if (/[<>"|?*]/.test(text)) throw bad('protected_folders entries must not contain < > " | ? *');
   if (text.split(/[\\/]/).some((part) => part === '.' || part === '..')) throw bad('protected_folders entries must not contain . or .. parts');
   // A whole drive would refuse every file, installer and program of the PC, and nothing could be done with it.
@@ -321,10 +329,12 @@ const processKey = (name) => {
 // drops from a name dropped here too. Short names (PROGRA~1) and links stay as written.
 function pathParts(path) {
   const parts = [];
+  // A POSIX path has no drive part, so .. may take away its first component too.
+  const floor = isPosixPath(String(path).trim()) ? 0 : 1;
   for (const raw of String(path).replace(/^\\\\\?\\/, '').split(/[\\/]+/)) {
     if (raw === '' || raw === '.') continue;
     if (raw === '..') {
-      if (parts.length > 1) parts.pop();
+      if (parts.length > floor) parts.pop();
       continue;
     }
     const name = raw.replace(/[. ]+$/, '').toLowerCase();
@@ -350,6 +360,10 @@ const APP_PROGRAM = /^support(?:-.+-[0-9a-f]{8})?$/;
 export const isAppProgram = (name) => APP_PROGRAM.test(processKey(name));
 export function isAppPath(path) {
   const p = pathParts(path);
+  // The Mac app and its data folder, from the root (a POSIX path has no drive part).
+  if (isPosixPath(String(path).trim())) {
+    return (p[0] === 'applications' && p[1] === 'support.app') || (p[0] === 'library' && p[1] === 'application support' && p[2] === 'supportmcp');
+  }
   return p.length >= 3 && p[1].startsWith('program files') && (p[2] === 'supportmcp' || p[2].startsWith('supportmcp-'));
 }
 // The registry key of the Support app in the list of installed programs (list_programs ids are 64:<key> or 32:<key>).

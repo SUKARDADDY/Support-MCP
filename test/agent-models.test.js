@@ -133,7 +133,7 @@ test('the agent\'s tools are the session tools without session_id and the PC, se
     assert.doesNotMatch(JSON.stringify(t.schema), /type_secret/, t.name);
   }
   assert.match(tools.find((t) => t.name === 'screenshot').description, /untrusted/, 'the safety guidance stays');
-  assert.ok(JSON.stringify(tools).length < 24000, 'about 5,000 tokens: 4,000 measured in step 0, and the six rule-governed tools add about 1,000');
+  assert.ok(JSON.stringify(tools).length < 24500, 'about 5,000 tokens: 4,000 measured in step 0, the six rule-governed tools add about 1,000, and the Mac wording about 100');
 });
 
 test('strict mode: every property required, an optional one also null, no extra properties, and nulls are stripped before the relay sees them', () => {

@@ -8,6 +8,7 @@ import { Session } from '../src/session.js';
 import { createHandler } from '../src/app.js';
 import { buildAppDownload, buildDeviceDownload, normalizeWindowsMode, clientMode } from '../src/template.js';
 import { openD1 } from './d1-fake.js';
+import { MAC_URL, macRelease, throwawayKey } from './release-fixture.js';
 
 const SID = 'a'.repeat(64), KEY = 'b'.repeat(64), ORIGIN = 'https://support.example.com';
 const bundle = JSON.parse(await readFile(new URL('../src/app-bundle.json', import.meta.url)));
@@ -661,6 +662,59 @@ test('the /install download is the same app with a device footer: origin and at 
   assert.throws(() => buildDeviceDownload(bundle, { origin: ORIGIN, code: 'ABCDE-FGH23', workspace: 'acme' }));
   assert.throws(() => buildDeviceDownload(bundle, { origin: ORIGIN, code: 'abcde-fgh23' }));
   assert.throws(() => buildDeviceDownload(bundle, { origin: "https://x'evil" }));
+});
+
+test('/install shows an "On a Mac" section only when a Mac release is set, and the Windows page and download stay as they were', async () => {
+  const handler = newHandler();
+  const mac = macRelease(throwawayKey()).env;
+  const page = async (env, query = '') => handler.fetch(new Request(`${INSTALL}${query}`), env);
+  const bare = await (await page({})).text();
+  assert.ok(!bare.includes('On a Mac') && !bare.includes('github.com'), 'no Mac release, no Mac section');
+  // Missing, half-set or malformed Mac settings are no release.
+  for (const env of [{ MAC_RELEASE_NOTE: mac.MAC_RELEASE_NOTE }, { MAC_RELEASE_SIGNATURE: mac.MAC_RELEASE_SIGNATURE }, { ...mac, MAC_RELEASE_NOTE: 'bm90IGEgbm90ZQ==' }, { ...mac, MAC_RELEASE_SIGNATURE: 'abc' }]) {
+    assert.equal(await (await page(env)).text(), bare, JSON.stringify(Object.keys(env)));
+  }
+  const res = await page(mac, '?code=abcdefgh23');
+  const html = await res.text();
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('content-security-policy'), "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+  assert.ok(html.includes('On a Mac'));
+  assert.ok(html.includes('ב-Mac'), 'in Hebrew too');
+  assert.ok(html.includes(`<a href="${MAC_URL}"`));
+  assert.match(html, /Download Support for Mac<\/a>/);
+  assert.equal((html.match(/<a /g) || []).length, 1, 'one link');
+  assert.equal((html.match(/<form/g) || []).length, 1, 'the Windows form is still the only form');
+  assert.match(html, /<form method="post" action="\/install\?code=ABCDE-FGH23"><button type="submit">Download Support/);
+  assert.ok(!/<script|src=|<link|@import|url\(/.test(html), 'no scripts or external requests');
+  // Everything of the Windows page is still there, in the same order, ahead of the Mac section.
+  const head = html.slice(0, html.indexOf('<h2'));
+  assert.ok(head.includes('Download Support on the computer your support team looks after.'));
+  assert.ok(html.indexOf('If your antivirus removes the file') < html.indexOf('On a Mac'));
+  // The Windows POST serves the same bytes with and without the Mac settings.
+  const post = async (env) => Buffer.from(await (await handler.fetch(new Request(`${INSTALL}?workspace=acme-1`, { method: 'POST', headers: { origin: ORIGIN } }), env)).arrayBuffer());
+  assert.deepEqual(await post(mac), await post({}));
+  // The link of the Mac note is escaped into the page, and a note whose link is not GitHub's is no release.
+  const odd = await (await page(macRelease(throwawayKey(), { url: 'https://github.com/a/b/x&y"z<.pkg' }).env)).text();
+  assert.ok(odd.includes('href="https://github.com/a/b/x&amp;y&quot;z&lt;.pkg"'));
+  const key = throwawayKey();
+  const foreign = macRelease(key).note.replace('https://github.com/', 'https://example.com/');
+  assert.equal(await (await page({ MAC_RELEASE_NOTE: Buffer.from(foreign).toString('base64'), MAC_RELEASE_SIGNATURE: macRelease(key).signature })).text(), bare);
+});
+
+test('/install with a Mac release and no Windows app still shows the page, with only the Mac section; with neither it is 404', async () => {
+  const noWindows = createHandler('powershell agent', null);
+  const mac = macRelease(throwawayKey()).env;
+  const page = await noWindows.fetch(new Request(`${INSTALL}?workspace=acme-1`), mac);
+  const html = await page.text();
+  assert.equal(page.status, 200);
+  assert.ok(html.includes('On a Mac') && html.includes(`<a href="${MAC_URL}"`));
+  assert.ok(!html.includes('<form') && !html.includes('Windows'), 'nothing to download for Windows');
+  assert.equal((await noWindows.fetch(new Request(`${INSTALL}?workspace=acme-1`), {})).status, 404, 'no Windows app and no Mac release');
+  // There is no Windows exe to POST for.
+  assert.equal((await noWindows.fetch(new Request(`${INSTALL}?workspace=acme-1`, { method: 'POST', headers: { origin: ORIGIN } }), mac)).status, 404);
+  // The checks that come first still do.
+  assert.equal((await noWindows.fetch(new Request(`${INSTALL}?code=bad`), mac)).status, 400);
+  assert.equal((await noWindows.fetch(new Request('http://support.example.com/install'), mac)).status, 403);
 });
 
 test('the setup page and its download carry no vendor branding', async () => {

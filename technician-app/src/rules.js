@@ -16,6 +16,21 @@ export const PROGRAM_MAX = 100;
 export const FOLDER_MAX = 260;
 // A whole drive (C:\, c:/) is not a folder to protect: it would refuse every file and installer of the PC. The relay refuses it too.
 export const isDriveRoot = (path) => /^[A-Za-z]:[\\/]*$/.test(String(path).trim());
+// A Mac's folder: one leading / (not the // of a network path). The relay sends a Mac only these, and a Windows PC only the others.
+export const isPosixFolder = (path) => /^\/(?!\/)/.test(String(path).trim());
+// The first mistake a form can catch in one protected folder, as { key, vars }, or null. A drive-letter path is a
+// Windows folder, a path from / a Mac's; the relay checks both again on save.
+export function folderProblem(folder) {
+  const text = String(folder).trim();
+  if (isPosixFolder(text)) {
+    if (/[\x00-\x1f\x7f]/.test(text) || text.split('/').some((part) => part === '.' || part === '..')) return { key: 'rules.err_folder_posix', vars: { path: folder } };
+    if (!text.split('/').some(Boolean)) return { key: 'rules.err_folder_root', vars: { path: folder } };
+    return null;
+  }
+  if (!/^[A-Za-z]:[\\/]/.test(text)) return { key: 'rules.err_folder', vars: { path: folder } };
+  if (isDriveRoot(text)) return { key: 'rules.err_folder_root', vars: { path: folder } };
+  return null;
+}
 export const FIELDS = ['time_zone', 'hours', ...ACTIONS, 'protected_programs', 'protected_folders'];
 
 // What a team with no saved rules has (the relay uses the same).
@@ -96,8 +111,8 @@ export function problemWith(doc, merged) {
     if (list.length > LIST_MAX) return { key: 'rules.err_list_long', vars: { max: LIST_MAX } };
   }
   for (const folder of doc.protected_folders ?? []) {
-    if (!/^[A-Za-z]:[\\/]/.test(folder)) return { key: 'rules.err_folder', vars: { path: folder } };
-    if (isDriveRoot(folder)) return { key: 'rules.err_folder_root', vars: { path: folder } };
+    const problem = folderProblem(folder);
+    if (problem) return problem;
   }
   return null;
 }

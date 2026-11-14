@@ -4,6 +4,7 @@
 import { createHash, createPublicKey, generateKeyPairSync, sign, verify } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { VERSION } from '../src/version.js';
+import { buildMacNote } from '../src/release.js';
 
 // The private key object and the public key as X||Y base64, the form the app and release-key.pub carry.
 export function throwawayKey() {
@@ -25,4 +26,15 @@ export function fixtureBundle(extra = 'fixture') {
   const exe = Buffer.concat([Buffer.from('MZ'), Buffer.from(VERSION, 'utf16le'), Buffer.from(extra)]);
   const source = readFileSync(new URL('../src/agent-app.cs', import.meta.url));
   return { source_sha256: createHash('sha256').update(source).digest('hex'), exe_b64: exe.toString('base64') };
+}
+
+// The two Worker secrets of a Mac release signed by `key`, and the note and URL they carry. signedAt is Unix seconds.
+// The Mac has its own version line, from 1.1.0, apart from the relay's VERSION.
+export const MAC_VERSION = '1.1.0';
+export const macUrl = (version) => `https://github.com/example/support-mcp/releases/download/v${version}/Support-${version}.pkg`;
+export const MAC_URL = macUrl(MAC_VERSION);
+export function macRelease(key, { version = MAC_VERSION, signedAt = Math.floor(Date.now() / 1000) - 72 * 3600, url = macUrl(version) } = {}) {
+  const note = buildMacNote({ version, sha256: 'cd'.repeat(32), size: 9_000_000, released: signedAt, url });
+  const signature = signNote(key, note);
+  return { note, signature, url, signedAt, env: { MAC_RELEASE_NOTE: Buffer.from(note).toString('base64'), MAC_RELEASE_SIGNATURE: signature } };
 }

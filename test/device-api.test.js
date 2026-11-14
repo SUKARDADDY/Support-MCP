@@ -10,7 +10,8 @@ import { teamStore } from '../src/workspace.js';
 import { deviceStore } from '../src/devices.js';
 import { VERSION } from '../src/version.js';
 import { buildNote, groupOf } from '../src/release.js';
-import { fixtureBundle, signNote, throwawayKey, verifies } from './release-fixture.js';
+import { MAC_URL, MAC_VERSION, fixtureBundle, macRelease, signNote, throwawayKey, verifies } from './release-fixture.js';
+import { rulesFromEnv } from '../src/rules-store.js';
 
 const HOST = 'https://support.example.com';
 const SECRET = 'a-deployment-secret-of-at-least-32-characters';
@@ -436,4 +437,198 @@ test('a 426 carries the signed release unless the rollout is paused or 0, on eve
   }
   const none = await releaseWire({ extra: { RELEASE_SIGNATURE: '' } });
   assert.equal(Object.hasOwn((await none.send('hello', { protocol: 2 })).body, 'update'), false, 'no release, no update');
+});
+
+// ---- the Mac's release, and the rules per platform ------------------------------------------------------
+const MAC_OS = 'macOS 26.1 (25B78)';
+// A relay with both releases: the Windows one from releaseWire and a Mac one signed by the same throwaway key.
+async function bothWire({ rollout = '', mac = true, windows = true } = {}) {
+  const w = windows ? await releaseWire({ rollout }) : await wire({ UPDATE_ROLLOUT: rollout });
+  const m = macRelease(w.key ?? throwawayKey(), { version: MAC_VERSION });
+  if (mac) Object.assign(w.env, m.env);
+  return { ...w, mac: m };
+}
+const helloAs = async (w, body, pairOs = '') => {
+  const paired = await w.send('pair', { protocol: 1, code: await w.code(), name: 'x', app_version: OLDER, ...(pairOs ? { os: pairOs } : {}) });
+  return w.send('hello', { protocol: 1, ...body }, { headers: w.bearer(paired.body.key) });
+};
+
+test('a check-in that reports a macOS os gets the Mac release, which verifies; a Windows os, or none, gets only the Windows one', async () => {
+  const w = await bothWire();
+  const mac = await helloAs(w, { app_version: OLDER, os: MAC_OS });
+  assert.deepEqual(mac.body.update, { version: MAC_VERSION, note: w.mac.note, signature: w.mac.signature });
+  assert.ok(verifies(w.key.xy, mac.body.update.note, mac.body.update.signature));
+  for (const os of ['Windows 11 Pro', 'macOS', 'macOSX 14', 'MACOS 26', 'Mac OS X 14']) {
+    const res = await helloAs(w, { app_version: OLDER, os });
+    assert.deepEqual(res.body.update, { version: VERSION, note: w.note, signature: w.env.RELEASE_SIGNATURE }, `${os} is not a Mac`);
+  }
+  assert.equal((await helloAs(w, { app_version: OLDER })).body.update.version, VERSION, 'no os at all is not a Mac');
+  // Without os in the request the stored one decides, as app_version does.
+  const stored = await helloAs(w, {}, MAC_OS);
+  assert.equal(stored.body.update.version, MAC_VERSION);
+  // A Mac at the Mac release, or above it, is offered nothing, and a Mac below it is offered the Mac one, not the Windows one.
+  assert.equal(Object.hasOwn((await helloAs(w, { app_version: MAC_VERSION, os: MAC_OS })).body, 'update'), false);
+  assert.equal((await helloAs(w, { app_version: VERSION, os: MAC_OS })).body.update.version, MAC_VERSION, 'older than the Mac release, newer than nothing');
+});
+
+test('a Mac never gets the Windows release, and Windows never gets the Mac one', async () => {
+  // A Windows release but no Mac one: a Mac is offered nothing.
+  const onlyWindows = await bothWire({ mac: false });
+  assert.equal(Object.hasOwn((await helloAs(onlyWindows, { app_version: OLDER, os: MAC_OS })).body, 'update'), false);
+  assert.ok((await helloAs(onlyWindows, { app_version: OLDER, os: 'Windows 11' })).body.update);
+  // A Mac release but no Windows release (no bundle): Windows is offered nothing, and the Mac its own.
+  const onlyMac = await bothWire({ windows: false });
+  assert.equal(Object.hasOwn((await helloAs(onlyMac, { app_version: OLDER, os: 'Windows 11' })).body, 'update'), false);
+  assert.equal(Object.hasOwn((await helloAs(onlyMac, { app_version: OLDER })).body, 'update'), false);
+  assert.equal((await helloAs(onlyMac, { app_version: OLDER, os: MAC_OS })).body.update.version, MAC_VERSION);
+  // A malformed Mac setting is no Mac release.
+  for (const extra of [{ MAC_RELEASE_NOTE: '' }, { MAC_RELEASE_SIGNATURE: '' }, { MAC_RELEASE_SIGNATURE: 'abc' }, { MAC_RELEASE_NOTE: 'bm90IGEgbm90ZQ==' }]) {
+    const w = await bothWire({ windows: false });
+    Object.assign(w.env, extra);
+    assert.equal(Object.hasOwn((await helloAs(w, { app_version: OLDER, os: MAC_OS })).body, 'update'), false, JSON.stringify(extra));
+  }
+  // The Mac's own rollout: paused means no Mac update, as for Windows.
+  const paused = await bothWire({ rollout: 'pause' });
+  assert.equal(Object.hasOwn((await helloAs(paused, { app_version: OLDER, os: MAC_OS })).body, 'update'), false);
+});
+
+// The first id (20 base32 characters) whose group for a release version is below, or at or above, a stage.
+async function idWithGroup(version, below, stage = 10) {
+  const alphabet = 'abcdefghijklmnopqrstuvwxyz234567';
+  for (const a of alphabet) {
+    for (const b of alphabet) {
+      const id = `${'a'.repeat(18)}${a}${b}`;
+      if (((await groupOf(version, 'default', id)) < stage) === below) return id;
+    }
+  }
+  throw new Error('no id found');
+}
+// Pairs a Mac and gives it `id`, which keeps its key hash. Returns its key.
+async function macWithId(w, id) {
+  const paired = await w.send('pair', { protocol: 1, code: await w.code(), name: 'x', app_version: OLDER, os: MAC_OS });
+  w.db.sqlite.prepare('UPDATE devices SET id = ? WHERE id = ?').run(id, paired.body.device_id);
+  return paired.body.key.replace(paired.body.device_id, id);
+}
+
+test('a Mac release signed just now reaches a Mac by its own signing time and group, not the Windows release\'s', async () => {
+  // This relay's Windows release is 72 hours old (stage 100); the Mac release was signed just now (stage 10).
+  const w = await bothWire();
+  Object.assign(w.env, macRelease(w.key, { signedAt: Math.floor(Date.now() / 1000) }).env);
+  const inside = await idWithGroup(MAC_VERSION, true);
+  const outside = await idWithGroup(MAC_VERSION, false);
+  assert.ok((await groupOf(MAC_VERSION, 'default', inside)) < 10 && (await groupOf(MAC_VERSION, 'default', outside)) >= 10);
+  const hello = async (id) => (await w.send('hello', { protocol: 1 }, { headers: w.bearer(await macWithId(w, id)) })).body;
+  assert.equal((await hello(inside)).update?.version, MAC_VERSION, 'group below the Mac stage');
+  assert.equal(Object.hasOwn(await hello(outside), 'update'), false, 'group at or above the Mac stage, though the Windows release would reach it');
+});
+
+test('the Mac has its own version line: 1.1.0 is offered to a Mac on 1.0.x whatever the relay\'s VERSION is, and so is a version below VERSION', async () => {
+  for (const [macVersion, macOn, upToDate] of [['1.1.0', '1.0.5', '1.1.0'], ['0.9.0', '0.8.0', '0.9.0']]) {
+    const w = await bothWire();
+    Object.assign(w.env, macRelease(w.key, { version: macVersion }).env);
+    const answer = async (app_version) => helloAs(w, { app_version, os: MAC_OS });
+    assert.equal((await answer(macOn)).body.update?.version, macVersion, `${macOn} is offered ${macVersion}`);
+    assert.equal(Object.hasOwn((await answer(upToDate)).body, 'update'), false, `${upToDate} is current`);
+    const refused = await w.send('hello', { protocol: 2, os: MAC_OS });
+    assert.equal(refused.body.update?.version, macVersion, 'on a 426 too');
+    // Windows is still offered its own release, not the Mac one, and by VERSION.
+    assert.equal((await helloAs(w, { app_version: OLDER, os: 'Windows 11' })).body.update.version, VERSION);
+  }
+});
+
+test('a Windows check-in answer is byte-identical with and without the Mac settings', async () => {
+  const w = await bothWire({ mac: false });
+  const answer = async (body, key) => {
+    const res = await w.send('hello', { protocol: 1, ...body }, { headers: w.bearer(key) });
+    const parsed = JSON.parse(res.text);
+    delete parsed.server_time; // the relay's clock, which can tick between two calls
+    return JSON.stringify(parsed);
+  };
+  for (const [os, version] of [['Windows 11 Pro', OLDER], ['Windows 11 Pro', VERSION], ['', OLDER]]) {
+    const paired = await w.send('pair', { protocol: 1, code: await w.code(), name: 'x', app_version: version, ...(os ? { os } : {}) });
+    const body = { app_version: version, ...(os ? { os } : {}) };
+    const before = await answer(body, paired.body.key);
+    Object.assign(w.env, w.mac.env);
+    const after = await answer(body, paired.body.key);
+    delete w.env.MAC_RELEASE_NOTE;
+    delete w.env.MAC_RELEASE_SIGNATURE;
+    assert.equal(after, before, `${os || 'no os'} on ${version}`);
+  }
+  // A 426 for a Windows body, or for one with no os, is the same too.
+  const refusal = async (body) => (await w.send('hello', { protocol: 2, ...body })).text;
+  const beforeRefusal = [await refusal({}), await refusal({ os: 'Windows 11' }), await refusal({ os: 7 })];
+  Object.assign(w.env, w.mac.env);
+  assert.deepEqual([await refusal({}), await refusal({ os: 'Windows 11' }), await refusal({ os: 7 })], beforeRefusal);
+});
+
+test('a 426 carries the Mac release for a body that reports a macOS os, and only that', async () => {
+  const w = await bothWire({ rollout: '100' });
+  const mac = await w.send('hello', { protocol: 2, os: MAC_OS });
+  assert.equal(mac.status, 426);
+  assert.deepEqual(mac.body.update, { version: MAC_VERSION, note: w.mac.note, signature: w.mac.signature });
+  for (const name of ['pair', 'update', 'leave']) assert.equal((await w.send(name, { protocol: 2, os: MAC_OS })).body.update.version, MAC_VERSION, name);
+  // Windows, no os, a bad os (not text, too long, a control character) are not a Mac.
+  for (const os of ['Windows 11', undefined, 7, null, ['macOS 26'], `macOS ${'x'.repeat(100)}`, 'macOS 26\u0007']) {
+    const res = await w.send('hello', { protocol: 2, ...(os === undefined ? {} : { os }) });
+    assert.equal(res.body.update.version, VERSION, JSON.stringify(os));
+  }
+  // A Mac with no Mac release is offered nothing on a 426, though there is a Windows one.
+  const none = await bothWire({ mac: false });
+  assert.equal(Object.hasOwn((await none.send('hello', { protocol: 2, os: MAC_OS })).body, 'update'), false);
+  // A Mac release only, and a Windows body: nothing.
+  const onlyMac = await bothWire({ windows: false });
+  assert.equal(Object.hasOwn((await onlyMac.send('hello', { protocol: 2, os: 'Windows 11' })).body, 'update'), false);
+  assert.equal((await onlyMac.send('hello', { protocol: 2, os: MAC_OS })).body.update.version, MAC_VERSION);
+});
+
+test('protected folders reach each PC by platform, and the tag of each is what its Session decides with', async () => {
+  const w = await wire();
+  const store = rulesFromEnv(w.env, w.team);
+  const pcs = {};
+  for (const [name, os] of [['win', 'Windows 11 Pro'], ['mac', MAC_OS], ['none', '']]) {
+    const paired = await w.send('pair', { protocol: 1, code: await w.code(), name, ...(os ? { os } : {}) });
+    pcs[name] = paired.body;
+  }
+  const hello = async (name) => (await w.send('hello', { protocol: 1 }, { headers: w.bearer(pcs[name].key) })).body;
+  const winBefore = await hello('win');
+  assert.deepEqual(winBefore.rules.protected_folders, []);
+
+  const saved = await store.save('default', BOSS, '', { protected_folders: ['C:\\Data', '/Users/a/Docs', 'D:/More', '/Library/Stuff'] }, 0);
+  assert.ok(saved);
+  const win = await hello('win'), mac = await hello('mac'), none = await hello('none');
+  assert.deepEqual(win.rules.protected_folders, ['C:\\Data', 'D:/More']);
+  assert.deepEqual(mac.rules.protected_folders, ['/Users/a/Docs', '/Library/Stuff']);
+  assert.deepEqual(none.rules.protected_folders, win.rules.protected_folders, 'a PC that reports no os is not a Mac');
+  assert.notEqual(win.rules_tag, mac.rules_tag);
+  // The Session reads the same rules for the same PC: the tag is the one the check-in gave.
+  for (const [name, answer] of [['win', win], ['mac', mac], ['none', none]]) {
+    const read = await w.devs.rulesFor('default', pcs[name].device_id);
+    assert.equal(read.tag, answer.rules_tag, name);
+    assert.deepEqual(read.rules.protected_folders, answer.rules.protected_folders, name);
+  }
+  // A Windows PC's rules and tag are what they would be with no Mac folder in the team's document.
+  const plain = await store.save('default', BOSS, '', { protected_folders: ['C:\\Data', 'D:/More'] }, saved.rev ?? 1);
+  assert.ok(plain);
+  const winAlone = await hello('win');
+  assert.equal(winAlone.rules_tag, win.rules_tag);
+  assert.deepEqual({ ...winAlone.rules, rev: 0 }, { ...win.rules, rev: 0 });
+  // A Mac in a team with only Windows folders gets none.
+  assert.deepEqual((await hello('mac')).rules.protected_folders, []);
+});
+
+test('a pair request that carries a macOS os stores it, so the first check-in already gets only the Mac folders', async () => {
+  const w = await wire();
+  const store = rulesFromEnv(w.env, w.team);
+  assert.ok(await store.save('default', BOSS, '', { protected_folders: ['C:\\Data', '/Users/a/Docs', '/Library/Stuff'] }, 0));
+  const mac = await w.send('pair', { protocol: 1, code: await w.code(), name: 'Mac', os: MAC_OS, machine: 'Mac-1', app_version: OLDER });
+  assert.equal(mac.status, 201);
+  assert.equal(rows(w.db, 'SELECT os FROM devices WHERE id = ?', mac.body.device_id)[0].os, MAC_OS, 'stored at pairing');
+  // The first hello after pairing, with no os in it, reads the stored one.
+  const first = await w.send('hello', { protocol: 1 }, { headers: w.bearer(mac.body.key) });
+  assert.deepEqual(first.body.rules.protected_folders, ['/Users/a/Docs', '/Library/Stuff']);
+  // A Windows PC paired the same way gets the other half.
+  const win = await w.send('pair', { protocol: 1, code: await w.code(), name: 'Win', os: 'Windows 11 Pro' });
+  const winFirst = await w.send('hello', { protocol: 1 }, { headers: w.bearer(win.body.key) });
+  assert.deepEqual(winFirst.body.rules.protected_folders, ['C:\\Data']);
+  assert.equal((await w.devs.rulesFor('default', mac.body.device_id)).tag, first.body.rules_tag);
 });
