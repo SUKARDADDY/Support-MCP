@@ -8,7 +8,7 @@
 //! reach `decide` on the Mac in the form those cases test.
 
 use serde_json::Value;
-use support_core::rules::{decide, parse_doc, rules_tag, Action, Hours, Verdict};
+use support_core::rules::{decide, mac_install_problem, parse_doc, rules_tag, Action, Hours, Verdict};
 
 fn cases() -> Value {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/rules-cases.json");
@@ -64,6 +64,17 @@ fn every_decide_posix_case_gives_the_relays_answer() {
     assert_eq!(skipped, 0);
     assert_eq!(ran, cases()["decide_posix"].as_array().unwrap().len());
     assert!(ran >= 20, "ran {ran}");
+}
+
+#[test]
+fn every_installers_posix_case_gives_the_relays_answer() {
+    let all = cases();
+    let list = all["installers_posix"].as_array().unwrap();
+    assert!(list.len() >= 30, "{}", list.len());
+    for c in list {
+        let got = mac_install_problem(c["path"].as_str().unwrap(), c["args"].as_str().unwrap());
+        assert_eq!(got.is_some(), c["problem"].as_bool().unwrap(), "{}: {got:?}", c["name"]);
+    }
 }
 
 #[test]

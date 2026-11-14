@@ -133,6 +133,40 @@ pub fn put(path: &str, data: &[u8], append: bool) -> Result<usize, String> {
     Ok(data.len())
 }
 
+/// Opens a regular file to read as root, walking from `/` without following any link, the last name included. Returns
+/// it with its stat, so the caller reads exactly the file at the path it checked, never one a link points to.
+pub fn open_regular(path: &str) -> Result<(std::fs::File, libc::stat), String> {
+    let (dir, name, full) = parent_of(path, false)?;
+    let fd = openat(dir.as_raw_fd(), &name, libc::O_RDONLY | libc::O_NONBLOCK, 0).map_err(|e| match link_target(dir.as_raw_fd(), &name) {
+        Some(t) => link_error(&full, &t),
+        None => os_error(e, &full),
+    })?;
+    let st = fstat(fd.as_raw_fd()).map_err(|e| e.to_string())?;
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(format!("{full} is not a regular file"));
+    }
+    Ok((std::fs::File::from(fd), st))
+}
+
+/// Opens a folder as root, walking from `/` without following any link, the last name included.
+pub fn open_dir(path: &str) -> Result<OwnedFd, String> {
+    if path.split('/').all(|n| n.is_empty()) {
+        let root = cstr("/")?;
+        // SAFETY: opening "/" as a folder; checked below.
+        let fd = unsafe { libc::open(root.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        // SAFETY: a new descriptor.
+        return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+    }
+    let (dir, name, full) = parent_of(path, false)?;
+    openat(dir.as_raw_fd(), &name, libc::O_RDONLY | libc::O_DIRECTORY, 0).map_err(|e| match link_target(dir.as_raw_fd(), &name) {
+        Some(t) => link_error(&full, &t),
+        None => os_error(e, &full),
+    })
+}
+
 /// Reads up to `length` bytes from `offset` as root.
 pub fn get(path: &str, offset: u64, length: usize) -> Result<FileChunk, String> {
     let (dir, name, full) = parent_of(path, false)?;
@@ -229,6 +263,26 @@ mod tests {
         assert_eq!(fs::read(format!("{d}/a")).unwrap(), b"keep", "not even emptied");
         // Reading one is fine.
         assert_eq!(get(&format!("{d}/b"), 0, 10).unwrap().data, b"keep");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_file_to_install_is_opened_only_where_no_link_leads() {
+        let d = temp("open");
+        fs::create_dir_all(format!("{d}/real")).unwrap();
+        fs::write(format!("{d}/real/a.pkg"), b"pkg").unwrap();
+        std::os::unix::fs::symlink(format!("{d}/real"), format!("{d}/via")).unwrap();
+        std::os::unix::fs::symlink(format!("{d}/real/a.pkg"), format!("{d}/real/b.pkg")).unwrap();
+        let (mut f, st) = open_regular(&format!("{d}/real/a.pkg")).unwrap();
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut f, &mut text).unwrap();
+        assert_eq!((text.as_str(), st.st_size), ("pkg", 3));
+        assert!(open_regular(&format!("{d}/via/a.pkg")).unwrap_err().contains("symbolic link"));
+        assert!(open_regular(&format!("{d}/real/b.pkg")).unwrap_err().contains("symbolic link"));
+        assert!(open_regular(&format!("{d}/real")).unwrap_err().contains("not a regular file"));
+        assert!(open_dir(&format!("{d}/real")).is_ok());
+        assert!(open_dir(&format!("{d}/via")).unwrap_err().contains("symbolic link"));
+        assert!(open_dir("/").is_ok());
         fs::remove_dir_all(&d).unwrap();
     }
 

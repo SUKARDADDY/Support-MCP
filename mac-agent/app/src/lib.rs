@@ -10,6 +10,7 @@ pub mod as_user;
 pub mod ax_plan;
 pub mod frame;
 pub mod input_plan;
+pub mod install;
 pub mod ipc;
 pub mod join;
 pub mod paths;
@@ -17,6 +18,7 @@ pub mod peer;
 pub mod plists;
 pub mod power;
 pub mod programs;
+pub mod remove;
 pub mod role;
 pub mod safe_files;
 pub mod server;
@@ -25,6 +27,7 @@ pub mod setup;
 pub mod show_request;
 pub mod state;
 pub mod uninstall;
+pub mod zipscan;
 
 #[cfg(target_os = "macos")]
 pub mod mac;

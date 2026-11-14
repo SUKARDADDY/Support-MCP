@@ -351,6 +351,10 @@ function pathParts(path) {
 // Mac name, so "..\\x" and "x." are names, never a step up or another spelling of "x". There is no drive, so
 // .. may take away the first component. Names are compared in NFC and lower case, as the Mac's usual
 // case-insensitive disk does, so a decomposed or upper-case spelling of a protected folder still matches.
+// /var, /tmp and /etc are links to the same folders under /private on every Mac, so /private/var/x and
+// /var/x are one path here: a protected folder written one way covers the other, and the Mac, which resolves
+// links before it compares, finds the /private form.
+const PRIVATE_ALIASES = Object.freeze(['var', 'tmp', 'etc']);
 function posixParts(path) {
   const parts = [];
   for (const raw of String(path).trim().split('/')) {
@@ -361,6 +365,7 @@ function posixParts(path) {
     }
     parts.push(raw.normalize('NFC').toLowerCase());
   }
+  if (parts.length >= 2 && parts[0] === 'private' && PRIVATE_ALIASES.includes(parts[1])) parts.shift();
   return parts;
 }
 
@@ -387,8 +392,11 @@ export function isAppPath(path) {
   }
   return p.length >= 3 && p[1].startsWith('program files') && (p[2] === 'supportmcp' || p[2].startsWith('supportmcp-'));
 }
-// The registry key of the Support app in the list of installed programs (list_programs ids are 64:<key> or 32:<key>).
-export const isAppProgramId = (id) => /^(?:32|64):supportmcpdevice$/i.test(String(id).trim());
+// The Support app in the list of installed programs: on Windows its registry key (list_programs ids are 64:<key> or
+// 32:<key>), on a Mac its bundle id and the one-off join app's (ids are bundle:<CFBundleIdentifier>).
+export const isAppProgramId = (id) => /^(?:(?:32|64):supportmcpdevice|bundle:io\.github\.sukardaddy\.supportmcp(?:\.join)?)$/i.test(String(id).trim());
+// A Mac program id that names one of Apple's own apps (bundle:com.apple.<name>): part of macOS, never uninstalled.
+export const isAppleProgramId = (id) => /^bundle:com\.apple\./i.test(String(id).trim());
 
 // Tools that are Windows itself. install_program runs an installer, never one of these: through it
 // shutdown.exe /r would restart the PC and msiexec.exe /x would uninstall a program, round the rules of
@@ -400,11 +408,36 @@ export const SYSTEM_TOOLS = Object.freeze([
   'wevtutil', 'wsl', 'bash', 'logoff', 'tsdiscon', 'psexec', 'psexec64',
 ]);
 
-// The local absolute path of a file as the PC accepts it (a drive letter and a separator, no stream or device
-// name): the text, or null. The PC refuses anything else.
-export function localAbsolutePath(path) {
+// The local absolute path of a file as the PC accepts it: the text, or null. The PC refuses anything else.
+//   windows  a drive letter and a separator, no stream or device name
+//   mac      a path from /, with no .. part, no NUL and at most 1,000 characters (the Mac resolves links itself)
+export function localAbsolutePath(path, platform = 'windows') {
   const text = typeof path === 'string' ? path.trim() : '';
+  if (platform === 'mac') {
+    return text.startsWith('/') && text.length <= 1000 && !text.includes('\u0000') && !text.split('/').includes('..') ? text : null;
+  }
   return /^[A-Za-z]:[\\/]/.test(text) && text.indexOf(':', 2) < 0 ? text : null;
+}
+
+// macOS's own folders. install_program on a Mac runs nothing from inside them (compared as Mac paths, so
+// /private/... spellings and any case count too).
+const MAC_SYSTEM_FOLDERS = Object.freeze([['system'], ['usr'], ['bin'], ['sbin'], ['library', 'apple']]);
+// Why a file may not be installed by install_program on a Mac, or null: only a package (.pkg, .mpkg), a disk image
+// (.dmg) or a zip (.zip), and none from macOS's own folders. The Mac checks the same again on the real path, with
+// links resolved, and checks what is inside a disk image or zip itself.
+export function installerProblemMac(path) {
+  const parts = posixParts(path);
+  const name = parts.at(-1) ?? '';
+  if (!/.\.(?:pkg|mpkg|dmg|zip)$/.test(name)) return 'install_program on a Mac installs only a .pkg or .mpkg package, a .dmg disk image or a .zip';
+  if (MAC_SYSTEM_FOLDERS.some((f) => parts.length > f.length && f.every((p, i) => parts[i] === p))) {
+    return 'install_program does not install files from macOS\'s own folders (/System, /usr, /bin, /sbin, /Library/Apple)';
+  }
+  return null;
+}
+// Why installer arguments are refused on a Mac, or null: a Mac install takes none. installer, hdiutil and ditto run
+// with fixed arguments the Mac builds itself.
+export function installArgsProblemMac(args) {
+  return String(args ?? '').trim() ? 'install_program on a Mac takes no arguments: leave args out' : null;
 }
 
 // Why a file may not be run by install_program, or null. Only .msi, .msu and .exe installers, and none in the
