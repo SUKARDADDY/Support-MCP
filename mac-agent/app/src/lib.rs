@@ -7,6 +7,7 @@
 //! authorization) and builds only for macOS.
 
 pub mod as_user;
+pub mod ax_plan;
 pub mod frame;
 pub mod input_plan;
 pub mod ipc;

@@ -10,6 +10,7 @@
 //!   helper also sends a `tick` every second: its permissions, the person's last input and whether the screen is locked.
 //! - Any request below makes it a request link: one answer for each request, in order.
 
+use crate::ax_plan;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use serde_json::{json, Map, Value};
@@ -23,6 +24,8 @@ pub const NAME_MAX: usize = 100;
 pub const CODE_MAX: usize = 20;
 pub const PERSON_MAX: usize = 200;
 pub const ERROR_MAX: usize = 300;
+/// The most characters of text a `ui_tree` answer carries: the tree's own cap and room for the closing line.
+pub const TREE_TEXT_MAX: usize = 200_000;
 /// The most processes one close asks the helper about.
 pub const PIDS_MAX: usize = 256;
 
@@ -260,7 +263,7 @@ pub fn to_helper_message(t: &ToHelper) -> Map<String, Value> {
 pub fn read_to_helper(m: &Map<String, Value>) -> Option<ToHelper> {
     match kind(m) {
         "screen" if exact(m, &["type", "id", "action"], &[]) => match m.get("action") {
-            Some(a @ Value::Object(_)) => Some(ToHelper::Screen { id: id(m)?, action: a.clone() }),
+            Some(a @ Value::Object(o)) if ui_action_ok(o) => Some(ToHelper::Screen { id: id(m)?, action: a.clone() }),
             _ => None,
         },
         "ask" if exact(m, &["type", "id", "by", "team", "full"], &[]) => {
@@ -278,6 +281,32 @@ pub fn read_to_helper(m: &Map<String, Value>) -> Option<ToHelper> {
         }
         _ => None,
     }
+}
+
+/// A `ui_tree` or `ui_act` the helper accepts: exactly the keys and types the service writes (`action_json`), with the
+/// relay's bounds on the line limit, the ref, the verb and the value. Any other action passes: the helper parses those
+/// leniently, as it always has.
+fn ui_action_ok(a: &Map<String, Value>) -> bool {
+    let name = a.get("name").and_then(Value::as_str).unwrap_or("");
+    if name != "ui_tree" && name != "ui_act" {
+        return true;
+    }
+    let v = Value::Object(a.clone());
+    if action_json(&ScreenAction::parse(&v)) != v {
+        return false;
+    }
+    let int = |k: &str| a.get(k).and_then(Value::as_i64);
+    let verb = a.get("verb").and_then(Value::as_str).unwrap_or("");
+    let value_ok = match a.get("value") {
+        None => true,
+        Some(Value::String(t)) => t.chars().count() <= ax_plan::VALUE_MAX,
+        Some(_) => false,
+    };
+    int("max_lines").is_some_and(|n| (1..=ax_plan::LINES_MAX).contains(&n))
+        && int("ref").is_some_and(|n| (0..=ax_plan::REF_MAX).contains(&n))
+        && verb.chars().count() <= 40
+        && !verb.chars().any(char::is_control)
+        && value_ok
 }
 
 fn obj(v: Value) -> Map<String, Value> {
@@ -306,6 +335,20 @@ pub fn action_json(a: &ScreenAction) -> Value {
 
 /// The helper's answer to a screen action.
 pub fn screen_reply(out: Result<ScreenOutput, String>) -> Map<String, Value> {
+    reply_with(out, ERROR_MAX, false)
+}
+
+/// The helper's answer to `ui_tree`: its text is the tree, up to `TREE_TEXT_MAX` characters, with its line breaks.
+pub fn tree_reply(out: Result<ScreenOutput, String>) -> Map<String, Value> {
+    reply_with(out, TREE_TEXT_MAX, true)
+}
+
+/// Control characters other than line breaks are dropped, and the text is cut to `max` characters.
+fn clean_lines(text: &str, max: usize) -> String {
+    text.chars().filter(|c| *c == '\n' || !c.is_control()).take(max).collect()
+}
+
+fn reply_with(out: Result<ScreenOutput, String>, max_text: usize, lines: bool) -> Map<String, Value> {
     match out {
         Err(e) => obj(json!({ "ok": false, "error": wire::clean(&e, ERROR_MAX) })),
         Ok(o) => {
@@ -317,7 +360,8 @@ pub fn screen_reply(out: Result<ScreenOutput, String>) -> Map<String, Value> {
                 m.insert("height".into(), json!(img.height));
             }
             if let Some(text) = o.text {
-                m.insert("text".into(), Value::String(wire::clean(&text, ERROR_MAX)));
+                let text = if lines { clean_lines(&text, max_text) } else { wire::clean(&text, max_text) };
+                m.insert("text".into(), Value::String(text));
             }
             m
         }
@@ -328,6 +372,15 @@ pub fn screen_reply(out: Result<ScreenOutput, String>) -> Map<String, Value> {
 /// limit and the screenshot size, the numbers are in range, the texts are short and clean. A malformed answer is an
 /// error, never passed on.
 pub fn read_screen_reply(m: &Map<String, Value>) -> Result<ScreenOutput, String> {
+    read_reply_with(m, ERROR_MAX, false)
+}
+
+/// The same for `ui_tree`, whose text is the tree.
+pub fn read_tree_reply(m: &Map<String, Value>) -> Result<ScreenOutput, String> {
+    read_reply_with(m, TREE_TEXT_MAX, true)
+}
+
+fn read_reply_with(m: &Map<String, Value>, max_text: usize, lines: bool) -> Result<ScreenOutput, String> {
     const BAD: &str = "the screen helper sent a malformed answer";
     match m.get("ok") {
         Some(Value::Bool(false)) => {
@@ -371,7 +424,7 @@ pub fn read_screen_reply(m: &Map<String, Value>) -> Result<ScreenOutput, String>
     };
     let text = match m.get("text") {
         None => None,
-        Some(Value::String(t)) if t.chars().count() <= ERROR_MAX => Some(wire::clean(t, ERROR_MAX)),
+        Some(Value::String(t)) if t.chars().count() <= max_text => Some(if lines { clean_lines(t, max_text) } else { wire::clean(t, max_text) }),
         Some(_) => return Err(BAD.into()),
     };
     Ok(ScreenOutput { image, display, displays, desktop, text })
@@ -567,5 +620,54 @@ mod tests {
         assert_eq!(read_close_reply(&m(json!({"asked":[5,6]})), &[5, 6, 7]), Some(vec![5, 6]));
         assert_eq!(read_close_reply(&m(json!({"asked":[8]})), &[5]), None, "a pid it was not given");
         assert_eq!(read_close_reply(&m(json!({"asked":[5,5]})), &[5]), None);
+    }
+
+    fn ui_msg(a: &ScreenAction) -> Map<String, Value> {
+        to_helper_message(&ToHelper::Screen { id: 5, action: action_json(a) })
+    }
+
+    #[test]
+    fn a_ui_action_reaches_the_helper_only_with_exact_keys_and_bounded_values() {
+        let tree = ScreenAction::parse(&json!({"name":"ui_tree"}));
+        assert!(matches!(read_to_helper(&ui_msg(&tree)), Some(ToHelper::Screen { id: 5, .. })));
+        let act = ScreenAction::parse(&json!({"name":"ui_act","ref":12,"verb":"set_value","value":"hello\nworld"}));
+        assert!(read_to_helper(&ui_msg(&act)).is_some(), "a value may hold a line break");
+        // Out of bounds, or not what the service writes: refused, and the helper's link closes.
+        for bad in [
+            ScreenAction { max_lines: 0, ..tree.clone() },
+            ScreenAction { max_lines: 2001, ..tree.clone() },
+            ScreenAction { ref_id: -1, ..act.clone() },
+            ScreenAction { ref_id: 1_000_001, ..act.clone() },
+            ScreenAction { verb: "x".repeat(41), ..act.clone() },
+            ScreenAction { verb: "a\nb".into(), ..act.clone() },
+            ScreenAction { value: Some("x".repeat(5001)), ..act.clone() },
+        ] {
+            assert!(read_to_helper(&ui_msg(&bad)).is_none(), "{bad:?}");
+        }
+        let mut extra = ui_msg(&tree);
+        extra["action"]["sneaky"] = json!(1);
+        assert!(read_to_helper(&extra).is_none());
+        let mut typed = ui_msg(&act);
+        typed["action"]["ref"] = json!("12");
+        assert!(read_to_helper(&typed).is_none());
+        // The other actions are read as before.
+        assert!(read_to_helper(&m(json!({"type":"screen","id":1,"action":{"name":"screenshot"}}))).is_some());
+    }
+
+    #[test]
+    fn a_tree_reply_keeps_its_line_breaks_and_its_length() {
+        let text = (1..=5000).map(|n| format!("[{n}] Button \"b\" (1,1) invoke")).collect::<Vec<_>>().join("\n");
+        assert!(text.chars().count() > ERROR_MAX);
+        let out = |t: &str| ScreenOutput { image: None, display: 1, displays: 2, desktop: Desktop::Default, text: Some(t.into()) };
+        let back = read_tree_reply(&tree_reply(Ok(out(&text)))).unwrap();
+        assert_eq!((back.text.as_deref(), back.display), (Some(text.as_str()), 1));
+        // The ordinary reply still cuts to 300 and drops line breaks.
+        let short = read_screen_reply(&screen_reply(Ok(out(&text)))).unwrap();
+        assert!(short.text.unwrap().chars().count() <= ERROR_MAX);
+        // A tree over the bound is refused by whoever reads it, and a control character other than a break is dropped.
+        let mut big = tree_reply(Ok(out("x")));
+        big.insert("text".into(), json!("x".repeat(TREE_TEXT_MAX + 1)));
+        assert!(read_tree_reply(&big).is_err());
+        assert_eq!(read_tree_reply(&tree_reply(Ok(out("a\u{7}b\nc")))).unwrap().text.as_deref(), Some("ab\nc"));
     }
 }

@@ -890,10 +890,10 @@ What differs:
   ([Updates for a Mac](#updates-for-a-mac)) and shows it as the PC's system in `device_list` and the technician app.
 - Its session hello is `{"type":"hello","machine":"<ComputerName>","user":"<console user or empty>","ps":"",
   "agent":"macos-app-1","version":"<app version>","elevated":<true when the service runs as root>,
-  "caps":["screen","lanes"(,"uia")(,"full")],"control":"full"|"normal"}`. `screen` and `lanes` are always there once the Mac
+  "caps":["screen","lanes","uia"(,"full")],"control":"full"|"normal"}`. `screen`, `lanes` and `uia` are always there once the Mac
   is set up, so the caps never change in a session (a new hello would fail the commands in flight). When no screen helper is
   running or a permission is missing, the Mac answers the screen frame itself with an error that says what to allow in System
-  Settings. `uia` is added only when the Mac can answer `ui_tree` and `ui_act`, and `full` only when its control is `full`.
+  Settings, Accessibility for `ui_tree` and `ui_act` included. `full` is added only when its control is `full`.
 - The relay forwards `block_input`, `send_sas` and the `control` frame (`request_full_control`) as it does to any app, and the
   Mac refuses them: `block_input is not available on a Mac`, `send_sas is not available on a Mac`, and `full control is chosen
   when Support is set up on this Mac`. The relay itself refuses `as:"system"` under limited control and any install path that
