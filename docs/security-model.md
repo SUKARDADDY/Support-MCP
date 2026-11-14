@@ -227,7 +227,7 @@ apply to only one client say which.
   origin. The page sends `Referrer-Policy: same-origin` so browsers keep that
   header on the click, `Cache-Control: no-store`, and a content security policy
   with `default-src 'none'`, no scripts and `form-action 'self'`. A second click
-  gets a "Check your downloads" page, not a second file. For the PowerShell
+  gets a "This support link was already used" page, not a second file. For the PowerShell
   link, the relay serves the script, and consumes the code, only when the
   `User-Agent` contains `PowerShell/`, which is what `irm` sends in Windows
   PowerShell 5.1 and PowerShell 7. Any other request gets a `Write-Host` line
@@ -236,6 +236,16 @@ apply to only one client say which.
 - **A code only works for its own client.** A code minted for the app cannot be
   used up by `irm`, a PowerShell code cannot be used up by the download page,
   and a session refuses the other client's transport.
+- **A Mac redeems its code over JSON, and a web page cannot.** The Mac join app
+  cannot carry a session key inside its signed file, so it calls
+  `POST /j/<code>/redeem`. The relay refuses a request with any `Origin` header,
+  one that is not `application/json`, and one without `X-Support-Client:
+  macos-app-1`. A web form can send none of those without a preflight, which the
+  relay never answers. The same code is single use: a code the Windows button
+  used up cannot be redeemed, and the other way round. The app shows the relay
+  and the session's label before it redeems, joins only the relay it was built
+  for, runs as the signed-in person with limited control, and resets its own
+  Screen Recording and Accessibility grants when the session ends.
 - **https only.** The script and the app both carry the attach key and run the
   whole session over the origin they were served from, so the relay builds that
   origin as `https://<host>` for every host except `localhost` and `127.0.0.1`.

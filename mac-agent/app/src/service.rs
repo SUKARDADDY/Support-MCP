@@ -116,13 +116,13 @@ fn now_ms() -> i64 {
 }
 
 /// The screen actions that take a picture, and those that send input.
-fn captures(a: &ScreenAction) -> bool {
+pub(crate) fn captures(a: &ScreenAction) -> bool {
     // A `ui_act` ends with a picture unless it says not to.
     matches!(a.name.as_str(), "screenshot" | "zoom" | "wait") || (a.name == "ui_act" && a.screenshot)
 }
 
 /// Those that need Accessibility: input, and reading or acting on controls.
-fn inputs(a: &ScreenAction) -> bool {
+pub(crate) fn inputs(a: &ScreenAction) -> bool {
     matches!(a.name.as_str(), "click" | "move" | "drag" | "scroll" | "type" | "type_secret" | "key" | "ui_tree" | "ui_act")
 }
 
@@ -305,6 +305,7 @@ impl Platform for MacPlatform {
         HostInfo {
             machine: id.machine,
             user,
+            os: id.os,
             // SAFETY: a getter.
             elevated: unsafe { libc::geteuid() } == 0,
             control: if self.limited() { Control::Normal } else { Control::Full },
