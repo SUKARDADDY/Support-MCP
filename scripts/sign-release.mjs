@@ -25,7 +25,9 @@
 //
 // With --product mac it signs the Mac app's installer package (Support-<V>.pkg, built by the macOS
 // job): the note has six lines, the usual four values under support-mcp-mac-release 1 and a url, the
-// GitHub release URL the Mac downloads the package from, https://github.com/<owner>/<repo>/releases/download/v<V>/Support-<V>.pkg.
+// GitHub release URL the Mac downloads the package from, https://github.com/<owner>/<repo>/releases/download/mac-v<V>/Support-<V>.pkg.
+// Mac releases are tagged mac-v<V> (.github/workflows/mac-release.yml), so they never collide with the v<V> tags of the
+// relay and the Windows app.
 // The Mac has its own version line, set by --version and unrelated to the relay's VERSION. It prints the two Worker secrets to set, MAC_RELEASE_NOTE (the
 // note in base64) and MAC_RELEASE_SIGNATURE, then the note. They are secrets, not [vars]: a Windows-only
 // deploy must not reset them. --out writes the package, the note and its signature for the GitHub release.
@@ -99,7 +101,7 @@ if (product === 'mac') {
   }
   if (exe.length < 4 || exe.subarray(0, 4).toString('latin1') !== 'xar!') fail('the package is not a macOS installer package');
   if (!basename(opts.file).includes(opts.version)) fail(`the package's file name does not carry version ${opts.version}`);
-  if (!opts.url.endsWith(`/releases/download/v${opts.version}/Support-${opts.version}.pkg`)) fail(`the url must end in /releases/download/v${opts.version}/Support-${opts.version}.pkg`);
+  if (!opts.url.endsWith(`/releases/download/mac-v${opts.version}/Support-${opts.version}.pkg`)) fail(`the url must end in /releases/download/mac-v${opts.version}/Support-${opts.version}.pkg`);
   assetBase = `Support-${opts.version}`;
   try {
     note = buildMacNote({ version: opts.version, sha256: createHash('sha256').update(exe).digest('hex'), size: exe.length, released, url: opts.url });

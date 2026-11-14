@@ -14,6 +14,12 @@
 # no ad-hoc fallback: an unsigned or ad-hoc app would have a designated requirement of its own cdhash, and the service's
 # peer check would then accept only that exact build. SUPPORT_SIGN_IDENTITY=- signs ad hoc, for a local try only.
 # The .pkg is not signed here: a self-signed code signing identity cannot sign an installer (call 1, A).
+#
+# The macOS update test (.github/workflows/test.yml, docs/development.md "Mac updates") builds test versions with
+# SUPPORT_CARGO_FEATURES=test-release, SUPPORT_CARGO_PROFILE=update-test (no LTO, so four builds stay quick),
+# SUPPORT_SKIP_JOIN=1 and the test-only variables SUPPORT_TEST_VERSION, SUPPORT_TEST_RELEASE_KEY,
+# SUPPORT_TEST_DOWNLOAD_ORIGIN and SUPPORT_TEST_BROKEN. A build without the feature refuses those variables (it does not
+# compile), so a release can never carry them.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -24,10 +30,18 @@ identity="${SUPPORT_SIGN_IDENTITY:?set SUPPORT_SIGN_IDENTITY to the signing iden
 
 version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$agent/app/Cargo.toml" | head -n 1)"
 [ -n "$version" ] || { echo "no version in app/Cargo.toml" >&2; exit 1; }
+features="${SUPPORT_CARGO_FEATURES:-}"
+profile="${SUPPORT_CARGO_PROFILE:-release}"
+if [ -n "${SUPPORT_TEST_VERSION:-}" ]; then
+    case ",$features," in *,test-release,*) ;; *) echo "SUPPORT_TEST_VERSION needs SUPPORT_CARGO_FEATURES=test-release" >&2; exit 1 ;; esac
+    version="$SUPPORT_TEST_VERSION"
+fi
+cargo_args=(build --locked --profile "$profile" --target "$target" -p support-mac)
+if [ -n "$features" ]; then cargo_args+=(--features "$features"); fi
 
-echo "Building Support $version for $target"
-(cd "$agent" && env -u SUPPORT_JOIN_RELAY_ORIGIN cargo build --release --locked --target "$target" -p support-mac --bin support)
-bin="$agent/target/$target/release/support"
+echo "Building Support $version for $target (profile $profile${features:+, features $features})"
+(cd "$agent" && env -u SUPPORT_JOIN_RELAY_ORIGIN cargo "${cargo_args[@]}" --bin support)
+bin="$agent/target/$target/$profile/support"
 archs="$(lipo -archs "$bin")"
 [ "$archs" = "arm64" ] || { echo "the binary is $archs, not arm64 only" >&2; exit 1; }
 
@@ -64,6 +78,12 @@ productbuild --distribution "$out/distribution.xml" --package-path "$out" "$out/
 rm -f "$out/Support-component.pkg"
 cp -R "$app" "$out/Support.app"
 
+if [ "${SUPPORT_SKIP_JOIN:-}" = "1" ]; then
+    echo "$out/Support.app"
+    echo "$out/Support-$version.pkg"
+    exit 0
+fi
+
 # ---- Support Join.app: the one-off app, a bundle of its own ----------------------------------------------------------
 # Its own binary (support-join, the join role only) and its own bundle id, so its Screen Recording and Accessibility grants
 # never mix with the saved app's. Only this bundle registers the supportmcp:// link scheme. It is not in the package: it
@@ -71,8 +91,8 @@ cp -R "$app" "$out/Support.app"
 join_origin="${SUPPORT_JOIN_RELAY_ORIGIN:?set SUPPORT_JOIN_RELAY_ORIGIN to the relay Support Join may join, https://<host>}"
 case "$join_origin" in https://*) ;; *) echo "SUPPORT_JOIN_RELAY_ORIGIN must be an https address" >&2; exit 1 ;; esac
 echo "Building Support Join $version for $target, joining $join_origin"
-(cd "$agent" && SUPPORT_JOIN_RELAY_ORIGIN="$join_origin" cargo build --release --locked --target "$target" -p support-mac --bin support-join)
-jbin="$agent/target/$target/release/support-join"
+(cd "$agent" && SUPPORT_JOIN_RELAY_ORIGIN="$join_origin" cargo "${cargo_args[@]}" --bin support-join)
+jbin="$agent/target/$target/$profile/support-join"
 jarchs="$(lipo -archs "$jbin")"
 [ "$jarchs" = "arm64" ] || { echo "the join binary is $jarchs, not arm64 only" >&2; exit 1; }
 japp="$out/Support Join.app"

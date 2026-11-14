@@ -11,6 +11,7 @@ pub mod join_ui;
 pub mod os;
 pub mod peer;
 pub mod ui;
+pub mod update;
 
 use crate::role::Role;
 use std::sync::Arc;
@@ -90,6 +91,12 @@ pub fn run(role: Role) -> i32 {
                     return 1;
                 }
             };
+            // The macOS update test's broken version: a service that exits at once, every time launchd starts it.
+            #[cfg(feature = "test-release")]
+            if option_env!("SUPPORT_TEST_BROKEN").is_some() {
+                eprintln!("support: this test build is broken on purpose (SUPPORT_TEST_BROKEN)");
+                return 3;
+            }
             let os = Arc::new(os::MacOs::new());
             let inspector = match peer::MacInspector::new() {
                 Ok(i) => Arc::new(i),
@@ -113,6 +120,7 @@ pub fn run(role: Role) -> i32 {
         Role::Setup(args) => cli::setup(&args),
         Role::Uninstall { finish: false } => cli::uninstall(),
         Role::Uninstall { finish: true } => cli::finish(),
+        Role::UpdateWatch { restart } => update::watch(restart),
         // Handled before this is called.
         Role::Version | Role::FileOp { .. } | Role::RunAs { .. } => 2,
     }

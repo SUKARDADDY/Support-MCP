@@ -40,6 +40,24 @@ SHA-256 fingerprint: (filled in at release)
 
 `codesign -dr- "Support Join.app"` shows the certificate the app is signed with.
 
+**The self-signed certificate.** It is the project's own code signing certificate
+(approved call 1: a self-signed identity now, an Apple Developer ID later). Apple has
+not checked or notarized it, so macOS does not trust it for Gatekeeper. That is why a
+downloaded package or zip needs **Open Anyway**, and why the fingerprint above, not
+macOS, is what tells you a download is the project's. Its private key is kept in the
+maintainers' Bitwarden and in the `mac-release` GitHub environment that builds
+releases (`.github/workflows/mac-release.yml`), and nowhere else. Releases are tagged
+`mac-v<version>`; the workflow run's summary lists each file's SHA-256.
+
+**Updates of a saved Mac** need two signatures. The update note must be signed with the
+project's offline release key (the same key as the Windows app's, never in CI), and
+the downloaded app must be signed by the same certificate as the app that runs: the
+Mac checks it with `codesign --verify --strict` against its own designated
+requirement before it replaces anything. A relay, or someone who controls the network,
+can hold an update back but cannot make one. If the certificate changes (a move to a
+Developer ID), installed Macs refuse updates signed with the new one, and need a new
+install and a new grant of Screen Recording and Accessibility.
+
 `Support Join.app` is the one-off app. It runs as the person who opened it, never
 asks for an administrator password and installs no service. It owns the
 `supportmcp://` link, and it joins only the relay it was built for. It shows that

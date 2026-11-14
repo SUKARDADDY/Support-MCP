@@ -175,9 +175,20 @@ pub fn verify_signature(key: &VerifyingKey, note: &[u8], signature_b64: &str) ->
     key.verify(note, &sig).is_ok()
 }
 
-/// The built-in key.
+/// The built-in key: the project's release key.
+#[cfg(not(feature = "test-release"))]
 pub fn release_key() -> Result<VerifyingKey, String> {
     load_key(RELEASE_KEY)
+}
+
+/// A `test-release` build trusts only the throwaway key it was built with (SUPPORT_TEST_RELEASE_KEY), never the
+/// project's. Without one it trusts nothing.
+#[cfg(feature = "test-release")]
+pub fn release_key() -> Result<VerifyingKey, String> {
+    match option_env!("SUPPORT_TEST_RELEASE_KEY") {
+        Some(k) => load_key(k),
+        None => Err("this test build was made without SUPPORT_TEST_RELEASE_KEY, so it trusts no release".to_string()),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -257,6 +268,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "test-release"))]
     fn the_built_in_key_is_the_projects_release_key() {
         // include_str! reads the file at the repository root, so this is a check that the path still points at it.
         let on_disk = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../release-key.pub")).unwrap();
@@ -298,6 +310,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "test-release"))]
     fn a_note_made_by_node_verifies_and_every_tampered_form_fails() {
         let v = vectors();
         let key = vector_key();
@@ -352,6 +365,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "test-release"))]
     fn check_update_follows_the_windows_clients_rules() {
         let v = vectors();
         let key = vector_key();

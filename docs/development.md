@@ -62,8 +62,10 @@ twice and compare the type names in the metadata.
 `node --test` fails when the source or manifest hash in the bundle no longer
 matches the files, so it catches a source change that was committed without a
 rebuild. It cannot tell whether `exe_b64` was compiled from that source. The
-`windows-app` job in `.github/workflows/test.yml` checks that, on every push and
-pull request, on a GitHub-hosted `windows-latest` runner:
+`windows-app` job in `.github/workflows/test.yml` checks that, on every push to
+`main` or a release tag, every pull request from this repository and every manual run,
+on our self-hosted Windows VM runner (labels `self-hosted, Windows, X64, laptop-win`),
+never on a GitHub-hosted one:
 
 1. It fetches the .NET Framework 4.5.2 reference assemblies with
    `scripts/fetch-net452-refs.ps1`. The script fails unless the downloaded
@@ -370,20 +372,21 @@ release signed long before its deploy would skip them.
    matter for them, or let them end on their own.
 
    **A Mac release** has its own note, signed by the same key and the same
-   offline step, but it is not part of the Windows deploy. Build the package
-   `Support-<version>.pkg` (the macOS job). The Mac has its own version line, starting
-   at 1.1.0 and unrelated to the relay's `VERSION`. Attach it to the GitHub release
-   `v<version>`, then sign it:
+   offline step, but it is not part of the Windows deploy. The Mac has its own
+   version line, starting at 1.1.0 and unrelated to the relay's `VERSION`, and its own
+   tags, `mac-v<version>`. Follow [Releasing the Mac app](#releasing-the-mac-app):
+   the `mac-release` workflow builds `Support-<version>.pkg` and attaches it to the
+   GitHub release `mac-v<version>`. Then sign it:
 
    ```sh
    wl-paste | node scripts/sign-release.mjs --product mac --version <version> --file Support-<version>.pkg \
-     --url https://github.com/<owner>/<repo>/releases/download/v<version>/Support-<version>.pkg \
+     --url https://github.com/<owner>/<repo>/releases/download/mac-v<version>/Support-<version>.pkg \
      --out release-files-mac
    wl-copy --clear
    ```
 
    It checks that the file is a macOS installer package named for `--version` and
-   that the URL is the GitHub release URL of that version, builds the six-line note
+   that the URL is the GitHub release URL of that version's `mac-v` tag, builds the six-line note
    (`support-mcp-mac-release 1`, version, SHA-256, size, released, url), signs it
    and checks the signature against `release-key.pub`. It prints
    `MAC_RELEASE_NOTE=<the note in base64>`, `MAC_RELEASE_SIGNATURE=<signature>` and
@@ -439,6 +442,79 @@ the same bundle. If you build your own app, make your own key the same way, put
 its public key in `release-key.pub` and in `ReleaseKey.ProjectKey`, rebuild the
 app, and sign with your key. A relay that serves a bundle the project key did
 not sign offers PCs nothing they will take.
+
+### Releasing the Mac app
+
+A Mac release is built and signed with the app's code signing identity by
+`.github/workflows/mac-release.yml`, and its update note is signed offline with the
+release key, as above. Neither key is ever in the other's place: the workflow never
+sees the release key, and the code signing identity never leaves GitHub's
+`mac-release` environment and the maintainers' Bitwarden.
+
+**Once, before the first release** (approved call 1: a self-signed identity now, a
+Developer ID later):
+
+1. Make the identity: a self-signed certificate for code signing, and its key, in a
+   `.p12` that macOS can import. With OpenSSL 3, pass `-legacy` to `pkcs12 -export`
+   (macOS's `security import` cannot read its newer default):
+
+   ```sh
+   cat > cert.cnf <<'CNF'
+   [req]
+   distinguished_name = dn
+   prompt = no
+   x509_extensions = ext
+   [dn]
+   CN = Support-MCP Mac release
+   [ext]
+   basicConstraints = critical, CA:false
+   keyUsage = critical, digitalSignature
+   extendedKeyUsage = critical, codeSigning
+   subjectKeyIdentifier = hash
+   CNF
+   openssl req -x509 -newkey rsa:3072 -nodes -days 3650 -config cert.cnf -keyout key.pem -out cert.pem
+   openssl pkcs12 -export -legacy -inkey key.pem -in cert.pem -name "Support-MCP Mac release" -out identity.p12
+   openssl x509 -in cert.pem -noout -fingerprint -sha256
+   ```
+
+   Keep `identity.p12` and its password in Bitwarden, then delete `key.pem` and
+   `identity.p12` from disk. Every release must use this same identity: macOS ties
+   the Screen Recording and Accessibility permissions to it, and an installed Mac
+   takes an update only when it is signed by the same certificate.
+2. In the repository's settings, make the environment `mac-release`. Limit it to
+   the tags `mac-v*` (deployment branches and tags), and add a required reviewer if
+   you want a second look before each release. Add two secrets, `MAC_SIGNING_P12`
+   (`base64 -i identity.p12`) and `MAC_SIGNING_PASSWORD`, and one variable,
+   `SUPPORT_JOIN_RELAY_ORIGIN`: the production relay, `https://<host>`, the only
+   relay `Support Join.app` will join.
+3. Put the certificate's SHA-256 fingerprint in [SECURITY.md](../SECURITY.md#the-mac-apps).
+
+**Each release:**
+
+1. Set the version in `mac-agent/app/Cargo.toml` and `mac-agent/core/Cargo.toml`
+   (and the two entries in `mac-agent/Cargo.lock`), add a `[Mac <version>]` entry to
+   the CHANGELOG, and merge.
+2. Tag the merge commit and push the tag: `git tag mac-v<version> && git push origin
+   mac-v<version>`. (Or run the workflow by hand with the version: it then tags the
+   commit it runs on.) The workflow checks that the tag is the crates' version, runs
+   the tests, builds and signs `Support.app`, `Support-<version>.pkg` and `Support
+   Join.app`, checks the signatures, the architecture and that the release key (and
+   nothing of the update test) is built in, and attaches `Support-<version>.pkg` and
+   `Support-<version>.zip` to the GitHub release `mac-v<version>`, which it never marks
+   as the latest (the technician app's updater reads the latest release). The run's
+   summary lists each file's size and SHA-256, the certificate's fingerprints and the
+   signing command.
+3. Download `Support-<version>.pkg` from the release, check its SHA-256 against the
+   summary, and sign its note with the release key from Bitwarden, as above:
+   `node scripts/sign-release.mjs --product mac --version <version> --file
+   Support-<version>.pkg --url https://github.com/<owner>/<repo>/releases/download/mac-v<version>/Support-<version>.pkg
+   --out release-files-mac`, with the key on stdin.
+4. Attach `Support-<version>.note` and `Support-<version>.note.sig` from
+   `release-files-mac` to the same release, so anyone can check the package.
+5. `npx wrangler secret put MAC_RELEASE_NOTE` and `npx wrangler secret put
+   MAC_RELEASE_SIGNATURE` with the two values it printed (each `secret put` deploys a
+   new version of the Worker), then deploy as usual. Macs take the update at their
+   next check-in, by the stages, counted from the signing time.
 
 ## Develop and test
 
@@ -702,6 +778,7 @@ several roles, chosen by its first argument (`app/src/role.rs`):
 | `helper` | the signed-in person (or root at the login window), from the LaunchAgent | screenshots, input, the question before a session, the corner window, the menu bar item and the setup window |
 | `setup`, `uninstall` | an administrator (`sudo support setup --link <link> --name <name> --access ask\|any --control full\|limited`, `sudo support uninstall`) | the same requests the windows send |
 | `file-op`, `run-as` | root, which drops to the person first | files under limited control, and `run` as the person through `launchctl asuser` |
+| `update-watch` | root, from the old app's copy in the data folder, by launchd | watches an update's trial: restarts the service and the helpers after a switch, and rolls back when the new version asks or misses its deadline ([Mac updates](#mac-updates)) |
 
 The service and its helpers talk over `/var/run/io.github.sukardaddy.supportmcp/helper.sock`
 (the folder is root's and 0755, the socket 0666). Every connection is checked before
@@ -736,6 +813,36 @@ The app is signed with the hardened runtime and no entitlements. The package ins
 on Apple silicon with macOS 14 or later, puts the app at `/Applications/Support.app` and
 nowhere else, and starts the service and the helper. The property lists are generated by
 `app/src/plists.rs`, and a test fails when the committed files differ.
+
+### Mac updates
+
+A saved Mac updates itself ([How a Mac takes an update](relay-v1-spec.md#how-a-mac-takes-an-update)).
+`app/src/update.rs` holds the rules (the offer, `update.json`, the trial, the watcher, the
+switch and the rollback) and `core/src/download.rs` the download (the hosts, the redirects,
+the size cap, the size and SHA-256). Both are tested on Linux with `cargo test`, the switch
+and the rollback with real files and a fake for `pkgutil`, `codesign` and `launchctl`
+(`app/src/mac/update.rs`, which only type-checks there).
+
+The `mac-agent-macos` job then runs a real update on its macOS runner
+(`mac-agent/e2e/update-macos.mjs`). It makes a throwaway release key and a second
+throwaway signing identity, and builds four versions with the `test-release` feature:
+A (1.1.0) and B (1.1.1) signed by the job's identity, C (1.1.2) by the second one, and D
+(1.1.3), signed like A, whose service exits at start (`SUPPORT_TEST_BROKEN`). It installs
+A on the runner, and a stand-in relay on 127.0.0.1:8791 offers B, then C, then D, each
+with a note built by `src/release.js` and signed by the throwaway key, and serves the
+packages through a redirect. A must update to B and B must commit; B must refuse C for
+its signer and keep nothing of it; and D must be rolled back to B within the trial,
+recorded as failed and never downloaded again. The job also checks that the release
+build holds no test key (and does hold `release-key.pub`).
+
+The `test-release` feature, in `core/Cargo.toml` and `app/Cargo.toml`, is for this test
+only. It trusts the key in `SUPPORT_TEST_RELEASE_KEY` instead of `release-key.pub`,
+reports `SUPPORT_TEST_VERSION`, may download from loopback over http starting at
+`SUPPORT_TEST_DOWNLOAD_ORIGIN`, shortens the trial to 60 seconds, and honours
+`SUPPORT_TEST_BROKEN`. A build without the feature does not compile when any of those
+variables is set, so the app that ships never has them. `build.sh` takes
+`SUPPORT_CARGO_FEATURES`, `SUPPORT_CARGO_PROFILE` (`update-test` is the release profile
+without LTO, for speed) and `SUPPORT_SKIP_JOIN=1` for these builds.
 
 ### Support Join (the one-off Mac app)
 
