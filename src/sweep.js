@@ -95,6 +95,8 @@ const UNTOLD = `EXISTS (
 // are stuck below the release. teams_left counts only the teams after the cursor that have a PC below the
 // release not seen lately: the PCs a pass rang check in, so they drop out of later rounds, and the ones that
 // cannot update are passed once. budget is the subrequests this pass may make; idleMs the quiet a PC needs.
+// Only Windows PCs are rung: both queries leave out a Mac (os starts with "macOS "), which takes its update
+// at its next check-in, so the Windows release is never what rings one.
 export async function ringUpdates(env, now, appBundle, { budget = RING_SUBREQUESTS, idleMs = RING_IDLE_MS, turn = 0, after = null } = {}) {
   if (String(env.EMERGENCY_STOP ?? '') !== '') return { rung: 0, teams_left: 0, next: null };
   const release = await releaseFrom(appBundle, env);
@@ -102,7 +104,7 @@ export async function ringUpdates(env, now, appBundle, { budget = RING_SUBREQUES
   const quiet = now - idleMs;
   const cursor = after !== null;
   const teams = (await env.DB.prepare(
-    `SELECT DISTINCT workspace FROM devices WHERE status = 'active' AND app_version <> '' AND app_version <> ? AND COALESCE(last_seen, paired_at) < ?${cursor ? ' AND workspace > ?' : ''} ORDER BY workspace`,
+    `SELECT DISTINCT workspace FROM devices WHERE status = 'active' AND app_version <> '' AND app_version <> ? AND os NOT LIKE 'macOS %' AND COALESCE(last_seen, paired_at) < ?${cursor ? ' AND workspace > ?' : ''} ORDER BY workspace`,
   ).bind(release.version, quiet, ...(cursor ? [after] : [])).all()).results.map((r) => r.workspace);
   const hooks = deviceHooks(env);
   let left = budget - 1;
@@ -118,7 +120,7 @@ export async function ringUpdates(env, now, appBundle, { budget = RING_SUBREQUES
     try {
       // Most recently seen first: a PC that is gone for good is last and never crowds out one that answers.
       const { results } = await env.DB.prepare(
-        `SELECT id, workspace, status, app_version FROM devices WHERE workspace = ? AND status = 'active' AND app_version <> '' AND app_version <> ?
+        `SELECT id, workspace, status, app_version FROM devices WHERE workspace = ? AND status = 'active' AND app_version <> '' AND app_version <> ? AND os NOT LIKE 'macOS %'
            AND COALESCE(last_seen, paired_at) < ? ORDER BY COALESCE(last_seen, paired_at) DESC, id LIMIT ?`,
       ).bind(workspace, release.version, quiet, RING_CANDIDATES).all();
       const due = [];

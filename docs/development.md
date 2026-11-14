@@ -369,6 +369,40 @@ release signed long before its deploy would skip them.
    `app_version`) and end the sessions on a PC below 1.0.0 if the team's rules
    matter for them, or let them end on their own.
 
+   **A Mac release** has its own note, signed by the same key and the same
+   offline step, but it is not part of the Windows deploy. Build the package
+   `Support-<version>.pkg` (the macOS job). The Mac has its own version line, starting
+   at 1.1.0 and unrelated to the relay's `VERSION`. Attach it to the GitHub release
+   `v<version>`, then sign it:
+
+   ```sh
+   wl-paste | node scripts/sign-release.mjs --product mac --version <version> --file Support-<version>.pkg \
+     --url https://github.com/<owner>/<repo>/releases/download/v<version>/Support-<version>.pkg \
+     --out release-files-mac
+   wl-copy --clear
+   ```
+
+   It checks that the file is a macOS installer package named for `--version` and
+   that the URL is the GitHub release URL of that version, builds the six-line note
+   (`support-mcp-mac-release 1`, version, SHA-256, size, released, url), signs it
+   and checks the signature against `release-key.pub`. It prints
+   `MAC_RELEASE_NOTE=<the note in base64>`, `MAC_RELEASE_SIGNATURE=<signature>` and
+   the note, and `--out` writes the package, the note and the signature. Set both
+   as Worker secrets (each `secret put` deploys a new version of the Worker):
+
+   ```sh
+   npx wrangler secret put MAC_RELEASE_NOTE        # paste the base64 value
+   npx wrangler secret put MAC_RELEASE_SIGNATURE   # paste the signature
+   ```
+
+   They are secrets and are not in `wrangler.toml`: an empty `[vars]` entry is
+   reset on every deploy, so a Windows-only deploy would drop a Mac release that
+   lived there. A secret stays until it is changed. With either one missing or
+   malformed the relay offers no Mac update and `/install` has no Mac section.
+   A Mac release is offered by the same rules and stages as the Windows one, from
+   its own `released` time; `ringUpdates` never rings a Mac, so a Mac takes the
+   update at its next check-in.
+
 `UPDATE_ROLLOUT` controls who is offered the release: empty follows the stages,
 `pause` (or `0`) offers nothing at once, also in the 426 answer, and a whole
 number 0 to 100 pins that share of PCs. Set it with `--var

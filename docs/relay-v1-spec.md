@@ -596,6 +596,15 @@ app bundle the answer is 404.
   filename="support-setup.exe"`, `Cache-Control: no-store`: the compiled app
   followed by the device footer.
 
+When a Mac release is set (see [Updates for a Mac](#updates-for-a-mac)), `GET
+/install` also has an "On a Mac" section, in English and Hebrew: a plain link,
+"Download Support for Mac", to the `url` of the Mac note, and a line telling the
+owner to open Support and paste this page's address. The link is HTML-escaped into
+the page. The page has no new form and no new route. Without a Mac release the
+page is exactly as above. A relay with a Mac release and no Windows app bundle
+still answers the `GET` with 200 and only the Mac section (no Windows text and no
+form), and a `POST` is 404 as before. A relay with neither answers 404.
+
 A saved PC downloads an update from the same address, as the page's button
 does: `POST <origin>/install` with no query, the header `Origin: <origin>` and an
 empty body. It carries no key. It strips the footer and checks the exe's size and
@@ -815,6 +824,81 @@ the form above, the version is newer than its own and has not failed on this PC
 before, and the size is at most 2 MB. It then downloads the app from `/install`
 ([above](#the-install-page-install)), strips the footer, and checks the size and
 SHA-256 against the note before it keeps a byte.
+
+### Updates for a Mac
+
+A Mac is a PC whose `os` text starts with `macOS ` (the Mac app always reports
+`macOS <ProductVersion> (<BuildVersion>)`, for example `macOS 26.1 (25B78)`; Windows
+reports its registry product name, which never starts that way). The relay uses the
+request's `os`, else the stored one, as it does for `app_version`: a check-in's
+answer is chosen by the `os` it reports, and a 426 has no stored row, so it uses the
+request's `os` alone, checked as a check-in checks it (text, at most 100 characters,
+no control characters; none or a bad one means not a Mac). Only the PC can set `os`.
+There is no new field and no column.
+
+A Mac has its own release. Its note is exactly six lines, UTF-8, each ending in LF,
+printable ASCII, at most 1024 bytes:
+
+```text
+support-mcp-mac-release 1
+version 1.2.0
+sha256 <64 lowercase hex: SHA-256 of the .pkg>
+size <decimal bytes, at most 41943040>
+released <unix seconds>
+url https://github.com/<owner>/<repo>/releases/download/v1.2.0/Support-1.2.0.pkg
+```
+
+The `url` is `https://github.com/` and a path with no `?`, `#`, space or `..` part,
+at most 300 characters. The header differs from the Windows note's and the technician
+app's, so no note passes as another product's, and the signature (the same key, ECDSA
+P-256 over SHA-256, 64 bytes `r||s` in base64) covers the header. The relay holds no
+Mac bytes, so the note names where the package is.
+
+The Mac has its own version line, starting at 1.1.0, unrelated to the relay's `VERSION`: the relay compares a Mac's `app_version` with the
+Mac note's version and never with `VERSION`.
+
+Two Worker secrets drive it. They are secrets, not `[vars]`, because an empty `[vars]`
+entry is reset on every deploy:
+
+| Secret | Holds |
+|---|---|
+| `MAC_RELEASE_NOTE` | the note, in standard base64 |
+| `MAC_RELEASE_SIGNATURE` | the note's signature, base64 of 64 bytes, from `scripts/sign-release.mjs --product mac` |
+
+Either one missing or malformed, or a note that does not parse, means no Mac release.
+The relay does not check the signature (the Mac does). `UPDATE_ROLLOUT` applies to a
+Mac as it does to Windows.
+
+The `update` object has the same shape as for Windows, `{"version","note","signature"}`,
+and is offered at a hello, and in a 426 for a body that reports a Mac `os`, under the
+same rules as [Updates](#updates): active, a valid version below the release, the
+prerelease rule, a group below the stage. For a Mac the release's own version and its
+note's `released` time are used (the group is the first 4 bytes of SHA-256 of
+`<Mac release version>:<workspace>:<device id>`, and the stages count from the Mac
+note's time). A Mac is never offered the Windows release, and a PC that is not a Mac is
+never offered the Mac one. A Windows PC's answer is byte for byte what it is without the
+Mac secrets. `ringUpdates` stays Windows-only: both of its queries leave out PCs whose
+`os` starts with `macOS `, and a Mac takes the update at its next check-in (6 hours with
+the doorbell up, 5 minutes without).
+
+### A Mac on the wire
+
+The Mac app speaks the same protocol 1 as the Windows one, over the same addresses, with no new required field.
+What differs:
+
+- `os` is always `macOS <ProductVersion> (<BuildVersion>)`, cut to 100 characters. The relay tells a Mac by it
+  ([Updates for a Mac](#updates-for-a-mac)) and shows it as the PC's system in `device_list` and the technician app.
+- Its session hello is `{"type":"hello","machine":"<ComputerName>","user":"<console user or empty>","ps":"",
+  "agent":"macos-app-1","version":"<app version>","elevated":<true when the service runs as root>,
+  "caps":["screen","lanes"(,"uia")(,"full")],"control":"full"|"normal"}`. `screen` and `lanes` are always there once the Mac
+  is set up, so the caps never change in a session (a new hello would fail the commands in flight). When no screen helper is
+  running or a permission is missing, the Mac answers the screen frame itself with an error that says what to allow in System
+  Settings. `uia` is added only when the Mac can answer `ui_tree` and `ui_act`, and `full` only when its control is `full`.
+- The relay forwards `block_input`, `send_sas` and the `control` frame (`request_full_control`) as it does to any app, and the
+  Mac refuses them: `block_input is not available on a Mac`, `send_sas is not available on a Mac`, and `full control is chosen
+  when Support is set up on this Mac`. The relay itself refuses `as:"system"` under limited control and any install path that
+  is not a Windows installer path.
+- The rules a Mac receives are its own platform's ([What a PC is told](#what-a-pc-is-told)).
 
 ## Sign-in (`/auth/*` and `/account`)
 
@@ -1594,8 +1678,9 @@ for the deployment's. `hours` is `null` (no business hours) or an object whose k
 (a day left out has none), each `["HH:MM","HH:MM"]` with the end after the start; the end may be
 `24:00`. An action value is `allow`, `approve`, `approve_in_hours` (approve inside business hours,
 allow outside), `outside_hours` (refuse inside business hours, allow outside) or `never`. The two lists
-hold at most 50 entries each; a program is 1 to 100 characters, a folder an absolute local path
-(`C:\...`, no `<>"|?*`, no `.` or `..` part) of at most 260. Entries are trimmed, free of control
+hold at most 50 entries each; a program is 1 to 100 characters, a folder an absolute local path of at most 260:
+a Windows one (`C:\...`, no `<>"|?*`, no `.` or `..` part, not a whole drive) or a Mac one (one leading `/`, not the `//`
+of a network path, no `.` or `..` part, not `/` itself; `<>"|?*` are legal in a Mac name). Entries are trimmed, free of control
 characters, and de-duplicated ignoring case. A team's document is whole: a field left out takes its
 default. An hour rule needs `hours`, else 400. Defaults, for a team with no row and for the PC before its
 first answer: `restart`, `shutdown`, `install` and `uninstall` are `approve`, `close_program` is
@@ -1678,7 +1763,11 @@ its site, the team's row and the customer's row):
 | `hours_until` | the end of that 8-day horizon, Unix seconds. Past it every moment counts as business hours |
 | `server_time` | the relay's clock, Unix seconds |
 
-A waiting PC gets none of them. The relay turns hours into UTC spans (across daylight saving changes: a time the clock
+A waiting PC gets none of them. `protected_folders` is cut to the PC's platform before the tag is made: a Mac (stored
+`os` starting with `macOS `) gets only the entries that start with `/`, and every other PC only the rest, so a Mac folder
+never protects the same-looking path on Windows and the reverse. The check-in and the Session's read of the rules both
+use this, so a PC's `rules_tag` is the tag its Session decides with. A Windows PC in a team with no Mac folders gets
+byte for byte the rules and tag it got before. The relay turns hours into UTC spans (across daylight saving changes: a time the clock
 never shows lands just after the gap, a time it shows twice is the first), so the PC needs no time zone data.
 `session_status` of a saved-PC session adds `approval` (below), and `rules` (the effective document) when asked by the
 `session_status` tool.
@@ -1712,6 +1801,14 @@ The relay compares paths as written. The PC also expands short names and follows
 
 A protected folder must be a folder: a whole drive (`C:\`, `d:/`) is refused when the rules are saved (400 `bad_request`, `not a whole drive`),
 since it would refuse every file and installer of the PC.
+
+A Mac's paths begin with `/` (one slash, not `//`) and are judged by the same order. Under `decide`, such a path is inside a folder
+by the same whole-component rule, ignoring case, with `.` and `..` resolved from the root (a `..` may take away the first
+component, since a POSIX path has no drive), and a drive-letter path is never inside a Mac folder, nor the reverse. A path inside
+`/Applications/Support.app` or `/Library/Application Support/SupportMCP` is `protected_folder` whatever the lists say, as the Windows
+app's own folder is. `/` itself is refused as a protected folder (`not the whole disk`). The Mac cases are the `decide_posix` array of
+`test/fixtures/rules-cases.json`: the relay runs them in `test/rules.test.js`, and the Windows app's `decide` and `installers`
+arrays are unchanged and are the only ones it reads. Which folders reach which PC is in [What a PC is told](#what-a-pc-is-told).
 
 `install_program` runs installers, never another tool by another name. Before anyone is asked, on the relay and again on the PC
 (`installerProblem`, `installArgsProblem`, the shared `installers` cases of `rules-cases.json`): `path` must be a local absolute

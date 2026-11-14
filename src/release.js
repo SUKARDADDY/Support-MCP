@@ -19,6 +19,10 @@
 // Which PCs are offered it is derived, not stored: each PC has a group (0 to 99)
 // per release, and the stage (10, 50, then 100) counts from the signed date.
 // UPDATE_ROLLOUT pauses the rollout or pins a percentage.
+//
+// A Mac has its own release: a six-line note under its own header, signed by the same key, that
+// comes from two Worker secrets (MAC_RELEASE_NOTE, MAC_RELEASE_SIGNATURE) and names the package's
+// GitHub URL, since the relay holds no Mac bytes. Which one a PC is offered follows its os text.
 import { VERSION, VERSION_PATTERN } from './version.js';
 import { bytesToHex } from './crypto.js';
 
@@ -27,6 +31,11 @@ export const NOTE_HEADER = 'support-mcp-release 1';
 // product never passes as a note for the other: each checks its own header, and the signature
 // covers it.
 export const TECHNICIAN_NOTE_HEADER = 'support-mcp-technician-release 1';
+// The Mac app's note: six lines under their own header, so a Windows note never passes as a Mac note.
+export const MAC_NOTE_HEADER = 'support-mcp-mac-release 1';
+const MAC_SIZE_MAX = 41943040;
+const MAC_NOTE_MAX = 1024;
+const MAC_URL = /^https:\/\/github\.com\/[\x21-\x7e]*$/;
 const HEX64 = /^[0-9a-f]{64}$/;
 const DECIMAL = /^[1-9][0-9]{0,15}$/;
 const SIGNATURE = /^[A-Za-z0-9+/]{86}==$/; // 64 bytes in standard base64
@@ -60,6 +69,31 @@ export function parseNote(text, header = NOTE_HEADER) {
 // The technician app's note: the same five lines under TECHNICIAN_NOTE_HEADER.
 export const buildTechnicianNote = (values) => buildNote(values, TECHNICIAN_NOTE_HEADER);
 export const parseTechnicianNote = (text) => parseNote(text, TECHNICIAN_NOTE_HEADER);
+
+// Whether a PC's os text says it is a Mac. The Mac app always reports "macOS <version> (<build>)", and
+// Windows reports its registry product name, which never starts that way.
+export const isMacOs = (os) => typeof os === 'string' && /^macOS /.test(os);
+
+// The Mac note's values, or null for anything but the exact six lines: the Windows note's four values and
+// a package url, which is https://github.com/ and a path with no ?, #, space or .. part, at most 300 characters.
+export function parseMacNote(text) {
+  if (typeof text !== 'string' || text.length > MAC_NOTE_MAX || !text.endsWith('\n') || /[^\x20-\x7e\n]/.test(text)) return null;
+  const lines = text.slice(0, -1).split('\n');
+  if (lines.length !== 6 || lines[0] !== MAC_NOTE_HEADER) return null;
+  const value = (line, name) => (line.startsWith(`${name} `) ? line.slice(name.length + 1) : null);
+  const version = value(lines[1], 'version'), sha256 = value(lines[2], 'sha256'), size = value(lines[3], 'size'), released = value(lines[4], 'released'), url = value(lines[5], 'url');
+  if (!validVersion(version) || !HEX64.test(sha256 ?? '') || !DECIMAL.test(size ?? '') || !DECIMAL.test(released ?? '')) return null;
+  if (typeof url !== 'string' || url.length > 300 || !MAC_URL.test(url) || /[?#\s]/.test(url) || url.split('/').includes('..')) return null;
+  const out = { version, sha256, size: Number(size), released: Number(released), url };
+  return Number.isSafeInteger(out.size) && out.size <= MAC_SIZE_MAX && Number.isSafeInteger(out.released) ? out : null;
+}
+
+// The note's exact text for a Mac package. Throws on a value that parseMacNote would refuse.
+export function buildMacNote({ version, sha256, size, released, url }) {
+  const note = `${buildNote({ version, sha256, size, released }, MAC_NOTE_HEADER)}url ${url}\n`;
+  if (!parseMacNote(note)) throw new Error('bad Mac note');
+  return note;
+}
 
 // SemVer precedence of two valid versions, build metadata ignored: -1, 0 or 1.
 // Throws on a version that is not valid.
@@ -161,9 +195,29 @@ export async function releaseFrom(bundle, env, version = VERSION) {
   }
 }
 
+// The Mac release, { version, note, signature, signedAt, url }, or null: MAC_RELEASE_NOTE is the note in
+// standard base64, MAC_RELEASE_SIGNATURE its 64-byte signature in base64, and the note has to parse.
+// The relay never checks the signature (the Mac does, as the PC does for the Windows release).
+export function macReleaseFrom(env) {
+  const signature = typeof env?.MAC_RELEASE_SIGNATURE === 'string' ? env.MAC_RELEASE_SIGNATURE.trim() : '';
+  const encoded = typeof env?.MAC_RELEASE_NOTE === 'string' ? env.MAC_RELEASE_NOTE.trim() : '';
+  if (!SIGNATURE.test(signature) || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded) || encoded.length % 4 !== 0 || encoded.length > 2048) return null;
+  let note;
+  try {
+    note = new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0)));
+  } catch (_) {
+    return null;
+  }
+  const values = parseMacNote(note);
+  return values ? { version: values.version, note, signature, signedAt: values.released, url: values.url } : null;
+}
+
 // The update object of an answer: what the PC checks, and the version for people reading the wire.
 export const updateField = (release) => ({ version: release.version, note: release.note, signature: release.signature });
 
+// `version` is the release the caller expects: the Windows release is this relay's own VERSION (the default,
+// so a release of another version is never offered as one); the Mac release has its own, so a Mac caller
+// passes the release's version. The signed time that sets the stages always comes from the release object.
 // Whether a release reaches a PC that is cut off by protocol (the 426 answer):
 // whenever one exists and the rollout is not paused or 0. Such a PC can do
 // nothing else, so there is no group check. A prerelease needs a pinned rollout.

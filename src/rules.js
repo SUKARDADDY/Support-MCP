@@ -171,8 +171,16 @@ function parseList(v, field, { max, check }) {
 }
 
 const FOLDER_RE = /^[A-Za-z]:[\\/]/;
+// An absolute POSIX path (a Mac's): one leading /, not the // of a network path.
+const isPosixPath = (text) => /^\/(?!\/)/.test(text);
 function checkFolder(text) {
-  if (!FOLDER_RE.test(text)) throw bad('protected_folders entries must be absolute local paths such as C:\\Data');
+  if (isPosixPath(text)) {
+    // A Mac folder: / is the only separator, and < > " | ? * are legal in a name. Never the whole disk.
+    if (text.split('/').some((part) => part === '.' || part === '..')) throw bad('protected_folders entries must not contain . or .. parts');
+    if (pathParts(text).length < 1) throw bad('protected_folders entries must be a folder, not the whole disk; name the folder to protect, such as /Users/ariel/Customer Data');
+    return;
+  }
+  if (!FOLDER_RE.test(text)) throw bad('protected_folders entries must be absolute local paths such as C:\\Data or /Users/ariel/Documents');
   if (/[<>"|?*]/.test(text)) throw bad('protected_folders entries must not contain < > " | ? *');
   if (text.split(/[\\/]/).some((part) => part === '.' || part === '..')) throw bad('protected_folders entries must not contain . or .. parts');
   // A whole drive would refuse every file, installer and program of the PC, and nothing could be done with it.
@@ -318,8 +326,10 @@ const processKey = (name) => {
 
 // A path as lower-case components: / the same as \, repeated and trailing separators dropped, . and ..
 // resolved (never above the drive), the \\?\ prefix dropped, and the trailing dots and spaces Windows
-// drops from a name dropped here too. Short names (PROGRA~1) and links stay as written.
+// drops from a name dropped here too. Short names (PROGRA~1) and links stay as written. A Mac path has
+// its own rules (posixParts).
 function pathParts(path) {
+  if (isPosixPath(String(path).trim())) return posixParts(path);
   const parts = [];
   for (const raw of String(path).replace(/^\\\\\?\\/, '').split(/[\\/]+/)) {
     if (raw === '' || raw === '.') continue;
@@ -329,6 +339,23 @@ function pathParts(path) {
     }
     const name = raw.replace(/[. ]+$/, '').toLowerCase();
     if (name) parts.push(name);
+  }
+  return parts;
+}
+
+// A Mac path as components. Only / separates: a backslash, a trailing dot or a trailing space is part of a
+// Mac name, so "..\\x" and "x." are names, never a step up or another spelling of "x". There is no drive, so
+// .. may take away the first component. Names are compared in NFC and lower case, as the Mac's usual
+// case-insensitive disk does, so a decomposed or upper-case spelling of a protected folder still matches.
+function posixParts(path) {
+  const parts = [];
+  for (const raw of String(path).trim().split('/')) {
+    if (raw === '' || raw === '.') continue;
+    if (raw === '..') {
+      parts.pop();
+      continue;
+    }
+    parts.push(raw.normalize('NFC').toLowerCase());
   }
   return parts;
 }
@@ -350,6 +377,10 @@ const APP_PROGRAM = /^support(?:-.+-[0-9a-f]{8})?$/;
 export const isAppProgram = (name) => APP_PROGRAM.test(processKey(name));
 export function isAppPath(path) {
   const p = pathParts(path);
+  // The Mac app and its data folder, from the root (a POSIX path has no drive part).
+  if (isPosixPath(String(path).trim())) {
+    return (p[0] === 'applications' && p[1] === 'support.app') || (p[0] === 'library' && p[1] === 'application support' && p[2] === 'supportmcp');
+  }
   return p.length >= 3 && p[1].startsWith('program files') && (p[2] === 'supportmcp' || p[2].startsWith('supportmcp-'));
 }
 // The registry key of the Support app in the list of installed programs (list_programs ids are 64:<key> or 32:<key>).

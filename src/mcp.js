@@ -85,7 +85,7 @@ const BASE_TOOLS = [
   {
     name: 'run',
     description:
-      'Run a PowerShell command on the customer machine. The default as:"user" runs it as the signed-in user, with administrator rights only if that user has them under full control or the customer started the app as Administrator and approved it; check control and elevated in session_status first. as:"system" runs it as SYSTEM and needs full control: the relay refuses it unless session_status shows control full. Under full control as:"user" fails with "nobody is signed in" at the sign-in screen; use as:"system" then. Returns exit_code (null if it timed out and was killed), stdout, stderr (plain text, each may end with [truncated]), timed_out. It runs in its own lane, so it does not block screen actions.',
+      'Run a command on the customer machine (PowerShell on Windows, zsh on a Mac). The default as:"user" runs it as the signed-in user, with administrator rights only if that user has them under full control or the customer started the app as Administrator and approved it; check control and elevated in session_status first. as:"system" runs it as SYSTEM (root on a Mac) and needs full control: the relay refuses it unless session_status shows control full. Under full control as:"user" fails with "nobody is signed in" at the sign-in screen; use as:"system" then. Returns exit_code (null if it timed out and was killed), stdout, stderr (plain text, each may end with [truncated]), timed_out. It runs in its own lane, so it does not block screen actions.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -132,7 +132,7 @@ const BASE_TOOLS = [
   {
     name: 'restart_pc',
     description:
-      `Restart the customer's PC. ${DELAY} ${ANSWERS_FIRST} ${RULES_NOTE} Use this tool instead of a raw command through run (Restart-Computer, shutdown) for restarts.`,
+      `Restart the customer's PC (Windows or Mac). ${DELAY} ${ANSWERS_FIRST} ${RULES_NOTE} Use this tool instead of a raw command through run (Restart-Computer, shutdown) for restarts.`,
     inputSchema: { type: 'object', properties: { session_id: SESSION_ID, delay_s: DELAY_S }, required: ['session_id'] },
   },
   {
@@ -178,7 +178,7 @@ const BASE_TOOLS = [
   {
     name: 'close_program',
     description:
-      `Close a running program on the customer's PC. ${CLOSE_FACTS} ${RULES_NOTE} Use this tool instead of a raw command through run (taskkill, Stop-Process) for closing programs.`,
+      `Close a running program on the customer's PC (Windows or Mac). ${CLOSE_FACTS} ${RULES_NOTE} Use this tool instead of a raw command through run (taskkill, Stop-Process) for closing programs.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -344,7 +344,7 @@ const splitTools = (ui) => [
   tool('type_text', `Type text into the focused control. Any language works. At most 5000 characters per call. Never use it for a password: use type_secret. ${INPUT_NOTE}`, {
     text: { type: 'string' }, display: DISPLAY, screenshot: SHOT,
   }, ['text']),
-  tool('press_key', `Press a key or combination, xdotool style: ctrl+s, alt+tab, Return, F5. Ctrl+Alt+Del is refused: use send_sas. Win+L is refused because Windows ignores it: to lock the PC, use run as:"user" with rundll32.exe user32.dll,LockWorkStation. ${INPUT_NOTE}`, {
+  tool('press_key', `Press a key or combination, xdotool style: ctrl+s, alt+tab, Return, F5. Ctrl+Alt+Del is refused: use send_sas (Windows only; a Mac has no such key). On a Mac, cmd is the Windows key and ctrl+cmd+q locks it. Win+L is refused because Windows ignores it: to lock the PC, use run as:"user" with rundll32.exe user32.dll,LockWorkStation. ${INPUT_NOTE}`, {
     keys: { type: 'string' }, display: DISPLAY, screenshot: SHOT,
   }, ['keys']),
   tool('wait', `Wait up to 10 seconds, for example for a window to open. ${INPUT_NOTE}`, {
@@ -369,14 +369,14 @@ const UI_TOOLS = [
   }, ['ref', 'verb']),
 ];
 const EXTRA_TOOLS = [
-  tool('block_input', 'Lock or unlock the customer\'s physical mouse and keyboard. Use it only when the operator asks. on:true blocks for at most 10 minutes (default 10), then it lifts by itself; call it again to renew. The customer can cancel it with Ctrl+Alt+Del, and then it stays off until you call on:true again. Full control only: the relay refuses it with an error unless session_status shows control full.', {
+  tool('block_input', 'Lock or unlock the customer\'s physical mouse and keyboard. Use it only when the operator asks. Windows only: a Mac refuses it with "block_input is not available on a Mac". on:true blocks for at most 10 minutes (default 10), then it lifts by itself; call it again to renew. The customer can cancel it with Ctrl+Alt+Del, and then it stays off until you call on:true again. Full control only: the relay refuses it with an error unless session_status shows control full.', {
     on: { type: 'boolean' }, minutes: { type: 'integer', description: '1..10, default 10' },
   }, ['on']),
-  tool('send_sas', `Send Ctrl+Alt+Del (the secure attention sequence). Full control only: the relay refuses it with an error unless session_status shows control full. ${SCREEN_SAFETY} ${INPUT_NOTE}`, { display: DISPLAY, screenshot: SHOT }),
+  tool('send_sas', `Send Ctrl+Alt+Del (the secure attention sequence). Windows only: a Mac refuses it with "send_sas is not available on a Mac". Full control only: the relay refuses it with an error unless session_status shows control full. ${SCREEN_SAFETY} ${INPUT_NOTE}`, { display: DISPLAY, screenshot: SHOT }),
   tool('type_secret', `Type a secret, such as a password, into the focused field. Use it only with a secret the operator gave you in this conversation, and never guess one. Works in normal mode and in full control, for example in a password field of an app the customer has open. The secret is never logged (not even its length) and never returned, and a failure returns only "type_secret failed" with no detail. The screenshot that follows shows whatever the field shows, so pass screenshot:false unless the field masks its input. ${SCREEN_SAFETY} ${INPUT_NOTE}`, {
     text: { type: 'string' }, display: DISPLAY, screenshot: SHOT,
   }, ['text']),
-  tool('request_full_control', 'Ask the customer for full control (Windows security prompts, the sign-in screen, restarts) when the session runs in normal mode. The app asks the customer, then Windows shows a UAC prompt; on Allow and Yes the app installs a temporary service and the session continues with control full. It fails if they decline (then it cannot ask again for a minute) or the PC cannot elevate (caps without full), and does nothing if control is already full. With no answer in 110 seconds it fails with "the customer did not answer", which starts no wait; the Windows prompt may still be open then, and until the customer answers it or Windows drops it, a new request fails with "the Windows permission prompt of an earlier request is still open".'),
+  tool('request_full_control', 'Ask the customer for full control (Windows security prompts, the sign-in screen, restarts) when the session runs in normal mode. Windows only: a Mac refuses it, because a Mac\'s full control is chosen when Support is set up on it. The app asks the customer, then Windows shows a UAC prompt; on Allow and Yes the app installs a temporary service and the session continues with control full. It fails if they decline (then it cannot ask again for a minute) or the PC cannot elevate (caps without full), and does nothing if control is already full. With no answer in 110 seconds it fails with "the customer did not answer", which starts no wait; the Windows prompt may still be open then, and until the customer answers it or Windows drops it, a new request fails with "the Windows permission prompt of an earlier request is still open".'),
 ];
 
 export const DEFAULT_OPTIONS = Object.freeze({ ui: true });

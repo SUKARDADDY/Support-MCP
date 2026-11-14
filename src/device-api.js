@@ -29,9 +29,9 @@
 // carries no data either way, so it needs no body and no protocol field in one.
 import { readTextCapped } from './body.js';
 import { TeamError } from './workspace.js';
-import { devicesFromEnv, parseDeviceKey } from './devices.js';
+import { devicesFromEnv, parseDeviceKey, reportedOs } from './devices.js';
 import { registryName } from './registry.js';
-import { offerAtCheckIn, offerOnRefusal, releaseFrom, updateField } from './release.js';
+import { isMacOs, macReleaseFrom, offerAtCheckIn, offerOnRefusal, releaseFrom, updateField } from './release.js';
 
 export const PROTOCOL = 1;
 const SUPPORTED = Object.freeze({ min: 1, max: 1 });
@@ -50,6 +50,17 @@ function keyOf(request) {
   return key;
 }
 
+// The release for a PC by its os: a Mac gets the Mac release and every other PC the Windows one, never the
+// other's. `version` is what offerAtCheckIn and offerOnRefusal expect of it: the relay's own VERSION for
+// Windows (their default), the Mac note's own version for a Mac.
+async function releaseFor(os, appBundle, env) {
+  if (isMacOs(os)) {
+    const release = macReleaseFrom(env);
+    return { release, version: release?.version };
+  }
+  return { release: await releaseFrom(appBundle, env), version: undefined };
+}
+
 // What each address does, given the store, the body, the request and
 // { env, appBundle }. Each returns [status, answer].
 const ROUTES = Object.freeze({
@@ -64,9 +75,9 @@ const ROUTES = Object.freeze({
     return [202, await devs.requestJoin(body)];
   },
   async hello(devs, body, request, { env, appBundle }) {
-    const { device, app_version, session, rules } = await devs.checkInFull(keyOf(request), body);
-    const release = await releaseFrom(appBundle, env);
-    const offered = release && await offerAtCheckIn(release, { ...device, app_version }, env?.UPDATE_ROLLOUT);
+    const { device, app_version, os, session, rules } = await devs.checkInFull(keyOf(request), body);
+    const { release, version } = await releaseFor(os, appBundle, env);
+    const offered = release && await offerAtCheckIn(release, { ...device, app_version }, env?.UPDATE_ROLLOUT, Date.now(), version);
     // While the relay is stopped by its operator a PC is told of no session (it would only be ended on arrival).
     const stopped = String(env?.EMERGENCY_STOP ?? '') !== '';
     return [200, {
@@ -134,8 +145,9 @@ export async function handleDevice(request, env, url, { isLoopback, isJsonConten
   if (body.protocol < SUPPORTED.min || body.protocol > SUPPORTED.max) {
     // A PC cut off by protocol can do nothing else, so it gets the release whenever there is one and the rollout
     // is not paused, without a group check or a key.
-    const release = await releaseFrom(appBundle, env);
-    const update = offerOnRefusal(release, env?.UPDATE_ROLLOUT) ? { update: updateField(release) } : {};
+    // No row is loaded here, so the body's own os is all there is to tell a Mac by.
+    const { release, version } = await releaseFor(reportedOs(body), appBundle, env);
+    const update = offerOnRefusal(release, env?.UPDATE_ROLLOUT, version) ? { update: updateField(release) } : {};
     return reply({ error: { code: 'protocol_unsupported', message: `this relay speaks protocol ${SUPPORTED.min} to ${SUPPORTED.max}` }, supported: SUPPORTED, ...update }, 426);
   }
   try {
