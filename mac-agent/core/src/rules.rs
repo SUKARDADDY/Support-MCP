@@ -408,16 +408,17 @@ pub fn process_key(name: &str) -> String {
     program_key(&t[t.rfind(['\\', '/']).map_or(0, |i| i + 1)..])
 }
 
-fn is_posix(text: &str) -> bool {
-    let mut chars = text.chars();
-    chars.next() == Some('/') && chars.next() != Some('/')
+/// Whether a path is compared as a Mac path: any that starts with /, // and /// included, since a Mac reads them as /
+/// (the relay's isMacPath).
+fn is_mac_path(text: &str) -> bool {
+    text.starts_with('/')
 }
 
 /// A path as lower-case components: / the same as \, repeated and trailing separators dropped, . and .. resolved
 /// (never above the drive), the \\?\ prefix dropped, and the trailing dots and spaces Windows drops dropped too.
 /// Links stay as written. A Mac path has its own rules (posix_parts).
 pub fn path_parts(path: &str) -> Vec<String> {
-    if is_posix(path.trim()) {
+    if is_mac_path(path.trim()) {
         return posix_parts(path);
     }
     let mut parts: Vec<String> = Vec::new();
@@ -484,7 +485,7 @@ pub fn is_app_program(name: &str) -> bool {
 
 pub fn is_app_path(path: &str) -> bool {
     let p = path_parts(path);
-    if is_posix(path.trim()) {
+    if is_mac_path(path.trim()) {
         // The Mac app and its data folder, from the root.
         return (p.first().map(String::as_str) == Some("applications") && p.get(1).map(String::as_str) == Some("support.app"))
             || (p.first().map(String::as_str) == Some("library")
