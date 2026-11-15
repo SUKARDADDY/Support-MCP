@@ -561,28 +561,47 @@ pub fn decide(r: &RulesDoc, hours: &Hours, now_s: i64, control: &str, a: &Action
 
 // ---- real paths ---------------------------------------------------------------------------------------------------------
 
-/// The path with its deepest existing folder resolved through links; the part below it, which does not exist yet,
-/// stays as written. A path that is not absolute is returned as it is.
+/// The path with its deepest existing part resolved through links, whatever that part is: a folder, a file, or a link to
+/// either. The part below it, which does not exist yet, stays as written. A last link whose target does not exist yet (a
+/// put_file through it would create that target) is followed by hand, so it resolves to where the file would land. A path
+/// that is not absolute is returned as it is.
 pub fn resolve(path: &str) -> String {
     if !path.starts_with('/') {
         return path.to_string();
     }
-    let mut dir = PathBuf::from(path);
+    resolve_from(PathBuf::from(path), 0).to_string_lossy().into_owned()
+}
+
+fn resolve_from(path: PathBuf, depth: u32) -> PathBuf {
+    let mut here = path.clone();
     let mut rest: Vec<std::ffi::OsString> = Vec::new();
-    while !dir.is_dir() {
-        match (dir.file_name().map(|n| n.to_os_string()), dir.parent().map(Path::to_path_buf)) {
+    while std::fs::symlink_metadata(&here).is_err() {
+        match (here.file_name().map(|n| n.to_os_string()), here.parent().map(Path::to_path_buf)) {
             (Some(name), Some(parent)) => {
                 rest.push(name);
-                dir = parent;
+                here = parent;
             }
-            _ => return path.to_string(),
+            _ => return path,
         }
     }
-    let mut real = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let mut real = match std::fs::canonicalize(&here) {
+        Ok(real) => real,
+        // A link whose target is missing: follow it by hand, at most 40 deep as the kernel does.
+        Err(_) => match std::fs::read_link(&here) {
+            Ok(target) if depth < 40 => {
+                let mut next = if target.is_absolute() { target } else { here.parent().unwrap_or(Path::new("/")).join(target) };
+                for name in rest.iter().rev() {
+                    next.push(name);
+                }
+                return resolve_from(next, depth + 1);
+            }
+            _ => here,
+        },
+    };
     for name in rest.iter().rev() {
         real.push(name);
     }
-    real.to_string_lossy().into_owned()
+    real
 }
 
 /// Whether `path` is inside any of `folders`, as written or with its links resolved, on either side. The relay
@@ -1210,6 +1229,39 @@ mod tests {
         assert!(!inside_any(&[], "/anything"));
         assert_eq!(resolve("relative/path"), "relative/path");
         assert_eq!(resolve(&link.to_string_lossy()), protected.to_string_lossy());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_link_to_a_file_in_a_protected_folder_is_caught_whether_or_not_the_file_exists() {
+        let dir = temp("file-links");
+        let protected = dir.join("Customer Data");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::create_dir_all(dir.join("open")).unwrap();
+        std::fs::write(protected.join("secret.txt"), "SECRET").unwrap();
+        let folders = vec![protected.to_string_lossy().into_owned()];
+        // A link to a file that exists: get_file would read it, put_file would overwrite it.
+        let to_file = dir.join("open/link.txt");
+        std::os::unix::fs::symlink(protected.join("secret.txt"), &to_file).unwrap();
+        assert!(inside_any(&folders, &to_file.to_string_lossy()));
+        // A link to a file that does not exist yet: put_file through it would create it in the protected folder.
+        let dangling = dir.join("open/new.txt");
+        std::os::unix::fs::symlink(protected.join("new.txt"), &dangling).unwrap();
+        assert!(inside_any(&folders, &dangling.to_string_lossy()));
+        // A relative link, and a chain of two.
+        let relative = dir.join("open/rel.txt");
+        std::os::unix::fs::symlink("../Customer Data/secret.txt", &relative).unwrap();
+        assert!(inside_any(&folders, &relative.to_string_lossy()));
+        let chain = dir.join("open/chain.txt");
+        std::os::unix::fs::symlink(&dangling, &chain).unwrap();
+        assert!(inside_any(&folders, &chain.to_string_lossy()));
+        // A plain file outside, and a link loop, stay outside.
+        std::fs::write(dir.join("open/plain.txt"), "x").unwrap();
+        assert!(!inside_any(&folders, &dir.join("open/plain.txt").to_string_lossy()));
+        let (a, b) = (dir.join("open/loop-a"), dir.join("open/loop-b"));
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        assert!(!inside_any(&folders, &a.to_string_lossy()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

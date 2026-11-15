@@ -1,124 +1,124 @@
 {
- "public_key_xy_b64": "divDIrIULOcM94TxACJB0Dq+fuBVScDYJMplkKgBYin98yxk11JZ7A8C1vfEepmEHEzjuLP79QtOiYdDQa1phA==",
+ "public_key_xy_b64": "o2Rh8rbhuWxaduBKpUiizMdQyVCl0OducNpgyTR9Yy4zkPZ7IyCylXpCh77EkDGUV8plXu8g21FtsvSI5y6Z9Q==",
  "notes": {
   "valid": {
    "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
-   "signature": "UlJVyXPyDbZuStyE5sP4FHqhckOHBgIwTniZSDXdS/SQvtcNN2HLbifO1hwjFbB87ym4GhAqAuIR7jurCdBxfQ==",
+   "signature": "R7SaH6YWQrj3mAnRHDYYqosBndgBjypJHo52uItlQI59eVI7UFiuB7i4lAu3jLL/sFI3iiC6lJXVFdB+5zq2lA==",
    "relay_accepts": true
   },
   "prerelease": {
    "note": "support-mcp-mac-release 1\nversion 2.0.0-rc.1\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v2.0.0-rc.1/Support-2.0.0-rc.1.pkg\n",
-   "signature": "eYanAck6ccQ6k1UscKp8AmoVtP2vCYMlVKgJPKvSqtdYOeG+K/qNIs5JgIBQpMr4T01bx5tA8xcH/Do5/m8q0g==",
+   "signature": "WA4KmxOYRFNlcf+P57FrFxmK20L1kH6l6c1fDm008HmhbBQnp8kBTMtOe+gxb1X7IDejxspOg4ROJ1C/VnPOyA==",
    "relay_accepts": true
   },
   "windows_header": {
    "note": "support-mcp-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
-   "signature": "Icmc+Ox46133d8zRrKbIOja1uCNONTIBTvyX+hRU5pMAFRMySC9nBKEPF39uK0HtXd5SVulHPVlE4lHIFFW5qw==",
+   "signature": "NcT0oCuxaj/eu7+PMc82gDpOYxj8LncdHgB4JWyFqUiFAtKB6I+syHtRhASywkNSggQtNXe3kXuBPKOMHoQRCQ==",
    "relay_accepts": false
   },
   "technician_header": {
    "note": "support-mcp-technician-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
-   "signature": "dnMdsoejGuz9nVPGXaRF4uY2lK0pwESe5lkJyxsxlEjt/KQ48LvfoBsu9wbcx1K64sBCaApY8jlRcW8LuRCTyQ==",
+   "signature": "lSB83CUInAV2gvTMvQnGGNQbAqjxNiPjuuaqOZ/rsI4f5Q/Sht5TGbexF7FmH6wVJ6A10NdbXDuDcxYiXu6q6w==",
    "relay_accepts": false
   },
   "five_lines": {
    "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\n",
-   "signature": "3URukko+2dgTdWf8XNpW9CgqwRLXEq7lPD/dYwLFNmjz/ZP4SME1TBqwo8m50ppqenUjfQrPYmrLZEi9RlJdAA==",
+   "signature": "wmh3xDnNxxbBWHcFjd+Ak63sNSNAsWIzT51bit6ppWwCS7qbbvVpU6A+Ox4bbqUf1+8pw5LS8wMEKH6GdMlyoQ==",
    "relay_accepts": false
   },
   "no_final_lf": {
    "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg",
-   "signature": "ftWJk59lWakU6d+fU8Y3YkZrzJcnpHli25soNFv4oOWpctCD0aldeOK5J3KJOxrN7U+uJZlcAKZHL07LLW/Juw==",
+   "signature": "cj18OLv7/iZADU/XqzcnUUxAFNNfFtCSJQuSlR2b9nU3fS4mY4awGtcdJ7HWYiRPMpemegI/S07SDvXkQJpRxQ==",
    "relay_accepts": false
   },
   "crlf": {
    "note": "support-mcp-mac-release 1\r\nversion 1.2.3\r\nsha256 abababababababababababababababababababababababababababababababab\r\nsize 12345678\r\nreleased 1794000000\r\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\r\n",
-   "signature": "aEFXXl+7H7irIzpXzoj6g7JZTA00VurtAepJWo6c6HVduk9RtNkHwPEWDeCOhYlgk5PTv5ATnfiAV7iYkq1K9Q==",
+   "signature": "jXOQpKi/jZeFSLoGaRskiMFO467lqoUrozGqfoaIL0mHMx6zNJWpfh7dRMl7+sJtpXSelSVkA6db90xnycFLbg==",
    "relay_accepts": false
   },
   "extra_line": {
    "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\nextra 1\n",
-   "signature": "1azzMLPzh6FX6hg8c3FA/tqa4qKK7/cnNdSUPoVQxMU4Q4j3ipRcoCzBxdr3+Pns4u/DP9nZl5+ClR6iOo9cBw==",
+   "signature": "PEk2+o/wmozWl3RLGy6FNF2t3tg5aSbZwIuwWupTI1jb5/EOH0owyL5uhX3Tn93LEjBsLjfoGAN1pK3zuDm1JQ==",
    "relay_accepts": false
   },
   "swapped_lines": {
    "note": "support-mcp-mac-release 1\nsha256 abababababababababababababababababababababababababababababababab\nversion 1.2.3\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
-   "signature": "996nf2dU708ToNL2+QyUGr07HCj87h4jw0+LPL1vytCTpebnn/BfV1GpZGRg7kPpm4CLs+BBytXhfSDy3pkSPw==",
+   "signature": "uyESfN5ZJfGM/cjZ/KJ1dpHu7C0IFMYtpjfe7SwhG89NkWtPmyzDznRELKHwlfbMdLzHv1ZwiDcUY+E2m5zVtA==",
    "relay_accepts": false
   },
   "uppercase_hex": {
    "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
-   "signature": "zM5k1gC9C8UxvBn+5ndG2Dq93wstZp8Z6YrheY6fEUp5AjCFVFwHRKpxvEoOlv1SJElNl9ngLW9DqKiOG8GIlA==",
+   "signature": "q3+o068ZcsV/QBsaU7Uxyr+6wbuk3H4unTMzflITaJZASf1eoFYTmhlTdgpJrKWR+U7MgcPz6v016SyWDDNhSw==",
    "relay_accepts": false
   },
   "leading_zero_size": {
    "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 012345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
-   "signature": "CbS6M4AMo+kwrw/oenKds0B9IKbpHVZ262I+dwMlQSe/DDhXHEGEPbwcfYM4FRXgggLpFLMyQ6oE4fB1PXO9Dg==",
+   "signature": "sFbcaBkoSz2AXgPGlZDc6hJceNsgTqLKHDfarQ02UXEcdlIW99SzStsntDsbL/m0vVeHvKQNdYYZafN6gH+ZRw==",
    "relay_accepts": false
   },
   "zero_size": {
    "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 0\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
-   "signature": "GcE+DejAZPJIf59aF7JXAC7/ccVL5f8HT23nUIzSiZwDp4optfMqal33jmLydvMSu1baoVBx6j5amUfC6bx41Q==",
+   "signature": "1D5N5mvcdjRMhGh3WuWsh4713cdKK2CfnJCnANRoRohzPGRrDtT5EJH2KsScfK7Lvh/5bEcCKJ7BrQc5xZ/3lw==",
    "relay_accepts": false
   },
   "size_over_40_mib": {
    "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 41943041\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
-   "signature": "iEShTt3F9b34RJ8HLsMtZy+TQa80PMG3wcQqQr8jDl/m3qekLL+mL8B7awnGVH/3IaHZuMYowuwAOmRMxazZTQ==",
+   "signature": "tXrAWoJY4mNaTWjTHg6dttLnj/KsXzup6nMvYwGGRaEUkj92XeLUdmH6i4cdAPolq3ERPqK2glDqsewCQ7fe4g==",
    "relay_accepts": false
   },
   "size_at_40_mib": {
    "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 41943040\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
-   "signature": "BapTcsThvSSS4ae4jzJhqZvO2afh0XoMdVnIyrVY3GEeJFfwBpr3sku4wfeEs02RXYacEtU9Yub/2e38X0qosQ==",
+   "signature": "q8kyhtJj8N9ub6CvCGoc6aRr013psVTfiD9LGMfe57+KOH0d1XrNuIx6z7vDDQg45K2q/40m/Gkex0W9/wW6rw==",
    "relay_accepts": true
   },
   "bad_version": {
    "note": "support-mcp-mac-release 1\nversion 1.2\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
-   "signature": "3I3qTKv5zQCaV0iHPaoSQHcAthZEQvu8PlGrLp5XaYLssRX1jwOc80rN/T1h5HMAm7+D5h5AnYwhsqXKFp8SRg==",
+   "signature": "yd31mkvyqUFVJAdKqR6Re11Gh7Zd1ArZpqQVAHKvnxwjPmnltjgJ+IUMILm8lW+akUaIYCDqicAltsqr/83cvA==",
    "relay_accepts": false
   },
   "url_http": {
    "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl http://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
-   "signature": "MR4NqqnNgCbgGV5AFRo/TZ7b5yaGrjpJBs06W9cmbaKaKo9HBejYbzIcWi7CMcieiTmPXDW0SgGNfxcM/Axi1Q==",
+   "signature": "yYvQnbq/ZMLd4fxwlfGwS4+4nC7qujh7diShVNxayExypKiWh32totQy7gZqlKp0J7GFuP629cw5hc5qF+zYwA==",
    "relay_accepts": false
   },
   "url_other_host": {
    "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://example.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
-   "signature": "B4rDikNB/vtNtnD3eum7JgVRJhHWIWgZgIDwXlR9oRAIHR7pgBQnNU4weUD3BsoBNmZi9qKoFyLwaqbcK2LhoA==",
+   "signature": "OEYmxmmwCDlWbSLOVbJTb6X5q0V1d1C3ltfruveL8sSB4wRfPRbKJGkeVOQfh94FeLcsvDa1itvKzlW6znVQog==",
    "relay_accepts": false
   },
   "url_query": {
    "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg?x=1\n",
-   "signature": "z6hA+y9WInEv6CXgW8s/xoVukbieUaq/wjWPezuGM06CG5NV4E625hFFAH3Q0ByxUj4hOzgpaAaH+AtLoHQ3FQ==",
+   "signature": "u8R9a0PkPhXS9/R13vjJ6VecT5jkmuo/bUjnudMJ0uJF969vgKl1YoibciAW8VoNttmXKjO/X4jST7p4u+lofg==",
    "relay_accepts": false
   },
   "url_fragment": {
    "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg#x\n",
-   "signature": "P6ztdJox7ulZ/6mZuzGvQh+rthvWzvA18uFyxtUEEP31EGB4DATO5dx2am1VKHUV2UQITyy3GmTRaBKGD6v5EQ==",
+   "signature": "tipsq/hMcVZ0vMwcVCxyIv3p0HFvFCOesNiOMJaKJB+YyeqIv+7LdOgT22huhcVhenCybEF3hGqKLZSP+SmZjg==",
    "relay_accepts": false
   },
   "url_dotdot": {
    "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/../releases/download/v1.2.3/Support-1.2.3.pkg\n",
-   "signature": "pn4pLSQIpSpF4EwNF/dCIQXNAdoVXpDUUTkxKxakHaRtgCUr33fsM6BU/3BHEYC28K17Kbsg0WaZyjYwe3AgDA==",
+   "signature": "vo3qSnNVEf9owP67JXNlHY3sHeKoWgH0SBRx92+CsxOi+zWeV+SR5cLWgX2SWuNzEmiU7/4J9nu0TPQ29Xpl7Q==",
    "relay_accepts": false
   },
   "url_space": {
    "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support 1.2.3.pkg\n",
-   "signature": "WFujkYBb017hcjaLYT/aIaMyJHjz1PxHZ7Dd2g0f8zZQr6Bnv3FQ/PrO3JtWnC6DozW4rCH7LQXw7LAFEQOhbg==",
+   "signature": "WjayKJhusFEEhFoGYkp+0wnNXvNmsEwt4sxNdbUFloCHADwo+i8NlO3yAXXFgOc1jXPC6QFwTBRrK3dMtT9wdQ==",
    "relay_accepts": false
   },
   "url_too_long": {
    "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pkg\n",
-   "signature": "Kpgs8cpganOWLsnGzkp8yP9WipDeFg7W04zIMc1ImyF5QTIxHtewpfS6/c+QmlI6NkX23mQIYfQHm7i9eFfqsw==",
+   "signature": "0B3hL9wmqhnUGznndw+ms3NdK3dq7X8UkP/iDlg/MX3Nc4kiLU9APcgemKGc3tcvUyCr3Ujg+tpdW3k+qDvWCA==",
    "relay_accepts": false
   },
   "non_ascii": {
    "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/SUKARDADDY/Suppört-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
-   "signature": "s6ao0z/bJjo7zCXuqIpI2cjPyyci5BAUGIgQm0xSbdx1BKIxsLUc8yDeizEKMSujD/UbGgFtZngJDjSwHQu86Q==",
+   "signature": "qSsD84Wa0JgvLMZi2kH7HQ6YiPZYuMIbowvC4hjpbLKID+QUNAa2B321CCNPAumEy96SLQ7YiGQ1Qf56YMv/sA==",
    "relay_accepts": false
   },
   "over_1024_bytes": {
    "note": "support-mcp-mac-release 1\nversion 1.2.3\nsha256 abababababababababababababababababababababababababababababababab\nsize 12345678\nreleased 1794000000\nurl https://github.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/https://github.com/SUKARDADDY/Support-MCP/releases/download/v1.2.3/Support-1.2.3.pkg\n",
-   "signature": "Ql2J8JIP+zbKKmueKKacZklqCDJReHTx0HupA/FD4BG7+87UGjPWRUp9MWEFQCS2IupVAjDd3qxZ5ycCvF2IsA==",
+   "signature": "iGY+wlWwto9mK7yWIruCZtVoCrXN1HHu+HDDE1DEq/xNECnZKYxsmTX9Bfw+utX7hAJcVR7cf0wyZ402in7Nvw==",
    "relay_accepts": false
   }
  },
@@ -1248,6 +1248,132 @@
     ]
    },
    "tag": "75b32b434b6ac763"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "approve",
+    "install": "allow",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": [
+     "/Data"
+    ]
+   },
+   "tag": "868ac8f71ce17e85"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "approve",
+    "install": "allow",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": [
+     "/Data/a\\..\\b"
+    ]
+   },
+   "tag": "bdd9e977e233c9d7"
+  },
+  {
+   "doc": {
+    "rev": 1,
+    "time_zone": "Asia/Jerusalem",
+    "hours": {
+     "sun": [
+      "08:00",
+      "18:00"
+     ],
+     "mon": [
+      "08:00",
+      "18:00"
+     ],
+     "tue": [
+      "08:00",
+      "18:00"
+     ],
+     "wed": [
+      "08:00",
+      "18:00"
+     ],
+     "thu": [
+      "08:00",
+      "18:00"
+     ],
+     "fri": [
+      "08:00",
+      "13:00"
+     ]
+    },
+    "restart": "approve",
+    "shutdown": "approve",
+    "install": "allow",
+    "uninstall": "approve",
+    "close_program": "allow",
+    "protected_programs": [],
+    "protected_folders": [
+     "/Users/ariel/Café"
+    ]
+   },
+   "tag": "7685f1efc7496672"
   },
   {
    "doc": {
