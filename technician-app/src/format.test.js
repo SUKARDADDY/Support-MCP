@@ -26,6 +26,14 @@ describe('format', () => {
 
   test('dollars', () => {
     expect(formatUsd(0.42)).toBe('$0.42');
+    // The default does not follow the machine's locale (a Windows set to Israel gives US$ otherwise).
+    const was = Intl.NumberFormat;
+    try {
+      Intl.NumberFormat = function (locale, options) { return new was(locale ?? 'he-IL', options); };
+      expect(formatUsd(0.42)).toBe('$0.42');
+    } finally {
+      Intl.NumberFormat = was;
+    }
     expect(formatUsd(2)).toBe('$2.00');
     expect(formatUsd(0.003)).toBe('$0.003');
     expect(formatUsd(0)).toBe('$0.00');
