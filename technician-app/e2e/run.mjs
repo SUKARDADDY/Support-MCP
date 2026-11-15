@@ -4,8 +4,8 @@
 //
 // It starts a real relay (wrangler dev, local D1, KV and Durable Objects), seeds a technician
 // and one saved PC, starts the installed app, and drives it. The app's web view is WebView2,
-// opened to a debug port by a machine policy the CI job writes (the runner is elevated, so
-// the environment variable that does the same for a normal user is ignored). The e2e build of
+// opened to a debug port by the WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS variable the CI job sets
+// (the runner is a standard user; the app inherits the variable from this run). The e2e build of
 // the app writes its authorize address to a file instead of opening a browser; a Chromium of
 // Playwright's own walks the sign-in pages (email link, authenticator set-up with a code worked
 // out here, consent). Then the run attaches to the app and checks:
