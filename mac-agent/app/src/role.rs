@@ -91,6 +91,27 @@ pub enum AppLaunch {
     Refuse(&'static str),
 }
 
+/// One step of an app launch, for `mac::open_app` to do in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchStep {
+    /// Leave the show-request marker (`show_request`) for a helper that is about to start.
+    WriteShowMarker,
+    /// Run `launchctl` with these arguments.
+    Launchctl(Vec<String>),
+}
+
+/// The steps of an app launch, in order. A running helper is signalled (`signal`). A stopped one gets the marker
+/// first and is started after, so the marker is there whenever the new helper looks for it. Nothing else is safe: a
+/// signal sent to a helper that has not installed its handler yet is dropped.
+pub fn launch_steps(launch: &AppLaunch, target: &str, signal: i32) -> Vec<LaunchStep> {
+    let ctl = |args: &[&str]| LaunchStep::Launchctl(args.iter().chain([&target]).map(|a| a.to_string()).collect());
+    match launch {
+        AppLaunch::Show => vec![ctl(&["kill", &signal.to_string()])],
+        AppLaunch::Start => vec![LaunchStep::WriteShowMarker, ctl(&["kickstart"])],
+        AppLaunch::Refuse(_) => Vec::new(),
+    }
+}
+
 pub const NOT_INSTALLED: &str = "Support is not installed correctly on this Mac. Install it again with its installer.";
 
 /// launchd's name for this session's helper: the LaunchAgent in the person's own GUI domain.
@@ -316,6 +337,17 @@ mod tests {
         assert_eq!(app_launch(501, None), AppLaunch::Refuse(NOT_INSTALLED));
         // Root: sudo, or the login window's helper. Nothing to show; the usage as before.
         assert_eq!(app_launch(0, Some(running)), AppLaunch::Refuse(USAGE));
+    }
+
+    #[test]
+    fn a_cold_launch_leaves_the_marker_before_it_starts_the_helper() {
+        let t = "gui/501/io.github.sukardaddy.supportmcp.helper";
+        let ctl = |a: &[&str]| LaunchStep::Launchctl(a.iter().map(|s| s.to_string()).chain([t.to_string()]).collect());
+        // A stopped helper: the marker first, so it is there when the new helper looks, then the start.
+        assert_eq!(launch_steps(&AppLaunch::Start, t, 29), vec![LaunchStep::WriteShowMarker, ctl(&["kickstart"])]);
+        // A running helper already has its handler: the signal alone, and no marker to go stale.
+        assert_eq!(launch_steps(&AppLaunch::Show, t, 29), vec![ctl(&["kill", "29"])]);
+        assert!(launch_steps(&AppLaunch::Refuse(NOT_INSTALLED), t, 29).is_empty());
     }
 
     #[test]

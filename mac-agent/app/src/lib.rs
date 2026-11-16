@@ -20,6 +20,7 @@ pub mod safe_files;
 pub mod server;
 pub mod service;
 pub mod setup;
+pub mod show_request;
 pub mod state;
 pub mod uninstall;
 

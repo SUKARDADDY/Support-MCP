@@ -391,6 +391,29 @@ extern "C" fn on_show(_: libc::c_int) {
     SHOW.store(true, Ordering::SeqCst);
 }
 
+/// The person's own per-user temp folder (`confstr`), else `$TMPDIR`. The same folder for the app launch and the
+/// helper, since both run as that person.
+pub fn user_temp_dir() -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    // _CS_DARWIN_USER_TEMP_DIR, from <unistd.h>.
+    const CS_DARWIN_USER_TEMP_DIR: libc::c_int = 65537;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: a writable buffer of the length given.
+    let n = unsafe { libc::confstr(CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr().cast(), buf.len()) };
+    if n > 1 && n <= buf.len() {
+        buf.truncate(n - 1);
+        return Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(buf)));
+    }
+    std::env::var_os("TMPDIR").map(std::path::PathBuf::from).filter(|p| p.is_absolute())
+}
+
+/// Called by the windows once the UI is up: a helper that an app launch started finds its marker and shows its window.
+pub fn take_show_request() {
+    if user_temp_dir().is_some_and(|d| crate::show_request::consume(&d)) {
+        SHOW.store(true, Ordering::SeqCst);
+    }
+}
+
 pub fn main() -> i32 {
     // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
     unsafe { libc::signal(SHOW_SIGNAL, on_show as *const () as libc::sighandler_t) };

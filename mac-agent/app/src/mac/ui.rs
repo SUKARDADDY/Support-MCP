@@ -718,7 +718,8 @@ pub fn run(mtm: MainThreadMarker, shared: Arc<Shared>) {
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     let target = Target::new(mtm);
-    let status_item = (shared.session == HelperSession::Aqua).then(|| {
+    let aqua = shared.session == HelperSession::Aqua;
+    let status_item = aqua.then(|| {
         let item = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
         if let Some(b) = item.button(mtm) {
             b.setTitle(ns_string!("Support"));
@@ -734,5 +735,9 @@ pub fn run(mtm: MainThreadMarker, shared: Arc<Shared>) {
         *u.borrow_mut() =
             Some(Ui { mtm, shared, target, status_item, menu_key: String::new(), ask: None, corner: None, setup: None, _timer: Some(timer) });
     });
+    // An app launch that had to start this helper left a request: the next tick shows the window.
+    if aqua {
+        super::helper::take_show_request();
+    }
     app.run();
 }
