@@ -271,11 +271,7 @@ export class Session {
   }
 
   clearCommand(id) {
-    for (const lane of LANES) {
-      if (this.httpCommands[lane]?.frame.id !== id) continue;
-      this.httpCommands[lane] = null;
-      this.httpPoll?.busy.delete(lane);
-    }
+    for (const lane of LANES) if (this.httpCommands[lane]?.frame.id === id) this.httpCommands[lane] = null;
   }
 
   ttlMs(def) {
@@ -1644,6 +1640,7 @@ export class Session {
         catch (_) {
           this.pending.delete(b.id);
           this.clearCommand(b.id);
+          this.httpPoll?.busy.delete(command.frame.lane);
           pending.resolve({
             ok: false, code: 'bad_result',
             error: 'bad_result: the PC answered but its reply could not be read. The action may or may not have happened. Check before retrying.',
@@ -1652,6 +1649,8 @@ export class Session {
         }
         this.pending.delete(b.id);
         this.clearCommand(b.id);
+        // Only a result says the PC finished the lane. A relay timeout does not.
+        this.httpPoll?.busy.delete(command.frame.lane);
         pending.resolve(result);
         if (result.desktop) await this.setMany({ desktop: result.desktop });
         // A block_input result says at once whether input is blocked now, without waiting for the next poll.

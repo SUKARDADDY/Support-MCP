@@ -783,7 +783,7 @@ test('/mcp exposes bad_result when a PC reply cannot be read', async (t) => {
 });
 
 for (const cleanup of ['timeout', 'disconnect']) {
-  test(`${cleanup} clears pending state and the parked poll busy lane`, async (t) => {
+  test(`${cleanup} clears pending state but preserves the PC busy lane`, async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const f = await attach();
     t.after(() => f.end());
@@ -799,12 +799,17 @@ for (const cleanup of ['timeout', 'disconnect']) {
     assert.equal((await p).ok, false);
     assert.equal(f.session.pending.size, 0);
     assert.equal(f.session.httpCommands.cmd, null);
-    assert.equal(f.session.httpPoll.busy.has('cmd'), false);
+    assert.equal(f.session.httpPoll.busy.has('cmd'), true);
     const next = f.op({ op: 'run', command: 'echo next' });
-    await until(() => delivered);
-    await poll;
-    await f.result(delivered, { stdout_b64: '', stderr_b64: '' });
+    await until(() => f.session.httpCommands.cmd);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(delivered, undefined, 'the busy poll stays parked');
+    assert.equal(f.session.httpCommands.cmd.sent_at, null);
+    const free = await f.poll({ busy_lanes: [] });
+    await f.result(free, { stdout_b64: '', stderr_b64: '' });
     assert.equal((await next).ok, true);
+    await f.end();
+    await poll;
   });
 }
 
@@ -828,4 +833,35 @@ test('install results normalize invalid exit codes and still release the lane', 
   await parked;
   await f.result(delivered, { stdout_b64: '', stderr_b64: '' });
   assert.equal((await next).ok, true);
+});
+
+test('a timed-out run keeps the busy poll parked until the PC reports the lane free', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_800_000_000_000 });
+  const f = await attach();
+  t.after(() => f.end());
+  const a = f.op({ op: 'run', command: 'echo A', timeout_s: 1 });
+  await until(() => f.session.httpCommands.cmd);
+  const frameA = await f.poll();
+  assert.equal(frameA.command, 'echo A');
+  let busyReply;
+  const busyPoll = f.poll({ busy_lanes: ['cmd'] }).then((r) => { busyReply = r; });
+  await until(() => f.session.httpPoll);
+  const parked = f.session.httpPoll;
+  t.mock.timers.tick(16000); // one second plus the relay's result slack
+  assert.equal((await a).timed_out, true);
+  const b = f.op({ op: 'run', command: 'echo B' });
+  await until(() => f.session.httpCommands.cmd);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(busyReply, undefined, 'B must not be sent to a PC that still reports cmd busy');
+  assert.equal(f.session.httpPoll, parked);
+  assert.equal(f.session.httpCommands.cmd.sent_at, null);
+  assert.deepEqual(await (await f.result(frameA, { stdout_b64: '', stderr_b64: '' })).json(), { type: 'ack' });
+  // No time advance: a free poll must get B without the redelivery delay.
+  const frameB = await f.poll({ busy_lanes: [] });
+  assert.equal(frameB.command, 'echo B');
+  assert.notEqual(frameB.id, frameA.id);
+  await f.result(frameB, { stdout_b64: '', stderr_b64: '' });
+  assert.equal((await b).ok, true);
+  await f.end();
+  await busyPoll;
 });
