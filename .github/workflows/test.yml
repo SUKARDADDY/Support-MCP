@@ -145,6 +145,18 @@ jobs:
           # The one relay Support Join may join. A release passes the production address; CI uses a stand-in.
           SUPPORT_JOIN_RELAY_ORIGIN: https://support.example.com
         run: mac-agent/packaging/build.sh "$RUNNER_TEMP/support-package"
+      # The same apps with the preview-permissions feature, which shows each state of the permission window
+      # from SUPPORT_PREVIEW_PERMISSIONS and asks macOS for nothing. Only for screenshots; never released.
+      - name: Build the permission-window preview apps
+        env:
+          SUPPORT_SIGN_IDENTITY: ${{ steps.identity.outputs.sha1 }}
+          SUPPORT_SIGN_KEYCHAIN: ${{ steps.identity.outputs.keychain }}
+          SUPPORT_JOIN_RELAY_ORIGIN: https://support.example.com
+          SUPPORT_CARGO_FEATURES: preview-permissions
+        run: |
+          mac-agent/packaging/build.sh "$RUNNER_TEMP/support-preview"
+          cd "$RUNNER_TEMP/support-preview"
+          ditto -c -k --keepParent Support.app support-preview.zip
       - name: Check the architecture, the signature and the package
         env:
           SHA1: ${{ steps.identity.outputs.sha1 }}
@@ -303,6 +315,13 @@ jobs:
           path: |
             ${{ runner.temp }}/support-package/Support-*.pkg
             ${{ runner.temp }}/support-package/Support-*.zip
+          if-no-files-found: error
+      - name: Upload the permission-window preview app
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: support-permissions-preview
+          path: ${{ runner.temp }}/support-preview/support-preview.zip
           if-no-files-found: error
 
   # Runs on our self-hosted Windows VM runner with the .NET Framework v4 compiler.
