@@ -271,7 +271,11 @@ export class Session {
   }
 
   clearCommand(id) {
-    for (const lane of LANES) if (this.httpCommands[lane]?.frame.id === id) this.httpCommands[lane] = null;
+    for (const lane of LANES) {
+      if (this.httpCommands[lane]?.frame.id !== id) continue;
+      this.httpCommands[lane] = null;
+      this.httpPoll?.busy.delete(lane);
+    }
   }
 
   ttlMs(def) {
@@ -1637,12 +1641,17 @@ export class Session {
       if (pending && pending.tag === `http${generation}` && command) {
         let result;
         try { result = decodeHttpResult(b, command.frame); }
-        catch (_) { return Response.json({ error: 'invalid result' }, { status: 400 }); }
+        catch (_) {
+          this.pending.delete(b.id);
+          this.clearCommand(b.id);
+          pending.resolve({
+            ok: false, code: 'bad_result',
+            error: 'bad_result: the PC answered but its reply could not be read. The action may or may not have happened. Check before retrying.',
+          });
+          return Response.json({ error: 'invalid result' }, { status: 400 });
+        }
         this.pending.delete(b.id);
-        this.httpCommands[command.frame.lane] = null;
-        // The lane is free now, so a parked poll that called it busy must not
-        // hold back the next command for it.
-        this.httpPoll?.busy.delete(command.frame.lane);
+        this.clearCommand(b.id);
         pending.resolve(result);
         if (result.desktop) await this.setMany({ desktop: result.desktop });
         // A block_input result says at once whether input is blocked now, without waiting for the next poll.
