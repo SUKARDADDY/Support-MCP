@@ -12,7 +12,6 @@ use crate::frame;
 use crate::input_plan;
 use crate::ipc::{self, HelperSession, Request, Tick, ToHelper};
 use crate::paths;
-use objc2_core_graphics::CGPreflightScreenCaptureAccess;
 use objc2_foundation::MainThreadMarker;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -65,18 +64,24 @@ pub fn locked() -> Option<bool> {
     Some(v.and_then(|v| v.downcast_ref::<CFBoolean>().map(|b| b.as_bool())).unwrap_or(false))
 }
 
+/// Whether this build is the permission window's screenshot build. It never calls a capture, Accessibility or privacy
+/// (TCC) API: the two readers below answer "not given" without asking macOS, and `main` starts no link, no status
+/// polling and no request worker. See docs/development.md, "Mac permission window".
+pub const PREVIEW_BUILD: bool = cfg!(feature = "preview-permissions");
+
+/// Whether Screen Recording is given to this process. The only place the app preflights it.
+pub fn screen_access() -> bool {
+    !PREVIEW_BUILD && objc2_core_graphics::CGPreflightScreenCaptureAccess()
+}
+
+/// Whether Accessibility is given to this process. The only place the app reads it.
 pub fn accessibility() -> bool {
     // SAFETY: no arguments.
-    unsafe { objc2_application_services::AXIsProcessTrusted() }
+    !PREVIEW_BUILD && unsafe { objc2_application_services::AXIsProcessTrusted() }
 }
 
 fn tick() -> Tick {
-    Tick {
-        screen: CGPreflightScreenCaptureAccess(),
-        accessibility: accessibility(),
-        customer_ago_ms: input::customer_ago_ms(),
-        locked: locked().unwrap_or(false),
-    }
+    Tick { screen: screen_access(), accessibility: accessibility(), customer_ago_ms: input::customer_ago_ms(), locked: locked().unwrap_or(false) }
 }
 
 // ---- screen actions ---------------------------------------------------------------------------------------------
@@ -497,11 +502,15 @@ pub fn main() -> i32 {
         notice: Mutex::new(None),
         requests: Mutex::new(tx),
     });
-    std::thread::spawn({
-        let s = shared.clone();
-        move || link_thread(s)
-    });
-    if session == HelperSession::Aqua {
+    // The preview build starts no link (its ticks preflight Screen Recording and Accessibility), no status polling and no
+    // request worker: it shows the window and talks to nothing.
+    if !PREVIEW_BUILD {
+        std::thread::spawn({
+            let s = shared.clone();
+            move || link_thread(s)
+        });
+    }
+    if session == HelperSession::Aqua && !PREVIEW_BUILD {
         std::thread::spawn({
             let s = shared.clone();
             move || status_thread(s)

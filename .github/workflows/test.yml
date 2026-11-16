@@ -154,8 +154,17 @@ jobs:
           SUPPORT_JOIN_RELAY_ORIGIN: https://support.example.com
           SUPPORT_CARGO_FEATURES: preview-permissions
         run: |
-          mac-agent/packaging/build.sh "$RUNNER_TEMP/support-preview"
-          cd "$RUNNER_TEMP/support-preview"
+          out="$RUNNER_TEMP/support-preview"
+          mac-agent/packaging/build.sh "$out"
+          # The preview apps must not look like the real ones to macOS: their own ids and names, in the plist and the signature.
+          for pair in "Support.app:io.github.sukardaddy.supportmcp.permissions-preview:Support Preview" \
+                      "Support Join.app:io.github.sukardaddy.supportmcp.join.permissions-preview:Support Join Preview"; do
+            app="$out/${pair%%:*}"; rest="${pair#*:}"; id="${rest%%:*}"; name="${rest#*:}"
+            test "$(plutil -extract CFBundleIdentifier raw -o - "$app/Contents/Info.plist")" = "$id"
+            test "$(plutil -extract CFBundleDisplayName raw -o - "$app/Contents/Info.plist")" = "$name"
+            codesign -dv "$app" 2>&1 | grep -Fx "Identifier=$id"
+          done
+          cd "$out"
           ditto -c -k --keepParent Support.app support-preview.zip
       - name: Check the architecture, the signature and the package
         env:

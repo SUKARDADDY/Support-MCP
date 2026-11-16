@@ -140,7 +140,8 @@ pub fn fatal(mtm: MainThreadMarker, text: &str) {
 }
 
 fn build_window(mtm: MainThreadMarker, target: &JoinTarget) -> Win {
-    let (w, h) = (520.0, 460.0);
+    // 20 points taller than before: the headline of the permission list has room for four lines.
+    let (w, h) = (520.0, 480.0);
     // SAFETY: a fresh window, kept in the UI state, so it is not released on close.
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -156,11 +157,11 @@ fn build_window(mtm: MainThreadMarker, target: &JoinTarget) -> Win {
     window.setTitle(ns_string!("Support Join"));
     let view = window.contentView().expect("a window has a content view");
     let title = label(mtm, "", rect(20.0, h - 52.0, w - 40.0, 26.0), 17.0, true);
-    let body = label(mtm, "", rect(20.0, 230.0, w - 40.0, 170.0), 13.0, false);
-    let field = NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(20.0, 280.0, w - 40.0, 24.0));
+    let body = label(mtm, "", rect(20.0, 250.0, w - 40.0, 170.0), 13.0, false);
+    let field = NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(20.0, 300.0, w - 40.0, 24.0));
     field.setPlaceholderString(Some(&s("Paste the link or type the code")));
-    let notice = label(mtm, "", rect(20.0, 230.0, w - 40.0, 44.0), 12.0, false);
-    let status = label(mtm, "", rect(20.0, 192.0, w - 40.0, 38.0), 13.0, true);
+    let notice = label(mtm, "", rect(20.0, 250.0, w - 40.0, 44.0), 12.0, false);
+    let status = label(mtm, "", rect(20.0, 212.0, w - 40.0, 38.0), 13.0, true);
     let primary = button(mtm, target, "", TAG_PRIMARY, rect(w - 250.0, 16.0, 230.0, 32.0));
     let secondary = button(mtm, target, "", TAG_SECONDARY, rect(20.0, 16.0, 150.0, 32.0));
     // The permission list sits in the lower part of the window, under the step's text, and shows on that step only.

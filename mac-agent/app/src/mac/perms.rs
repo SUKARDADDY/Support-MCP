@@ -36,7 +36,9 @@ pub fn owns(tag: isize) -> bool {
     (TAG_OPEN..=TAG_RESTART).contains(&tag)
 }
 
-const HEADLINE_H: f64 = 52.0;
+/// A line of the headline (12.5 points) is about 16 points tall. The room is `HEADLINE_LINES` lines, and the layout, the
+/// window's height and the Join window's position all follow from it, so the longest headline is never cut off.
+const HEADLINE_H: f64 = 8.0 + 16.0 * permissions::HEADLINE_LINES as f64;
 const RESTART_H: f64 = 52.0;
 const BUTTON_W: f64 = 150.0;
 /// How often the permissions are read: about every second, as the window is open.
@@ -171,7 +173,7 @@ impl PermPanel {
         for row in &self.rows {
             let forced = self.preview.and_then(|p| p.state(row.perm));
             let state = forced.unwrap_or_else(|| match row.perm {
-                Perm::ScreenRecording => State::from_bool(objc2_core_graphics::CGPreflightScreenCaptureAccess()),
+                Perm::ScreenRecording => State::from_bool(super::helper::screen_access()),
                 Perm::Accessibility => State::from_bool(super::helper::accessibility()),
                 Perm::FullDiskAccess => full_disk.map_or(State::Unknown, State::from_bool),
             });
@@ -198,7 +200,7 @@ impl PermPanel {
         let preview = preview();
         permissions::items(kind).iter().filter(|i| i.required).any(|i| {
             let state = preview.and_then(|p| p.state(i.perm)).unwrap_or_else(|| match i.perm {
-                Perm::ScreenRecording => State::from_bool(objc2_core_graphics::CGPreflightScreenCaptureAccess()),
+                Perm::ScreenRecording => State::from_bool(super::helper::screen_access()),
                 _ => State::from_bool(super::helper::accessibility()),
             });
             state != State::Granted
@@ -223,8 +225,8 @@ impl PermPanel {
             _ => {
                 let Some(row) = usize::try_from(tag - TAG_OPEN).ok().and_then(|i| self.rows.get(i)) else { return };
                 self.tracker.borrow_mut().opened(row.perm, now_ms());
-                // A preview asks macOS nothing and opens nothing.
-                if self.preview.is_none() {
+                // A preview build asks macOS nothing and opens nothing, even when it was given no states to show.
+                if self.preview.is_none() && !super::helper::PREVIEW_BUILD {
                     register(row.perm);
                     open_settings(row.perm);
                 }
@@ -235,7 +237,7 @@ impl PermPanel {
     }
 
     fn restart_app(&self) {
-        if self.preview.is_some() {
+        if self.preview.is_some() || super::helper::PREVIEW_BUILD {
             return;
         }
         // SAFETY: a getter.
@@ -281,9 +283,15 @@ pub fn take_reopen() -> bool {
 fn register(perm: Perm) {
     match perm {
         Perm::ScreenRecording => {
-            let _ = objc2_core_graphics::CGRequestScreenCaptureAccess();
+            if !super::helper::PREVIEW_BUILD {
+                let _ = objc2_core_graphics::CGRequestScreenCaptureAccess();
+            }
         }
-        Perm::Accessibility => super::ui::prompt_accessibility(),
+        Perm::Accessibility => {
+            if !super::helper::PREVIEW_BUILD {
+                super::ui::prompt_accessibility()
+            }
+        }
         // No call puts an app in this list. The row tells the person to use + or to drag the app from Finder.
         Perm::FullDiskAccess => {}
     }
