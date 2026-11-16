@@ -21,9 +21,9 @@ use objc2::{define_class, msg_send, sel, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSControlStateValueOn, NSFloatingWindowLevel, NSFont,
     NSMenu, NSMenuItem, NSPanel, NSScreen, NSStatusBar, NSStatusBarButton, NSStatusItem, NSTextField, NSVariableStatusItemLength, NSView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
-use objc2_foundation::{ns_string, MainThreadMarker, NSObject, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer, NSURL};
+use objc2_foundation::{ns_string, MainThreadMarker, NSObject, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer};
 use serde_json::{Map, Value};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;

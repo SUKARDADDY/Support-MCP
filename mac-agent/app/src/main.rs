@@ -6,7 +6,12 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let role = match role::launch(&args) {
         Ok(Launch::Role(r)) => r,
-        // Opened as an app (Finder, `open`): show this session's helper, never start a second one.
+        // Opened as an app (Finder, `open`): show this session's helper, never start a second one. A preview build is
+        // started with the helper role and must never reach the real helper through launchctl.
+        Ok(Launch::App) if cfg!(feature = "preview-permissions") => {
+            eprintln!("support: this is the permission window's preview build; start it with the helper role.");
+            std::process::exit(2);
+        }
         Ok(Launch::App) => std::process::exit(open_app()),
         Err(e) => {
             eprintln!("{e}");
