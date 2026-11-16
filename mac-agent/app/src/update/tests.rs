@@ -374,9 +374,13 @@ impl World {
     }
 
     fn updater(&self, version: &str) -> Arc<Updater> {
+        self.updater_timed(version, timing())
+    }
+
+    fn updater_timed(&self, version: &str, timing: Timing) -> Arc<Updater> {
         let clock = self.clock.clone();
         let policy = Policy { allow_loopback: true, origin: Some(self.origin.clone()) };
-        Updater::with(self.places.clone(), version, self.sys.clone(), policy, timing(), Box::new(move || clock.load(Ordering::SeqCst)))
+        Updater::with(self.places.clone(), version, self.sys.clone(), policy, timing, Box::new(move || clock.load(Ordering::SeqCst)))
     }
 
     /// Puts a package on the server and gives its note (as the core hands it over, signature already checked).
@@ -530,10 +534,13 @@ fn a_refusal_on_trial_rolls_back_at_once() {
     let st = w.state();
     assert_eq!(st.trial.as_ref().unwrap().phase, Phase::Rollback);
     assert_eq!(st.failed, vec!["1.1.1".to_string()]);
-    // The watcher acts on it at once, without waiting for the deadline.
+    // The watcher acts on it at once, without waiting for the deadline. Its trial is long here (10 s), so a watcher
+    // that waited fails clearly, while the rollback's own file work has room on a slow or busy test machine (the 200 ms
+    // trial of the other tests failed once on a CI runner).
+    let long = Timing { trial_ms: 10_000, ..timing() };
     let began = Instant::now();
-    assert_eq!(w.updater(A).watch(false), 0);
-    assert!(began.elapsed() < Duration::from_millis(timing().trial_ms as u64));
+    assert_eq!(w.updater_timed(A, long).watch(false), 0);
+    assert!(began.elapsed() < Duration::from_millis(long.trial_ms as u64 / 2));
     assert_eq!(w.installed().as_deref(), Some(A));
     assert_eq!(w.state().trial, None);
     assert_eq!(w.sys.count("restart service"), 1, "only after the rollback: no restart at start without --restart");
