@@ -719,6 +719,11 @@ bar. Support adds itself to the Screen Recording and Accessibility lists first,
 so the person only flips its switch. macOS has no call for Full Disk Access: the
 window says to use + or to drag Support in from Finder. If Screen Recording still
 says "Not yet" after the switch is on, the window offers **Restart Support**.
+On recent macOS versions the first screenshot may also bring up a system prompt,
+"Support is requesting to bypass the system private window picker and directly
+access your screen and audio", and macOS may show it again from time to time.
+Someone at the Mac must click **Allow**; until then screenshots fail with the
+permission error.
 Until both required switches are on, a screen command fails with an error that
 names the missing permission, and commands and files still work.
 
