@@ -38,8 +38,10 @@ export function formatAgo(ms, now = Date.now(), locale) {
   return formatDate(ms, locale);
 }
 
-// Dollars for a task's cost: $0.42, $2.00, and three places for a few cents so $0.003 is not $0.00.
-export function formatUsd(amount, locale) {
+// Dollars for a task's cost: $0.42, $2.00, and three places for a few cents so $0.003 is not $0.00. The amount sits
+// inside the app's English sentences, so it is written the US way by default: the PC's own locale would give
+// "US$0.42" on a Windows set to another region, or put the sign after the number.
+export function formatUsd(amount, locale = 'en-US') {
   if (!Number.isFinite(amount)) return '';
   const places = amount > 0 && amount < 1 ? 3 : 2;
   return new Intl.NumberFormat(locale, { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: places }).format(amount);

@@ -333,6 +333,6 @@ release. The key goes in on stdin and is never written to disk, as for the PC ap
   or changed.
 - The `technician-app` CI job runs all of that on Windows, builds the installer, installs an
   end-to-end build silently and drives it: Playwright opens the sign-in address the app writes,
-  walks the pages, then attaches to the app's WebView2 through a debug port (opened by a
-  machine policy, because the runner is elevated) and checks that the device list shows the
+  walks the pages, then attaches to the app's WebView2 through a debug port (opened by the
+  `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` variable, which the app inherits; the runner is a standard user) and checks that the device list shows the
   seeded PC, that a pairing code appears, and that a PC asking to join reaches the notification list.

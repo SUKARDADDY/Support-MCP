@@ -214,20 +214,16 @@ jobs:
           "installed $($exe.FullName)"
           "exe=$($exe.FullName)" >> $env:GITHUB_OUTPUT
           "name=$($exe.Name)" >> $env:GITHUB_OUTPUT
-      # The runner is elevated, so WebView2 ignores its debug-port environment variable. A machine
-      # policy opens the port for this app's exe instead.
-      - name: Open WebView2's debug port for the app
-        shell: pwsh
-        run: |
-          $key = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments'
-          New-Item -Path $key -Force | Out-Null
-          New-ItemProperty -Path $key -Name '${{ steps.install.outputs.name }}' -Value '--remote-debugging-port=9222' -PropertyType String -Force | Out-Null
-          Get-ItemProperty -Path $key
       - name: Run the end-to-end test
         working-directory: technician-app
+        # The runner is a standard user, so WebView2 reads its environment variable, and the app the
+        # run starts inherits it: the web view opens its debug port with no machine policy and no
+        # administrator rights. WebView2 appends the variable to the arguments Tauri (wry) passes, so
+        # the app keeps the shipping build's flags, as it did under the old policy key.
         env:
           APP_EXE: ${{ steps.install.outputs.exe }}
           E2E_OUT: ${{ github.workspace }}/e2e-out
+          WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: --remote-debugging-port=9222
         run: npm run e2e
       - name: Upload what the end-to-end run saw
         if: failure()
