@@ -13,7 +13,6 @@ use crate::ax_plan;
 use crate::join::{self, Effect, EndHow, Event, Loaded, Saved, Step, TrashOffer};
 use crate::paths;
 use crate::service::{captures, inputs, permission_text, Os};
-use objc2_core_graphics::CGPreflightScreenCaptureAccess;
 use objc2_foundation::MainThreadMarker;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -122,7 +121,7 @@ impl Platform for JoinPlatform {
 
     fn screen(&self, action: &ScreenAction, _keys: &[KeyCombo], stop: &Stop) -> Result<ScreenOutput, String> {
         let action = &ax_plan::normalize(action)?;
-        let screen_ok = CGPreflightScreenCaptureAccess() || !captures(action);
+        let screen_ok = helper::screen_access() || !captures(action);
         let ax_ok = helper::accessibility() || !inputs(action);
         if let Some(text) = permission_text(screen_ok, ax_ok) {
             return Err(text);
@@ -311,7 +310,7 @@ impl Controller {
     }
 
     fn poll(&mut self) {
-        self.screen = CGPreflightScreenCaptureAccess();
+        self.screen = helper::screen_access();
         self.accessibility = helper::accessibility();
         let now = now_ms();
         if *self.machine.step() == Step::Permissions {
@@ -350,6 +349,10 @@ impl Controller {
 /// say what macOS allowed.
 fn cleanup(dir: &Path) -> Vec<String> {
     let mut lines = Vec::new();
+    // The preview build never touches privacy settings, not even to reset an id of its own.
+    if helper::PREVIEW_BUILD {
+        return lines;
+    }
     if let Err(e) = join::delete(dir) {
         lines.push(format!("The session's file could not be removed ({e}). Delete {}/{} yourself.", dir.display(), paths::JOIN_FILE));
     } else {

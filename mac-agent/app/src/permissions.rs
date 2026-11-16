@@ -39,6 +39,13 @@ pub struct Item {
     pub help: Option<&'static str>,
 }
 
+/// The room the window gives the line at the top (`headline`): this many lines of this many characters each. The window
+/// is 480 to 500 points wide and the text 12.5 points, which fits about 75 characters a line; 55 leaves a wide margin for
+/// a wider font or a longer word. The layout in `mac/perms.rs` is sized from `HEADLINE_LINES`, and a test holds every
+/// headline to this box, so a longer text cannot be cut off again.
+pub const HEADLINE_LINES: usize = 4;
+pub const HEADLINE_LINE_CHARS: usize = 55;
+
 pub const FDA_HELP: &str = "macOS cannot add Support to this list for you. If Support is not listed, click + and choose it, or drag it in from the Finder window that \"Show Support in Finder\" opens.";
 
 const SCREEN: Item =
@@ -472,6 +479,40 @@ mod tests {
         assert_eq!(join.0, "/bin/sh");
         assert_eq!(join.1[2], "/Users/a/Support Join.app", "the path is an argument, never part of the script");
         assert!(restart_command(Kind::Join, 501, Path::new("/tmp/support-join")).is_none());
+    }
+
+    #[test]
+    fn every_headline_fits_the_room_the_window_gives_it() {
+        let states = [State::Unknown, State::Missing, State::Granted];
+        let mut longest = 0;
+        for kind in [Kind::Saved, Kind::Join] {
+            for screen in states {
+                for ax in states {
+                    for fda in states {
+                        let mut t = Tracker::new(kind);
+                        t.observe(Perm::ScreenRecording, screen);
+                        t.observe(Perm::Accessibility, ax);
+                        t.observe(Perm::FullDiskAccess, fda);
+                        let text = t.headline();
+                        longest = longest.max(text.chars().count());
+                        assert!(
+                            text.chars().count() <= HEADLINE_LINES * HEADLINE_LINE_CHARS,
+                            "{} characters do not fit {HEADLINE_LINES} lines of {HEADLINE_LINE_CHARS}: {text}",
+                            text.chars().count()
+                        );
+                    }
+                }
+            }
+        }
+        // The one that was cut off: both required items missing is the longest, and it needs three lines at the real width.
+        assert!(longest > 2 * HEADLINE_LINE_CHARS, "the longest headline is {longest} characters");
+    }
+
+    #[test]
+    fn an_items_description_fits_its_two_lines() {
+        for perm in [Perm::ScreenRecording, Perm::Accessibility, Perm::FullDiskAccess] {
+            assert!(item(perm).what.chars().count() <= 2 * 45, "{perm:?}");
+        }
     }
 
     #[test]

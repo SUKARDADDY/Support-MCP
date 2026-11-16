@@ -847,6 +847,19 @@ preview parser. `app/src/mac/perms.rs` is the one AppKit panel the saved app's h
   `SUPPORT_PREVIEW_PERMISSIONS=screen=granted,accessibility=missing,restart Support.app/Contents/MacOS/support helper`
   (the window opens by itself when a required one is missing, or choose Permissions… from the menu bar item). For Support Join,
   start `support-join` the same way and paste a link to reach the permission step.
+- **The preview is not the real app.** `build.sh` with `preview-permissions` in `SUPPORT_CARGO_FEATURES` writes the apps
+  with ids and names of their own: `io.github.sukardaddy.supportmcp.permissions-preview` and "Support Preview", and
+  `io.github.sukardaddy.supportmcp.join.permissions-preview` and "Support Join Preview" (the preview Join registers
+  `supportmcp-preview://`, not `supportmcp://`). The signing identifier matches, and the script and the CI step check the
+  ids. So macOS never sees the real app's id on a build with a different signature, and a prompt or a list entry cannot
+  land on the real app's privacy entry. The binary also reaches no privacy API: `helper::screen_access` and
+  `helper::accessibility` (the only readers) answer "not given" without asking macOS, the preview helper starts no service
+  link, no status polling and no request worker, the buttons do not call `CGRequestScreenCaptureAccess` or
+  `AXIsProcessTrustedWithOptions`, open Settings, restart or run `tccutil`, and every role but `helper` (so also `fda-probe`)
+  is refused. Use it only on a Mac you do not mind prompting, and never release it.
+- **Layout.** The line at the top of the window has room for four lines (`HEADLINE_LINES` in `permissions.rs`; the panel's
+  height and Support Join's window follow from it). A test holds every headline to `HEADLINE_LINES` x `HEADLINE_LINE_CHARS`,
+  so a longer text fails the test instead of being cut off on a Mac.
 
 ### Mac updates
 

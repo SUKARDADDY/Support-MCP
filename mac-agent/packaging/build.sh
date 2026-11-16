@@ -15,6 +15,13 @@
 # peer check would then accept only that exact build. SUPPORT_SIGN_IDENTITY=- signs ad hoc, for a local try only.
 # The .pkg is not signed here: a self-signed code signing identity cannot sign an installer (call 1, A).
 #
+# SUPPORT_CARGO_FEATURES=preview-permissions builds the permission window's screenshot apps (docs/development.md, "Mac
+# permission window"). They must not look like the real apps to macOS, or a privacy prompt or a list entry could land on a
+# real app's id. So their Info.plist and signing identifier carry ids of their own (io.github.sukardaddy.supportmcp.
+# permissions-preview and ...join.permissions-preview), the names "Support Preview" and "Support Join Preview", and the
+# preview Join registers supportmcp-preview:// instead of supportmcp://. The binary itself calls no capture,
+# Accessibility or privacy API. Never release such a build.
+#
 # The macOS update test (.github/workflows/test.yml, docs/development.md "Mac updates") builds test versions with
 # SUPPORT_CARGO_FEATURES=test-release, SUPPORT_CARGO_PROFILE=update-test (no LTO, so four builds stay quick),
 # SUPPORT_SKIP_JOIN=1 and the test-only variables SUPPORT_TEST_VERSION, SUPPORT_TEST_RELEASE_KEY,
@@ -36,6 +43,31 @@ if [ -n "${SUPPORT_TEST_VERSION:-}" ]; then
     case ",$features," in *,test-release,*) ;; *) echo "SUPPORT_TEST_VERSION needs SUPPORT_CARGO_FEATURES=test-release" >&2; exit 1 ;; esac
     version="$SUPPORT_TEST_VERSION"
 fi
+preview=0
+case ",$features," in *,preview-permissions,*) preview=1 ;; esac
+bundle_id=io.github.sukardaddy.supportmcp
+join_id=io.github.sukardaddy.supportmcp.join
+if [ "$preview" = 1 ]; then
+    bundle_id=io.github.sukardaddy.supportmcp.permissions-preview
+    join_id=io.github.sukardaddy.supportmcp.join.permissions-preview
+fi
+# Writes an Info.plist from its template: the version, and for a preview build the preview id and name (and, in the join
+# app, the preview link scheme). Fails when a preview build's plist does not carry the preview id.
+write_plist() { # template output expected-id
+    local template="$1" output="$2" id="$3"
+    if [ "$preview" = 1 ]; then
+        sed -e "s/@VERSION@/$version/g" \
+            -e "s|<string>io\.github\.sukardaddy\.supportmcp\.join</string>|<string>$join_id</string>|" \
+            -e "s|<string>io\.github\.sukardaddy\.supportmcp</string>|<string>$bundle_id</string>|" \
+            -e 's|<string>Support</string>|<string>Support Preview</string>|' \
+            -e 's|<string>Support Join</string>|<string>Support Join Preview</string>|' \
+            -e 's|<string>supportmcp</string>|<string>supportmcp-preview</string>|' "$template" > "$output"
+    else
+        sed "s/@VERSION@/$version/g" "$template" > "$output"
+    fi
+    plutil -lint "$output"
+    [ "$(plutil -extract CFBundleIdentifier raw -o - "$output")" = "$id" ] || { echo "$output does not carry $id" >&2; exit 1; }
+}
 cargo_args=(build --locked --profile "$profile" --target "$target" -p support-mac)
 if [ -n "$features" ]; then cargo_args+=(--features "$features"); fi
 
@@ -49,13 +81,13 @@ rm -rf "$out"
 mkdir -p "$out/root/Applications" "$out/root/Library/LaunchDaemons" "$out/root/Library/LaunchAgents"
 app="$out/root/Applications/Support.app"
 mkdir -p "$app/Contents/MacOS"
-sed "s/@VERSION@/$version/g" "$here/Info.plist" > "$app/Contents/Info.plist"
+write_plist "$here/Info.plist" "$app/Contents/Info.plist" "$bundle_id"
 printf 'APPL????' > "$app/Contents/PkgInfo"
 cp "$bin" "$app/Contents/MacOS/support"
 chmod 755 "$app/Contents/MacOS/support"
 plutil -lint "$app/Contents/Info.plist" "$here/io.github.sukardaddy.supportmcp.device.plist" "$here/io.github.sukardaddy.supportmcp.helper.plist" "$here/entitlements.plist"
 
-sign=(codesign --force --sign "$identity" --identifier io.github.sukardaddy.supportmcp --options runtime --entitlements "$here/entitlements.plist")
+sign=(codesign --force --sign "$identity" --identifier "$bundle_id" --options runtime --entitlements "$here/entitlements.plist")
 if [ -n "${SUPPORT_SIGN_KEYCHAIN:-}" ]; then sign+=(--keychain "$SUPPORT_SIGN_KEYCHAIN"); fi
 if [ "${SUPPORT_SIGN_TIMESTAMP:-}" = "1" ]; then sign+=(--timestamp); else sign+=(--timestamp=none); fi
 "${sign[@]}" "$app"
@@ -97,12 +129,12 @@ jarchs="$(lipo -archs "$jbin")"
 [ "$jarchs" = "arm64" ] || { echo "the join binary is $jarchs, not arm64 only" >&2; exit 1; }
 japp="$out/Support Join.app"
 mkdir -p "$japp/Contents/MacOS"
-sed "s/@VERSION@/$version/g" "$here/Info-join.plist" > "$japp/Contents/Info.plist"
+write_plist "$here/Info-join.plist" "$japp/Contents/Info.plist" "$join_id"
 printf 'APPL????' > "$japp/Contents/PkgInfo"
 cp "$jbin" "$japp/Contents/MacOS/support-join"
 chmod 755 "$japp/Contents/MacOS/support-join"
 plutil -lint "$japp/Contents/Info.plist"
-jsign=(codesign --force --sign "$identity" --identifier io.github.sukardaddy.supportmcp.join --options runtime --entitlements "$here/entitlements.plist")
+jsign=(codesign --force --sign "$identity" --identifier "$join_id" --options runtime --entitlements "$here/entitlements.plist")
 if [ -n "${SUPPORT_SIGN_KEYCHAIN:-}" ]; then jsign+=(--keychain "$SUPPORT_SIGN_KEYCHAIN"); fi
 if [ "${SUPPORT_SIGN_TIMESTAMP:-}" = "1" ]; then jsign+=(--timestamp); else jsign+=(--timestamp=none); fi
 "${jsign[@]}" "$japp"
