@@ -25,8 +25,14 @@ pub struct DeviceState {
     /// The six digits the owner reads to a technician, while pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirm: Option<String>,
+    /// The session the person allowed (or that needed no question), which a restarted service rejoins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_session: Option<String>,
+    /// The uid of the person `accepted_session` belongs to: who allowed it, or who was signed in when it started.
+    /// None when nobody was (the login window), and in a file written before this field existed. A session without
+    /// an owner is not rejoined (see `service::Service::resume`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_owner: Option<u32>,
     /// `{rules, rules_tag}` as the core saves them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<Value>,
@@ -148,6 +154,7 @@ mod tests {
             state: "pending".into(),
             confirm: Some("123456".into()),
             accepted_session: None,
+            accepted_owner: None,
             rules: Some(serde_json::json!({"rules":{},"rules_tag":"x"})),
         };
         save(&dir, &s).unwrap();

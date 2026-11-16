@@ -381,7 +381,19 @@ fn request_thread(shared: Arc<Shared>, rx: mpsc::Receiver<UiRequest>) {
     }
 }
 
+/// The signal an app launch sends (`launchctl kill`) to ask the running helper for its window. SIGINFO is ignored by
+/// default, so one that comes before the handler is in place does nothing instead of ending the helper.
+pub const SHOW_SIGNAL: libc::c_int = libc::SIGINFO;
+/// Set by the signal, read by the windows' timer.
+pub static SHOW: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_show(_: libc::c_int) {
+    SHOW.store(true, Ordering::SeqCst);
+}
+
 pub fn main() -> i32 {
+    // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+    unsafe { libc::signal(SHOW_SIGNAL, on_show as *const () as libc::sighandler_t) };
     let Some(mtm) = MainThreadMarker::new() else { return 2 };
     // SAFETY: a getter.
     let session = if unsafe { libc::geteuid() } == 0 { HelperSession::LoginWindow } else { HelperSession::Aqua };

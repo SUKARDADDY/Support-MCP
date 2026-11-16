@@ -95,6 +95,7 @@ pub async fn pair(link: &Link, name: &str, access: &str, control: &str, id: &Ide
         state: if pending { "pending".into() } else { "active".into() },
         confirm: if pending { paired.confirm } else { None },
         accepted_session: None,
+        accepted_owner: None,
         rules: None,
     })
 }

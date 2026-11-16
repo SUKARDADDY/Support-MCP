@@ -10,6 +10,9 @@
 //! | `uninstall` | an administrator (the CLI under sudo); `--finish` as root, by the service | a person, the service |
 //! | `file-op` | root, which drops to the user first | the service |
 //! | `run-as` | root, which drops to the user first | the service, through `launchctl asuser` |
+//!
+//! With no arguments the binary was opened as an app (Finder, Launchpad, `open`). It never starts a second helper: it
+//! asks this session's helper (the LaunchAgent's) to show its window, or has launchd start it (see `app_launch`).
 
 /// What a setup from the command line gives.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +61,55 @@ The other roles are started by the system (device-service, helper) or by the ser
 
 pub fn usage() -> &'static str {
     USAGE
+}
+
+/// What the binary does with its arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Launch {
+    /// A role, chosen by its first argument.
+    Role(Role),
+    /// No arguments: opened as an app.
+    App,
+}
+
+/// The arguments after the program name: none is an app launch, anything else goes to `parse` as it is.
+pub fn launch(args: &[String]) -> Result<Launch, String> {
+    if args.is_empty() {
+        return Ok(Launch::App);
+    }
+    parse(args).map(Launch::Role)
+}
+
+/// What an app launch does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppLaunch {
+    /// This session's helper is running: signal it to show its window (`launchctl kill`).
+    Show,
+    /// Its LaunchAgent is loaded but the helper is not running: have launchd start that one (`launchctl kickstart`).
+    Start,
+    /// There is no helper to reach from here. The text says why.
+    Refuse(&'static str),
+}
+
+pub const NOT_INSTALLED: &str = "Support is not installed correctly on this Mac. Install it again with its installer.";
+
+/// launchd's name for this session's helper: the LaunchAgent in the person's own GUI domain.
+pub fn helper_target(uid: u32) -> String {
+    format!("gui/{uid}/{}", crate::paths::AGENT_LABEL)
+}
+
+/// What an app launch does as `uid`, given what `launchctl print <helper_target>` wrote (None when it failed: the
+/// LaunchAgent is not loaded in this session). Root has no GUI session of its own here (sudo, or the login window),
+/// so it gets the usage. The helper is only ever launchd's, so there is one per session.
+pub fn app_launch(uid: u32, print: Option<&str>) -> AppLaunch {
+    if uid == 0 {
+        return AppLaunch::Refuse(USAGE);
+    }
+    match print {
+        None => AppLaunch::Refuse(NOT_INSTALLED),
+        Some(text) if text.lines().any(|l| l.trim() == "state = running") => AppLaunch::Show,
+        Some(_) => AppLaunch::Start,
+    }
 }
 
 /// The value after `--name`, once. A flag given twice, or without a value, is an error.
@@ -239,6 +291,31 @@ mod tests {
         assert!(p(&["run-as", "--uid", "501", "--", "a", "b"]).is_err());
         assert!(p(&["run-as", "--uid", "501", "id"]).is_err());
         assert!(p(&["run-as", "--uid", "0", "--", "id"]).is_err());
+    }
+
+    #[test]
+    fn no_arguments_is_an_app_launch_and_every_role_is_parsed_as_before() {
+        assert_eq!(launch(&[]), Ok(Launch::App));
+        let args = |line: &[&str]| line.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(launch(&args(&["helper"])), Ok(Launch::Role(Role::Helper)));
+        assert_eq!(launch(&args(&["device-service"])), Ok(Launch::Role(Role::DeviceService)));
+        assert_eq!(launch(&args(&["version"])), Ok(Launch::Role(Role::Version)));
+        // Anything else is still a role or the usage, word for word.
+        assert_eq!(launch(&args(&["join"])), Err(USAGE.to_string()));
+        assert_eq!(launch(&args(&[""])), Err(USAGE.to_string()));
+        assert!(launch(&args(&["setup", "--link", "l"])).unwrap_err().contains("--name"));
+    }
+
+    #[test]
+    fn an_app_launch_shows_the_running_helper_or_has_launchd_start_it() {
+        assert_eq!(helper_target(501), "gui/501/io.github.sukardaddy.supportmcp.helper");
+        let running = "gui/501/io.github.sukardaddy.supportmcp.helper = {\n\tactive count = 1\n\tstate = running\n\tpid = 812\n}\n";
+        let stopped = "gui/501/io.github.sukardaddy.supportmcp.helper = {\n\tactive count = 0\n\tstate = not running\n}\n";
+        assert_eq!(app_launch(501, Some(running)), AppLaunch::Show);
+        assert_eq!(app_launch(501, Some(stopped)), AppLaunch::Start);
+        assert_eq!(app_launch(501, None), AppLaunch::Refuse(NOT_INSTALLED));
+        // Root: sudo, or the login window's helper. Nothing to show; the usage as before.
+        assert_eq!(app_launch(0, Some(running)), AppLaunch::Refuse(USAGE));
     }
 
     #[test]

@@ -10,6 +10,9 @@
 //!
 //! Under limited control a session is pinned to the person who allowed it (or who was signed in when it started):
 //! once someone else is at the console, nothing runs, no file is opened and no screen is touched until they are back.
+//! That person is saved with the session in device.json, so a session rejoined later (after a restart of the
+//! service, or a new connection for the same session) stays theirs. A saved session without a known owner is not
+//! rejoined: the Mac asks again, as for a new session.
 //! Everything that touches macOS itself is behind `Os`, so this runs and is tested on Linux.
 
 use crate::as_user;
@@ -88,12 +91,18 @@ struct Live {
     pin: Option<u32>,
     /// The person who answered the last question, for the pin of the session that follows.
     asked: Option<u32>,
+    /// Under limited control: a rejoined session whose owner is not known. Nothing works for anyone.
+    unowned: bool,
+    /// The pin (and `unowned`) `accept` chose for the session that is starting.
+    next: Option<(Option<u32>, bool)>,
 }
 
 pub struct MacPlatform {
     os: Arc<dyn Os>,
     helpers: Arc<Helpers>,
     live: Mutex<Live>,
+    /// The session the core accepted last (or that a restarted service may rejoin), and its owner.
+    accepted: Mutex<Option<(String, Option<u32>)>>,
     device: Mutex<Weak<DeviceService>>,
     /// The control a new hello reports before the device service exists (setup's answer).
     control: Mutex<String>,
@@ -141,6 +150,7 @@ impl MacPlatform {
             os,
             helpers,
             live: Mutex::default(),
+            accepted: Mutex::new(None),
             device: Mutex::new(Weak::new()),
             control: Mutex::new(control.to_string()),
             latch: PowerLatch::new(),
@@ -160,7 +170,13 @@ impl MacPlatform {
     /// The person a limited session works for, if they are at the console now.
     fn person(&self) -> Result<u32, String> {
         let console = self.os.console_uid();
-        let pin = self.live.lock().unwrap().pin;
+        let (pin, unowned) = {
+            let l = self.live.lock().unwrap();
+            (l.pin, l.unowned)
+        };
+        if unowned {
+            return Err(SOMEONE_ELSE.into());
+        }
         match (pin, console) {
             (Some(p), Some(c)) if p == c => Ok(p),
             (Some(_), _) => Err(SOMEONE_ELSE.into()),
@@ -187,6 +203,34 @@ impl MacPlatform {
         }
     }
 
+    /// The core accepted session `id`: the person allowed it, it needed no question, or it is rejoined. Chooses the
+    /// pin of the session that is starting and returns the owner to save with it.
+    ///
+    /// A new session belongs to whoever answered the question, or else to whoever is at the console. A rejoined one
+    /// keeps the owner it had: under limited control it is pinned to them (and to nobody, refusing everything, when
+    /// the owner is not known), whoever is at the console now. Under full control a rejoined session is pinned as a
+    /// new one is, and never takes the saved owner as its pin.
+    fn accept(&self, id: &str) -> Option<u32> {
+        let limited = self.limited();
+        let mut accepted = self.accepted.lock().unwrap();
+        let mut l = self.live.lock().unwrap();
+        let fresh = |l: &mut Live| l.asked.take().or_else(|| self.os.console_uid());
+        let owner = match accepted.as_ref() {
+            Some((known, owner)) if known == id => {
+                let owner = *owner;
+                l.next = Some(if limited { (owner, owner.is_none()) } else { (fresh(&mut l), false) });
+                owner
+            }
+            _ => {
+                let owner = fresh(&mut l);
+                l.next = Some((owner, false));
+                owner
+            }
+        };
+        *accepted = Some((id.to_string(), owner));
+        owner
+    }
+
     /// The hooks call this as a session starts (`by`) and ends (None).
     fn session(&self, by: Option<&str>) {
         let mut l = self.live.lock().unwrap();
@@ -194,12 +238,18 @@ impl MacPlatform {
             Some(by) => {
                 l.count += 1;
                 l.by = Some((by.to_string(), now_ms()));
-                l.pin = l.asked.take().or_else(|| self.os.console_uid());
+                let (pin, unowned) = match l.next.take() {
+                    Some(next) => next,
+                    None => (l.asked.take().or_else(|| self.os.console_uid()), false),
+                };
+                (l.pin, l.unowned) = (pin, unowned);
             }
             None => {
                 l.count = l.count.saturating_sub(1);
                 if l.count == 0 {
-                    *l = Live::default();
+                    // A session that is starting keeps the pin `accept` chose for it.
+                    let next = l.next.take();
+                    *l = Live { next, ..Live::default() };
                 }
             }
         }
@@ -420,6 +470,15 @@ impl Service {
         self.device.lock().unwrap().clone()
     }
 
+    /// The saved session a restarted service may rejoin without asking: only one whose owner is known. A session
+    /// saved without an owner (by an older version, or started at the login window) is not rejoined, so the Mac asks
+    /// again (or declines) as it would for a new session.
+    fn resume(&self, s: &DeviceState) -> Option<String> {
+        let id = s.accepted_session.clone().filter(|_| s.accepted_owner.is_some());
+        *self.platform.accepted.lock().unwrap() = id.clone().map(|id| (id, s.accepted_owner));
+        id
+    }
+
     /// Starts the device service for the saved state, unless the Mac was removed.
     pub fn start_device(self: &Arc<Self>) -> Result<(), String> {
         let Some(s) = self.state.lock().unwrap().clone() else { return Ok(()) };
@@ -432,7 +491,7 @@ impl Service {
             identity: self.os.identity(),
             access: s.access.clone(),
             control: s.control.clone(),
-            accepted_session: s.accepted_session.clone(),
+            accepted_session: self.resume(&s),
             doorbell: DoorbellConfig::default(),
         };
         *self.platform.control.lock().unwrap() = s.control.clone();
@@ -543,7 +602,11 @@ impl Hooks for ServiceHooks {
     }
     fn session_accepted(&self, id: &str) {
         if let Some(svc) = self.svc.upgrade() {
-            svc.with_state(|s| s.accepted_session = Some(id.to_string()));
+            let owner = svc.platform.accept(id);
+            svc.with_state(|s| {
+                s.accepted_session = Some(id.to_string());
+                s.accepted_owner = owner;
+            });
         }
     }
     fn history(&self, line: &str) {
@@ -633,8 +696,8 @@ impl Api for Service {
 ///
 /// launchd sends SIGTERM when the Mac shuts down or restarts. The service then exits without ending the live session,
 /// as the Windows service does at a shutdown: the session goes on after the restart, within its own end, and the
-/// saved `accepted_session` lets the new service rejoin it without asking again. An uninstall ends the session
-/// itself first.
+/// saved `accepted_session` and `accepted_owner` let the new service rejoin it without asking again, still pinned to
+/// its owner under limited control. An uninstall ends the session itself first.
 pub async fn run(os: Arc<dyn Os>, inspector: Arc<dyn Inspector>, dir: PathBuf, owner: u32) -> Result<(), String> {
     state::ensure_dir(&dir, owner)?;
     let helpers = Helpers::new();
@@ -926,6 +989,152 @@ mod tests {
         assert!(p.live_by().is_none());
     }
 
+    fn saved(control: &str) -> DeviceState {
+        DeviceState {
+            origin: "https://r.example".into(),
+            key: "k".into(),
+            device_id: "d".into(),
+            workspace: "w".into(),
+            name: "Mac".into(),
+            access: "ask".into(),
+            control: control.into(),
+            state: "active".into(),
+            ..DeviceState::default()
+        }
+    }
+
+    /// The core's side of a session start: it accepted `id` (asked, no question needed, or rejoined), then hosts it.
+    fn start(svc: &Arc<Service>, id: &str) {
+        let hooks = ServiceHooks { svc: Arc::downgrade(svc) };
+        hooks.session_accepted(id);
+        hooks.session(Some("Dana"));
+    }
+
+    /// A new service on the same data folder, as after a restart, and the session it gives the core to rejoin.
+    fn restart(r: &Rig) -> (Arc<Service>, Option<String>) {
+        let svc = Service::new(r.os.clone(), Helpers::new(), r.svc.dir.clone(), tokio::runtime::Handle::current());
+        let resumed = svc.resume(&state::load(&svc.dir).unwrap());
+        (svc, resumed)
+    }
+
+    fn run_as(p: &Arc<MacPlatform>, as_system: bool) -> tokio::task::JoinHandle<Result<RunOutput, String>> {
+        let p = p.clone();
+        on_thread(move || p.run(&RunRequest { command: "true".into(), timeout_s: 5, as_system }, &Stop::new()))
+    }
+
+    fn shot_of(p: &Arc<MacPlatform>) -> tokio::task::JoinHandle<Result<ScreenOutput, String>> {
+        let p = p.clone();
+        on_thread(move || p.screen(&ScreenAction::parse(&json!({"name":"screenshot"})), &[], &Stop::new()))
+    }
+
+    /// Alice (501) allows a limited session, and its device.json says it is hers. The service then restarts.
+    async fn alice_allows_then_restart(name: &str) -> (Rig, Arc<Service>) {
+        let r = rig(name, "limited").await;
+        *r.svc.state.lock().unwrap() = Some(saved("limited"));
+        helper(&r.sock, ALL, true).await;
+        wait_helper(&r.svc, 501).await;
+        let p = r.svc.platform.clone();
+        assert!(on_thread(move || p.ask("Dana", "Team", false, &Stop::new())).await.unwrap());
+        start(&r.svc, "s1");
+        let s = state::load(&r.svc.dir).unwrap();
+        assert_eq!((s.accepted_session.as_deref(), s.accepted_owner), (Some("s1"), Some(501)));
+        r.svc.platform.session(None);
+        let (svc, resumed) = restart(&r);
+        assert_eq!(resumed.as_deref(), Some("s1"), "a session with its owner saved is rejoined without asking");
+        (r, svc)
+    }
+
+    #[tokio::test]
+    async fn a_rejoined_limited_session_does_nothing_while_someone_else_is_at_the_console() {
+        let (r, svc) = alice_allows_then_restart("own-bob").await;
+        // Bob is at the console when the core rejoins Alice's session.
+        *r.os.console.lock().unwrap() = Some(502);
+        start(&svc, "s1");
+        let p = svc.platform.clone();
+        assert_eq!(run_as(&p, false).await.unwrap().unwrap_err(), SOMEONE_ELSE);
+        assert_eq!(p.put_file("/Users/x/f", b"abc", false).unwrap_err(), SOMEONE_ELSE);
+        assert_eq!(p.get_file("/Users/x/f", 0, 10).err().as_deref(), Some(SOMEONE_ELSE));
+        assert_eq!(shot_of(&p).await.unwrap().unwrap_err(), SOMEONE_ELSE);
+        assert!(r.os.files.lock().unwrap().is_empty(), "no file was opened as anyone");
+        assert_eq!(state::load(&svc.dir).unwrap().accepted_owner, Some(501), "the rejoin keeps Alice as the owner");
+        // The same holds for a rejoin within one run of the service (a new connection for the same session).
+        p.session(None);
+        start(&r.svc, "s1");
+        assert_eq!(run_as(&r.svc.platform, false).await.unwrap().unwrap_err(), SOMEONE_ELSE);
+    }
+
+    #[tokio::test]
+    async fn a_rejoined_limited_session_works_for_the_person_who_allowed_it() {
+        let (r, svc) = alice_allows_then_restart("own-alice").await;
+        *r.os.console.lock().unwrap() = Some(502);
+        start(&svc, "s1");
+        let p = svc.platform.clone();
+        assert_eq!(run_as(&p, false).await.unwrap().unwrap_err(), SOMEONE_ELSE);
+        // Alice is back at the console.
+        *r.os.console.lock().unwrap() = Some(501);
+        let out = run_as(&p, false).await.unwrap().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "as 501\n");
+        assert_eq!(p.put_file("/Users/x/f", b"abc", false).unwrap(), 3);
+        assert!(r.os.files.lock().unwrap()[0].starts_with("501 Put"));
+    }
+
+    #[tokio::test]
+    async fn a_saved_session_without_an_owner_is_asked_again_never_rejoined() {
+        let r = rig("own-none", "limited").await;
+        // device.json as a version before the owner was saved wrote it: a limited session someone allowed.
+        let old = json!({"origin":"https://r.example","key":"k","device_id":"d","workspace":"w","name":"Mac","access":"ask",
+            "control":"limited","state":"active","accepted_session":"s0"});
+        state::write_atomic(&r.svc.dir.join(crate::paths::DEVICE_FILE), old.to_string().as_bytes()).unwrap();
+        assert_eq!(state::load(&r.svc.dir).unwrap().accepted_owner, None, "an older file reads as no known owner");
+        *r.os.console.lock().unwrap() = Some(502);
+        let (svc, resumed) = restart(&r);
+        assert_eq!(resumed, None, "not rejoined");
+        assert!(svc.platform.accepted.lock().unwrap().is_none());
+        // So the core asks the person at the console before the session goes on, as for a new session.
+        let start_now = support_core::session::decide_start(false, "ask", "limited", Target::Console, resumed.as_deref() == Some("s0"));
+        assert_eq!(start_now, support_core::session::Start::Ask);
+
+        // A session started with nobody signed in (full control at the login window) has no owner either. Should the
+        // team lower the control to limited and the core rejoin it, it works for nobody.
+        let r = rig("own-none2", "full").await;
+        *r.svc.state.lock().unwrap() = Some(saved("full"));
+        *r.os.console.lock().unwrap() = None;
+        start(&r.svc, "s2");
+        assert_eq!(state::load(&r.svc.dir).unwrap().accepted_owner, None);
+        r.svc.platform.session(None);
+        *r.svc.platform.control.lock().unwrap() = "limited".into();
+        *r.os.console.lock().unwrap() = Some(502);
+        start(&r.svc, "s2");
+        let p = r.svc.platform.clone();
+        assert_eq!(run_as(&p, false).await.unwrap().unwrap_err(), SOMEONE_ELSE);
+        assert_eq!(p.put_file("/Users/x/f", b"abc", false).unwrap_err(), SOMEONE_ELSE);
+        assert_eq!(shot_of(&p).await.unwrap().unwrap_err(), SOMEONE_ELSE);
+        // A new session is not affected: it belongs to whoever allows it.
+        p.session(None);
+        start(&r.svc, "s3");
+        let out = run_as(&p, false).await.unwrap().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "as 502\n");
+    }
+
+    #[tokio::test]
+    async fn a_rejoined_full_control_session_is_unchanged_and_takes_no_owner_pin() {
+        let r = rig("own-full", "full").await;
+        *r.svc.state.lock().unwrap() = Some(saved("full"));
+        start(&r.svc, "s1");
+        assert_eq!(state::load(&r.svc.dir).unwrap().accepted_owner, Some(501));
+        r.svc.platform.session(None);
+        *r.os.console.lock().unwrap() = Some(502);
+        let (svc, resumed) = restart(&r);
+        assert_eq!(resumed.as_deref(), Some("s1"), "rejoined without asking, as before");
+        start(&svc, "s1");
+        let p = svc.platform.clone();
+        assert_eq!(String::from_utf8_lossy(&run_as(&p, true).await.unwrap().unwrap().stdout), "as root\n");
+        // As whoever is at the console when it rejoined, as a new full-control session is: not Alice's pin.
+        assert_eq!(String::from_utf8_lossy(&run_as(&p, false).await.unwrap().unwrap().stdout), "as 502\n");
+        assert_eq!(svc.platform.live.lock().unwrap().pin, Some(502));
+        assert!(!svc.platform.live.lock().unwrap().unowned);
+    }
+
     #[tokio::test]
     async fn full_control_runs_as_root_or_as_whoever_is_at_the_console() {
         let r = rig("full", "full").await;
@@ -1055,6 +1264,7 @@ mod tests {
             state: "pending".into(),
             confirm: Some("123456".into()),
             accepted_session: None,
+            accepted_owner: None,
             rules: None,
         };
         *r.svc.state.lock().unwrap() = Some(saved);

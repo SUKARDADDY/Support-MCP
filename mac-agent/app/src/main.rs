@@ -1,11 +1,13 @@
 //! `support`: see src/role.rs for the roles.
 
-use support_mac::role::{self, Role};
+use support_mac::role::{self, Launch, Role};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let role = match role::parse(&args) {
-        Ok(r) => r,
+    let role = match role::launch(&args) {
+        Ok(Launch::Role(r)) => r,
+        // Opened as an app (Finder, `open`): show this session's helper, never start a second one.
+        Ok(Launch::App) => std::process::exit(open_app()),
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(2);
@@ -36,5 +38,16 @@ fn run_mac(role: Role) -> i32 {
 #[cfg(not(target_os = "macos"))]
 fn run_mac(_role: Role) -> i32 {
     eprintln!("This role runs only on a Mac.");
+    2
+}
+
+#[cfg(target_os = "macos")]
+fn open_app() -> i32 {
+    support_mac::mac::open_app()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_app() -> i32 {
+    eprintln!("{}", role::usage());
     2
 }

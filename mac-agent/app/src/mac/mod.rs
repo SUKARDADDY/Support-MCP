@@ -12,6 +12,41 @@ pub mod ui;
 use crate::role::Role;
 use std::sync::Arc;
 
+/// An app launch (no arguments): signals this session's helper to show its window, or has launchd start it. The
+/// helper is only ever the LaunchAgent's, so opening the app never makes a second one. Returns the exit code.
+pub fn open_app() -> i32 {
+    use crate::role::{self, AppLaunch};
+    use std::process::Command;
+    // SAFETY: a getter.
+    let uid = unsafe { libc::getuid() };
+    let target = role::helper_target(uid);
+    let launchctl = |args: &[&str]| Command::new(crate::paths::LAUNCHCTL).args(args).output();
+    let print = launchctl(&["print", &target]).ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let done = match role::app_launch(uid, print.as_deref()) {
+        AppLaunch::Show => launchctl(&["kill", &helper::SHOW_SIGNAL.to_string(), &target]),
+        AppLaunch::Start => launchctl(&["kickstart", &target]),
+        AppLaunch::Refuse(text) => {
+            eprintln!("{text}");
+            if text == role::NOT_INSTALLED {
+                ui::lone_alert(text);
+                return 1;
+            }
+            return 2;
+        }
+    };
+    match done {
+        Ok(o) if o.status.success() => 0,
+        Ok(o) => {
+            eprintln!("launchctl: {}", String::from_utf8_lossy(&o.stderr).trim());
+            1
+        }
+        Err(e) => {
+            eprintln!("launchctl: {e}");
+            1
+        }
+    }
+}
+
 /// Runs a role that needs macOS. Returns the exit code.
 pub fn run(role: Role) -> i32 {
     match role {

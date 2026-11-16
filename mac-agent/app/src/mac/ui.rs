@@ -17,7 +17,7 @@ use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSControlStateValueOn, NSFloatingWindowLevel, NSFont,
-    NSMenu, NSMenuItem, NSPanel, NSScreen, NSStatusBar, NSStatusItem, NSTextField, NSVariableStatusItemLength, NSView, NSWindow,
+    NSMenu, NSMenuItem, NSPanel, NSScreen, NSStatusBar, NSStatusBarButton, NSStatusItem, NSTextField, NSVariableStatusItemLength, NSView, NSWindow,
     NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{ns_string, MainThreadMarker, NSObject, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer, NSURL};
@@ -659,25 +659,58 @@ fn own_windows(ui: &Ui) -> Vec<Rect> {
     out
 }
 
+/// The app was opened while this helper runs (`helper::SHOW`): the setup window when Support can be set up, else the
+/// menu. Returns the menu bar button to click once the UI state is no longer borrowed (its menu runs its own loop).
+fn show(ui: &mut Ui) -> Option<Retained<NSStatusBarButton>> {
+    let status = ui.shared.status.lock().unwrap().clone();
+    let can_set_up = status.as_ref().is_some_and(|m| {
+        let state = status_text(m, "state");
+        m.get("set_up") != Some(&Value::Bool(true)) || state == "removed" || state == "expired"
+    });
+    if can_set_up {
+        open_setup(ui);
+        return None;
+    }
+    rebuild_menu(ui);
+    ui.status_item.as_ref().and_then(|i| i.button(ui.mtm))
+}
+
 fn tick() {
     if MODAL.with(|m| m.get()) {
         return;
     }
-    UI.with(|u| {
-        let Ok(mut guard) = u.try_borrow_mut() else { return };
-        let Some(ui) = guard.as_mut() else { return };
+    let menu_button = UI.with(|u| {
+        let Ok(mut guard) = u.try_borrow_mut() else { return None };
+        let ui = guard.as_mut()?;
         tick_ask(ui);
+        let mut menu_button = None;
         if ui.shared.session == HelperSession::Aqua {
             rebuild_menu(ui);
             tick_corner(ui);
             tick_setup(ui);
+            if super::helper::SHOW.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                menu_button = show(ui);
+            }
         }
         let rects = own_windows(ui);
         *ui.shared.own_windows.lock().unwrap() = rects;
+        menu_button
     });
+    if let Some(b) = menu_button {
+        NSApplication::sharedApplication(b.mtm()).activate();
+        // SAFETY: a click on our own status item's button, which opens its menu.
+        unsafe { b.performClick(None) };
+    }
     if let Some((mtm, text)) = PENDING_ALERT.with(|p| p.borrow_mut().take()) {
         alert(mtm, "Support", &text, &["OK"]);
     }
+}
+
+/// An alert from a process with no other window: an app launch that has no helper to show.
+pub fn lone_alert(text: &str) {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    NSApplication::sharedApplication(mtm).setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    alert(mtm, "Support", text, &["OK"]);
 }
 
 /// Sets up the app and runs its loop. Never returns.
