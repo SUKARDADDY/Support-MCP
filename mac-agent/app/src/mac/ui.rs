@@ -21,10 +21,10 @@ use objc2::{define_class, msg_send, sel, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType, NSButton, NSControlStateValueOn,
     NSFloatingWindowLevel, NSFont, NSMenu, NSMenuItem, NSPanel, NSScreen, NSStatusBar, NSStatusBarButton, NSStatusItem, NSTextField,
-    NSVariableStatusItemLength, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSVariableStatusItemLength, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    ns_string, MainThreadMarker, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer, NSURL,
+    ns_string, MainThreadMarker, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer,
 };
 use serde_json::{Map, Value};
 use std::cell::{Cell, RefCell};

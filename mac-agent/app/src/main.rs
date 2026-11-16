@@ -6,6 +6,11 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let role = match role::launch(&args) {
         Ok(Launch::Role(r)) => r,
+        // A preview build is started with the helper role and must never reach the real helper through launchctl.
+        Ok(Launch::App) if cfg!(feature = "preview-permissions") => {
+            eprintln!("support: this is the permission window's preview build; start it with the helper role.");
+            std::process::exit(2);
+        }
         // Opened as an app with no helper registered with LaunchServices (stopped), or the binary started directly:
         // show this session's helper, never start a second one. While the helper runs, Finder and `open` reach it
         // as a reopen event instead, and this branch does not run.
