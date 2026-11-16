@@ -20,6 +20,7 @@ fn main() {
             println!("Support {}", support_mac::VERSION);
             0
         }
+        Role::FdaProbe => support_mac::permissions::fda_probe_main(),
         // These two work the same anywhere: they only drop to a user and do one thing.
         Role::FileOp { uid, op } => support_mac::as_user::file_op_main(uid, &op),
         Role::RunAs { uid, command } => {

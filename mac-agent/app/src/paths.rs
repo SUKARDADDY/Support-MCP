@@ -64,6 +64,9 @@ pub const CODESIGN: &str = "/usr/bin/codesign";
 /// System Settings, Privacy & Security, at the two switches Support needs.
 pub const SETTINGS_SCREEN: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
 pub const SETTINGS_ACCESSIBILITY: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+/// Full Disk Access, which only the saved app asks for, and Privacy & Security itself, the last page tried (src/permissions.rs).
+pub const SETTINGS_FULL_DISK: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
+pub const SETTINGS_PRIVACY: &str = "x-apple.systempreferences:com.apple.preference.security";
 
 /// The one-off join app, `Support Join.app`: a bundle of its own, with its own id, so its Screen Recording and
 /// Accessibility grants never mix with the saved app's, and so a `tccutil reset` for it touches nothing of the saved app's.

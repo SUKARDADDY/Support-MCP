@@ -87,6 +87,11 @@ pub trait Os: Send + Sync + 'static {
     fn file_as_user(&self, uid: u32, op: &FileOp, input: &[u8]) -> Result<Value, String>;
     /// Starts the last step of an uninstall (the jobs, the files, the permissions), detached from this service.
     fn uninstall_finish(&self) -> Result<(), String>;
+    /// Whether this service, and the file helpers it starts, have Full Disk Access (src/permissions.rs). None when it
+    /// cannot tell, and anywhere but a Mac.
+    fn full_disk_access(&self) -> Option<bool> {
+        None
+    }
     /// The update steps that need macOS (pkgutil, codesign, launchctl). None anywhere else.
     fn update_system(&self) -> Arc<dyn update::System> {
         Arc::new(update::Unsupported)
@@ -638,6 +643,11 @@ impl Service {
             m.insert("state".into(), json!("not_set_up"));
         }
         m.insert("history".into(), json!(self.history.lock().unwrap().clone()));
+        // What the service itself can read, for the helper's permission window: Full Disk Access belongs to this app, and
+        // the window's process (the person's) cannot see whether the root service has it.
+        if let Some(full_disk) = self.os.full_disk_access() {
+            m.insert("full_disk".into(), json!(full_disk));
+        }
         if let Some((by, since)) = self.platform.live_by() {
             m.insert("session".into(), json!({ "by": by, "since": since }));
         }
@@ -852,9 +862,13 @@ mod tests {
         files: Mutex<Vec<String>>,
         apps: Mutex<PathBuf>,
         tools: Mutex<Option<Arc<dyn install::Tools>>>,
+        full_disk: Mutex<Option<bool>>,
     }
 
     impl Os for FakeOs {
+        fn full_disk_access(&self) -> Option<bool> {
+            *self.full_disk.lock().unwrap()
+        }
         fn console_uid(&self) -> Option<u32> {
             *self.console.lock().unwrap()
         }
@@ -918,6 +932,7 @@ mod tests {
             files: Mutex::default(),
             apps: Mutex::new(PathBuf::from("/nonexistent-applications")),
             tools: Mutex::new(None),
+            full_disk: Mutex::new(None),
         })
     }
 
@@ -1514,5 +1529,15 @@ mod tests {
         assert!(s.get("key").is_none(), "the key never leaves the service");
         r.svc.platform.session(Some("Dana"));
         assert_eq!(r.svc.status()["session"]["by"], "Dana");
+    }
+
+    #[tokio::test]
+    async fn the_status_carries_full_disk_access_only_when_the_service_can_tell() {
+        let r = rig("fda", "limited").await;
+        assert!(r.svc.status().get("full_disk").is_none());
+        *r.os.full_disk.lock().unwrap() = Some(false);
+        assert_eq!(r.svc.status()["full_disk"], json!(false));
+        *r.os.full_disk.lock().unwrap() = Some(true);
+        assert_eq!(r.svc.status()["full_disk"], json!(true));
     }
 }
