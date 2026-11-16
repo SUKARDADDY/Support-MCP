@@ -10,6 +10,7 @@ pub mod join;
 pub mod join_ui;
 pub mod os;
 pub mod peer;
+pub mod perms;
 pub mod ui;
 pub mod update;
 
@@ -122,6 +123,6 @@ pub fn run(role: Role) -> i32 {
         Role::Uninstall { finish: true } => cli::finish(),
         Role::UpdateWatch { restart } => update::watch(restart),
         // Handled before this is called.
-        Role::Version | Role::FileOp { .. } | Role::RunAs { .. } => 2,
+        Role::Version | Role::FdaProbe | Role::FileOp { .. } | Role::RunAs { .. } => 2,
     }
 }

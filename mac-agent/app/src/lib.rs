@@ -15,6 +15,7 @@ pub mod ipc;
 pub mod join;
 pub mod paths;
 pub mod peer;
+pub mod permissions;
 pub mod plists;
 pub mod power;
 pub mod programs;

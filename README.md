@@ -708,12 +708,19 @@ commands as root (`run` with `as: "system"`), works at the login window, and can
 install and uninstall programs. A check-in can lower full control to limited,
 never raise it.
 
-**Permissions.** macOS lets only a person at the Mac grant two switches in System
+**Permissions.** macOS lets only a person at the Mac grant these switches in System
 Settings, Privacy & Security: **Screen Recording** (screenshots) and
-**Accessibility** (mouse, keyboard, `ui_tree` and `ui_act`). The setup window has
-a button for each. macOS restarts Support after the first. Until both are on, a
-screen command fails with an error that names the missing permission, and
-commands and files still work.
+**Accessibility** (mouse, keyboard, `ui_tree` and `ui_act`), both required, and
+**Full Disk Access**, optional, which lets full-control file tools write into
+Desktop, Documents and Downloads. A Permissions window lists them with a live
+state and an Open Settings button for each. It opens by itself after install
+while a required one is missing, and any time from **Permissions…** in the menu
+bar. Support adds itself to the Screen Recording and Accessibility lists first,
+so the person only flips its switch. macOS has no call for Full Disk Access: the
+window says to use + or to drag Support in from Finder. If Screen Recording still
+says "Not yet" after the switch is on, the window offers **Restart Support**.
+Until both required switches are on, a screen command fails with an error that
+names the missing permission, and commands and files still work.
 
 **Restart and shut down.** `restart_pc` is refused while FileVault is on, since
 the Mac would wait at the FileVault password and not come back to the team.

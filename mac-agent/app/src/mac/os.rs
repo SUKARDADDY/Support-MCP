@@ -45,13 +45,17 @@ fn self_exe() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from(paths::BINARY_PATH))
 }
 
+/// How long the answer about Full Disk Access is kept: the helper asks for the status every second.
+const FDA_KEEP: Duration = Duration::from_secs(2);
+
 pub struct MacOs {
     identity: Mutex<Option<(Identity, Instant)>>,
+    fda: Mutex<Option<(Option<bool>, Instant)>>,
 }
 
 impl MacOs {
     pub fn new() -> MacOs {
-        MacOs { identity: Mutex::new(None) }
+        MacOs { identity: Mutex::new(None), fda: Mutex::new(None) }
     }
 }
 
@@ -119,6 +123,29 @@ impl Os for MacOs {
 
     fn file_as_user(&self, uid: u32, op: &FileOp, input: &[u8]) -> Result<Value, String> {
         as_user::spawn_file_op(&self_exe(), uid, op, input)
+    }
+
+    /// Asks a fresh child of this binary (`support fda-probe`), the same app the file helpers are, so a grant shows at
+    /// once and the answer is what a file operation would meet. Kept for two seconds.
+    fn full_disk_access(&self) -> Option<bool> {
+        let mut kept = self.fda.lock().unwrap();
+        if let Some((v, at)) = *kept {
+            if at.elapsed() < FDA_KEEP {
+                return v;
+            }
+        }
+        let code = Command::new(self_exe())
+            .arg("fda-probe")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .current_dir("/")
+            .status()
+            .ok()
+            .and_then(|s| s.code());
+        let v = crate::permissions::fda_from_exit(code);
+        *kept = Some((v, Instant::now()));
+        v
     }
 
     fn update_system(&self) -> std::sync::Arc<dyn crate::update::System> {
