@@ -1,0 +1,15 @@
+#!/bin/sh
+# Runs as root before the payload is written: stops a running Support (an upgrade or a reinstall), so no old helper
+# or service holds the old binary. Every step may fail on a Mac without Support; none of that stops the install.
+set -u
+LABEL_DEVICE=io.github.sukardaddy.supportmcp.device
+LABEL_HELPER=io.github.sukardaddy.supportmcp.helper
+BIN=/Applications/Support.app/Contents/MacOS/support
+
+# The helper in each signed-in session: every loginwindow process belongs to one person's GUI session.
+for uid in $(/bin/ps -axo uid=,comm= | /usr/bin/awk '$2 ~ /\/loginwindow$/ && $1 != 0 { print $1 }' | /usr/bin/sort -u); do
+    /bin/launchctl bootout "gui/$uid/$LABEL_HELPER" 2>/dev/null || true
+done
+/bin/launchctl bootout "system/$LABEL_DEVICE" 2>/dev/null || true
+/usr/bin/pkill -9 -f "^$BIN( |\$)" 2>/dev/null || true
+exit 0
