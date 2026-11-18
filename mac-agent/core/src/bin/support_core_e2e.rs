@@ -5,7 +5,7 @@
 //! It pairs with the code (access "any"), checks in, listens on the doorbell, runs the one session the relay points it
 //! to with a platform that runs commands with `sh -c`, reads and writes real files and serves a fixed JPEG for the
 //! screen, and exits when that session ends. It prints one JSON object per line on stdout for the script to read and
-//! never prints the device key.
+//! never prints the device key. Each install or uninstall that reaches the fake platform is printed as a "program" event.
 //!
 //!   support-core-e2e --origin http://127.0.0.1:8787 --join <link code> [--decline]
 //!
@@ -91,6 +91,9 @@ async fn main() {
     say(json!({ "event": "paired", "status": paired.status, "device_id": paired.device_id, "workspace": paired.workspace }));
 
     let platform = Arc::new(FakePlatform::new(if control == "full" { Control::Full } else { Control::Normal }));
+    // What reached the platform's install and uninstall, printed as it comes, so the script can tell what the relay refused.
+    let fake = platform.clone();
+    let mut told_programs = 0;
     let clock = SystemClock::new();
     let cfg = DeviceConfig {
         origin: origin.clone(),
@@ -132,6 +135,11 @@ async fn main() {
             told_rules = true;
             // The tag the relay sent is the tag of the document it sent: this client reads the document as the relay hashed it.
             say(json!({ "event": "rules", "tag": view.tag, "tag_matches": rules_tag(&view.doc.raw) == view.tag, "folders": view.doc.folders }));
+        }
+        let programs: Vec<String> = fake.program_log.lock().unwrap()[told_programs..].to_vec();
+        for line in programs {
+            told_programs += 1;
+            say(json!({ "event": "program", "line": line }));
         }
         if started.elapsed() > Duration::from_secs(max) {
             say(json!({ "event": "timeout" }));

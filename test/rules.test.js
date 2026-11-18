@@ -4,7 +4,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
-  DEFAULT_RULES, REFUSALS, RulesError, decide, effectiveRules, hoursUtc, installArgsProblem, installerProblem, isAppPath, isTimeZone, parseRules, parseStored, pathInside, resolveTimeZone, rulesTag,
+  DEFAULT_RULES, REFUSALS, RulesError, decide, effectiveRules, hoursUtc, installArgsProblem, installArgsProblemMac, installerProblem, installerProblemMac, isAppPath, isAppProgramId,
+  isAppleProgramId, isTimeZone, localAbsolutePath, parseRules, parseStored, pathInside, resolveTimeZone, rulesTag,
 } from '../src/rules.js';
 
 const cases = JSON.parse(readFileSync(new URL('./fixtures/rules-cases.json', import.meta.url), 'utf8'));
@@ -12,7 +13,7 @@ const cases = JSON.parse(readFileSync(new URL('./fixtures/rules-cases.json', imp
 test('the shared file has the cases the plan names', () => {
   assert.ok(cases.decide.length >= 60);
   assert.ok(cases.decide_posix.length >= 20);
-  for (const k of ['decide', 'hours', 'effective', 'validate', 'installers']) assert.ok(cases[k].length > 5, k);
+  for (const k of ['decide', 'hours', 'effective', 'validate', 'installers', 'installers_posix']) assert.ok(cases[k].length > 5, k);
   assert.equal(new Set(Object.values(cases).filter(Array.isArray).flat().map((c) => c.name)).size, Object.values(cases).filter(Array.isArray).flat().length, 'case names are unique');
 });
 
@@ -89,6 +90,54 @@ for (const c of cases.installers) {
     assert.equal((installerProblem(c.path) ?? installArgsProblem(c.path, c.args)) !== null, c.problem);
   });
 }
+
+// The Mac's install checks: the path as the relay accepts it for a Mac, the file type and folder, and no arguments.
+const macInstallProblem = (path, args) => (localAbsolutePath(path, 'mac') === null ? 'not a Mac path' : installerProblemMac(path) ?? installArgsProblemMac(args));
+for (const c of cases.installers_posix) {
+  test(`installer (posix): ${c.name}`, () => {
+    assert.equal(macInstallProblem(c.path, c.args) !== null, c.problem);
+  });
+}
+
+test('the Mac install checks say what is wrong, and leave the Windows ones as they were', () => {
+  assert.match(installerProblemMac('/Users/a/Foo.app'), /only a \.pkg or \.mpkg package, a \.dmg disk image or a \.zip/);
+  assert.match(installerProblemMac('/System/Library/x.pkg'), /macOS's own folders/);
+  assert.match(installArgsProblemMac('-target /'), /takes no arguments/);
+  assert.equal(installArgsProblemMac(undefined), null);
+  assert.equal(localAbsolutePath('/Users/a/x.pkg'), null, 'a Mac path is not a Windows path');
+  assert.equal(localAbsolutePath('C:\\a.pkg', 'mac'), null, 'nor the other way round');
+  assert.equal(localAbsolutePath('  /Users/a/x.pkg ', 'mac'), '/Users/a/x.pkg');
+  assert.equal(localAbsolutePath(`/${'a'.repeat(999)}`, 'mac'), `/${'a'.repeat(999)}`);
+  assert.equal(localAbsolutePath(`/${'a'.repeat(1000)}`, 'mac'), null);
+  assert.equal(localAbsolutePath('C:\\Temp\\a.msi'), 'C:\\Temp\\a.msi');
+  // A Mac installer is never a Windows one.
+  assert.notEqual(installerProblem('/Users/a/x.pkg'), null);
+});
+
+test('/private/var, /private/tmp and /private/etc are /var, /tmp and /etc in a Mac path, and nothing else is', () => {
+  assert.equal(pathInside('/var/folders', '/private/var/folders/x'), true);
+  assert.equal(pathInside('/private/var/folders', '/var/folders/x'), true);
+  assert.equal(pathInside('/tmp', '/private/tmp'), true);
+  assert.equal(pathInside('/etc/ssh', '/PRIVATE/ETC/ssh/a'), true);
+  assert.equal(pathInside('/private', '/var/x'), false, '/private itself is a folder of its own');
+  assert.equal(pathInside('/db', '/private/db/x'), false);
+  assert.equal(pathInside('/var', '/privatevar/x'), false);
+  assert.equal(pathInside('/var', '/x/private/var/y'), false, 'only at the root');
+  assert.equal(pathInside('C:\\private\\var', 'C:\\var\\x'), false, 'a Windows path is as it was');
+});
+
+test('the Support app and the join app are protected by their Mac bundle ids, and Apple\'s apps are known by theirs', () => {
+  for (const id of ['bundle:io.github.sukardaddy.supportmcp', 'bundle:IO.GITHUB.SUKARDADDY.SUPPORTMCP', ' bundle:io.github.sukardaddy.supportmcp.join ', '64:SupportMcpDevice', '32:supportmcpdevice']) {
+    assert.equal(isAppProgramId(id), true, id);
+  }
+  for (const id of ['bundle:io.github.sukardaddy.supportmcp.other', 'bundle:io.github.sukardaddy', 'bundle:com.knollsoft.Rectangle', 'io.github.sukardaddy.supportmcp', 'bundle:io.github.sukardaddy.supportmcpx']) {
+    assert.equal(isAppProgramId(id), false, id);
+  }
+  assert.equal(isAppleProgramId('bundle:com.apple.TextEdit'), true);
+  assert.equal(isAppleProgramId('bundle:COM.APPLE.Safari'), true);
+  assert.equal(isAppleProgramId('bundle:com.applesauce.x'), false);
+  assert.equal(isAppleProgramId('64:com.apple.x'), false);
+});
 
 for (const c of cases.hours) {
   test(`hours: ${c.name}`, () => {

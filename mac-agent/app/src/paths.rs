@@ -28,6 +28,12 @@ pub const PKG_ID: &str = "io.github.sukardaddy.supportmcp.pkg";
 pub const SOCKET_DIR: &str = "/var/run/io.github.sukardaddy.supportmcp";
 pub const SOCKET_PATH: &str = "/var/run/io.github.sukardaddy.supportmcp/helper.sock";
 
+/// Under the data folder: install_program's copies (one root-only folder per install, removed when it ends), and the
+/// apps uninstall_program took away (`removed/<bundle id>-<Unix seconds>/`, deleted after `REMOVED_KEEP_S`).
+pub const STAGING_DIR: &str = "staging";
+pub const REMOVED_DIR: &str = "removed";
+pub const REMOVED_KEEP_S: i64 = 7 * 86_400;
+
 /// Where a run as root starts.
 pub const ROOT_HOME: &str = "/var/root";
 /// The shell for `run`.
@@ -44,6 +50,10 @@ pub const PKGUTIL: &str = "/usr/sbin/pkgutil";
 pub const SW_VERS: &str = "/usr/bin/sw_vers";
 pub const SCUTIL: &str = "/usr/sbin/scutil";
 pub const PS: &str = "/bin/ps";
+pub const SPCTL: &str = "/usr/sbin/spctl";
+pub const INSTALLER: &str = "/usr/sbin/installer";
+pub const HDIUTIL: &str = "/usr/bin/hdiutil";
+pub const DITTO: &str = "/usr/bin/ditto";
 
 /// System Settings, Privacy & Security, at the two switches Support needs.
 pub const SETTINGS_SCREEN: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
