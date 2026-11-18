@@ -174,6 +174,10 @@ async function until(what, fn, ms) {
   }
 }
 
+// The watcher removes its property list as its last step, after it has restarted the service and the helpers, so the
+// new service can check in first. Wait for it rather than look once.
+const watcherGone = (what) => until(what, () => sudoTry(['/bin/test', '-e', WATCH_PLIST]) === null, 30_000).then(() => true, () => false);
+
 const helloSince = (v, t) => hellos.some((h) => h.version === v && h.at >= t);
 
 function diagnose() {
@@ -214,7 +218,7 @@ async function main() {
   await until("B's commit", () => !updateJson().trial && history().includes(`Support updated to version ${VERSIONS.B}.`), 60_000);
   check('B is installed and committed', version(APP) === VERSIONS.B && !updateJson().trial, `${version(APP)} ${JSON.stringify(updateJson())}`);
   check('A is kept in previous/', version(`${DATA}/previous/Support.app`) === VERSIONS.A);
-  check('the watcher is gone after the commit', sudoTry(['/bin/test', '-e', WATCH_PLIST]) === null);
+  check('the watcher is gone after the commit', await watcherGone('the watcher to go after the commit'));
   offer = null;
 
   // 2. C is signed by another identity: refused, and nothing changes.
@@ -246,7 +250,7 @@ async function main() {
   const back = Date.now();
   await until('a check-in from B after the rollback', () => helloSince(VERSIONS.B, back - 5_000), 60_000);
   check('B checks in again', true);
-  check('the watcher is gone after the rollback', sudoTry(['/bin/test', '-e', WATCH_PLIST]) === null);
+  check('the watcher is gone after the rollback', await watcherGone('the watcher to go after the rollback'));
   // Offered again, D is not even downloaded.
   const before = downloads.length;
   t = Date.now();
