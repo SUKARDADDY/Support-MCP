@@ -846,11 +846,15 @@ version 1.2.0
 sha256 <64 lowercase hex: SHA-256 of the .pkg>
 size <decimal bytes, at most 41943040>
 released <unix seconds>
-url https://github.com/<owner>/<repo>/releases/download/v1.2.0/Support-1.2.0.pkg
+url https://github.com/<owner>/<repo>/releases/download/mac-v1.2.0/Support-1.2.0.pkg
 ```
 
 The `url` is `https://github.com/` and a path with no `?`, `#`, space or `..` part,
-at most 300 characters. The header differs from the Windows note's and the technician
+at most 300 characters. Mac releases are tagged `mac-v<version>`, so they never share a
+tag with the relay's and the Windows app's `v<version>` releases;
+`scripts/sign-release.mjs --product mac` requires a URL that ends in
+`/releases/download/mac-v<version>/Support-<version>.pkg`. The relay itself checks only
+the rule above. The header differs from the Windows note's and the technician
 app's, so no note passes as another product's, and the signature (the same key, ECDSA
 P-256 over SHA-256, 64 bytes `r||s` in base64) covers the header. The relay holds no
 Mac bytes, so the note names where the package is.
@@ -881,6 +885,69 @@ never offered the Mac one. A Windows PC's answer is byte for byte what it is wit
 Mac secrets. `ringUpdates` stays Windows-only: both of its queries leave out PCs whose
 `os` starts with `macOS `, and a Mac takes the update at its next check-in (6 hours with
 the doorbell up, 5 minutes without).
+
+### How a Mac takes an update
+
+The Mac app (`mac-agent/app/src/update.rs`, `mac-agent/core/src/download.rs`) follows the
+Windows app's rules and numbers, with what differs for a bundle on macOS.
+
+- **Which offers.** The `update` of a check-in's 200 or of a 426. The Mac checks the signature
+  over the note's exact bytes against the key built in (`release-key.pub`), the note's form, an
+  outer `version` equal to the note's, a version newer than its own by SemVer, and one that has
+  not failed its trial on this Mac. It does nothing while a session runs or the answer points to
+  one, while a trial is open, or for the same version within an hour of a failed download or
+  check.
+- **The download.** Only from the note's `url` on `https://github.com/`. A redirect is followed
+  only to `https://objects.githubusercontent.com` or `https://release-assets.githubusercontent.com`,
+  at most 5 times. A declared length other than the note's `size` is refused, the body is cut off
+  past it, and the file is kept only with exactly the note's size and SHA-256 (read back from disk
+  once written). The package is written new, only for root, into a new folder under the data
+  folder's `staging/`, and removed on any failure.
+- **The checks.** `pkgutil --expand-full` expands the package there. The app in its payload
+  (`Support-component.pkg/Payload/Applications/Support.app`) must be a real folder with no link
+  that leads out of it, with bundle id `io.github.sukardaddy.supportmcp`, executable `support`
+  and `CFBundleShortVersionString` equal to the note's version. Its files are given to root
+  with no write for others. Then `codesign --verify --strict` and the Security framework
+  (`SecStaticCodeCheckValidity` with strict validation, all architectures and links held to the
+  bundle) must both pass against the designated requirement of the app that runs now. A
+  self-signed release's requirement names its certificate, so only an app signed by the same
+  identity is taken, and macOS keeps the Screen Recording and Accessibility grants it ties to
+  that requirement. The package's own scripts never run, and the launchd property lists are not
+  replaced: an update replaces the app only.
+- **The switch.** Under the lock `update.lock`, and again only when no session runs, the Mac
+  writes the trial to `update.json`, swaps the new app into `/Applications/Support.app` in one
+  step (`renamex_np` with `RENAME_SWAP`, so the path is never empty), moves the old app to
+  `previous/Support.app` in the data folder, and loads the watcher: a one-shot LaunchDaemon
+  (`io.github.sukardaddy.supportmcp.update`, property list in /Library/LaunchDaemons for the
+  trial, so a restart of the Mac starts it again) that runs `support update-watch --restart`
+  from the old app's copy. The watcher restarts the service (`launchctl kickstart -k`) and the
+  helper in each signed-in session, and ends any other process of the old copy. Any failure
+  before the watcher is loaded puts the old app back and closes the trial.
+- **The trial.** The new service records that it started and moves the deadline to at least 240
+  seconds from its own start. A check-in answer (200 or 202) or a 401 commits: the trial closes, the watcher
+  is unloaded, and `previous/` keeps the old app as the last good one. A 426 or any other 4xx
+  records the version as failed and asks the watcher to roll back at once. No answer or a 5xx
+  says hello again every 30 seconds, and commits from 90 seconds before the deadline. The
+  watcher rolls back a trial still open at its deadline, once it has itself watched for 240
+  seconds (or after 480 whatever the deadline says), which covers a version that cannot start at
+  all. A rollback records the version as failed first, swaps the old app back, deletes the failed
+  one, adds "Support couldn't update to version X, so it went back to version Y." to the
+  history, and restarts the service and the helpers. With no old copy to go back to, the trial
+  ends on the new version. At most 20 failed versions are kept, and a failed version is never
+  downloaded again.
+- **At start.** The service reads `update.json` before it checks in, as the Windows service does:
+  its own trial begins (and the watcher is loaded again if it is not running); a trial away from
+  its own version that never finished is closed (the new version failed only if it ran); a
+  rollback decided but not finished is handed to the watcher; and a record about other versions
+  more than 10 minutes past its deadline is cleared. A Mac that is not set up, removed or expired
+  never checks in, so its trial commits at once. An uninstall waits for an open trial, unless it
+  is more than 10 minutes past its deadline.
+
+`update.json` (root's, 0600) is
+`{"failed":[...],"trial":{"phase":"trial"|"rollback","from_version","version","deadline","started"},"last_error":{"version","reason","at"}}`,
+times in Unix ms. `last_error` says why the last offer was not taken, for a person reading the
+file; nothing acts on it. A damaged file counts as empty, and one that cannot be read now is
+never written over.
 
 ### A Mac on the wire
 

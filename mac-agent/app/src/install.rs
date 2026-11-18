@@ -86,7 +86,7 @@ pub trait Tools: Send + Sync {
 }
 
 /// A tool by its full path, with a clean environment, from /, with nothing on stdin.
-fn tool(path: &str) -> std::process::Command {
+pub(crate) fn tool(path: &str) -> std::process::Command {
     let mut c = std::process::Command::new(path);
     c.env_clear().env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin").env("LANG", "en_US.UTF-8").current_dir("/");
     c
@@ -98,9 +98,9 @@ const FULL_MAX: usize = 64 << 20;
 /// Runs a tool and reads all it writes (up to `FULL_MAX`), killing it at the timeout. Returns its exit code (None when it
 /// was killed), stdout and stderr.
 /// A tool's exit code (None when it was killed), stdout and stderr.
-type Ran = (Option<i32>, Vec<u8>, Vec<u8>);
+pub(crate) type Ran = (Option<i32>, Vec<u8>, Vec<u8>);
 
-fn run_full(mut c: std::process::Command, timeout: Duration) -> Result<Ran, String> {
+pub(crate) fn run_full(mut c: std::process::Command, timeout: Duration) -> Result<Ran, String> {
     use std::process::Stdio;
     let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
     let read = |pipe: Option<Box<dyn Read + Send>>| {
@@ -130,7 +130,7 @@ fn run_full(mut c: std::process::Command, timeout: Duration) -> Result<Ran, Stri
 }
 
 /// What a tool said, on one line.
-fn said(out: &[u8], err: &[u8]) -> String {
+pub(crate) fn said(out: &[u8], err: &[u8]) -> String {
     let text = String::from_utf8_lossy(if err.iter().any(|b| !b.is_ascii_whitespace()) { err } else { out }).replace(['\n', '\r'], " ");
     support_core::wire::clean(&text, 300)
 }

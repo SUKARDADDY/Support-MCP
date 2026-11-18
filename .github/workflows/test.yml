@@ -75,17 +75,24 @@ jobs:
   # on macOS, lints for macOS, makes a throwaway self-signed code signing identity in a temporary keychain, builds and
   # signs Support.app and Support-<version>.pkg with it, checks that the binary is arm64 only, that the signature is
   # that certificate's (not ad hoc) and passes `codesign --verify --strict`, and that the package refuses Intel and
-  # macOS before 14. The package is uploaded as an artifact. The identity's key is deleted with the keychain.
+  # macOS before 14. The package is uploaded as an artifact. Then the update test (docs/development.md, "Mac updates"):
+  # four `test-release` builds with a throwaway release key, A and B signed by the same identity, C by a second one and
+  # D broken; A is installed on the runner, updates to B, refuses C and rolls D back. The release build is checked to
+  # hold no test key. The identities' keys are deleted with the keychain.
   mac-agent-macos:
     if: >-
       (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
       || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The update test signs its notes with src/release.js.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
       # The same pinned toolchain as mac-agent/rust-toolchain.toml, with the Apple silicon target.
       - name: Install the pinned Rust toolchain
         run: |
@@ -205,6 +212,85 @@ jobs:
           test "$(ls "$out/unzipped" | wc -l | tr -d ' ')" = "1"
           codesign --verify --strict --verbose=2 "$out/unzipped/Support Join.app"
           codesign -d -r- "$out/unzipped/Support Join.app" 2>&1 | grep -Ei "certificate (leaf|root) = H\"$SHA1\""
+      # A second identity, for the update test's C: a valid signature by someone else.
+      - name: Make a second throwaway code signing identity
+        id: other
+        env:
+          KEYCHAIN: ${{ steps.identity.outputs.keychain }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/signing-other"
+          mkdir -p "$work"
+          pass="$(/usr/bin/openssl rand -hex 24)"
+          cat > "$work/cert.cnf" <<'CNF'
+          [req]
+          distinguished_name = dn
+          prompt = no
+          x509_extensions = ext
+          [dn]
+          CN = Support CI other signer
+          [ext]
+          basicConstraints = critical, CA:false
+          keyUsage = critical, digitalSignature
+          extendedKeyUsage = critical, codeSigning
+          subjectKeyIdentifier = hash
+          CNF
+          /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 2 -config "$work/cert.cnf" -keyout "$work/key.pem" -out "$work/cert.pem"
+          /usr/bin/openssl pkcs12 -export -inkey "$work/key.pem" -in "$work/cert.pem" -name "Support CI other signer" -out "$work/identity.p12" -passout "pass:$pass"
+          security import "$work/identity.p12" -k "$KEYCHAIN" -P "$pass" -T /usr/bin/codesign
+          rm -f "$work/key.pem" "$work/identity.p12"
+          sha1="$(/usr/bin/openssl x509 -in "$work/cert.pem" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')"
+          echo "sha1=$sha1" >> "$GITHUB_OUTPUT"
+      - name: Make the update test's throwaway release key
+        id: testkey
+        run: |
+          set -euo pipefail
+          pub="$(node mac-agent/e2e/update-macos.mjs keygen "$RUNNER_TEMP/update-key")"
+          echo "pub=$pub" >> "$GITHUB_OUTPUT"
+      # A and B signed by the first identity, C by the second, D by the first but broken. Each is a `test-release` build
+      # (the test key, its own version, downloads from the stand-in relay on loopback, a 60 s trial) without LTO.
+      - name: Build the update test's four versions
+        env:
+          SIGN_A: ${{ steps.identity.outputs.sha1 }}
+          SIGN_C: ${{ steps.other.outputs.sha1 }}
+          SUPPORT_SIGN_KEYCHAIN: ${{ steps.identity.outputs.keychain }}
+          SUPPORT_CARGO_FEATURES: test-release
+          SUPPORT_CARGO_PROFILE: update-test
+          SUPPORT_SKIP_JOIN: '1'
+          SUPPORT_TEST_RELEASE_KEY: ${{ steps.testkey.outputs.pub }}
+          SUPPORT_TEST_DOWNLOAD_ORIGIN: http://127.0.0.1:8791
+        run: |
+          set -euo pipefail
+          pkgs="$RUNNER_TEMP/update-packages"
+          mkdir -p "$pkgs"
+          build() { # name version identity broken
+            if [ "$4" = 1 ]; then export SUPPORT_TEST_BROKEN=1; else unset SUPPORT_TEST_BROKEN; fi
+            SUPPORT_TEST_VERSION="$2" SUPPORT_SIGN_IDENTITY="$3" mac-agent/packaging/build.sh "$RUNNER_TEMP/update-$1"
+            cp "$RUNNER_TEMP/update-$1/Support-$2.pkg" "$pkgs/"
+          }
+          build A 1.1.0 "$SIGN_A" 0
+          build B 1.1.1 "$SIGN_A" 0
+          build C 1.1.2 "$SIGN_C" 0
+          build D 1.1.3 "$SIGN_A" 1
+          ls -l "$pkgs"
+          codesign -d -r- "$RUNNER_TEMP/update-C/Support.app" 2>&1 | grep -Ei "certificate (leaf|root) = H\"$SIGN_C\""
+      # The test key is in the test builds and nowhere in the release build, which carries the project's key instead.
+      - name: Check that the release build holds no test key
+        env:
+          TEST_KEY: ${{ steps.testkey.outputs.pub }}
+        run: |
+          set -euo pipefail
+          release="$RUNNER_TEMP/support-package/Support.app/Contents/MacOS/support"
+          test_build="$RUNNER_TEMP/update-A/Support.app/Contents/MacOS/support"
+          grep -qF "$TEST_KEY" "$test_build" || { echo "the check cannot see the key: it is not even in the test build" >&2; exit 1; }
+          if grep -qF "$TEST_KEY" "$release"; then echo "the release build holds the test key" >&2; exit 1; fi
+          if grep -qF "127.0.0.1:8791" "$release"; then echo "the release build holds the test download origin" >&2; exit 1; fi
+          grep -qF "$(tr -d '\n' < release-key.pub)" "$release" || { echo "the release build does not hold release-key.pub" >&2; exit 1; }
+          if grep -qF "$TEST_KEY" "$RUNNER_TEMP/support-package/Support Join.app/Contents/MacOS/support-join"; then echo "the join app holds the test key" >&2; exit 1; fi
+      # Installs Support on this runner (as root, with the runner's password-less sudo) and drives a real update, a
+      # refusal and a rollback against a stand-in relay on loopback. Last, since it changes the machine.
+      - name: Run the update test
+        run: node mac-agent/e2e/update-macos.mjs run --key "$RUNNER_TEMP/update-key/test-key.pem" --packages "$RUNNER_TEMP/update-packages"
       - name: Delete the throwaway keychain
         if: always()
         run: |

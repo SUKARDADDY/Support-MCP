@@ -121,6 +121,10 @@ impl Os for MacOs {
         as_user::spawn_file_op(&self_exe(), uid, op, input)
     }
 
+    fn update_system(&self) -> std::sync::Arc<dyn crate::update::System> {
+        std::sync::Arc::new(super::update::MacSystem::new())
+    }
+
     fn uninstall_finish(&self) -> Result<(), String> {
         let mut c = Command::new(self_exe());
         c.args(["uninstall", "--finish"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).current_dir("/");

@@ -1,8 +1,9 @@
 [package]
 name = "support-core"
-# The version the Mac app reports as its app_version and in its session hello. The relay lets a
-# saved PC be connected only from 1.0.0 (src/devices.js MIN_SESSION_VERSION), so it starts there.
-version = "1.0.0"
+# The version the Mac app reports as its app_version and in its session hello. The Mac has its own version line
+# (approved call 7), apart from the relay's VERSION, starting at 1.1.0. The relay lets a saved PC be connected only
+# from 1.0.0 (src/devices.js MIN_SESSION_VERSION), which 1.1.0 passes. app/Cargo.toml carries the same version.
+version = "1.1.0"
 description = "The platform-neutral core of the Support-MCP Mac client"
 license = "MIT"
 edition = "2021"
@@ -15,6 +16,13 @@ path = "src/lib.rs"
 [[bin]]
 name = "support-core-e2e"
 path = "src/bin/support_core_e2e.rs"
+
+# A build for the macOS update test only (docs/development.md, "Mac updates"). It trusts the throwaway release key given
+# at build time in SUPPORT_TEST_RELEASE_KEY instead of release-key.pub, reports SUPPORT_TEST_VERSION, and may download
+# from loopback over http, starting at SUPPORT_TEST_DOWNLOAD_ORIGIN. A build without the feature fails to compile when
+# any of the three is set (src/lib.rs), so the app that ships never has them.
+[features]
+test-release = []
 
 [dependencies]
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
