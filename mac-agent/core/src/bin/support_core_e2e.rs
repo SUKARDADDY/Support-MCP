@@ -6,6 +6,12 @@
 //! to with a platform that runs commands with `sh -c`, reads and writes real files and serves a fixed JPEG for the
 //! screen, and exits when that session ends. It prints one JSON object per line on stdout for the script to read and
 //! never prints the device key.
+//!
+//!   support-core-e2e --origin http://127.0.0.1:8787 --join <link code> [--decline]
+//!
+//! The one-off mode: it previews the link, redeems it with the core's redeem client, and joins the session with the
+//! session key (`Auth::Attach`) and the same fake platform, until the session ends. With `--decline` it says
+//! "Don't allow" instead of joining. It never prints the session key.
 
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -13,8 +19,10 @@ use std::time::Duration;
 use support_core::clock::SystemClock;
 use support_core::device::{self, DeviceConfig, DeviceLink, DeviceService, DoorbellConfig, Hooks, Identity};
 use support_core::platform::FakePlatform;
+use support_core::redeem;
 use support_core::release::MacNote;
 use support_core::rules::rules_tag;
+use support_core::session::{send_decline, Client, Events, HttpTransport, SessionConfig, SessionEnd};
 use support_core::wire::Control;
 
 fn say(v: Value) {
@@ -62,6 +70,10 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let (Some(origin), Some(code)) = (arg(&args, "--origin"), arg(&args, "--join")) {
+        join(&origin, &code, args.iter().any(|a| a == "--decline")).await;
+        return;
+    }
     let (Some(origin), Some(code)) = (arg(&args, "--origin"), arg(&args, "--code")) else {
         eprintln!("usage: support-core-e2e --origin <relay> --code <pairing code> [--control full|limited] [--name <name>]");
         std::process::exit(2);
@@ -129,6 +141,37 @@ async fn main() {
     }
     let _ = runner.await;
     say(json!({ "event": "exit" }));
+}
+
+struct JoinPrinter;
+
+impl Events for JoinPrinter {
+    fn connected(&self) {
+        say(json!({ "event": "connected" }));
+    }
+}
+
+/// The one-off mode: preview, redeem, then decline or join.
+async fn join(origin: &str, code: &str, decline: bool) {
+    let preview = redeem::preview(origin, code).await.unwrap_or_else(|e| fail(&format!("preview: {}", e.text())));
+    say(json!({ "event": "preview", "label": preview.label }));
+    let redeemed = redeem::redeem(origin, code).await.unwrap_or_else(|e| fail(&format!("redeem: {}", e.text())));
+    say(json!({ "event": "redeemed", "sid": redeemed.one_off.sid, "startup_ms": redeemed.startup_ms }));
+    let transport = Arc::new(
+        HttpTransport::new(&redeemed.origin, &redeemed.one_off.sid, redeemed.one_off.auth()).unwrap_or_else(|e| fail(&format!("transport: {e}"))),
+    );
+    if decline {
+        let sent = send_decline(&*transport, "declined").await;
+        say(json!({ "event": "declined", "sent": sent }));
+        return;
+    }
+    let platform = Arc::new(FakePlatform::new(Control::Normal));
+    let stop = support_core::stop::Stop::new();
+    let client = Client::new(transport, platform, None, Arc::new(JoinPrinter), SessionConfig::new(Duration::from_millis(redeemed.startup_ms)), stop);
+    let end = client.run().await;
+    say(
+        json!({ "event": "session_end", "how": match end { SessionEnd::Relay => "relay".to_string(), SessionEnd::Stopped => "stopped".to_string(), SessionEnd::Failed(e) => format!("failed: {e}") } }),
+    );
 }
 
 fn fail(message: &str) -> ! {

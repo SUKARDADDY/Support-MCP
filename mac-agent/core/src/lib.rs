@@ -15,6 +15,7 @@ pub mod geometry;
 pub mod keys;
 pub mod ops;
 pub mod platform;
+pub mod redeem;
 pub mod release;
 pub mod rules;
 pub mod session;

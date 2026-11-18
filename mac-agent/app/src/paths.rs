@@ -48,3 +48,15 @@ pub const PS: &str = "/bin/ps";
 /// System Settings, Privacy & Security, at the two switches Support needs.
 pub const SETTINGS_SCREEN: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
 pub const SETTINGS_ACCESSIBILITY: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+
+/// The one-off join app, `Support Join.app`: a bundle of its own, with its own id, so its Screen Recording and
+/// Accessibility grants never mix with the saved app's, and so a `tccutil reset` for it touches nothing of the saved app's.
+pub const JOIN_BUNDLE_ID: &str = "io.github.sukardaddy.supportmcp.join";
+pub const JOIN_APP_NAME: &str = "Support Join";
+/// The join app's executable. It is a binary of its own (`src/bin/support_join.rs`), with the join role only.
+pub const JOIN_EXECUTABLE: &str = "support-join";
+/// The link scheme only the join app registers: `supportmcp://join?code=<code>`.
+pub const JOIN_URL_SCHEME: &str = "supportmcp";
+/// The person's own folder for the join app's state, under their home, and the file in it.
+pub const JOIN_DIR_UNDER_HOME: &str = "Library/Application Support/SupportMCP";
+pub const JOIN_FILE: &str = "join.json";

@@ -11,6 +11,7 @@ pub mod ax_plan;
 pub mod frame;
 pub mod input_plan;
 pub mod ipc;
+pub mod join;
 pub mod paths;
 pub mod peer;
 pub mod plists;

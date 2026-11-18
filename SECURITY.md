@@ -10,8 +10,9 @@ choose **Report a vulnerability**, and describe the problem. Include the steps
 to reproduce it and the commit you tested. Please don't open a public issue or
 pull request for a vulnerability.
 
-The relay Worker, the Windows app, the PowerShell agent and the scripts in `cf/`
-and `scripts/` are in scope.
+The relay Worker, the Windows app, the PowerShell agent, the Mac apps (`Support.app`
+and `Support Join.app`, in `mac-agent/`) and the scripts in `cf/` and `scripts/` are in
+scope.
 Test only against your own deployment, never someone else's.
 
 ## Check the Windows app binary
@@ -25,3 +26,32 @@ timestamp and module id. To check it yourself, run `scripts/fetch-net452-refs.ps
 <folder>\support-mcp-app.exe`. The check trusts the compiler on the build
 machine. [docs/development.md](docs/development.md#what-ci-proves-about-the-committed-exe)
 lists what it does not prove.
+
+## The Mac apps
+
+Both Mac apps are built from `mac-agent/`, for Apple silicon and macOS 14 or later.
+Releases are signed with a self-signed code-signing certificate, not an Apple
+Developer ID, so macOS asks the person to choose **Open Anyway** once. Check a
+download against the certificate's SHA-256 fingerprint:
+
+```text
+SHA-256 fingerprint: (filled in at release)
+```
+
+`codesign -dr- "Support Join.app"` shows the certificate the app is signed with.
+
+`Support Join.app` is the one-off app. It runs as the person who opened it, never
+asks for an administrator password and installs no service. It owns the
+`supportmcp://` link, and it joins only the relay it was built for. It shows that
+relay and the session's label before it uses the link's code.
+
+**Leftover permissions.** macOS lets only a person grant Screen Recording and
+Accessibility. `Support Join.app` asks for both, and macOS keeps a grant until it
+is reset. When a session ends, the app runs `tccutil reset ScreenCapture` and
+`tccutil reset Accessibility` for its own bundle id, and says whether macOS allowed
+it. If it could not, or the app was force-quit first, the grants stay: remove them in
+System Settings, Privacy & Security, or run `tccutil reset All
+io.github.sukardaddy.supportmcp.join`. The saved Mac's app has its own bundle id and
+its permissions are separate. The join app also deletes its one small state file,
+`~/Library/Application Support/SupportMCP/join.json`, which holds the session's key
+for at most two hours so that it can carry on after macOS restarts it.

@@ -16,6 +16,11 @@ path = "src/lib.rs"
 name = "support"
 path = "src/main.rs"
 
+# The one-off join app: the same crate, the join role only (src/bin/support_join.rs).
+[[bin]]
+name = "support-join"
+path = "src/bin/support_join.rs"
+
 [dependencies]
 support-core = { path = "../core" }
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "signal"] }

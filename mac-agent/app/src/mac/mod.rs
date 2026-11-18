@@ -6,6 +6,8 @@ pub mod capture;
 pub mod cli;
 pub mod helper;
 pub mod input;
+pub mod join;
+pub mod join_ui;
 pub mod os;
 pub mod peer;
 pub mod ui;
