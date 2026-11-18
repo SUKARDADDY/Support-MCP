@@ -4,15 +4,13 @@
 //! Without the Screen Recording permission there is no picture: the answer is the Mac's own error, never a black
 //! image (research file, section 2.5).
 
+use super::helper::screen_access;
 use crate::input_plan::View;
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_core_foundation::{CFDictionary, CFMutableData, CFNumber, CFRetained, CFString, CGPoint, CGRect, CGSize};
-use objc2_core_graphics::{
-    CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayMode, CGError, CGGetActiveDisplayList, CGImage, CGMainDisplayID,
-    CGPreflightScreenCaptureAccess,
-};
+use objc2_core_graphics::{CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayMode, CGError, CGGetActiveDisplayList, CGImage, CGMainDisplayID};
 use objc2_foundation::{NSArray, NSError};
 use objc2_image_io::{kCGImageDestinationLossyCompressionQuality, CGImageDestination};
 use objc2_screen_capture_kit::{SCContentFilter, SCDisplay, SCScreenshotManager, SCShareableContent, SCStreamConfiguration};
@@ -93,9 +91,7 @@ fn shareable() -> Result<Retained<SCShareableContent>, String> {
 }
 
 fn sc_display(id: u32) -> Result<Retained<SCDisplay>, String> {
-    let content =
-        shareable()
-            .map_err(|e| if CGPreflightScreenCaptureAccess() { format!("the screens could not be listed: {e}") } else { permission_error() })?;
+    let content = shareable().map_err(|e| if screen_access() { format!("the screens could not be listed: {e}") } else { permission_error() })?;
     // SAFETY: a live object.
     let list = unsafe { content.displays() };
     list.iter().find(|d| unsafe { d.displayID() } == id).ok_or_else(|| "the display went away".to_string())
@@ -103,7 +99,7 @@ fn sc_display(id: u32) -> Result<Retained<SCDisplay>, String> {
 
 /// The display's picture, or a part of it (`source`, in the display's own points), at `size` pixels.
 pub fn capture(id: u32, source: Option<(i64, i64, i64, i64)>, size: (i64, i64)) -> Result<CFRetained<CGImage>, String> {
-    if !CGPreflightScreenCaptureAccess() {
+    if !screen_access() {
         return Err(permission_error());
     }
     let display = sc_display(id)?;
@@ -130,7 +126,7 @@ pub fn capture(id: u32, source: Option<(i64, i64, i64, i64)>, size: (i64, i64)) 
     // SAFETY: live arguments; the framework copies the block.
     unsafe { SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(&filter, &config, Some(&block)) };
     let r = rx.recv_timeout(WAIT).map_err(|_| "the screenshot did not come".to_string())?.0;
-    r.map_err(|e| if CGPreflightScreenCaptureAccess() { format!("the screen could not be captured: {e}") } else { permission_error() })
+    r.map_err(|e| if screen_access() { format!("the screen could not be captured: {e}") } else { permission_error() })
 }
 
 /// One JPEG of the image at `quality` (10 to 80).

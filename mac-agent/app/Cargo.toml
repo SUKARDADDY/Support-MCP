@@ -27,6 +27,10 @@ path = "src/bin/support_join.rs"
 [features]
 test-release = ["support-core/test-release"]
 
+# Screenshots of the permission window (docs/development.md, "Mac permission window"): SUPPORT_PREVIEW_PERMISSIONS forces
+# each permission's state, and the window asks macOS for nothing. Never in a release.
+preview-permissions = []
+
 [dependencies]
 support-core = { path = "../core" }
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "signal"] }

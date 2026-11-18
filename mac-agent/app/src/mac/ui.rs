@@ -6,21 +6,24 @@
 //! - The corner window: who is connected and for how long, and End session (a second click within 5 s confirms).
 //! - The menu: the state, who is connected with End session, Check now, Allow any time (when asking), the six digits
 //!   while pending, recent history, Set up or Uninstall, and the version.
-//! - The setup window: the link, an optional code, the name, ask or any and full or limited with nothing chosen, the
-//!   two permissions with their live state and Open Settings, and the outcome (the six digits while pending).
+//! - The setup window: the link, an optional code, the name, ask or any and full or limited with nothing chosen, one
+//!   line on the permissions with a button to their window, and the outcome (the six digits while pending).
+//! - The permissions window (`perms.rs`): Screen Recording, Accessibility and Full Disk Access with their live state.
+//!   It opens by itself at the helper's start while a required one is missing, and from the menu's Permissions.
 
 use super::helper::{AskRequest, Shared, UiRequest};
+use super::perms::{self, PermPanel};
 use crate::ipc::{HelperSession, Request};
-use crate::paths;
+use crate::permissions::Kind;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, MainThreadOnly};
 use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSControlStateValueOn, NSFloatingWindowLevel, NSFont,
     NSMenu, NSMenuItem, NSPanel, NSScreen, NSStatusBar, NSStatusBarButton, NSStatusItem, NSTextField, NSVariableStatusItemLength, NSView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
-use objc2_foundation::{ns_string, MainThreadMarker, NSObject, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer, NSURL};
+use objc2_foundation::{ns_string, MainThreadMarker, NSObject, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer};
 use serde_json::{Map, Value};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -36,8 +39,8 @@ const TAG_ASK_ALLOW: isize = 10;
 const TAG_ASK_DENY: isize = 11;
 const TAG_CORNER_END: isize = 20;
 const TAG_SETUP_GO: isize = 30;
-const TAG_OPEN_SCREEN: isize = 31;
-const TAG_OPEN_AX: isize = 32;
+const TAG_PERMS: isize = 6;
+const TAG_PERMS_DONE: isize = 31;
 
 const ASK_ARM: Duration = Duration::from_millis(500);
 const ASK_LIMIT: Duration = Duration::from_millis(support_core::platform::ASK_MS);
@@ -99,10 +102,14 @@ struct SetupWin {
     any: Retained<NSButton>,
     full: Retained<NSButton>,
     limited: Retained<NSButton>,
-    screen_state: Retained<NSTextField>,
-    ax_state: Retained<NSTextField>,
+    perm_line: Retained<NSTextField>,
     outcome: Retained<NSTextField>,
     go: Retained<NSButton>,
+}
+
+struct PermWin {
+    window: Retained<NSWindow>,
+    panel: PermPanel,
 }
 
 struct Ui {
@@ -114,6 +121,9 @@ struct Ui {
     ask: Option<AskPanel>,
     corner: Option<Corner>,
     setup: Option<SetupWin>,
+    perms: Option<PermWin>,
+    /// Whether the start's decision to open the permissions window was made.
+    perms_decided: bool,
     _timer: Option<Retained<NSTimer>>,
 }
 
@@ -252,8 +262,13 @@ fn rebuild_menu(ui: &mut Ui) {
         if !set_up || state == "removed" || state == "expired" {
             menu.addItem(&menu_item(mtm, t, "Set up Support…", TAG_SETUP));
         }
+        menu.addItem(&menu_item(mtm, t, "Permissions…", TAG_PERMS));
         menu.addItem(&menu_item(mtm, t, "Uninstall Support…", TAG_UNINSTALL));
         menu.addItem(&menu_item(mtm, t, &format!("Version {}", status_text(m, "version")), 0));
+    } else {
+        // Without the service the permissions can still be turned on.
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        menu.addItem(&menu_item(mtm, t, "Permissions…", TAG_PERMS));
     }
     item.setMenu(Some(&menu));
 }
@@ -479,13 +494,10 @@ fn open_setup(ui: &mut Ui) {
         group(row(50.0), "Full control: also as an administrator and at the login window", "Limited: only as me, while I am signed in");
     view.addSubview(&g2);
 
-    view.addSubview(&label(mtm, "Two permissions in System Settings, Privacy & Security", rect(20.0, row(30.0), w - 40.0, 18.0), 13.0, true));
-    let screen_state = label(mtm, "", rect(20.0, row(30.0), 330.0, 20.0), 12.0, false);
-    view.addSubview(&screen_state);
-    view.addSubview(&button(mtm, t, "Open Settings", TAG_OPEN_SCREEN, rect(w - 160.0, y.get() - 4.0, 140.0, 28.0)));
-    let ax_state = label(mtm, "", rect(20.0, row(30.0), 330.0, 20.0), 12.0, false);
-    view.addSubview(&ax_state);
-    view.addSubview(&button(mtm, t, "Open Settings", TAG_OPEN_AX, rect(w - 160.0, y.get() - 4.0, 140.0, 28.0)));
+    view.addSubview(&label(mtm, "Permissions in System Settings, Privacy & Security", rect(20.0, row(30.0), w - 40.0, 18.0), 13.0, true));
+    let perm_line = label(mtm, "", rect(20.0, row(36.0), w - 190.0, 32.0), 12.0, false);
+    view.addSubview(&perm_line);
+    view.addSubview(&button(mtm, t, "Permissions…", TAG_PERMS, rect(w - 160.0, y.get() + 2.0, 140.0, 28.0)));
 
     let outcome = label(mtm, "", rect(20.0, 60.0, w - 40.0, y.get() - 70.0), 13.0, false);
     view.addSubview(&outcome);
@@ -495,7 +507,7 @@ fn open_setup(ui: &mut Ui) {
     window.center();
     NSApplication::sharedApplication(mtm).activate();
     window.makeKeyAndOrderFront(None);
-    ui.setup = Some(SetupWin { window, link, code, name, ask, any, full, limited, screen_state, ax_state, outcome, go });
+    ui.setup = Some(SetupWin { window, link, code, name, ask, any, full, limited, perm_line, outcome, go });
 }
 
 fn submit_setup(ui: &mut Ui) {
@@ -540,10 +552,12 @@ fn tick_setup(ui: &mut Ui) {
         }
         return;
     };
-    let screen = objc2_core_graphics::CGPreflightScreenCaptureAccess();
-    let ax = super::helper::accessibility();
-    w.screen_state.setStringValue(&s(&format!("Screen Recording: {}", if screen { "allowed" } else { "not allowed yet" })));
-    w.ax_state.setStringValue(&s(&format!("Accessibility: {}", if ax { "allowed" } else { "not allowed yet" })));
+    let missing = PermPanel::required_missing_now(Kind::Saved);
+    w.perm_line.setStringValue(&s(if missing {
+        "Support still needs Screen Recording and Accessibility. Open Permissions to turn them on."
+    } else {
+        "Screen Recording and Accessibility are on."
+    }));
     if let Some((text, ok)) = notice {
         w.outcome.setStringValue(&s(&text));
         w.go.setEnabled(!ok);
@@ -556,17 +570,63 @@ fn tick_setup(ui: &mut Ui) {
     }
 }
 
+// ---- the permissions window -------------------------------------------------------------------------------------
+
+fn open_perms(ui: &mut Ui) {
+    if ui.perms.is_none() {
+        let mtm = ui.mtm;
+        let width = 500.0;
+        let panel = PermPanel::new(mtm, &ui.target, Kind::Saved, width);
+        let (w, h) = (width + 40.0, perms::panel_height(Kind::Saved) + 100.0);
+        // SAFETY: a fresh window, kept in the UI state, so it is not released on close.
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                rect(0.0, 0.0, w, h),
+                NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        unsafe { window.setReleasedWhenClosed(false) };
+        window.setTitle(ns_string!("Support permissions"));
+        let Some(view) = window.contentView() else { return };
+        view.addSubview(&label(mtm, "Permissions Support needs", rect(20.0, h - 44.0, w - 40.0, 24.0), 16.0, true));
+        panel.view.setFrameOrigin(NSPoint::new(20.0, 56.0));
+        view.addSubview(&panel.view);
+        let done = button(mtm, &ui.target, "Done", TAG_PERMS_DONE, rect(w - 130.0, 14.0, 110.0, 32.0));
+        done.setKeyEquivalent(ns_string!("\r"));
+        view.addSubview(&done);
+        window.center();
+        ui.perms = Some(PermWin { window, panel });
+    }
+    if let Some(p) = ui.perms.as_ref() {
+        p.panel.read_soon();
+        NSApplication::sharedApplication(ui.mtm).activate();
+        p.window.makeKeyAndOrderFront(None);
+    }
+}
+
+fn tick_perms(ui: &mut Ui) {
+    // At the helper's start the window opens by itself when a required permission is missing (or when Restart Support
+    // asked for it), and never again until the next start.
+    if !ui.perms_decided {
+        ui.perms_decided = true;
+        if perms::take_reopen() | PermPanel::required_missing_now(Kind::Saved) {
+            open_perms(ui);
+        }
+    }
+    let full_disk = ui.shared.status.lock().unwrap().as_ref().and_then(|m| m.get("full_disk")).and_then(Value::as_bool);
+    if let Some(p) = ui.perms.as_ref().filter(|p| p.window.isVisible()) {
+        p.panel.update(full_disk);
+    }
+}
+
 thread_local! {
     static PENDING_ALERT: RefCell<Option<(MainThreadMarker, String)>> = const { RefCell::new(None) };
 }
 
 // ---- actions and the timer --------------------------------------------------------------------------------------
-
-pub(super) fn open_url(text: &str) {
-    if let Some(url) = NSURL::URLWithString(&s(text)) {
-        NSWorkspace::sharedWorkspace().openURL(&url);
-    }
-}
 
 fn action(tag: isize) {
     let mut confirm_uninstall = None;
@@ -604,14 +664,16 @@ fn action(tag: isize) {
                 }
             }
             TAG_SETUP_GO => submit_setup(ui),
-            TAG_OPEN_SCREEN => {
-                // Puts Support in the list (and asks once), then opens the right page.
-                let _ = objc2_core_graphics::CGRequestScreenCaptureAccess();
-                open_url(paths::SETTINGS_SCREEN);
+            TAG_PERMS => open_perms(ui),
+            TAG_PERMS_DONE => {
+                if let Some(p) = ui.perms.as_ref() {
+                    p.window.orderOut(None);
+                }
             }
-            TAG_OPEN_AX => {
-                prompt_accessibility();
-                open_url(paths::SETTINGS_ACCESSIBILITY);
+            t if perms::owns(t) => {
+                if let Some(p) = ui.perms.as_ref() {
+                    p.panel.handle(t);
+                }
             }
             _ => {}
         }
@@ -661,6 +723,9 @@ fn own_windows(ui: &Ui) -> Vec<Rect> {
     if let Some(w) = ui.setup.as_ref().filter(|w| w.window.isVisible()) {
         add(w.window.frame());
     }
+    if let Some(p) = ui.perms.as_ref().filter(|p| p.window.isVisible()) {
+        add(p.window.frame());
+    }
     out
 }
 
@@ -693,6 +758,7 @@ fn tick() {
             rebuild_menu(ui);
             tick_corner(ui);
             tick_setup(ui);
+            tick_perms(ui);
             if super::helper::SHOW.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 menu_button = show(ui);
             }
@@ -737,8 +803,19 @@ pub fn run(mtm: MainThreadMarker, shared: Arc<Shared>) {
     // SAFETY: the main run loop and a framework constant.
     unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes) };
     UI.with(|u| {
-        *u.borrow_mut() =
-            Some(Ui { mtm, shared, target, status_item, menu_key: String::new(), ask: None, corner: None, setup: None, _timer: Some(timer) });
+        *u.borrow_mut() = Some(Ui {
+            mtm,
+            shared,
+            target,
+            status_item,
+            menu_key: String::new(),
+            ask: None,
+            corner: None,
+            setup: None,
+            perms: None,
+            perms_decided: false,
+            _timer: Some(timer),
+        });
     });
     // An app launch that had to start this helper left a request: the next tick shows the window.
     if aqua {

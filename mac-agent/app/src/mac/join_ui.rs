@@ -4,15 +4,17 @@
 //!
 //! - The question: "Don't allow" is the default button (Return), "Allow" is off for its first 500 ms, and with no
 //!   answer after 2 minutes it closes as Don't allow. This is the saved app's question (src/mac/ui.rs).
-//! - The two switches: live state of Screen Recording and Accessibility, a button to each page of System Settings.
+//! - The two switches: the shared permission list (`perms.rs`) with the live state of Screen Recording and Accessibility,
+//!   a button to each page of System Settings and, when macOS needs it, Restart Support.
 //! - The corner window: End session, a second click within 5 seconds confirms.
 //! - The page's button hands the code over as a `supportmcp://join?code=...` Apple event, which goes to the controller
 //!   as a pasted link would.
 
 use super::join::{JoinShared, View};
-use super::ui::{alert, label, modal, open_url, panel, prompt_accessibility, rect, s};
+use super::perms::{self, PermPanel};
+use super::ui::{alert, label, modal, panel, rect, s};
 use crate::join::{Event, Step, TrashOffer};
-use crate::paths;
+use crate::permissions::Kind;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, MainThreadOnly};
@@ -28,8 +30,6 @@ use support_core::geometry::Rect;
 
 const TAG_PRIMARY: isize = 1;
 const TAG_SECONDARY: isize = 2;
-const TAG_OPEN_SCREEN: isize = 3;
-const TAG_OPEN_AX: isize = 4;
 const TAG_CORNER_END: isize = 5;
 const TAG_QUIT: isize = 6;
 
@@ -95,8 +95,7 @@ struct Win {
     status: Retained<NSTextField>,
     primary: Retained<NSButton>,
     secondary: Retained<NSButton>,
-    open_screen: Retained<NSButton>,
-    open_ax: Retained<NSButton>,
+    panel: PermPanel,
 }
 
 struct Corner {
@@ -141,7 +140,8 @@ pub fn fatal(mtm: MainThreadMarker, text: &str) {
 }
 
 fn build_window(mtm: MainThreadMarker, target: &JoinTarget) -> Win {
-    let (w, h) = (520.0, 380.0);
+    // 20 points taller than before: the headline of the permission list has room for four lines.
+    let (w, h) = (520.0, 480.0);
     // SAFETY: a fresh window, kept in the UI state, so it is not released on close.
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -157,22 +157,25 @@ fn build_window(mtm: MainThreadMarker, target: &JoinTarget) -> Win {
     window.setTitle(ns_string!("Support Join"));
     let view = window.contentView().expect("a window has a content view");
     let title = label(mtm, "", rect(20.0, h - 52.0, w - 40.0, 26.0), 17.0, true);
-    let body = label(mtm, "", rect(20.0, 150.0, w - 40.0, 170.0), 13.0, false);
-    let field = NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(20.0, 200.0, w - 40.0, 24.0));
+    let body = label(mtm, "", rect(20.0, 250.0, w - 40.0, 170.0), 13.0, false);
+    let field = NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(20.0, 300.0, w - 40.0, 24.0));
     field.setPlaceholderString(Some(&s("Paste the link or type the code")));
-    let notice = label(mtm, "", rect(20.0, 150.0, w - 40.0, 44.0), 12.0, false);
-    let status = label(mtm, "", rect(20.0, 112.0, w - 40.0, 38.0), 13.0, true);
+    let notice = label(mtm, "", rect(20.0, 250.0, w - 40.0, 44.0), 12.0, false);
+    let status = label(mtm, "", rect(20.0, 212.0, w - 40.0, 38.0), 13.0, true);
     let primary = button(mtm, target, "", TAG_PRIMARY, rect(w - 250.0, 16.0, 230.0, 32.0));
     let secondary = button(mtm, target, "", TAG_SECONDARY, rect(20.0, 16.0, 150.0, 32.0));
-    let open_screen = button(mtm, target, "Open Screen Recording settings", TAG_OPEN_SCREEN, rect(20.0, 72.0, 240.0, 28.0));
-    let open_ax = button(mtm, target, "Open Accessibility settings", TAG_OPEN_AX, rect(270.0, 72.0, 230.0, 28.0));
+    // The permission list sits in the lower part of the window, under the step's text, and shows on that step only.
+    let panel = PermPanel::new(mtm, target, Kind::Join, w - 40.0);
+    panel.view.setFrameOrigin(objc2_foundation::NSPoint::new(20.0, 60.0));
+    panel.view.setHidden(true);
+    view.addSubview(&panel.view);
     for v in [&title, &body, &field, &notice, &status] {
         view.addSubview(v);
     }
-    for b in [&primary, &secondary, &open_screen, &open_ax] {
+    for b in [&primary, &secondary] {
         view.addSubview(b);
     }
-    Win { window, title, body, field, notice, status, primary, secondary, open_screen, open_ax }
+    Win { window, title, body, field, notice, status, primary, secondary, panel }
 }
 
 fn host_line(host: &str, label: &Option<String>) -> String {
@@ -221,14 +224,10 @@ fn texts(v: &View) -> (String, String, String, String, Option<&'static str>, Opt
         ),
         Step::Permissions => (
             "Turn on two switches".into(),
-            "macOS lets only you allow these two. Open each page, find Support Join in the list and switch it on. After the first one macOS may ask you to quit and reopen Support Join: do that, it carries on by itself.\n\nSupport connects when both are on. If you change your mind, click End session."
+            "macOS lets only you allow these two. Open each one and switch Support Join on. The first may ask you to quit and reopen Support Join: do that, it carries on by itself.\n\nSupport connects when both are on. To stop, click End session."
                 .into(),
             none(),
-            format!(
-                "Screen Recording: {}\nAccessibility: {}",
-                if v.screen { "on" } else { "not yet" },
-                if v.accessibility { "on" } else { "not yet" }
-            ),
+            none(),
             None,
             Some("End session"),
             false,
@@ -270,8 +269,10 @@ fn draw(ui: &mut Ui, v: &View) {
     w.field.setHidden(!field);
     // The permission page puts its status where the body's second half would be, and the settings buttons below it.
     w.status.setHidden(status.is_empty());
-    w.open_screen.setHidden(!settings);
-    w.open_ax.setHidden(!settings);
+    w.panel.view.setHidden(!settings);
+    if settings {
+        w.panel.read_soon();
+    }
     for (b, text) in [(&w.primary, primary), (&w.secondary, secondary)] {
         b.setHidden(text.is_none());
         if let Some(t) = text {
@@ -387,6 +388,9 @@ fn tick() {
                 ui.win.primary.setEnabled(true);
             }
         }
+        if v.step == Step::Permissions {
+            ui.win.panel.update(None);
+        }
         tick_corner(ui, &v);
         *ui.shared.helper.own_windows.lock().unwrap() = own_windows(ui);
         let alerts: Vec<String> = std::mem::take(&mut *ui.shared.alerts.lock().unwrap());
@@ -436,15 +440,7 @@ fn action(tag: isize) {
             }
             (TAG_SECONDARY, Step::Permissions | Step::Connecting) => ui.shared.send(Event::EndClicked),
             (TAG_SECONDARY, Step::Done { .. }) => quit = true,
-            (TAG_OPEN_SCREEN, _) => {
-                // Puts Support Join in the list (and asks once), then opens the right page.
-                let _ = objc2_core_graphics::CGRequestScreenCaptureAccess();
-                open_url(paths::SETTINGS_SCREEN);
-            }
-            (TAG_OPEN_AX, _) => {
-                prompt_accessibility();
-                open_url(paths::SETTINGS_ACCESSIBILITY);
-            }
+            (t, _) if perms::owns(t) => ui.win.panel.handle(t),
             (TAG_CORNER_END, _) => {
                 if let Some(c) = ui.corner.as_mut() {
                     if c.armed_until.is_some_and(|t| Instant::now() <= t) {
