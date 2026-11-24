@@ -46,7 +46,7 @@ pub struct Item {
 pub const HEADLINE_LINES: usize = 4;
 pub const HEADLINE_LINE_CHARS: usize = 55;
 
-pub const FDA_HELP: &str = "macOS cannot add Support to this list for you. If Support is not listed, click + and choose it, or drag it in from the Finder window that \"Show Support in Finder\" opens.";
+pub const FDA_HELP: &str = "macOS cannot add Support to this list for you. If Support is not listed, click + and choose it, or drag it in from the Finder window that \"Show in Finder\" opens.";
 
 const SCREEN: Item =
     Item { perm: Perm::ScreenRecording, name: "Screen Recording", required: true, what: "Lets your support team see this Mac's screen.", help: None };

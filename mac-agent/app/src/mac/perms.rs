@@ -5,7 +5,7 @@
 //!
 //! Everything here runs in the process that needs the permission, as the signed-in person: the saved app's helper, or the
 //! join app. `CGRequestScreenCaptureAccess` and `AXIsProcessTrustedWithOptions` put the app in the list of its own pane,
-//! and macOS adds the app that asks. Full Disk Access has no such call: the row says so, and "Show Support in Finder"
+//! and macOS adds the app that asks. Full Disk Access has no such call: the row says so, and "Show in Finder"
 //! reveals the app to drag into the list. Its state is the root service's (`full_disk` in the service's status), because
 //! the service and its file helpers are what need it, not this process.
 //!
@@ -138,7 +138,7 @@ impl PermPanel {
             let open = button(mtm, target, "Open Settings", TAG_OPEN + tag, rect(width - BUTTON_W, top - 52.0, BUTTON_W, 28.0));
             view.addSubview(&open);
             let reveal = (item.perm == Perm::FullDiskAccess).then(|| {
-                let b = button(mtm, target, "Show Support in Finder", TAG_REVEAL, rect(width - BUTTON_W, top - 84.0, BUTTON_W, 28.0));
+                let b = button(mtm, target, "Show in Finder", TAG_REVEAL, rect(width - BUTTON_W, top - 84.0, BUTTON_W, 28.0));
                 view.addSubview(&b);
                 b
             });

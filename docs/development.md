@@ -829,7 +829,7 @@ preview parser. `app/src/mac/perms.rs` is the one AppKit panel the saved app's h
 - **Registering.** Before the page opens, the process that needs the permission asks, so it is already listed:
   `CGRequestScreenCaptureAccess()`, and `AXIsProcessTrustedWithOptions` with the prompt option. They run in the helper (as
   the person) or in Support Join, never in the root service. Full Disk Access cannot be registered: its row says to use + or
-  to drag Support in, and "Show Support in Finder" reveals `Support.app` for that.
+  to drag Support in, and "Show in Finder" reveals `Support.app` for that.
 - **State.** The window reads about once a second: `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted`, and for Full Disk
   Access the service's `full_disk` status field. The service answers by running `support fda-probe` in a fresh child, which
   opens `/Library/Application Support/com.apple.TCC/TCC.db` (then the Time Machine preferences if that is missing) and never
