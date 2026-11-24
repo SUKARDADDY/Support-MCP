@@ -285,14 +285,16 @@ pub fn in_own_window(own: &[Rect], x: f64, y: f64) -> bool {
     own.iter().any(|r| x >= r.left as f64 && x < r.right as f64 && y >= r.top as f64 && y < r.bottom as f64)
 }
 
-/// The person's input pauses the app's: milliseconds since their last input, or -1 when the last input was the app's
-/// own. `last_event_ms` is how long ago the system saw any input; `own_ms` how long ago the app sent its last event.
-pub fn customer_ago_ms(last_event_ms: i64, own_ms: Option<i64>) -> i64 {
-    const SLACK_MS: i64 = 50;
-    match own_ms {
-        // The system's last input is no newer than the app's own (with a little slack): it was the app's.
-        Some(own) if last_event_ms + SLACK_MS >= own => -1,
-        _ => last_event_ms.max(0),
+/// The person's input pauses the app's: milliseconds since their last input, or -1 when the system reports none.
+/// `last_event_ms` is how long ago the HID system state saw input. That state counts hardware input only: events the
+/// app posts at the HID tap reach apps but leave its "seconds since the last event" and its counters alone (measured
+/// on macOS 27 with a posted F19 key, and how Apple describes the HID system state). So the age needs no correction
+/// for the app's own events, and the person's input stays visible while the app types every 20 ms.
+pub fn customer_ago_ms(last_event_ms: i64) -> i64 {
+    if last_event_ms < 0 {
+        -1
+    } else {
+        last_event_ms
     }
 }
 
@@ -404,11 +406,19 @@ mod tests {
         assert!(in_own_window(&own, 1300.0, 950.0));
         assert!(!in_own_window(&own, 1199.0, 950.0));
         assert!(!in_own_window(&own, 1500.0, 950.0));
-        // The person typed 500 ms ago, the app sent its last event 2 s ago: the person's.
-        assert_eq!(customer_ago_ms(500, Some(2_000)), 500);
-        // The system's last input is the app's own event.
-        assert_eq!(customer_ago_ms(2_000, Some(2_000)), -1);
-        assert_eq!(customer_ago_ms(2_030, Some(2_000)), -1);
-        assert_eq!(customer_ago_ms(700, None), 700);
+        // The hardware age is the person's, whatever the app sent meanwhile.
+        assert_eq!(customer_ago_ms(500), 500);
+        assert_eq!(customer_ago_ms(0), 0);
+        assert_eq!(customer_ago_ms(-5), -1);
+    }
+
+    #[test]
+    fn the_person_pauses_the_app_while_it_types() {
+        // The review's case: the app typed at t=0, the person pressed a key at t=10, the app's next guard runs at
+        // t=20. The person's key is 10 ms old, inside the 3 s pause.
+        let pause = support_core::geometry::CUSTOMER_PAUSE_MS as i64;
+        assert!((0..pause).contains(&customer_ago_ms(10)));
+        // An hour of nothing from the person: no pause.
+        assert!(!(0..pause).contains(&customer_ago_ms(3_600_000)));
     }
 }

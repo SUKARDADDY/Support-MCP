@@ -10,12 +10,8 @@ use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventType, CGMouseButton, CGScrollEventUnit,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use support_core::geometry::{CLICK_GAP_MS, DRAG_STEPS, DRAG_STEP_MS, KEY_GAP_MS, KEY_HOLD_MS, PAUSE_TEXT, TYPE_CHAR_MS};
-
-/// When the app last sent an event, to tell the person's input from its own.
-static LAST_SENT: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// What every input step checks before it goes.
 pub trait Guard {
@@ -27,12 +23,12 @@ pub trait Guard {
     fn key_target(&self) -> Result<(), String>;
 }
 
-/// Milliseconds since the person last used the mouse or keyboard, -1 when the last input was the app's own.
+/// Milliseconds since the person last used the mouse or keyboard (hardware input only; see
+/// `input_plan::customer_ago_ms`), -1 when the system reports none.
 pub fn customer_ago_ms() -> i64 {
     // kCGAnyInputEventType is ~0.
     let secs = CGEventSource::seconds_since_last_event_type(CGEventSourceStateID::HIDSystemState, CGEventType(u32::MAX));
-    let own = LAST_SENT.lock().unwrap().map(|t| t.elapsed().as_millis() as i64);
-    input_plan::customer_ago_ms((secs * 1000.0) as i64, own)
+    input_plan::customer_ago_ms((secs * 1000.0) as i64)
 }
 
 pub fn paused() -> bool {
@@ -42,7 +38,6 @@ pub fn paused() -> bool {
 fn post(e: Option<objc2_core_foundation::CFRetained<CGEvent>>) -> Result<(), String> {
     let e = e.ok_or("macOS refused to make the input event")?;
     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&e));
-    *LAST_SENT.lock().unwrap() = Some(Instant::now());
     Ok(())
 }
 
