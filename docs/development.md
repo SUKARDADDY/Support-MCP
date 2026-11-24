@@ -373,7 +373,10 @@ release signed long before its deploy would skip them.
    offline step, but it is not part of the Windows deploy. Build the package
    `Support-<version>.pkg` (the macOS job). The Mac has its own version line, starting
    at 1.1.0 and unrelated to the relay's `VERSION`. Attach it to the GitHub release
-   `v<version>`, then sign it:
+   `v<version>` together with `Support-<version>.zip`, the Support Join app that the
+   same build makes: the one-off link page links the zip at the note's URL with `.pkg`
+   replaced by `.zip`, so a release without it shows customers a broken download link.
+   Then sign the package:
 
    ```sh
    wl-paste | node scripts/sign-release.mjs --product mac --version <version> --file Support-<version>.pkg \
