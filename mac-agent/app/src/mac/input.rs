@@ -57,8 +57,14 @@ fn wait(ms: u64, cancel: &AtomicBool) -> Result<(), String> {
     Ok(())
 }
 
+/// An event made with no source inherits the event system's modifier state, so a Cmd left "held" by an earlier chord
+/// would turn a click or a typed letter into a shortcut. Every event we make says its own flags instead.
+const NO_FLAGS: CGEventFlags = CGEventFlags(0);
+
 fn mouse(kind: CGEventType, x: f64, y: f64, button: CGMouseButton) -> Option<objc2_core_foundation::CFRetained<CGEvent>> {
-    CGEvent::new_mouse_event(None, kind, CGPoint::new(x, y), button)
+    let e = CGEvent::new_mouse_event(None, kind, CGPoint::new(x, y), button)?;
+    CGEvent::set_flags(Some(&e), NO_FLAGS);
+    Some(e)
 }
 
 pub fn move_to(x: f64, y: f64) -> Result<(), String> {
@@ -120,12 +126,25 @@ pub fn scroll(at: Option<(f64, f64)>, wheels: (i32, i32), guard: &dyn Guard) -> 
         guard.target(x, y)?;
         move_to(x, y)?;
     }
-    post(CGEvent::new_scroll_wheel_event2(None, CGScrollEventUnit::Line, 2, wheels.0, wheels.1, 0))
+    let e = CGEvent::new_scroll_wheel_event2(None, CGScrollEventUnit::Line, 2, wheels.0, wheels.1, 0);
+    if let Some(e) = &e {
+        CGEvent::set_flags(Some(e), NO_FLAGS);
+    }
+    post(e)
 }
 
 fn key(code: u16, down: bool, flags: u64) -> Result<(), String> {
     let e = CGEvent::new_keyboard_event(None, code, down).ok_or("macOS refused to make the key event")?;
     CGEvent::set_flags(Some(&e), CGEventFlags(flags));
+    post(Some(e))
+}
+
+/// Tells the event system that no modifier is down. A modifier's key-up alone does not clear its combined modifier
+/// state, so this flags-changed event follows the chord's key-ups.
+fn clear_modifiers(code: u16) -> Result<(), String> {
+    let e = CGEvent::new_keyboard_event(None, code, false).ok_or("macOS refused to make the key event")?;
+    CGEvent::set_type(Some(&e), CGEventType::FlagsChanged);
+    CGEvent::set_flags(Some(&e), NO_FLAGS);
     post(Some(e))
 }
 
@@ -153,6 +172,9 @@ pub fn chords(list: &[Chord], guard: &dyn Guard, cancel: &AtomicBool) -> Result<
         for code in c.modifiers.iter().rev() {
             let _ = key(*code, false, 0);
         }
+        if let Some(code) = c.last_released() {
+            let _ = clear_modifiers(code);
+        }
         result?;
     }
     Ok(())
@@ -174,6 +196,7 @@ pub fn type_text(text: &str, guard: &dyn Guard, cancel: &AtomicBool) -> Result<(
             TypeStep::Text(units) => {
                 for down in [true, false] {
                     let e = CGEvent::new_keyboard_event(None, 0, down).ok_or("macOS refused to make the key event")?;
+                    CGEvent::set_flags(Some(&e), NO_FLAGS);
                     // SAFETY: the pointer and length describe `units`, which outlives the call.
                     unsafe { CGEvent::keyboard_set_unicode_string(Some(&e), units.len() as _, units.as_ptr()) };
                     post(Some(e))?;

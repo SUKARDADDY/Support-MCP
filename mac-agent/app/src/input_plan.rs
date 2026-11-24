@@ -137,6 +137,14 @@ pub struct Chord {
     pub flags: u64,
 }
 
+impl Chord {
+    /// The modifier whose key-up ends the chord: the first one pressed, since the modifiers come up in reverse. The
+    /// flags-changed event that clears the system's modifier state names it. None for a chord with no modifier.
+    pub fn last_released(&self) -> Option<u16> {
+        self.modifiers.first().copied()
+    }
+}
+
 pub fn chords(combos: &[KeyCombo]) -> Result<Vec<Chord>, String> {
     combos
         .iter()
@@ -260,6 +268,14 @@ pub fn customer_ago_ms(last_event_ms: i64, own_ms: Option<i64>) -> i64 {
 mod tests {
     use super::*;
     use support_core::keys;
+
+    #[test]
+    fn a_chord_ends_on_its_first_pressed_modifier() {
+        let c = chords(&keys::parse("ctrl+shift+Tab cmd+Down Return").unwrap()).unwrap();
+        assert_eq!(c[0].last_released(), Some(0x3B));
+        assert_eq!(c[1].last_released(), Some(0x37));
+        assert_eq!(c[2].last_released(), None);
+    }
 
     #[test]
     fn key_names_become_mac_key_codes() {
