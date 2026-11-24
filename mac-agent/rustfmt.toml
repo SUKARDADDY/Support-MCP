@@ -1,0 +1,3 @@
+# Wide lines and compact one-liners where they read well: the wire code is easier to compare with src/agent-app.cs.
+max_width = 150
+use_small_heuristics = "Max"
