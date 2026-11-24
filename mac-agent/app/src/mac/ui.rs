@@ -709,6 +709,8 @@ fn show(ui: &mut Ui) -> Option<Retained<NSStatusBarButton>> {
 }
 
 fn tick() {
+    // A stop signal (launchd's SIGTERM) is acted on here, on the main thread, even while a modal alert runs.
+    super::helper::exit_if_terminated();
     if MODAL.with(|m| m.get()) {
         return;
     }

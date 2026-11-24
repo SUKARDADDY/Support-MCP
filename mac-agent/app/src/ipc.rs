@@ -5,7 +5,8 @@
 //!
 //! A connection's first frame says what it is:
 //! - `{"type":"helper","session":"aqua"|"loginwindow"}` makes it a helper's link. The service then sends `screen`,
-//!   `ask`, `cancel` and `close_apps` with an `id`, and the helper answers each with `{"type":"reply","id",...}`. The
+//!   `ask`, `cancel` and `close_apps` with an `id`, and the helper answers each with `{"type":"reply","id",...}`. It
+//!   also sends `release_input`, which has no id and no answer. The
 //!   helper also sends a `tick` every second: its permissions, the person's last input and whether the screen is locked.
 //! - Any request below makes it a request link: one answer for each request, in order.
 
@@ -111,6 +112,8 @@ pub enum ToHelper {
         id: u64,
         pids: Vec<i32>,
     },
+    /// Let go of every modifier key. No answer: the service does not wait, and the helper may get it any time.
+    ReleaseInput,
 }
 
 /// True when `m` has every key of `required` and no key outside `required` and `optional`.
@@ -249,6 +252,7 @@ pub fn to_helper_message(t: &ToHelper) -> Map<String, Value> {
         ToHelper::Ask { id, by, team, full } => obj(json!({ "type": "ask", "id": id, "by": by, "team": team, "full": full })),
         ToHelper::Cancel { id } => obj(json!({ "type": "cancel", "id": id })),
         ToHelper::CloseApps { id, pids } => obj(json!({ "type": "close_apps", "id": id, "pids": pids })),
+        ToHelper::ReleaseInput => obj(json!({ "type": "release_input" })),
     }
 }
 
@@ -263,6 +267,7 @@ pub fn read_to_helper(m: &Map<String, Value>) -> Option<ToHelper> {
             Some(ToHelper::Ask { id: id(m)?, by: string(m, "by", PERSON_MAX)?, team: string(m, "team", PERSON_MAX)?, full: boolean(m, "full")? })
         }
         "cancel" if exact(m, &["type", "id"], &[]) => Some(ToHelper::Cancel { id: id(m)? }),
+        "release_input" if exact(m, &["type"], &[]) => Some(ToHelper::ReleaseInput),
         "close_apps" if exact(m, &["type", "id", "pids"], &[]) => {
             let list = m.get("pids")?.as_array()?;
             if list.len() > PIDS_MAX {
@@ -483,6 +488,7 @@ mod tests {
             ToHelper::Ask { id: 2, by: "Dana".into(), team: "Team".into(), full: true },
             ToHelper::Cancel { id: 3 },
             ToHelper::CloseApps { id: 4, pids: vec![400, 401] },
+            ToHelper::ReleaseInput,
         ];
         for t in all {
             assert_eq!(read_to_helper(&to_helper_message(&t)), Some(t));
@@ -490,6 +496,7 @@ mod tests {
         assert_eq!(read_to_helper(&m(json!({"type":"close_apps","id":4,"pids":[1]}))), None, "never launchd");
         assert_eq!(read_to_helper(&m(json!({"type":"ask","id":2,"by":"x".repeat(201),"team":"","full":false}))), None);
         assert_eq!(read_to_helper(&m(json!({"type":"screen","id":1,"action":"screenshot"}))), None);
+        assert_eq!(read_to_helper(&m(json!({"type":"release_input","id":1}))), None, "it carries nothing");
     }
 
     #[test]

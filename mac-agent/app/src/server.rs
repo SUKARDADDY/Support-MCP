@@ -110,6 +110,15 @@ impl Helpers {
         }
     }
 
+    /// Tells every helper to let go of every modifier key. No answer is waited for: this runs when a session ends or
+    /// its link drops, and it must not block. A helper that is gone has nothing held.
+    pub fn release_input(&self) {
+        let all: Vec<Arc<HelperConn>> = self.by_uid.lock().unwrap().values().filter(|h| !h.is_closed()).cloned().collect();
+        for h in all {
+            let _ = h.out.send(ipc::to_helper_message(&ToHelper::ReleaseInput));
+        }
+    }
+
     /// Sends one request to the helper of `uid` and waits for its answer. Blocking: it runs on a command's thread.
     /// When `stop` is set first, the helper is told to cancel.
     pub fn request(&self, uid: u32, make: impl FnOnce(u64) -> ToHelper, timeout: Duration, stop: &Stop) -> Result<Map<String, Value>, HelperError> {

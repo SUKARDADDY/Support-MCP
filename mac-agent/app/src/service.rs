@@ -250,6 +250,9 @@ impl MacPlatform {
                     // A session that is starting keeps the pin `accept` chose for it.
                     let next = l.next.take();
                     *l = Live { next, ..Live::default() };
+                    // However the last session ended (the technician, the person, the clock, a dropped link): no
+                    // key stays held down on the person's Mac.
+                    self.helpers.release_input();
                 }
             }
         }
@@ -289,6 +292,10 @@ impl programs::Closer for HelperCloser<'_> {
 }
 
 impl Platform for MacPlatform {
+    fn release_input(&self) {
+        self.helpers.release_input();
+    }
+
     fn info(&self) -> HostInfo {
         let id = self.os.identity();
         let user = self.os.console_uid().and_then(|u| self.os.user_name(u)).unwrap_or_default();
@@ -843,6 +850,11 @@ mod tests {
 
     /// A helper that reports `tick` and answers screen requests with a 2x2 picture, asks with `answer`.
     async fn helper(sock: &std::path::Path, tick: Tick, answer: bool) {
+        helper_counting(sock, tick, answer, Arc::default()).await
+    }
+
+    /// The same helper, counting the `release_input` requests it gets.
+    async fn helper_counting(sock: &std::path::Path, tick: Tick, answer: bool, releases: Arc<std::sync::atomic::AtomicUsize>) {
         let mut s = UnixStream::connect(sock).await.unwrap();
         frame::write(&mut s, &ipc::opening_helper(ipc::HelperSession::Aqua)).await.unwrap();
         frame::write(&mut s, &ipc::tick_message(&tick)).await.unwrap();
@@ -862,6 +874,10 @@ mod tests {
                     }
                     Some(ToHelper::Ask { id, .. }) => ipc::reply_message(id, json!({"answer": answer}).as_object().unwrap().clone()),
                     Some(ToHelper::CloseApps { id, pids }) => ipc::reply_message(id, json!({"asked": pids}).as_object().unwrap().clone()),
+                    Some(ToHelper::ReleaseInput) => {
+                        releases.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        continue;
+                    }
                     _ => continue,
                 };
                 let _ = frame::write(&mut s, &ipc::tick_message(&tick)).await;
@@ -913,6 +929,38 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!((out.image.unwrap().width, out.text.as_deref()), (2, Some("did screenshot")));
+    }
+
+    async fn releases_reach(seen: &std::sync::atomic::AtomicUsize, n: usize) {
+        for _ in 0..100 {
+            if seen.load(std::sync::atomic::Ordering::SeqCst) >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the helper got {} release requests, wanted {n}", seen.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn the_end_of_a_session_and_a_dropped_link_each_tell_the_helper_to_release_input() {
+        use std::sync::atomic::Ordering;
+        let r = rig("release", "full").await;
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        helper_counting(&r.sock, ALL, true, seen.clone()).await;
+        wait_helper(&r.svc, 501).await;
+        // A session starts: nothing is released. It ends, for whatever reason: the helper is told.
+        r.svc.platform.session(Some("Dana"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+        r.svc.platform.session(None);
+        releases_reach(&seen, 1).await;
+        // The core tells the platform the relay link dropped (and again as it closes): the helper is told each time.
+        r.svc.platform.release_input();
+        releases_reach(&seen, 2).await;
+        // With nobody connected there is nothing to tell, and it is no error.
+        let none = rig("release-none", "full").await;
+        none.svc.platform.release_input();
+        none.svc.platform.session(None);
     }
 
     #[tokio::test]

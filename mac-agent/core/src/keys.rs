@@ -56,14 +56,24 @@ pub struct KeyCombo {
 
 pub const CTRL_ALT_DEL: &str = "Ctrl+Alt+Del is not available on a Mac.";
 
+/// Every modifier name the parser accepts, and the modifier it means. A platform that must release every modifier it
+/// can press reads its list from here, so a modifier added to this table is never missed.
+pub const MODIFIER_NAMES: &[(&str, Modifier)] = &[
+    ("ctrl", Modifier::Ctrl),
+    ("control", Modifier::Ctrl),
+    ("alt", Modifier::Option),
+    ("option", Modifier::Option),
+    ("opt", Modifier::Option),
+    ("shift", Modifier::Shift),
+    ("super", Modifier::Command),
+    ("win", Modifier::Command),
+    ("meta", Modifier::Command),
+    ("cmd", Modifier::Command),
+    ("command", Modifier::Command),
+];
+
 fn modifier(name: &str) -> Option<Modifier> {
-    Some(match name {
-        "ctrl" | "control" => Modifier::Ctrl,
-        "alt" | "option" | "opt" => Modifier::Option,
-        "shift" => Modifier::Shift,
-        "super" | "win" | "meta" | "cmd" | "command" => Modifier::Command,
-        _ => return None,
-    })
+    MODIFIER_NAMES.iter().find(|(n, _)| *n == name).map(|(_, m)| *m)
 }
 
 fn named(name: &str) -> Option<Key> {

@@ -3,7 +3,7 @@
 //! and where a screenshot pixel lands on the screen.
 
 use support_core::geometry::{self, Rect};
-use support_core::keys::{Key, KeyCombo, Modifier};
+use support_core::keys::{self, Key, KeyCombo, Modifier};
 
 /// The modifier keys' own codes, pressed before the chord's keys and released after them.
 pub fn modifier_code(m: Modifier) -> u16 {
@@ -13,6 +13,28 @@ pub fn modifier_code(m: Modifier) -> u16 {
         Modifier::Option => 0x3A,
         Modifier::Ctrl => 0x3B,
     }
+}
+
+/// What letting go of every modifier takes: a key-up for each modifier key, then one flags-changed event with flags 0
+/// (named by `reset_code`) so the event system sees no modifier down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleasePlan {
+    pub key_ups: Vec<u16>,
+    pub reset_code: u16,
+}
+
+/// The release plan for every modifier the chord parser accepts. It reads `keys::MODIFIER_NAMES`, the parser's own
+/// table, so a modifier added there is released too.
+pub fn release_plan() -> ReleasePlan {
+    let mut key_ups: Vec<u16> = Vec::new();
+    for (_, m) in keys::MODIFIER_NAMES {
+        let code = modifier_code(*m);
+        if !key_ups.contains(&code) {
+            key_ups.push(code);
+        }
+    }
+    let reset_code = key_ups.last().copied().unwrap_or(0x37);
+    ReleasePlan { key_ups, reset_code }
 }
 
 /// The CGEventFlags bit a modifier sets on the events of its chord.
@@ -268,6 +290,25 @@ pub fn customer_ago_ms(last_event_ms: i64, own_ms: Option<i64>) -> i64 {
 mod tests {
     use super::*;
     use support_core::keys;
+
+    #[test]
+    fn the_release_plan_covers_every_modifier_the_parser_accepts() {
+        let plan = release_plan();
+        // Every name in the parser's table, parsed the way a chord is, ends up released.
+        for (name, _) in keys::MODIFIER_NAMES {
+            let chord = chords(&keys::parse(&format!("{name}+a")).unwrap()).unwrap();
+            for code in &chord[0].modifiers {
+                assert!(plan.key_ups.contains(code), "{name} (code {code:#x}) is not released");
+            }
+        }
+        // Each modifier once, in a stable order, and the reset event names one of them.
+        let mut sorted = plan.key_ups.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), plan.key_ups.len());
+        assert_eq!(plan.key_ups, vec![0x3B, 0x3A, 0x38, 0x37]);
+        assert!(plan.key_ups.contains(&plan.reset_code));
+    }
 
     #[test]
     fn a_chord_ends_on_its_first_pressed_modifier() {

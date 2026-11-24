@@ -303,6 +303,7 @@ async fn link_once(shared: Arc<Shared>) -> Result<(), String> {
                 }
                 shared.cancelled_asks.lock().unwrap().push(id);
             }
+            ToHelper::ReleaseInput => input::release_all(),
             ToHelper::CloseApps { id, pids } => {
                 let mut asked = Vec::new();
                 for pid in pids {
@@ -321,6 +322,8 @@ async fn link_once(shared: Arc<Shared>) -> Result<(), String> {
     for c in cancels.lock().unwrap().values() {
         c.store(true, Ordering::SeqCst);
     }
+    // The service is gone, so nothing will tell this helper to let go: it does, whatever was in flight.
+    input::release_all();
     result
 }
 
@@ -388,6 +391,22 @@ fn request_thread(shared: Arc<Shared>, rx: mpsc::Receiver<UiRequest>) {
 pub const SHOW_SIGNAL: libc::c_int = libc::SIGINFO;
 /// Set by the signal or the reopen event, read by the windows' timer.
 pub static SHOW: AtomicBool = AtomicBool::new(false);
+/// Set by SIGTERM (launchd stopping the helper), SIGINT or SIGHUP. The windows' timer sees it on the main thread,
+/// releases every modifier key and exits.
+pub static TERMINATE: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_terminate(_: libc::c_int) {
+    TERMINATE.store(true, Ordering::SeqCst);
+}
+
+/// Called from the windows' timer on the main thread. When a stop signal came in, releases every modifier key and
+/// exits; the signal handler itself only sets a flag.
+pub fn exit_if_terminated() {
+    if TERMINATE.load(Ordering::SeqCst) {
+        input::release_all();
+        std::process::exit(0);
+    }
+}
 
 extern "C" fn on_show(_: libc::c_int) {
     SHOW.store(true, Ordering::SeqCst);
@@ -418,7 +437,12 @@ pub fn take_show_request() {
 
 pub fn main() -> i32 {
     // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
-    unsafe { libc::signal(SHOW_SIGNAL, on_show as *const () as libc::sighandler_t) };
+    unsafe {
+        libc::signal(SHOW_SIGNAL, on_show as *const () as libc::sighandler_t);
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::signal(sig, on_terminate as *const () as libc::sighandler_t);
+        }
+    }
     let Some(mtm) = MainThreadMarker::new() else { return 2 };
     // SAFETY: a getter.
     let session = if unsafe { libc::geteuid() } == 0 { HelperSession::LoginWindow } else { HelperSession::Aqua };
@@ -447,5 +471,7 @@ pub fn main() -> i32 {
         });
     }
     ui::run(mtm, shared);
+    // The run loop ended: nothing stays held down.
+    input::release_all();
     0
 }

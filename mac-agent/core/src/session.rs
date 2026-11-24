@@ -418,6 +418,7 @@ impl<T: Transport> Client<T> {
                     if !network_error {
                         self.log(&format!("Connection error: {e}"));
                         self.events.link(false);
+                        self.platform.release_input();
                     }
                     network_error = true;
                     if self.pause(RETRY_DELAY).await {
@@ -445,6 +446,8 @@ impl<T: Transport> Client<T> {
             }
             let _ = self.transport.post(&bye, END_TIMEOUT).await;
         }
+        // Whatever ended the session, and whatever was running when it did: nothing stays held down.
+        self.platform.release_input();
         self.events.busy(0);
         end
     }
@@ -794,10 +797,14 @@ mod tests {
         screen_gate: Option<Gate>,
         runs: AtomicUsize,
         screens: AtomicUsize,
+        releases: AtomicUsize,
         huge_list: bool,
     }
 
     impl Platform for Stub {
+        fn release_input(&self) {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+        }
         fn info(&self) -> HostInfo {
             HostInfo { machine: "Neo".into(), user: "ariel".into(), elevated: false, control: Control::Normal, uia: false }
         }
@@ -1313,6 +1320,33 @@ mod tests {
         let took = started.elapsed();
         assert!(took >= Duration::from_secs(10) && took < Duration::from_secs(14), "{took:?}");
         assert!(fake.of_type("end").is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_link_and_the_close_each_release_the_input() {
+        // The link never comes up: the first failure releases once, and the close releases once more.
+        let fake = Fake::new(|_| Step::Net(NetError::Offline("down".into())));
+        let stub = Arc::new(Stub::default());
+        let (c, _s) = client(&fake, stub.clone(), 10);
+        assert_eq!(c.run().await, SessionEnd::Stopped);
+        assert_eq!(stub.releases.load(Ordering::SeqCst), 2, "once for the drop (not for each retry), once for the close");
+        // A session that ends with the owner's stop releases at its close.
+        let fake = Fake::new(move |m| match text(m, "type").as_str() {
+            "hello" => welcome(2, 600_000),
+            "poll" => Step::Hang,
+            _ => ack(),
+        });
+        let stub = Arc::new(Stub::default());
+        let (c, stop) = client(&fake, stub.clone(), 600);
+        let task = tokio::spawn({
+            let c = c.clone();
+            async move { c.run().await }
+        });
+        sleep(Duration::from_secs(5)).await;
+        assert_eq!(stub.releases.load(Ordering::SeqCst), 0, "nothing is released while the session is healthy");
+        stop.set();
+        assert_eq!(task.await.unwrap(), SessionEnd::Stopped);
+        assert_eq!(stub.releases.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(start_paused = true)]

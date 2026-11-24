@@ -148,6 +148,17 @@ fn clear_modifiers(code: u16) -> Result<(), String> {
     post(Some(e))
 }
 
+/// Lets go of every modifier the app can press: a key-up for each, then a flags-changed event with flags 0. Safe to
+/// call at any time and when nothing is held. The service asks for it when a session ends or its link drops, and the
+/// helper does it when its own link to the service drops and when it exits.
+pub fn release_all() {
+    let plan = input_plan::release_plan();
+    for code in &plan.key_ups {
+        let _ = key(*code, false, 0);
+    }
+    let _ = clear_modifiers(plan.reset_code);
+}
+
 /// Presses each chord: its modifiers down in order, its keys down and up, the modifiers up in reverse.
 pub fn chords(list: &[Chord], guard: &dyn Guard, cancel: &AtomicBool) -> Result<(), String> {
     for (n, c) in list.iter().enumerate() {
