@@ -34,8 +34,18 @@ pub fn release_plan() -> ReleasePlan {
         }
     }
     let reset_code = key_ups.last().copied().unwrap_or(0x37);
+    // Also the keys the agent never presses: Fn and the right-hand modifiers. A key-up for a key that is not down does
+    // nothing, and this way no modifier can stay held after a session, whoever pressed it.
+    for code in EXTRA_RELEASES {
+        if !key_ups.contains(&code) {
+            key_ups.push(code);
+        }
+    }
     ReleasePlan { key_ups, reset_code }
 }
+
+/// Fn, right Command, right Shift, right Option and right Control.
+const EXTRA_RELEASES: [u16; 5] = [0x3F, 0x36, 0x3C, 0x3D, 0x3E];
 
 /// The CGEventFlags bit a modifier sets on the events of its chord.
 pub fn modifier_flag(m: Modifier) -> u64 {
@@ -306,7 +316,8 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), plan.key_ups.len());
-        assert_eq!(plan.key_ups, vec![0x3B, 0x3A, 0x38, 0x37]);
+        assert_eq!(plan.key_ups, vec![0x3B, 0x3A, 0x38, 0x37, 0x3F, 0x36, 0x3C, 0x3D, 0x3E]);
+        assert_eq!(plan.reset_code, 0x37);
         assert!(plan.key_ups.contains(&plan.reset_code));
     }
 
