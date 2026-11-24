@@ -419,11 +419,8 @@ test('screen frames carry the lane and the normalized action; a bad action is re
   assert.equal((await f.op({ op: 'screen' })).ok, false);
 });
 
-test('a screen result is validated field by field; a bad one gets 400 and leaves the command waiting', async () => {
+test('a screen result is validated field by field; a bad one gets 400 and settles the command', async () => {
   const f = await attach();
-  const p = f.op(screen('screenshot'));
-  await until(() => f.session.httpCommands.screen);
-  const frame = await f.poll({ busy_lanes: [] });
   const long = '/9j/' + 'A'.repeat(700000);
   const bad = [
     shotResult({ image_b64: long }), shotResult({ image_b64: 'not base64!!' }), shotResult({ image_b64: PNG }),
@@ -432,11 +429,18 @@ test('a screen result is validated field by field; a bad one gets 400 and leaves
     { image_b64: undefined, mime: undefined, width: undefined, height: undefined }, // a screenshot with no image
   ];
   for (const body of bad) {
+    const p = f.op(screen('screenshot'));
+    await until(() => f.session.httpCommands.screen);
+    const frame = await f.poll({ busy_lanes: [] });
     const r = await f.result(frame, body);
     assert.equal(r.status, 400, JSON.stringify(body).slice(0, 80));
     assert.deepEqual(await r.json(), { error: 'invalid result' });
-    assert.equal(f.session.pending.has(frame.id), true);
+    assert.equal(f.session.pending.has(frame.id), false);
+    assert.equal((await p).code, 'bad_result');
   }
+  const p = f.op(screen('screenshot'));
+  await until(() => f.session.httpCommands.screen);
+  const frame = await f.poll({ busy_lanes: [] });
   assert.equal((await f.result(frame, shotResult({ image_b64: PNG, mime: 'image/png' }))).status, 200);
   assert.equal((await p).mime, 'image/png');
 });
@@ -557,6 +561,10 @@ test('request_full_control: a result, a refusal, and a hello without full contro
   await until(() => f.session.httpCommands.screen);
   frame = await f.poll({ busy_lanes: [] });
   assert.equal((await f.result(frame, { control: 'root' })).status, 400);
+  assert.equal((await p).code, 'bad_result');
+  p = f.op({ op: 'control', action: 'request_full_control' });
+  await until(() => f.session.httpCommands.screen);
+  frame = await f.poll({ busy_lanes: [] });
   await f.agent({ type: 'result', id: frame.id, ok: false, error: 'the customer declined' });
   assert.deepEqual(await p, { ok: false, error: 'the customer declined' });
   p = f.op({ op: 'control', action: 'request_full_control' });
@@ -574,6 +582,9 @@ test('a new hello fails the commands of the old generation', async () => {
   await f.req('/agent', { type: 'hello', caps: NEW_CAPS }, f.key);
   assert.equal((await run).error, 'agent replaced');
   assert.equal((await shot).error, 'agent replaced');
+  assert.equal(f.session.pending.size, 0);
+  assert.deepEqual(f.session.httpCommands, { cmd: null, screen: null });
+  assert.equal(f.session.httpPoll, null);
 });
 
 test('a screen result stores the desktop it saw', async () => {
@@ -691,8 +702,9 @@ test('a block_input result sets input_blocked_until at once, and off clears it',
   await until(() => f.session.httpCommands.screen);
   const fr = await f.poll({ busy_lanes: [] });
   assert.equal((await f.result(fr, { input_blocked_until: 'soon' })).status, 400);
+  assert.equal((await q).code, 'bad_result');
   await f.result(fr, { input_blocked_until: until10 });
-  await q;
+  assert.equal((await f.status()).input_blocked_until, null);
 });
 
 test('an input whose screenshot failed is still a success, with the note and no image', async () => {
@@ -703,4 +715,153 @@ test('an input whose screenshot failed is still a success, with the note and no 
   await f.result(fr, { text: 'input sent; no screenshot: cannot capture the screen', desktop: 'default', display: 0, displays: 1 });
   const r = await q;
   assert.deepEqual([r.ok, r.text, r.image_b64, r.desktop], [true, 'input sent; no screenshot: cannot capture the screen', undefined, 'default']);
+});
+
+// Queue frames directly to isolate result handling from command validation and
+// saved-PC approvals. Separate tests exercise /command and MCP propagation.
+for (const [name, frame, body] of [
+  ['run', { type: 'run', lane: 'cmd' }, { stdout_b64: '!', stderr_b64: '' }],
+  ['get_file', { type: 'get_file', lane: 'cmd' }, { data_b64: '', size: -1, eof: true }],
+  ['put_file', { type: 'put_file', lane: 'cmd' }, { bytes: -1 }],
+  ['screenshot', { type: 'screen', lane: 'screen', action: { name: 'screenshot' } }, {}],
+  ['list programs', { type: 'programs', lane: 'cmd', action: 'list' }, { installed: [], running: null }],
+  ['close program', { type: 'programs', lane: 'cmd', action: 'close' }, { closed: -1 }],
+]) {
+  test(`malformed ${name} resolves promptly with bad_result and frees the parked lane`, async (t) => {
+    const f = await attach();
+    t.after(() => f.end());
+    const { lane } = frame;
+    const sent = { ...frame, id: 'bad-result' };
+    const tag = `http${f.generation}`;
+    f.session.httpCommands[lane] = { frame: sent, tag, sent_at: null };
+    let out, settlements = 0;
+    const pending = f.session.awaitResult(sent.id, { send: () => f.session.dispatchHttp(lane) }, tag, sent, 60000)
+      .then((r) => { out = r; });
+    const entry = f.session.pending.get(sent.id);
+    const resolve = entry.resolve;
+    entry.resolve = (r) => { settlements++; resolve(r); };
+    await f.poll();
+    let delivered;
+    const parked = f.poll({ busy_lanes: [lane] }).then((r) => { delivered = r; });
+    await until(() => f.session.httpPoll);
+    const response = await f.result(sent, body);
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: 'invalid result' });
+    await until(() => out);
+    await pending;
+    assert.equal(out.ok, false);
+    assert.equal(out.code, 'bad_result');
+    assert.match(out.error, /^bad_result:.*PC answered.*reply could not be read.*may or may not have happened.*Check before retrying/);
+    assert.equal(out.timed_out, undefined);
+    assert.equal(f.session.pending.has(sent.id), false);
+    assert.equal(f.session.httpCommands[lane], null);
+    assert.equal(f.session.httpPoll.busy.has(lane), false);
+    assert.deepEqual(await (await f.result(sent, body)).json(), { type: 'ack' });
+    assert.equal(settlements, 1);
+    const next = f.op(lane === 'screen' ? screen('screenshot') : { op: 'run', command: 'echo next' });
+    await until(() => delivered);
+    await parked;
+    assert.equal(delivered.lane, lane);
+    assert.notEqual(delivered.id, sent.id);
+    await f.result(delivered, lane === 'screen' ? shotResult() : { stdout_b64: '', stderr_b64: '' });
+    assert.equal((await next).ok, true);
+  });
+}
+
+test('/mcp exposes bad_result when a PC reply cannot be read', async (t) => {
+  const f = await attach();
+  t.after(() => f.end());
+  let out;
+  const call = mcp(f, '', 'tools/call', { name: 'run', arguments: { session_id: SID, command: 'echo test' } })
+    .then((r) => { out = r; });
+  await until(() => f.session.httpCommands.cmd);
+  assert.equal((await f.result(await f.poll(), { stdout_b64: '!' })).status, 400);
+  await until(() => out);
+  await call;
+  assert.equal(out.body.result.isError, true);
+  assert.match(out.body.result.content[0].text, /^bad_result:.*Check before retrying/);
+});
+
+for (const cleanup of ['timeout', 'disconnect']) {
+  test(`${cleanup} clears pending state but preserves the PC busy lane`, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const f = await attach();
+    t.after(() => f.end());
+    const frame = { type: 'run', lane: 'cmd', id: 'cleanup' };
+    f.session.httpCommands.cmd = { frame, tag: 'http1', sent_at: null };
+    const p = f.session.awaitResult(frame.id, { send() {} }, 'http1', frame, 100);
+    await f.poll();
+    let delivered;
+    const poll = f.poll({ busy_lanes: ['cmd'] }).then((r) => { delivered = r; });
+    await until(() => f.session.httpPoll);
+    if (cleanup === 'timeout') t.mock.timers.tick(100);
+    else f.session.failPending(() => true, 'agent disconnected');
+    assert.equal((await p).ok, false);
+    assert.equal(f.session.pending.size, 0);
+    assert.equal(f.session.httpCommands.cmd, null);
+    assert.equal(f.session.httpPoll.busy.has('cmd'), true);
+    const next = f.op({ op: 'run', command: 'echo next' });
+    await until(() => f.session.httpCommands.cmd);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(delivered, undefined, 'the busy poll stays parked');
+    assert.equal(f.session.httpCommands.cmd.sent_at, null);
+    const free = await f.poll({ busy_lanes: [] });
+    await f.result(free, { stdout_b64: '', stderr_b64: '' });
+    assert.equal((await next).ok, true);
+    await f.end();
+    await poll;
+  });
+}
+
+test('install results normalize invalid exit codes and still release the lane', async (t) => {
+  const f = await attach();
+  t.after(() => f.end());
+  const frame = { type: 'programs', action: 'install', lane: 'cmd', id: 'install-result' };
+  f.session.httpCommands.cmd = { frame, tag: 'http1', sent_at: null };
+  const pending = f.session.awaitResult(frame.id, { send() {} }, 'http1', frame, 60000);
+  await f.poll();
+  let delivered;
+  const parked = f.poll({ busy_lanes: ['cmd'] }).then((r) => { delivered = r; });
+  await until(() => f.session.httpPoll);
+  assert.equal((await f.result(frame, { exit_code: 'invalid' })).status, 200);
+  assert.deepEqual(await pending, { ok: true, exit_code: null });
+  assert.equal(f.session.pending.size, 0);
+  assert.equal(f.session.httpCommands.cmd, null);
+  assert.equal(f.session.httpPoll.busy.has('cmd'), false);
+  const next = f.op({ op: 'run', command: 'echo next' });
+  await until(() => delivered);
+  await parked;
+  await f.result(delivered, { stdout_b64: '', stderr_b64: '' });
+  assert.equal((await next).ok, true);
+});
+
+test('a timed-out run keeps the busy poll parked until the PC reports the lane free', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_800_000_000_000 });
+  const f = await attach();
+  t.after(() => f.end());
+  const a = f.op({ op: 'run', command: 'echo A', timeout_s: 1 });
+  await until(() => f.session.httpCommands.cmd);
+  const frameA = await f.poll();
+  assert.equal(frameA.command, 'echo A');
+  let busyReply;
+  const busyPoll = f.poll({ busy_lanes: ['cmd'] }).then((r) => { busyReply = r; });
+  await until(() => f.session.httpPoll);
+  const parked = f.session.httpPoll;
+  t.mock.timers.tick(16000); // one second plus the relay's result slack
+  assert.equal((await a).timed_out, true);
+  const b = f.op({ op: 'run', command: 'echo B' });
+  await until(() => f.session.httpCommands.cmd);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(busyReply, undefined, 'B must not be sent to a PC that still reports cmd busy');
+  assert.equal(f.session.httpPoll, parked);
+  assert.equal(f.session.httpCommands.cmd.sent_at, null);
+  assert.deepEqual(await (await f.result(frameA, { stdout_b64: '', stderr_b64: '' })).json(), { type: 'ack' });
+  // No time advance: a free poll must get B without the redelivery delay.
+  const frameB = await f.poll({ busy_lanes: [] });
+  assert.equal(frameB.command, 'echo B');
+  assert.notEqual(frameB.id, frameA.id);
+  await f.result(frameB, { stdout_b64: '', stderr_b64: '' });
+  assert.equal((await b).ok, true);
+  await f.end();
+  await busyPoll;
 });

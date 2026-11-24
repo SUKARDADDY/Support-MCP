@@ -1637,11 +1637,19 @@ export class Session {
       if (pending && pending.tag === `http${generation}` && command) {
         let result;
         try { result = decodeHttpResult(b, command.frame); }
-        catch (_) { return Response.json({ error: 'invalid result' }, { status: 400 }); }
+        catch (_) {
+          this.pending.delete(b.id);
+          this.clearCommand(b.id);
+          this.httpPoll?.busy.delete(command.frame.lane);
+          pending.resolve({
+            ok: false, code: 'bad_result',
+            error: 'bad_result: the PC answered but its reply could not be read. The action may or may not have happened. Check before retrying.',
+          });
+          return Response.json({ error: 'invalid result' }, { status: 400 });
+        }
         this.pending.delete(b.id);
-        this.httpCommands[command.frame.lane] = null;
-        // The lane is free now, so a parked poll that called it busy must not
-        // hold back the next command for it.
+        this.clearCommand(b.id);
+        // Only a result says the PC finished the lane. A relay timeout does not.
         this.httpPoll?.busy.delete(command.frame.lane);
         pending.resolve(result);
         if (result.desktop) await this.setMany({ desktop: result.desktop });
