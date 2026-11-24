@@ -669,8 +669,18 @@ in your home folder (`rustup toolchain install 1.99.1 --profile minimal --compon
 cd mac-agent
 cargo test --locked                           # unit tests, the shared rules cases, the note vectors
 cargo clippy --locked --all-targets -- -D warnings
+scripts/clippy-macos.sh                       # the Mac-only code too, from Linux (needs zig)
 cd .. && npm ci --ignore-scripts && node mac-agent/e2e/run.mjs
 ```
+
+A plain `cargo clippy` on Linux skips `app/src/mac/` and the two Mac binaries, because they
+compile only for macOS. `mac-agent/scripts/clippy-macos.sh` lints them for
+`aarch64-apple-darwin` with warnings denied. It adds that target to the pinned toolchain
+when missing and makes a throwaway C compiler from zig for `ring` (`zig cc -target
+aarch64-macos`), since nothing is linked. It finds zig as `$ZIG`, then `zig` on `PATH`,
+then the `ziglang` Python package (`python3 -m pip install --user ziglang`). Extra cargo
+arguments, such as `--features preview-permissions`, go through. On a Mac it runs the same
+clippy without zig.
 
 `cargo test` reads `test/fixtures/rules-cases.json` at test time and runs every `decide`
 case except the two marked `"scope":"relay"` (the relay compares short names and relative
