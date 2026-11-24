@@ -142,7 +142,14 @@ pub struct FakePlatform {
 impl FakePlatform {
     pub fn new(control: Control) -> FakePlatform {
         FakePlatform {
-            info: HostInfo { machine: "Fake-Mac".into(), user: "tester".into(), elevated: false, control, uia: false },
+            info: HostInfo {
+                machine: "Fake-Mac".into(),
+                user: "tester".into(),
+                os: "macOS 26.1 (25B78)".into(),
+                elevated: false,
+                control,
+                uia: false,
+            },
             screen_log: Mutex::new(vec![]),
             key_log: Mutex::new(vec![]),
             power_log: Mutex::new(vec![]),

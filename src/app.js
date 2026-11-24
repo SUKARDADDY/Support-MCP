@@ -74,7 +74,29 @@ bdi{white-space:nowrap}
 const HEADSET_SVG = '<svg width="26" height="26" viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 11V9.5a6.5 6.5 0 0 1 13 0V11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><rect x="2.5" y="10.5" width="3.5" height="5" rx="1.4" fill="currentColor"/><rect x="14" y="10.5" width="3.5" height="5" rx="1.4" fill="currentColor"/><path d="M15.8 15.5c0 1.4-1.4 2.2-3.8 2.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
 const SCREEN_SVG = '<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5.5 14h5M8 11.5V14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>';
 
-function appPage(url, state = 'pending', sid = '', expiredStatus = 410) {
+// The Mac join app's package is the Mac release's package with .zip for .pkg, both on GitHub. Without a release,
+// or with a note whose url is not a .pkg, there is no link to give.
+export const joinZipUrl = (mac) => (mac && /\.pkg$/.test(mac.url) ? mac.url.replace(/\.pkg$/, '.zip') : null);
+
+// The "On a Mac" part of the one-off page: the join app's package, the button that hands it the code, and the code
+// itself for a Mac whose browser cannot open the button. The same link and code serve a Windows PC through the form above.
+function macSection(code, mac) {
+  const zip = joinZipUrl(mac);
+  const step = (en, he) => `<li><span>${en}</span><span class="he" lang="he" dir="rtl">${he}</span></li>`;
+  const spaced = code.replace(/(.{4})(?=.)/g, '$1 ');
+  const btn = 'display:block;min-height:52px;line-height:52px;margin:4px 0 14px;border-radius:8px;background:#2563EB;color:#fff;font-weight:600;font-size:17px;text-align:center;text-decoration:none';
+  return `<h2 style="margin-top:28px">On a Mac<span class="he" lang="he" dir="rtl" style="display:block;font-size:14px;font-weight:400">ב-Mac</span></h2>
+       <p class="sub">Needs an Apple silicon Mac with macOS 14 or later.</p>
+       <p class="sub he" lang="he" dir="rtl">נדרש Mac עם שבב Apple ו-macOS 14 ומעלה.</p>
+       <ol>${zip ? step(`<a href="${esc(zip)}" style="font-weight:600;color:#2563EB">Download Support Join</a> and open the .zip file.`, `<a href="${esc(zip)}" style="font-weight:600;color:#2563EB">הורידו את Support Join</a> ופתחו את קובץ ה-zip.`) : ''}${step('Open <strong>Support Join</strong>. If macOS says it cannot be opened, open <strong>System Settings</strong>, then <strong>Privacy &amp; Security</strong>, and click <strong>Open Anyway</strong>.', 'פתחו את <bdi dir="ltr"><strong>Support Join</strong></bdi>. אם macOS מציג שאי אפשר לפתוח אותו, פתחו את <bdi dir="ltr"><strong>System Settings</strong></bdi>, ואז <bdi dir="ltr"><strong>Privacy &amp; Security</strong></bdi>, ולחצו על <bdi dir="ltr"><strong>Open Anyway</strong></bdi>.')}${step('Click the button below, or type the code in the app. It asks you to allow support, then to switch on <strong>Screen Recording</strong> and <strong>Accessibility</strong>.', 'לחצו על הכפתור למטה, או הקלידו את הקוד באפליקציה. היא שואלת אם לאשר תמיכה, ואז מבקשת להפעיל <bdi dir="ltr"><strong>Screen Recording</strong></bdi> ו-<bdi dir="ltr"><strong>Accessibility</strong></bdi>.')}</ol>
+       <a href="supportmcp://join?code=${code}" style="${btn}">Open Support Join<span class="he" lang="he" dir="rtl" style="display:block;line-height:1.2;margin-top:-14px;margin-bottom:14px;font-size:14px;font-weight:400;text-align:center">פתיחת Support Join</span></a>
+       <p class="sub" style="margin:0">Your code</p><p class="sub he" lang="he" dir="rtl" style="margin:0 0 4px">הקוד שלכם</p>
+       <p dir="ltr" style="font:600 26px/1.3 ui-monospace,Menlo,Consolas,monospace;letter-spacing:.06em;margin:0 0 12px;user-select:all"><bdi>${spaced}</bdi></p>
+       <p class="note">A small window stays in the corner of your screen while support is connected. Click End session there to stop access. Nothing is installed, and the app removes its permissions when the session ends.</p>
+       <p class="note he" lang="he" dir="rtl">חלון קטן נשאר בפינת המסך בזמן שהתמיכה מחוברת. לחצו שם על <bdi dir="ltr">End session</bdi> כדי להפסיק את הגישה. שום דבר לא מותקן, והאפליקציה מסירה את ההרשאות שלה בסיום ההפעלה.</p>`;
+}
+
+function appPage(url, state = 'pending', sid = '', expiredStatus = 410, { code = '', mac = null } = {}) {
   const ready = state === 'pending';
   const downloaded = state === 'consumed' || state === 'attached';
   const filename = /^[0-9a-f]{64}$/.test(sid) ? `remote-support-${sid.slice(0, 8)}.exe` : 'the support app';
@@ -87,10 +109,13 @@ function appPage(url, state = 'pending', sid = '', expiredStatus = 410) {
        <p class="note">A small window stays in the corner of your screen while support is connected. Close it or click End session to stop access.</p>
        <p class="note he" lang="he" dir="rtl">חלון קטן נשאר בפינת המסך בזמן שהתמיכה מחוברת. סגירתו או לחיצה על End session מפסיקה את הגישה.</p>
        <p class="note">If your antivirus removes the file, tell support.</p>
-       <p class="note he" lang="he" dir="rtl">אם האנטי-וירוס מוחק את הקובץ, ספרו לתמיכה.</p>`
+       <p class="note he" lang="he" dir="rtl">אם האנטי-וירוס מוחק את הקובץ, ספרו לתמיכה.</p>
+       ${/^[a-z2-7]{16}$/.test(code) ? macSection(code, mac) : ''}`
     : downloaded
-      ? `<h2>Check your downloads</h2><p>A download was already requested for this session. Open <strong>${filename}</strong> from your browser's Downloads list.</p>
-         <p>If the file did not download, ask support for a new link.</p><p class="he" lang="he" dir="rtl">ההורדה כבר התבקשה. פתחו את הקובץ ברשימת ההורדות בדפדפן. אם לא התקבל קובץ, בקשו קישור חדש.</p>`
+      ? `<h2>This support link was already used</h2>
+         <p>On Windows, open <strong>${filename}</strong> from your browser's Downloads list. On a Mac, go back to <strong>Support Join</strong>: it carries on by itself.</p>
+         <p>If that does not work, ask support for a new link.</p>
+         <p class="he" lang="he" dir="rtl">הקישור כבר נוצל. ב-Windows, פתחו את <bdi dir="ltr"><strong>${filename}</strong></bdi> מרשימת ההורדות בדפדפן. ב-Mac, חזרו אל <bdi dir="ltr"><strong>Support Join</strong></bdi> והוא ימשיך לבד. אם זה לא עובד, בקשו קישור חדש.</p>`
       : '<h2>This support link has expired</h2><p>Ask support for a new link, then open it on the computer that needs help.</p><p class="he" lang="he" dir="rtl">בקשו קישור חדש ופתחו אותו במחשב שזקוק לתמיכה.</p>';
   return new Response(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Remote support</title>
     <style>${APP_PAGE_CSS}</style></head>
@@ -495,7 +520,45 @@ const isLoopback = (hostname) => hostname === 'localhost' || hostname === '127.0
 // the secret.
 const isPowerShellClient = (request) => (request.headers.get('user-agent') || '').includes('PowerShell/');
 
+// POST /j/<code>/redeem: what the Mac join app calls. It does what the Windows button does, but returns the
+// session's id and key as JSON, because a signed Mac app cannot carry them inside its file. The app is not a
+// browser, so a request that has an Origin header is a web page and is refused. The JSON content type and the custom
+// header are two more things a plain web form cannot send, and the relay never answers a preflight for them. Body
+// {"preview":true} changes nothing and returns the session's label, so the app can show it before the code is used.
+const MAC_CLIENT = 'macos-app-1';
+const REDEEM_PATH = /^\/j\/([^/]*)\/redeem$/;
+const REDEEM_STATUS = { 'not-pending': 409, 'wrong-client': 409, expired: 410 };
+async function handleRedeem(request, env, url, origin, code) {
+  const refuse = (status, reason, extra = {}) => json({ ok: false, reason }, status, { ...noStore, ...extra });
+  if (request.method !== 'POST') return refuse(405, 'method', { allow: 'POST' });
+  if (request.headers.has('origin')) return refuse(403, 'forbidden');
+  if (url.protocol !== 'https:' && !isLoopback(url.hostname)) return refuse(403, 'https_required');
+  if (!isJsonContentType(request)) return refuse(415, 'content_type');
+  if (request.headers.get('x-support-client') !== MAC_CLIENT) return refuse(403, 'forbidden');
+  let body;
+  try { body = await request.json(); } catch (_) { return refuse(400, 'bad_request'); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return refuse(400, 'bad_request');
+  if (!/^[a-z2-7]{16}$/.test(code)) return refuse(404, 'invalid');
+  const id = env.SESSION.idFromName(code);
+  const stub = env.SESSION.get(id);
+  if (body.preview === true) {
+    const out = await (await stub.fetch('https://do/preview', { method: 'POST' })).json();
+    if (!out.ok) return refuse(REDEEM_STATUS[out.reason] ?? 409, out.reason);
+    return json({ ok: true, label: out.label, origin }, 200, noStore);
+  }
+  const r = await stub.fetch('https://do/consume', { method: 'POST', body: JSON.stringify({ windows_mode: 'app', redeemed: true }) });
+  const out = await r.json();
+  if (!out.ok) return refuse(REDEEM_STATUS[out.reason] ?? 409, out.reason);
+  return json({
+    ok: true, sid: id.toString(), key: out.key, origin,
+    startup_expires_at: out.startup_expires_at,
+    startup_ms: Math.min(7200000, Math.max(1, out.startup_expires_at - Date.now())),
+  }, 200, noStore);
+}
+
 async function handleJ(request, env, url, origin, agentText, appBundle) {
+  const redeem = REDEEM_PATH.exec(url.pathname);
+  if (redeem) return handleRedeem(request, env, url, origin, redeem[1]);
   // `?client=app` (or its alias `legacy`) is the downloaded Windows app. Any
   // other `client` value is not a link this relay hands out.
   const hasClient = url.searchParams.has('client');
@@ -525,7 +588,7 @@ async function handleJ(request, env, url, origin, agentText, appBundle) {
     const stub = env.SESSION.get(id);
     const page = async () => {
       const status = await (await stub.fetch('https://do/status?log_tail=0')).json();
-      return appPage(url, status.windows_mode === 'app' ? status.state : 'ended', id.toString());
+      return appPage(url, status.windows_mode === 'app' ? status.state : 'ended', id.toString(), 410, { code, mac: macReleaseFrom(env) });
     };
     // A button click on our own page is same-origin. Browsers send Origin on it,
     // and it must match exactly. A few older ones (IE11 on Windows 7) omit Origin

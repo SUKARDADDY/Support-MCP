@@ -1,6 +1,7 @@
-//! The one binary's roles, chosen by its first argument. PR 4 adds nothing here (Accessibility lives in the helper),
-//! PR 5 adds `join` (the one-off app, a separate bundle) and PR 7 adds the update roles. Each is a new variant, so a
-//! role that is not built yet is refused like any unknown one.
+//! The one binary's roles, chosen by its first argument. PR 4 adds nothing here (Accessibility lives in the helper).
+//! The one-off join app is not a role here: it is a binary and a bundle of its own (`support-join`), so a link can never
+//! reach the root-backed app. PR 7 adds the update roles. Each is a new variant, so a role that is not built yet is
+//! refused like any unknown one.
 //!
 //! | Role | Runs as | Started by |
 //! |---|---|---|
@@ -268,7 +269,8 @@ mod tests {
         assert!(p(&["device-service", "--x"]).is_err());
         assert!(p(&["helper", "extra"]).is_err());
         assert!(p(&[]).is_err());
-        // Roles of later PRs are unknown until they are built.
+        // `join` is never a role of this binary: the one-off app is a binary of its own (src/bin/support_join.rs), so the
+        // saved app can neither join a link nor be handed one. Roles of later PRs are unknown until they are built.
         for later in ["join", "device-update", "update-rollback", "--service"] {
             assert!(p(&[later]).is_err(), "{later}");
         }

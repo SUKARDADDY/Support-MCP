@@ -119,6 +119,8 @@ impl Lane {
 pub struct HostInfo {
     pub machine: String,
     pub user: String,
+    /// The os text a saved Mac reports at check-in (`macOS 26.1 (25B78)`). The relay checks it against `agent`.
+    pub os: String,
     pub elevated: bool,
     pub control: Control,
     /// `uia` joins the caps only once the Mac can answer ui_tree and ui_act (PR 4).
@@ -141,6 +143,7 @@ pub fn hello(info: &HostInfo, version: &str) -> Value {
         "machine": info.machine,
         "user": info.user,
         "ps": "",
+        "os": info.os,
         "agent": AGENT,
         "version": version,
         "elevated": info.elevated,
@@ -319,12 +322,20 @@ mod tests {
 
     #[test]
     fn the_hello_has_screen_and_lanes_always_and_full_only_for_full_control() {
-        let mut info = HostInfo { machine: "Neo".into(), user: "ariel".into(), elevated: true, control: Control::Full, uia: false };
+        let mut info = HostInfo {
+            machine: "Neo".into(),
+            user: "ariel".into(),
+            os: "macOS 26.1 (25B78)".into(),
+            elevated: true,
+            control: Control::Full,
+            uia: false,
+        };
         let h = hello(&info, "1.0.0");
         assert_eq!(h["caps"], json!(["screen", "lanes", "full"]));
         assert_eq!(h["control"], "full");
         assert_eq!(h["agent"], "macos-app-1");
         assert_eq!(h["ps"], "");
+        assert_eq!(h["os"], "macOS 26.1 (25B78)");
         info.control = Control::Normal;
         info.uia = true;
         info.elevated = false;

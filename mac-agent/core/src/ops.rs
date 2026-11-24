@@ -12,7 +12,7 @@ use serde_json::{json, Map, Value};
 
 pub const NO_SAS: &str = "send_sas is not available on a Mac";
 pub const NO_BLOCK: &str = "block_input is not available on a Mac";
-pub const NO_CONTROL_FRAME: &str = "full control is chosen when Support is set up on this Mac";
+pub const NO_CONTROL_FRAME: &str = "a Mac cannot raise its control in a session: a saved Mac's is chosen when Support is set up, and a one-off link session runs as the signed-in person only";
 pub const NO_UI_TREE: &str = "ui_tree is not available on this Mac yet";
 pub const NO_UI_ACT: &str = "ui_act is not available on this Mac yet";
 

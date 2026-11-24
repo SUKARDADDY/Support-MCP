@@ -323,6 +323,7 @@ export class Session {
     try {
       if (p === '/create') return await this.doCreate(request);
       if (p === '/consume') return await this.doConsume(request);
+      if (p === '/preview') return await this.doPreview();
       if (p === '/agent') return await this.doAgent(request);
       if (p === '/ws') return await this.doWs(request);
       if (p === '/status') return await this.doStatus(url);
@@ -415,11 +416,28 @@ export class Session {
     return Response.json({ ok: true, sid: b.sid, code_expires_at: codeExpiry });
   }
 
+  // What the Mac join app may show before it uses the code up: the session's label. Only a code that is still
+  // pending, made for the app, answers; nothing changes.
+  async doPreview() {
+    if (await this.get('device_id', null)) return Response.json({ ok: false, reason: 'not-pending' });
+    if (await this.expireIfDue()) return Response.json({ ok: false, reason: 'expired' });
+    if ((await this.get('state')) !== 'pending') return Response.json({ ok: false, reason: 'not-pending' });
+    if ((await this.get('windows_mode', 'powershell')) !== 'app') return Response.json({ ok: false, reason: 'wrong-client' });
+    const label = await this.get('label', null);
+    return Response.json({ ok: true, label: typeof label === 'string' ? truncate(label, 100) : null, code_expires_at: await this.get('code_expires_at', null) });
+  }
+
   async doConsume(request) {
     // A saved PC's session has no link to use up.
     if (await this.get('device_id', null)) return Response.json({ ok: false, reason: 'not-pending' });
     let windowsMode = 'powershell';
-    try { windowsMode = (await request.json()).windows_mode ?? 'powershell'; } catch (_) {}
+    let redeemed = false;
+    try {
+      const body = await request.json();
+      windowsMode = body.windows_mode ?? 'powershell';
+      // Set only by POST /j/<code>/redeem, the route of the Mac join app. The Windows button never sends it.
+      redeemed = body.redeemed === true;
+    } catch (_) {}
     // Hash first. Hashing yields to other requests, so doing it between the state
     // check and the write would let two concurrent consumes both see `pending`
     // and both mint a key. From the state read to the write there is only
@@ -441,6 +459,7 @@ export class Session {
       key_hash: keyHash,
       consumed_at: now,
       consumed_expires_at: deadline,
+      consumed_via: redeemed ? 'redeem' : null,
     });
     this.logRow('consumed');
     await this.ctx.storage.setAlarm(deadline);
@@ -1538,8 +1557,20 @@ export class Session {
     // Remote Desktop users to choose from (busy), says so after the hello, so
     // those two reasons are taken while attached too. "declined" is not.
     if (b.type === 'decline') {
+      // A one-off link session of a Mac may say no as well: the code was used up through the join app's route, or the
+      // client already said macos- in its hello. Only "declined" makes sense there. A Windows link session cannot.
+      if (!deviceId) {
+        const macLink = (state === 'consumed' || state === 'attached')
+          && ((await this.get('consumed_via', null)) === 'redeem' || String(await this.get('agent', '') ?? '').startsWith('macos-'));
+        if (!macLink || b.reason !== 'declined') return Response.json({ error: 'invalid message' }, { status: 400 });
+        this.logRow('declined', b.reason);
+        this.failPending(() => true, 'session ended');
+        this.closeAll({ type: 'end', reason: b.reason }, b.reason);
+        await this.markEnded(b.reason);
+        return Response.json({ type: 'end' });
+      }
       const allowed = state === 'waiting' || (state === 'attached' && (b.reason === 'nobody' || b.reason === 'busy'));
-      if (!deviceId || !allowed || !DECLINE_REASONS.includes(b.reason)) return Response.json({ error: 'invalid message' }, { status: 400 });
+      if (!allowed || !DECLINE_REASONS.includes(b.reason)) return Response.json({ error: 'invalid message' }, { status: 400 });
       this.logRow('declined', b.reason);
       this.failPending(() => true, 'session ended');
       this.closeAll({ type: 'end', reason: b.reason }, b.reason);
@@ -1547,6 +1578,11 @@ export class Session {
       return Response.json({ type: 'end' });
     }
     if (b.type === 'hello') {
+      // The relay has two signals for what a client is: the agent string here and the os text a saved PC reports
+      // at check-in. They must agree, so a Windows client cannot pass for a Mac or the other way round.
+      const claimsMac = typeof b.agent === 'string' && b.agent.startsWith('macos-');
+      const reportsMac = typeof b.os === 'string' && /^macOS /.test(b.os);
+      if (claimsMac !== reportsMac) return Response.json({ error: 'agent and os disagree' }, { status: 400 });
       // A limited PC never runs a full-control session, whatever its hello says.
       if (deviceId && request.headers.get('X-Device-Control') === 'limited' && decodeControl(b.control) === 'full') {
         return Response.json({ error: 'this PC is limited; it cannot run a full-control session' }, { status: 403 });
