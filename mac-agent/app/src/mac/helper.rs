@@ -7,6 +7,7 @@
 //! here with the core's own parser, so the helper does nothing the service could not have asked for on the wire.
 
 use super::{capture, input, ui};
+use crate::ax_plan;
 use crate::frame;
 use crate::input_plan;
 use crate::ipc::{self, HelperSession, Request, Tick, ToHelper};
@@ -150,6 +151,9 @@ fn shot_after(d: &capture::Display, index: i64, count: usize, desktop: Desktop, 
 /// One screen action, as the core's own parser reads it.
 pub fn act(a: &ScreenAction, shared: &Shared, cancel: &AtomicBool) -> Result<ScreenOutput, String> {
     let desktop = if shared.session == HelperSession::LoginWindow || locked().unwrap_or(false) { Desktop::Secure } else { Desktop::Default };
+    if matches!(a.name.as_str(), "ui_tree" | "ui_act") {
+        return ui(a, shared, cancel, desktop);
+    }
     let displays = capture::displays();
     let d = pick(&displays, a.display)?;
     let n = displays.len();
@@ -230,6 +234,42 @@ pub fn act(a: &ScreenAction, shared: &Shared, cancel: &AtomicBool) -> Result<Scr
     }
 }
 
+/// `ui_tree` and `ui_act`. Both read or drive another app through Accessibility, which the person must have allowed, and
+/// neither works on the lock screen or at the login window. The picture after a `ui_act` is of the display the latest
+/// `ui_tree` read, so a ref and the pixels in its line agree.
+fn ui(a: &ScreenAction, shared: &Shared, cancel: &AtomicBool, desktop: Desktop) -> Result<ScreenOutput, String> {
+    if desktop == Desktop::Secure {
+        return Err(ax_plan::LOCKED.into());
+    }
+    if !accessibility() {
+        return Err(crate::service::permission_text(true, false).unwrap_or_default());
+    }
+    let displays = capture::displays();
+    if displays.is_empty() {
+        return Err("no display is connected".into());
+    }
+    let n = displays.len();
+    if a.name == "ui_tree" {
+        let tree = super::ax::read_tree(a, &displays, cancel)?;
+        return Ok(ScreenOutput { image: None, display: tree.display, displays: n as i64, desktop, text: Some(tree.text) });
+    }
+    let guard = Guards { shared, cancel };
+    input::Guard::free(&guard)?;
+    let note = super::ax::act(a)?;
+    // The display of the latest tree, or the main one when the displays have changed since.
+    let index = usize::try_from(super::ax::tree_display()).ok().filter(|i| *i < n).unwrap_or(0);
+    let mut out = if a.screenshot {
+        shot_after(&displays[index], index as i64, n, desktop, cancel)
+    } else {
+        ScreenOutput { image: None, display: index as i64, displays: n as i64, desktop, text: None }
+    };
+    out.text = match (note, out.text.take()) {
+        (Some(note), Some(rest)) => Some(format!("{note}\n{rest}")),
+        (note, rest) => note.or(rest),
+    };
+    Ok(out)
+}
+
 // ---- the link to the service ------------------------------------------------------------------------------------
 
 fn obj(v: Value) -> Map<String, Value> {
@@ -284,7 +324,8 @@ async fn link_once(shared: Arc<Shared>) -> Result<(), String> {
                     let a = ScreenAction::parse(&action);
                     let out = act(&a, &shared, &cancel);
                     cancels.lock().unwrap().remove(&id);
-                    let _ = tx.send(ipc::reply_message(id, ipc::screen_reply(out)));
+                    let reply = if a.name == "ui_tree" { ipc::tree_reply(out) } else { ipc::screen_reply(out) };
+                    let _ = tx.send(ipc::reply_message(id, reply));
                 });
             }
             ToHelper::Ask { id, by, team, full } => {

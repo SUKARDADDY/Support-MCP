@@ -1,6 +1,7 @@
 //! The macOS side: the frameworks, and each role's entry point.
 
 pub mod auth;
+pub mod ax;
 pub mod capture;
 pub mod cli;
 pub mod helper;

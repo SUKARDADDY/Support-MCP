@@ -16,6 +16,7 @@
 //! Everything that touches macOS itself is behind `Os`, so this runs and is tested on Linux.
 
 use crate::as_user;
+use crate::ax_plan;
 use crate::ipc::{self, SetupRequest, ToHelper};
 use crate::peer::{Inspector, Peer};
 use crate::power::{self, FileVault, PowerLatch};
@@ -116,11 +117,13 @@ fn now_ms() -> i64 {
 
 /// The screen actions that take a picture, and those that send input.
 fn captures(a: &ScreenAction) -> bool {
-    matches!(a.name.as_str(), "screenshot" | "zoom" | "wait")
+    // A `ui_act` ends with a picture unless it says not to.
+    matches!(a.name.as_str(), "screenshot" | "zoom" | "wait") || (a.name == "ui_act" && a.screenshot)
 }
 
+/// Those that need Accessibility: input, and reading or acting on controls.
 fn inputs(a: &ScreenAction) -> bool {
-    matches!(a.name.as_str(), "click" | "move" | "drag" | "scroll" | "type" | "type_secret" | "key")
+    matches!(a.name.as_str(), "click" | "move" | "drag" | "scroll" | "type" | "type_secret" | "key" | "ui_tree" | "ui_act")
 }
 
 /// The text for missing permissions (research file, section 2.5).
@@ -309,7 +312,9 @@ impl Platform for MacPlatform {
             // SAFETY: a getter.
             elevated: unsafe { libc::geteuid() } == 0,
             control: if self.limited() { Control::Normal } else { Control::Full },
-            uia: false,
+            // Always, once the Mac is set up: the caps never change in a session (a new hello would fail the commands in
+            // flight). With Accessibility missing, the Mac answers `ui_tree` and `ui_act` with its own error.
+            uia: true,
         }
     }
 
@@ -346,6 +351,8 @@ impl Platform for MacPlatform {
     }
 
     fn screen(&self, action: &ScreenAction, _keys: &[KeyCombo], stop: &Stop) -> Result<ScreenOutput, String> {
+        // The relay's own bounds on a ui action, applied once more before anything crosses the socket.
+        let action = &ax_plan::normalize(action)?;
         let uid = self.screen_uid()?;
         let helper = self.helpers.get(uid).ok_or_else(|| self.helper_error(HelperError::None, uid))?;
         // The permissions the helper last reported. Without a fresh tick, ask it anyway: it answers for itself.
@@ -361,7 +368,11 @@ impl Platform for MacPlatform {
             .helpers
             .request(uid, |id| ToHelper::Screen { id, action: ipc::action_json(action) }, screen_timeout(action), stop)
             .map_err(|e| self.helper_error(e, uid))?;
-        ipc::read_screen_reply(&body)
+        if action.name == "ui_tree" {
+            ipc::read_tree_reply(&body)
+        } else {
+            ipc::read_screen_reply(&body)
+        }
     }
 
     fn power(&self, action: &str, delay_s: i64) -> Result<i64, String> {
@@ -912,11 +923,11 @@ mod tests {
     async fn the_hello_says_who_is_signed_in_and_the_control() {
         let r = rig("info", "full").await;
         let info = r.svc.platform.info();
-        assert_eq!((info.machine.as_str(), info.user.as_str(), info.control, info.uia), ("Test-Mac", "user501", Control::Full, false));
+        assert_eq!((info.machine.as_str(), info.user.as_str(), info.control, info.uia), ("Test-Mac", "user501", Control::Full, true));
         *r.os.console.lock().unwrap() = None;
         assert_eq!(r.svc.platform.info().user, "", "nobody at the login window");
         let hello = support_core::wire::hello(&r.svc.platform.info(), "1.0.0");
-        assert_eq!(hello["caps"], json!(["screen", "lanes", "full"]), "screen and lanes even with no helper");
+        assert_eq!(hello["caps"], json!(["screen", "uia", "lanes", "full"]), "screen, uia and lanes even with no helper or permission");
     }
 
     #[tokio::test]
@@ -965,6 +976,36 @@ mod tests {
         let none = rig("release-none", "full").await;
         none.svc.platform.release_input();
         none.svc.platform.session(None);
+    }
+
+    #[tokio::test]
+    async fn ui_actions_need_accessibility_and_reach_the_helper_in_bounds() {
+        let r = rig("ui", "full").await;
+        helper(&r.sock, Tick { screen: false, accessibility: false, customer_ago_ms: -1, locked: false }, true).await;
+        wait_helper(&r.svc, 501).await;
+        let p = r.svc.platform.clone();
+        let run = |p: Arc<MacPlatform>, v: Value| {
+            on_thread(move || {
+                let stop = Stop::new();
+                p.screen(&ScreenAction::parse(&v), &[], &stop)
+            })
+        };
+        let no_ax = "screen permission needed: Accessibility; someone at the Mac must allow Support in System Settings, Privacy & Security";
+        assert_eq!(run(p.clone(), json!({"name":"ui_tree"})).await.unwrap().unwrap_err(), no_ax);
+        assert_eq!(run(p.clone(), json!({"name":"ui_act","ref":1,"verb":"invoke","screenshot":false})).await.unwrap().unwrap_err(), no_ax);
+        // With Accessibility and no Screen Recording, a tree and an act without a picture go through.
+        let r = rig("ui2", "full").await;
+        helper(&r.sock, Tick { screen: false, accessibility: true, customer_ago_ms: -1, locked: false }, true).await;
+        wait_helper(&r.svc, 501).await;
+        let p = r.svc.platform.clone();
+        let out = run(p.clone(), json!({"name":"ui_tree","max_lines":99999})).await.unwrap().unwrap();
+        assert_eq!(out.text.as_deref(), Some("did ui_tree"));
+        assert!(run(p.clone(), json!({"name":"ui_act","ref":1,"verb":"invoke","screenshot":false})).await.unwrap().is_ok());
+        // Without that flag the act ends with a picture, which needs Screen Recording.
+        assert!(run(p.clone(), json!({"name":"ui_act","ref":1,"verb":"invoke"})).await.unwrap().unwrap_err().contains("Screen Recording"));
+        // A value over the relay's bound never leaves the service.
+        let long = "x".repeat(ax_plan::VALUE_MAX + 1);
+        assert!(run(p, json!({"name":"ui_act","ref":1,"verb":"set_value","value":long,"screenshot":false})).await.unwrap().is_err());
     }
 
     #[tokio::test]
