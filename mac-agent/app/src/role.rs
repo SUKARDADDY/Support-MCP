@@ -11,8 +11,11 @@
 //! | `file-op` | root, which drops to the user first | the service |
 //! | `run-as` | root, which drops to the user first | the service, through `launchctl asuser` |
 //!
-//! With no arguments the binary was opened as an app (Finder, Launchpad, `open`). It never starts a second helper: it
-//! asks this session's helper (the LaunchAgent's) to show its window, or has launchd start it (see `app_launch`).
+//! While the helper runs, Finder, Launchpad and `open` do not start this binary: the helper is the bundle's running
+//! instance, so they send it a reopen event, which its app delegate turns into its window. With no arguments the
+//! binary was opened as an app only when no helper is registered with LaunchServices (it is stopped) or the binary
+//! was started directly. It never starts a second helper: it asks this session's helper (the LaunchAgent's) to show
+//! its window, or has launchd start it (see `app_launch`).
 
 /// What a setup from the command line gives.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,9 +86,11 @@ pub fn launch(args: &[String]) -> Result<Launch, String> {
 /// What an app launch does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppLaunch {
-    /// This session's helper is running: signal it to show its window (`launchctl kill`).
+    /// This session's helper is running (the binary was started directly, since Finder and `open` would have sent the
+    /// helper a reopen event): signal it to show its window (`launchctl kill`).
     Show,
-    /// Its LaunchAgent is loaded but the helper is not running: have launchd start that one (`launchctl kickstart`).
+    /// Its LaunchAgent is loaded but the helper is not running, so LaunchServices had no instance to reopen: have
+    /// launchd start that one (`launchctl kickstart`).
     Start,
     /// There is no helper to reach from here. The text says why.
     Refuse(&'static str),

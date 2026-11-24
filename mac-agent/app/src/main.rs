@@ -6,7 +6,9 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let role = match role::launch(&args) {
         Ok(Launch::Role(r)) => r,
-        // Opened as an app (Finder, `open`): show this session's helper, never start a second one.
+        // Opened as an app with no helper registered with LaunchServices (stopped), or the binary started directly:
+        // show this session's helper, never start a second one. While the helper runs, Finder and `open` reach it
+        // as a reopen event instead, and this branch does not run.
         Ok(Launch::App) => std::process::exit(open_app()),
         Err(e) => {
             eprintln!("{e}");

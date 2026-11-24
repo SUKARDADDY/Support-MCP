@@ -13,14 +13,16 @@ use super::helper::{AskRequest, Shared, UiRequest};
 use crate::ipc::{HelperSession, Request};
 use crate::paths;
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
+use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSControlStateValueOn, NSFloatingWindowLevel, NSFont,
-    NSMenu, NSMenuItem, NSPanel, NSScreen, NSStatusBar, NSStatusBarButton, NSStatusItem, NSTextField, NSVariableStatusItemLength, NSView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
+    NSAlert, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType, NSButton, NSControlStateValueOn,
+    NSFloatingWindowLevel, NSFont, NSMenu, NSMenuItem, NSPanel, NSScreen, NSStatusBar, NSStatusBarButton, NSStatusItem, NSTextField,
+    NSVariableStatusItemLength, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
-use objc2_foundation::{ns_string, MainThreadMarker, NSObject, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer, NSURL};
+use objc2_foundation::{
+    ns_string, MainThreadMarker, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer, NSURL,
+};
 use serde_json::{Map, Value};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
@@ -72,6 +74,34 @@ impl Target {
     }
 }
 
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements, and AppDelegate does not implement Drop.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SupportMcpAppDelegate"]
+    struct AppDelegate;
+
+    unsafe impl NSObjectProtocol for AppDelegate {}
+
+    unsafe impl NSApplicationDelegate for AppDelegate {
+        /// Finder, Launchpad and `open` reach a running helper as this event, not as a new process (the helper is
+        /// the bundle's running instance). Ask the next tick to show the window, and tell AppKit to do nothing more.
+        #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
+        fn should_handle_reopen(&self, _app: &NSApplication, _has_visible_windows: bool) -> bool {
+            super::helper::SHOW.store(true, std::sync::atomic::Ordering::SeqCst);
+            false
+        }
+    }
+);
+
+impl AppDelegate {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        // SAFETY: NSObject's init.
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
 struct AskPanel {
     id: u64,
     window: Retained<NSPanel>,
@@ -109,6 +139,8 @@ struct Ui {
     mtm: MainThreadMarker,
     shared: Arc<Shared>,
     target: Retained<Target>,
+    /// NSApplication holds its delegate weakly, so the UI keeps it for the life of the process.
+    _delegate: Retained<AppDelegate>,
     status_item: Option<Retained<NSStatusItem>>,
     menu_key: String,
     ask: Option<AskPanel>,
@@ -659,8 +691,9 @@ fn own_windows(ui: &Ui) -> Vec<Rect> {
     out
 }
 
-/// The app was opened while this helper runs (`helper::SHOW`): the setup window when Support can be set up, else the
-/// menu. Returns the menu bar button to click once the UI state is no longer borrowed (its menu runs its own loop).
+/// The app was opened while this helper runs (`helper::SHOW`, set by the reopen event or the show signal): the setup
+/// window when Support can be set up, else the menu. Returns the menu bar button to click once the UI state is no
+/// longer borrowed (its menu runs its own loop).
 fn show(ui: &mut Ui) -> Option<Retained<NSStatusBarButton>> {
     let status = ui.shared.status.lock().unwrap().clone();
     let can_set_up = status.as_ref().is_some_and(|m| {
@@ -718,6 +751,8 @@ pub fn run(mtm: MainThreadMarker, shared: Arc<Shared>) {
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     let target = Target::new(mtm);
+    let delegate = AppDelegate::new(mtm);
+    app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     let aqua = shared.session == HelperSession::Aqua;
     let status_item = aqua.then(|| {
         let item = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
@@ -732,8 +767,18 @@ pub fn run(mtm: MainThreadMarker, shared: Arc<Shared>) {
     // SAFETY: the main run loop and a framework constant.
     unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes) };
     UI.with(|u| {
-        *u.borrow_mut() =
-            Some(Ui { mtm, shared, target, status_item, menu_key: String::new(), ask: None, corner: None, setup: None, _timer: Some(timer) });
+        *u.borrow_mut() = Some(Ui {
+            mtm,
+            shared,
+            target,
+            _delegate: delegate,
+            status_item,
+            menu_key: String::new(),
+            ask: None,
+            corner: None,
+            setup: None,
+            _timer: Some(timer),
+        });
     });
     // An app launch that had to start this helper left a request: the next tick shows the window.
     if aqua {

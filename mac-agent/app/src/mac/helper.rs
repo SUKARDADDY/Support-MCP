@@ -381,10 +381,12 @@ fn request_thread(shared: Arc<Shared>, rx: mpsc::Receiver<UiRequest>) {
     }
 }
 
-/// The signal an app launch sends (`launchctl kill`) to ask the running helper for its window. SIGINFO is ignored by
-/// default, so one that comes before the handler is in place does nothing instead of ending the helper.
+/// The signal an app launch sends (`launchctl kill`) to ask the running helper for its window. It only matters when
+/// the binary is started directly: while the helper runs, Finder and `open` reach it as a reopen event, which the
+/// app delegate in `ui.rs` turns into `SHOW`. SIGINFO is ignored by default, so one that comes before the handler is
+/// in place does nothing instead of ending the helper.
 pub const SHOW_SIGNAL: libc::c_int = libc::SIGINFO;
-/// Set by the signal, read by the windows' timer.
+/// Set by the signal or the reopen event, read by the windows' timer.
 pub static SHOW: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_show(_: libc::c_int) {
