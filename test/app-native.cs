@@ -2182,7 +2182,15 @@ public static class AppTests {
             var sys = Run("[Console]::Write([Security.Principal.WindowsIdentity]::GetCurrent().Name)", 30); sys["as"] = "system";
             var r = relay.Call(sys); Assert(Wire.Flag(r, "ok") && Decode(r, "stdout_b64") == WindowsIdentity.GetCurrent().Name, "as: system runs with the service's own token: " + Wire.Text(r, "error"));
             var user = Run("[Console]::Write([Security.Principal.WindowsIdentity]::GetCurrent().Name + '|' + (Get-Location).Path)", 30); user["as"] = "user";
-            r = relay.Call(user); Assert(Wire.Flag(r, "ok") && Decode(r, "stdout_b64") == WindowsIdentity.GetCurrent().Name + "|" + Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "as: user runs with the given token in its profile folder: " + Wire.Text(r, "error") + Decode(r, "stderr_b64"));
+            r = relay.Call(user);
+            // Windows paths ignore case, and under a service account (the CI runner runs as NETWORK SERVICE) the
+            // profile path PowerShell reports can differ from GetFolderPath in case alone, so the folder is compared
+            // that way. The message shows both sides.
+            string got = Decode(r, "stdout_b64") ?? "", want = WindowsIdentity.GetCurrent().Name + "|" + Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            int bar = got.IndexOf('|');
+            Assert(Wire.Flag(r, "ok") && bar > 0 && got.Substring(0, bar) == want.Substring(0, want.IndexOf('|'))
+                && string.Equals(got.Substring(bar + 1).TrimEnd('\\'), want.Substring(want.IndexOf('|') + 1).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase),
+                "as: user runs with the given token in its profile folder: got '" + got + "', want '" + want + "' " + Wire.Text(r, "error") + Decode(r, "stderr_b64"));
             full.SignedIn = false;
             r = relay.Call(user); Assert(!Wire.Flag(r, "ok") && Wire.Text(r, "error") == TokenChoice.NobodySignedIn, "as: user with nobody signed in: " + Wire.Text(r, "error"));
             var bad = Run("1", 10); bad["as"] = "root"; r = relay.Call(bad); Assert(Wire.Text(r, "error") == "as must be user or system", "Only user and system");
