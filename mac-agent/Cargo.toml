@@ -1,8 +1,8 @@
-# The Mac agent's Rust workspace. PR 2 holds the platform-neutral core (support-core). The macOS
-# app (PR 3 on) joins as another member. Every dependency is pinned with `=` and Cargo.lock is
+# The Mac agent's Rust workspace: the platform-neutral core (support-core) and the macOS app
+# (support-mac, binary `support`). Every dependency is pinned with `=` and Cargo.lock is
 # committed, so a build here, in CI and on the Mac uses the same code.
 [workspace]
-members = ["core"]
+members = ["core", "app"]
 resolver = "2"
 
 [profile.release]

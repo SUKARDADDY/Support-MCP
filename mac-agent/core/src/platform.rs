@@ -108,6 +108,11 @@ pub trait Platform: Send + Sync + 'static {
         None
     }
 
+    /// Lets go of every modifier key (and mouse button) the platform may be holding down. The client calls it when
+    /// the link to the relay drops and when the session closes, so a lost connection never leaves a key held on the
+    /// person's machine. It must be quick, safe to call at any time, and do nothing when nothing is held.
+    fn release_input(&self) {}
+
     /// The question before a session ("<by> from <team> wants to connect"). Blocks until the person answers, at most
     /// `ASK_MS` plus a margin. `full` says the session has full control. No answer is no.
     fn ask(&self, _by: &str, _team: &str, _full: bool, _stop: &Stop) -> bool {
