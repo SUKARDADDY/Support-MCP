@@ -83,7 +83,8 @@ pub struct Tick {
     pub screen: bool,
     /// Accessibility is allowed (input).
     pub accessibility: bool,
-    /// Milliseconds since the person last used the mouse or keyboard, -1 when the last input was the app's own.
+    /// Milliseconds since the person last used the mouse or keyboard (hardware input only), -1 when the system
+    /// reports none.
     pub customer_ago_ms: i64,
     /// The screen is locked (or a screen saver asks for the password).
     pub locked: bool,

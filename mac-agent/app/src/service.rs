@@ -170,9 +170,13 @@ impl MacPlatform {
         control != "full"
     }
 
-    /// The person a limited session works for, if they are at the console now.
+    /// The person as:user work runs as. Under full control that is whoever is at the console now, as on Windows; the
+    /// pin and the unowned refusal are only for a limited session, which works for the person who allowed it.
     fn person(&self) -> Result<u32, String> {
         let console = self.os.console_uid();
+        if !self.limited() {
+            return console.ok_or_else(|| NOBODY.into());
+        }
         let (pin, unowned) = {
             let l = self.live.lock().unwrap();
             (l.pin, l.unowned)
@@ -1032,6 +1036,26 @@ mod tests {
             "screen permission needed: Accessibility; someone at the Mac must allow Support in System Settings, Privacy & Security"
         );
         assert!(permission_text(false, false).unwrap().contains("Screen Recording and Accessibility"));
+    }
+
+    #[tokio::test]
+    async fn a_full_control_session_runs_as_whoever_is_at_the_console_now() {
+        let r = rig("full-switch", "full").await;
+        helper(&r.sock, ALL, true).await;
+        wait_helper(&r.svc, 501).await;
+        let p = r.svc.platform.clone();
+        assert_eq!(p.accept("s1"), Some(501));
+        p.session(Some("Dana"));
+        let run =
+            |p: Arc<MacPlatform>| on_thread(move || p.run(&RunRequest { command: "true".into(), timeout_s: 5, as_system: false }, &Stop::new()));
+        assert_eq!(String::from_utf8_lossy(&run(p.clone()).await.unwrap().unwrap().stdout), "as 501\n");
+        // Another person signs in at the console: as:user follows them, it is not refused.
+        *r.os.console.lock().unwrap() = Some(502);
+        assert_eq!(String::from_utf8_lossy(&run(p.clone()).await.unwrap().unwrap().stdout), "as 502\n");
+        // Nobody at the console: the usual answer, with the hint to use as: "system".
+        *r.os.console.lock().unwrap() = None;
+        let err = run(p.clone()).await.unwrap().unwrap_err();
+        assert!(err.starts_with(NOBODY) && err.contains("as: \"system\""), "{err}");
     }
 
     #[tokio::test]
