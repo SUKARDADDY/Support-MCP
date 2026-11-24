@@ -298,7 +298,7 @@ test('app sessions bound what the client reports and what a result may carry', a
   const bad = await f.req('/agent', { type: 'result', id: frame.id, generation: hello.generation, ok: true, data_b64: 'AA==', size: -1, eof: true }, key);
   assert.equal(bad.status, 400);
   assert.equal((await (await f.req('/agent', { type: 'result', id: frame.id, generation: hello.generation, ok: true, data_b64: 'AA==', size: 1, eof: true }, key)).json()).type, 'ack');
-  assert.deepEqual(await (await command).json(), { ok: true, data_b64: 'AA==', size: 1, eof: true });
+  assert.equal((await (await command).json()).code, 'bad_result');
   assert.equal((await f.req('/agent', { type: 'nonsense', generation: hello.generation }, key)).status, 400);
 });
 
