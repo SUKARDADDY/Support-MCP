@@ -56,7 +56,7 @@ pub struct Installed {
 
 /// An app's Info.plist, read as root: only a regular file of at most 4 MiB, opened without following a link (the last
 /// name) and without waiting on it, so an app folder a person made cannot hang the service on a pipe or feed it a huge file.
-fn info_plist(app: &Path) -> Option<plist::Dictionary> {
+pub(crate) fn info_plist(app: &Path) -> Option<plist::Dictionary> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(app.join("Contents/Info.plist")).ok()?;

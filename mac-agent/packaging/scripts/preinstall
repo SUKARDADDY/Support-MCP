@@ -4,6 +4,7 @@
 set -u
 LABEL_DEVICE=io.github.sukardaddy.supportmcp.device
 LABEL_HELPER=io.github.sukardaddy.supportmcp.helper
+LABEL_WATCH=io.github.sukardaddy.supportmcp.update
 BIN=/Applications/Support.app/Contents/MacOS/support
 
 # The helper in each signed-in session: every loginwindow process belongs to one person's GUI session.
@@ -11,5 +12,8 @@ for uid in $(/bin/ps -axo uid=,comm= | /usr/bin/awk '$2 ~ /\/loginwindow$/ && $1
     /bin/launchctl bootout "gui/$uid/$LABEL_HELPER" 2>/dev/null || true
 done
 /bin/launchctl bootout "system/$LABEL_DEVICE" 2>/dev/null || true
+# An update's watcher: a package installed by hand replaces what it would put back.
+/bin/launchctl bootout "system/$LABEL_WATCH" 2>/dev/null || true
+/bin/rm -f "/Library/LaunchDaemons/$LABEL_WATCH.plist"
 /usr/bin/pkill -9 -f "^$BIN( |\$)" 2>/dev/null || true
 exit 0

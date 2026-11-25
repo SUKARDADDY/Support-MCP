@@ -1,7 +1,8 @@
 [package]
 name = "support-mac"
-# The Mac app's release. It is the core's version, so the hello, the check-in and the bundle all say the same.
-version = "1.0.0"
+# The Mac app's release. It is the core's version, so the hello, the check-in and the bundle all say the same. The Mac has
+# its own version line (approved call 7), apart from the relay's VERSION, starting at 1.1.0.
+version = "1.1.0"
 description = "The Support-MCP Mac app: the root service, the session helper, setup and uninstall"
 license = "MIT"
 edition = "2021"
@@ -20,6 +21,11 @@ path = "src/main.rs"
 [[bin]]
 name = "support-join"
 path = "src/bin/support_join.rs"
+
+# The macOS update test's builds only (docs/development.md, "Mac updates"): the core's test key, test version and
+# loopback download, a 60 s trial, and SUPPORT_TEST_BROKEN (a service that exits at start). Never in a release.
+[features]
+test-release = ["support-core/test-release"]
 
 [dependencies]
 support-core = { path = "../core" }

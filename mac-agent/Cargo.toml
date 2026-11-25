@@ -11,3 +11,10 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# The macOS update test's four builds (packaging/build.sh with SUPPORT_CARGO_PROFILE=update-test): the release profile
+# without LTO, so each takes a fraction of the time. Releases use the release profile above.
+[profile.update-test]
+inherits = "release"
+lto = false
+codegen-units = 16

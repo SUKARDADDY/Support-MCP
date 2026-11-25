@@ -13,6 +13,8 @@ use crate::paths;
 pub enum Step {
     /// A tool by its full path and its arguments. A failure is noted and the next step runs.
     Run(Vec<String>),
+    /// The same, for something that is usually not there: a failure is not noted.
+    Try(Vec<String>),
     /// Ends every process of the app's binary except this one.
     KillHelpers,
     RemoveFile(String),
@@ -30,9 +32,12 @@ pub fn finish_steps(gui_uids: &[u32]) -> Vec<Step> {
         steps.push(run(&[paths::LAUNCHCTL, "bootout", &format!("gui/{uid}/{}", paths::AGENT_LABEL)]));
     }
     steps.push(run(&[paths::LAUNCHCTL, "bootout", &format!("system/{}", paths::DAEMON_LABEL)]));
+    // An update's watcher, if one is loaded (an uninstall during a trial long past its deadline).
+    steps.push(Step::Try([paths::LAUNCHCTL, "bootout", &format!("system/{}", paths::WATCH_LABEL)].iter().map(|s| s.to_string()).collect()));
     steps.push(Step::KillHelpers);
     steps.push(Step::RemoveFile(paths::AGENT_PLIST.into()));
     steps.push(Step::RemoveFile(paths::DAEMON_PLIST.into()));
+    steps.push(Step::RemoveFile(paths::WATCH_PLIST.into()));
     steps.push(Step::RemoveTree(paths::DATA_DIR.into()));
     steps.push(Step::RemoveTree(paths::SOCKET_DIR.into()));
     steps.push(run(&[paths::TCCUTIL, "reset", "ScreenCapture", paths::BUNDLE_ID]));
@@ -55,7 +60,7 @@ pub fn run_steps(steps: &[Step], own_pid: i32, procs: impl Fn() -> Vec<crate::pr
     let mut failed = Vec::new();
     for step in steps {
         match step {
-            Step::Run(args) => {
+            Step::Run(args) | Step::Try(args) => {
                 let ok = std::process::Command::new(&args[0])
                     .args(&args[1..])
                     .stdin(std::process::Stdio::null())
@@ -63,7 +68,7 @@ pub fn run_steps(steps: &[Step], own_pid: i32, procs: impl Fn() -> Vec<crate::pr
                     .stderr(std::process::Stdio::null())
                     .status()
                     .is_ok_and(|s| s.success());
-                if !ok {
+                if !ok && matches!(step, Step::Run(_)) {
                     failed.push(args.join(" "));
                 }
             }
@@ -113,7 +118,8 @@ mod tests {
         assert!(steps.contains(&run(&["/usr/bin/tccutil", "reset", "ScreenCapture", "io.github.sukardaddy.supportmcp"])));
         assert!(steps.contains(&run(&["/usr/bin/tccutil", "reset", "Accessibility", "io.github.sukardaddy.supportmcp"])));
         assert!(steps.contains(&run(&["/usr/sbin/pkgutil", "--forget", "io.github.sukardaddy.supportmcp.pkg"])));
-        for path in [paths::AGENT_PLIST, paths::DAEMON_PLIST] {
+        assert_eq!(steps[3], Step::Try(["/bin/launchctl", "bootout", "system/io.github.sukardaddy.supportmcp.update"].map(String::from).to_vec()));
+        for path in [paths::AGENT_PLIST, paths::DAEMON_PLIST, paths::WATCH_PLIST] {
             assert!(steps.contains(&Step::RemoveFile(path.into())));
         }
         assert!(steps.contains(&Step::RemoveTree(paths::DATA_DIR.into())));
@@ -137,7 +143,13 @@ mod tests {
         std::os::unix::fs::symlink(d.join("keep"), d.join("link")).unwrap();
         let s = |p: &str| d.join(p).to_string_lossy().into_owned();
         let failed = run_steps(
-            &[Step::Run(vec!["/no/such/tool".into()]), Step::RemoveTree(s("link")), Step::RemoveTree(s("gone")), Step::RemoveFile(s("missing"))],
+            &[
+                Step::Run(vec!["/no/such/tool".into()]),
+                Step::Try(vec!["/no/such/other".into()]),
+                Step::RemoveTree(s("link")),
+                Step::RemoveTree(s("gone")),
+                Step::RemoveFile(s("missing")),
+            ],
             0,
             Vec::new,
         );

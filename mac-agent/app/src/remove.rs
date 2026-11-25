@@ -259,8 +259,26 @@ fn held_since(name: &str) -> Option<i64> {
     (secs.len() >= 9 && secs.bytes().all(|b| b.is_ascii_digit())).then(|| secs.parse().ok()).flatten()
 }
 
-/// Deletes what uninstall_program has held for more than 7 days, and staging folders an install left behind for more than
-/// a day. A name that tells no time goes by its last change. Never follows a link. Returns what it deleted.
+/// Whether a staging folder (`install-<pid>-…` or `update-<pid>-…`) belongs to a process that is gone. An update restarts
+/// the service before its stage is dropped, so the new service clears the old one's at its start. A pid that was reused
+/// keeps its folder until the day is up.
+fn stage_owner_gone(name: &str) -> bool {
+    let mut parts = name.splitn(3, '-');
+    let (Some(kind), Some(pid)) = (parts.next(), parts.next()) else { return false };
+    if !matches!(kind, "install" | "update") {
+        return false;
+    }
+    let Ok(pid) = pid.parse::<libc::pid_t>() else { return false };
+    if pid <= 1 || pid as u32 == std::process::id() {
+        return false;
+    }
+    // SAFETY: signal 0 only asks whether the process exists.
+    let r = unsafe { libc::kill(pid, 0) };
+    r == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Deletes what uninstall_program has held for more than 7 days, staging folders whose process is gone, and staging
+/// folders left behind for more than a day. A name that tells no time goes by its last change. Never follows a link. Returns what it deleted.
 pub fn sweep(data_dir: &Path, now_s: i64) -> Vec<String> {
     let mut gone = Vec::new();
     let mtime = |p: &Path| fs::symlink_metadata(p).ok().map(|m| m.mtime());
@@ -276,7 +294,7 @@ pub fn sweep(data_dir: &Path, now_s: i64) -> Vec<String> {
             let p = e.path();
             let name = e.file_name().to_string_lossy().into_owned();
             let since = if by_name { held_since(&name).or_else(|| mtime(&p)) } else { mtime(&p) };
-            if since.is_some_and(|t| now_s - t > keep) {
+            if since.is_some_and(|t| now_s - t > keep) || (!by_name && stage_owner_gone(&name)) {
                 remove_tree(&p);
                 gone.push(format!("{sub}/{name}"));
             }
@@ -294,6 +312,17 @@ mod tests {
 
     fn receipt(volume: &str, location: &str, files: &[&str]) -> Receipt {
         Receipt { volume: volume.into(), location: location.into(), files: files.iter().map(|s| s.to_string()).collect() }
+    }
+
+    #[test]
+    fn a_stage_whose_process_is_gone_is_cleared_and_a_live_ones_is_kept() {
+        let mine = std::process::id();
+        assert!(!stage_owner_gone(&format!("update-{mine}-1-0")), "this process");
+        assert!(!stage_owner_gone("update-1-1-0"), "launchd");
+        assert!(stage_owner_gone("update-2000000000-1-0"), "no such process");
+        assert!(stage_owner_gone("install-2000000000-1-0"));
+        assert!(!stage_owner_gone("other-2000000000-1-0"));
+        assert!(!stage_owner_gone("update-x-1-0"));
     }
 
     #[test]

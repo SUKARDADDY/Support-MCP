@@ -8,6 +8,7 @@
 
 pub mod clock;
 pub mod device;
+pub mod download;
 #[cfg(unix)]
 pub mod exec;
 pub mod files;
@@ -26,4 +27,23 @@ pub mod tls;
 pub mod wire;
 
 /// The release version of this client. It is the `app_version` of a check-in and the `version` of a session hello.
+#[cfg(not(feature = "test-release"))]
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// A `test-release` build may report another version (SUPPORT_TEST_VERSION at build time), so the macOS update test can
+/// build several versions from one source.
+#[cfg(feature = "test-release")]
+pub const VERSION: &str = match option_env!("SUPPORT_TEST_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
+// The build-time names only a `test-release` build may use. Any other build stops here, so the app that ships can never
+// trust a test key, report a made-up version or download from loopback.
+#[cfg(not(feature = "test-release"))]
+const _: () = assert!(
+    option_env!("SUPPORT_TEST_RELEASE_KEY").is_none()
+        && option_env!("SUPPORT_TEST_VERSION").is_none()
+        && option_env!("SUPPORT_TEST_DOWNLOAD_ORIGIN").is_none(),
+    "SUPPORT_TEST_RELEASE_KEY, SUPPORT_TEST_VERSION or SUPPORT_TEST_DOWNLOAD_ORIGIN is set in the build environment. Only a build with the test-release feature may use them. Unset them to build the app that ships."
+);

@@ -1,7 +1,5 @@
-//! The one binary's roles, chosen by its first argument. PR 4 adds nothing here (Accessibility lives in the helper).
-//! The one-off join app is not a role here: it is a binary and a bundle of its own (`support-join`), so a link can never
-//! reach the root-backed app. PR 7 adds the update roles. Each is a new variant, so a role that is not built yet is
-//! refused like any unknown one.
+//! The one binary's roles, chosen by its first argument. The one-off join app is not a role here: it is a binary and a
+//! bundle of its own (`support-join`), so a link can never reach the root-backed app. Anything else is refused.
 //!
 //! | Role | Runs as | Started by |
 //! |---|---|---|
@@ -11,6 +9,7 @@
 //! | `uninstall` | an administrator (the CLI under sudo); `--finish` as root, by the service | a person, the service |
 //! | `file-op` | root, which drops to the user first | the service |
 //! | `run-as` | root, which drops to the user first | the service, through `launchctl asuser` |
+//! | `update-watch` | root, from the old app's copy in the data folder | launchd, for an update's trial (src/update.rs) |
 //!
 //! While the helper runs, Finder, Launchpad and `open` do not start this binary: the helper is the bundle's running
 //! instance, so they send it a reopen event, which its app delegate turns into its window. With no arguments the
@@ -53,6 +52,10 @@ pub enum Role {
     RunAs {
         uid: u32,
         command: String,
+    },
+    /// The update watcher. `restart`: it restarts the service and the helpers first (loaded by the switch).
+    UpdateWatch {
+        restart: bool,
     },
     Version,
 }
@@ -218,6 +221,10 @@ pub fn parse(args: &[String]) -> Result<Role, String> {
             }
             Ok(Role::Setup(SetupArgs { link, code: take(rest, "--code")?, name, access, control }))
         }
+        "update-watch" => {
+            only(rest, &[], &["--restart"])?;
+            Ok(Role::UpdateWatch { restart: rest.iter().any(|a| a == "--restart") })
+        }
         "uninstall" => {
             only(rest, &[], &["--finish"])?;
             Ok(Role::Uninstall { finish: rest.iter().any(|a| a == "--finish") })
@@ -271,7 +278,7 @@ mod tests {
         assert!(p(&[]).is_err());
         // `join` is never a role of this binary: the one-off app is a binary of its own (src/bin/support_join.rs), so the
         // saved app can neither join a link nor be handed one. Roles of later PRs are unknown until they are built.
-        for later in ["join", "device-update", "update-rollback", "--service"] {
+        for later in ["join", "device-update", "update-rollback", "--service", "update"] {
             assert!(p(&[later]).is_err(), "{later}");
         }
     }
@@ -355,6 +362,14 @@ mod tests {
         // A running helper already has its handler: the signal alone, and no marker to go stale.
         assert_eq!(launch_steps(&AppLaunch::Show, t, 29), vec![ctl(&["kill", "29"])]);
         assert!(launch_steps(&AppLaunch::Refuse(NOT_INSTALLED), t, 29).is_empty());
+    }
+
+    #[test]
+    fn the_update_watcher_has_one_switch() {
+        assert_eq!(p(&["update-watch"]), Ok(Role::UpdateWatch { restart: false }));
+        assert_eq!(p(&["update-watch", "--restart"]), Ok(Role::UpdateWatch { restart: true }));
+        assert!(p(&["update-watch", "--now"]).is_err());
+        assert!(p(&["update-watch", "/tmp/x.pkg"]).is_err());
     }
 
     #[test]
