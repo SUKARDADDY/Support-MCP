@@ -946,6 +946,8 @@ pub(crate) mod tests {
         pub receipts: Mutex<HashMap<String, Receipt>>,
         /// The contents of the last copy the stage made, by size: what the install read.
         pub staged_bytes: Mutex<Vec<u8>>,
+        /// Set while the receipts are read: a session that stops in the middle of an uninstall.
+        pub stop_on_receipts: Mutex<Option<std::sync::Arc<Stop>>>,
     }
 
     impl FakeTools {
@@ -1008,6 +1010,9 @@ pub(crate) mod tests {
             copy_tree(from, to).map_err(|e| e.to_string())
         }
         fn receipts_owning(&self, paths: &[String]) -> Vec<String> {
+            if let Some(stop) = &*self.stop_on_receipts.lock().unwrap() {
+                stop.set();
+            }
             let r = self.receipts.lock().unwrap();
             let mut ids: Vec<String> = r
                 .iter()
