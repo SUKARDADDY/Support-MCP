@@ -93,6 +93,11 @@ fn quit_within(
         return Err(STOPPED.into());
     }
     let asked = closer.ask_quit(pids);
+    // Asking can take seconds (the helper answers for the person's session). A session that stopped meanwhile sends
+    // nothing more, not even the fallback SIGTERM for apps the helper did not reach.
+    if stop.is_set() {
+        return Err(STOPPED.into());
+    }
     for p in pids.iter().filter(|p| !asked.contains(p)) {
         closer.signal(*p, libc::SIGTERM);
     }
@@ -356,6 +361,33 @@ mod tests {
         fn alive(&self, pid: i32) -> bool {
             self.alive.lock().unwrap().contains(&pid)
         }
+    }
+
+    /// A helper that is still answering when the session stops, and reaches none of the apps.
+    struct StopsWhileAsked {
+        stop: std::sync::Arc<Stop>,
+        log: Mutex<Vec<String>>,
+    }
+
+    impl Closer for StopsWhileAsked {
+        fn ask_quit(&self, pids: &[i32]) -> Vec<i32> {
+            self.log.lock().unwrap().push(format!("quit {pids:?}"));
+            self.stop.set();
+            Vec::new()
+        }
+        fn signal(&self, pid: i32, sig: i32) {
+            self.log.lock().unwrap().push(format!("sig{sig} {pid}"));
+        }
+        fn alive(&self, _pid: i32) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_session_stopped_while_the_helper_is_asked_sends_no_signal() {
+        let closer = StopsWhileAsked { stop: Stop::new(), log: Mutex::default() };
+        assert_eq!(quit(&[700], &closer, &closer.stop), Err(STOPPED.to_string()));
+        assert_eq!(*closer.log.lock().unwrap(), vec!["quit [700]"]);
     }
 
     fn run(w: &World, id: &str, protected: &[&str], closer: &Gone, procs: Vec<Proc>) -> Result<Value, String> {
