@@ -4,8 +4,8 @@
 //! - The question: "Don't allow" is the default button (Return), "Allow" is off for its first 500 ms, and with no
 //!   answer after 120 seconds it closes as Don't allow.
 //! - The corner window: who is connected and for how long, and End session (a second click within 5 s confirms).
-//! - The menu: the state, who is connected with End session, Check now, Allow any time (when asking), the six digits
-//!   while pending, recent history, Set up or Uninstall, and the version.
+//! - The menu: the state, who is connected with End session, Check now, Allow any time (when asking and no one is
+//!   connected), the six digits while pending, recent history, Set up or Uninstall, and the version.
 //! - The setup window: the link, an optional code, the name, ask or any and full or limited with nothing chosen, one
 //!   line on the permissions with a button to their window, and the outcome (the six digits while pending).
 //! - The permissions window (`perms.rs`): Screen Recording, Accessibility and Full Disk Access with their live state.
@@ -269,7 +269,8 @@ fn rebuild_menu(ui: &mut Ui) {
             }
             let ask = status_text(m, "access") == "ask";
             menu.addItem(&menu_item(mtm, t, if ask { "Support asks you before each connection." } else { "Support can connect any time." }, 0));
-            if ask && state == "active" {
+            // Not during a session: the technician's input can reach this menu, and the root service refuses it then.
+            if ask && state == "active" && m.get("session").and_then(Value::as_object).is_none() {
                 menu.addItem(&menu_item(mtm, t, "Allow any time", TAG_ANY));
             }
             menu.addItem(&menu_item(mtm, t, "Check now", TAG_CHECK));
@@ -757,6 +758,10 @@ fn own_windows(ui: &Ui) -> Vec<Rect> {
     }
     if let Some(p) = ui.perms.as_ref().filter(|p| p.window.isVisible()) {
         add(p.window.frame());
+    }
+    // The menu bar item: a technician's click there would open the app's own menu.
+    if let Some(w) = ui.status_item.as_ref().and_then(|i| i.button(ui.mtm)).and_then(|b| b.window()) {
+        add(w.frame());
     }
     out
 }

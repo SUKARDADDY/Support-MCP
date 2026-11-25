@@ -190,6 +190,11 @@ impl MacPlatform {
         self.device.lock().unwrap().upgrade()
     }
 
+    /// A session is live (started and not yet ended).
+    pub fn in_session(&self) -> bool {
+        self.live.lock().unwrap().count > 0
+    }
+
     fn limited(&self) -> bool {
         let control = self.device().map(|d| d.control()).unwrap_or_else(|| self.control.lock().unwrap().clone());
         control != "full"
@@ -496,6 +501,13 @@ impl Platform for MacPlatform {
     }
 }
 
+/// Whether "Allow any time" may drop the question before each connection. Only from asking, and never while a
+/// session is live: the technician's own input can reach the menu (a click on the menu bar item, or reopening the
+/// app, which shows it), and a session must not widen its own access.
+fn may_allow_any_time(access: &str, in_session: bool) -> bool {
+    access == "ask" && !in_session
+}
+
 // ---- the service ------------------------------------------------------------------------------------------------
 
 pub struct Service {
@@ -771,7 +783,7 @@ impl Api for Service {
 
     fn allow_any_time(&self) {
         let Some(d) = self.device() else { return };
-        if d.access() != "ask" {
+        if !may_allow_any_time(&d.access(), self.platform.in_session()) {
             return;
         }
         let Some(s) = self.state.lock().unwrap().clone() else { return };
@@ -1183,6 +1195,29 @@ mod tests {
         *r.os.console.lock().unwrap() = None;
         let err = run(p.clone()).await.unwrap().unwrap_err();
         assert!(err.starts_with(NOBODY) && err.contains("as: \"system\""), "{err}");
+    }
+
+    #[test]
+    fn allow_any_time_works_only_from_asking_and_never_during_a_session() {
+        assert!(may_allow_any_time("ask", false));
+        assert!(!may_allow_any_time("ask", true), "a technician in a session must not drop the question");
+        assert!(!may_allow_any_time("any", false));
+        assert!(!may_allow_any_time("any", true));
+    }
+
+    #[tokio::test]
+    async fn the_platform_knows_while_a_session_is_live() {
+        let r = rig("in-session", "full").await;
+        let p = r.svc.platform.clone();
+        assert!(!p.in_session());
+        p.session(Some("Dana"));
+        assert!(p.in_session());
+        // A replaced session can report its end after the new one started: still live until both ended.
+        p.session(Some("Dana"));
+        p.session(None);
+        assert!(p.in_session());
+        p.session(None);
+        assert!(!p.in_session());
     }
 
     #[tokio::test]
