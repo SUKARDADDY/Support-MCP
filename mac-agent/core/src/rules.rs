@@ -985,7 +985,11 @@ pub fn check(ruled: Option<&dyn Ruled>, limited: bool, frame: &Frame, stop: &Sto
                 if let Some(problem) = mac_install_problem(&frame.text("path"), &frame.text("args")) {
                     return Some(problem);
                 }
-                path = Some(files::absolute_path(js_trim(&frame.text("path"))).ok()?);
+                // A path that cannot be made whole is refused, never let through without its approval check.
+                match files::absolute_path(js_trim(&frame.text("path"))) {
+                    Ok(p) => path = Some(p),
+                    Err(_) => return Some(MAC_NEEDS_PATH.to_string()),
+                }
                 "install".to_string()
             }
             "uninstall" => {
