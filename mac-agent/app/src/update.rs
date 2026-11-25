@@ -21,7 +21,8 @@
 //!    the deadline. The watcher rolls back when the trial is still open at its deadline, which covers a version that
 //!    cannot even start. A rollback swaps the old app back, records the version as failed so it is never taken again,
 //!    and restarts the service and the helpers. The watcher's property list is in /Library/LaunchDaemons for the
-//!    trial, so a restart of the Mac in the middle starts it again.
+//!    trial, so a restart of the Mac in the middle starts it again. A rollback that runs again reads which version is
+//!    in each place first, so it never swaps the failed version back in.
 //!
 //! Everything that needs macOS is behind `System`, so the rest runs and is tested on Linux.
 
@@ -414,6 +415,20 @@ pub fn watch_plist(binary: &str, restart: bool) -> String {
 /// Whether `launchctl print` says the job has a process now.
 pub fn running_in(print: &str) -> bool {
     print.lines().any(|l| l.trim() == "state = running")
+}
+
+/// The version of the Support app at `app`, read from its Info.plist: None when the path is not a real folder, its
+/// Info.plist cannot be read, or the app is not Support.
+pub fn bundle_version(app: &Path) -> Option<String> {
+    if !fs::symlink_metadata(app).ok()?.file_type().is_dir() {
+        return None;
+    }
+    let info = programs::info_plist(app)?;
+    let field = |k: &str| info.get(k).and_then(|v| v.as_string()).map(str::to_string);
+    if field("CFBundleIdentifier")?.as_str() != paths::BUNDLE_ID {
+        return None;
+    }
+    field("CFBundleShortVersionString").filter(|v| !v.is_empty())
 }
 
 /// Whether a process's executable is an old copy of the app: Support's binary under the data folder (previous/, or a
@@ -949,6 +964,11 @@ impl Updater {
     /// Puts the old version back; the caller holds the lock. The version is recorded as failed first, so even a rollback
     /// cut short never takes it again. Only a rollback that put the old app back closes the trial; otherwise it stays in
     /// its rollback phase and the next watcher (or the old version's next start) finishes it.
+    ///
+    /// It may run again after one cut short (the Mac lost power after the swap, before the record was closed), so it
+    /// first reads which version is in each place, and swaps only when the failed version is in /Applications and the
+    /// old one in previous/. When the old version is in /Applications already, it only finishes. When either place
+    /// holds something it does not expect, it deletes nothing and leaves the record for a person or the next run.
     pub fn rollback_locked(&self, version: &str) -> Result<Rolled, String> {
         let mut st = load(&self.places.data).ok_or("update.json cannot be read now")?;
         let Some(t) = st.trial_of(version).cloned() else { return Ok(Rolled::NoTrial) };
@@ -960,15 +980,36 @@ impl Updater {
             save(&self.places.data, &st)?;
         }
         let (current, previous) = (self.places.current(), self.places.previous());
-        let gone = !fs::symlink_metadata(&previous).is_ok_and(|m| m.file_type().is_dir());
-        let line = if gone {
-            format!("Support couldn't update to version {version}.")
-        } else {
+        let (now_in, prev_in) = (bundle_version(&current), bundle_version(&previous));
+        let prev_missing = fs::symlink_metadata(&previous).is_err();
+        let back = format!("Support couldn't update to version {version}, so it went back to version {}.", t.from_version);
+        let gone = if now_in.as_deref() == Some(t.from_version.as_str()) {
+            // An earlier run swapped already: previous/ holds the failed version, or nothing if that run removed it.
+            if prev_in.as_deref() == Some(version) {
+                install::remove_tree(&previous);
+            }
+            false
+        } else if now_in.as_deref() == Some(version) && prev_in.as_deref() == Some(t.from_version.as_str()) {
             install::swap(&previous, &current).map_err(|e| format!("the old app could not be put back: {e}"))?;
             // previous/ now holds the version that failed: it goes.
             install::remove_tree(&previous);
-            format!("Support couldn't update to version {version}, so it went back to version {}.", t.from_version)
+            false
+        } else if now_in.as_deref() == Some(version) && prev_missing {
+            // No old copy to go back to: the trial ends on the new version.
+            true
+        } else {
+            let shown = |v: &Option<String>| v.clone().unwrap_or_else(|| "missing or unreadable".into());
+            return Err(format!(
+                "{} holds {} and {} holds {}, but the rollback expects {version} and {}; nothing was deleted, and update.json \
+                 keeps the rollback so a person or the next run can finish it",
+                current.display(),
+                shown(&now_in),
+                previous.display(),
+                shown(&prev_in),
+                t.from_version
+            ));
         };
+        let line = if gone { format!("Support couldn't update to version {version}.") } else { back };
         self.history(&line);
         let mut st = load(&self.places.data).ok_or("update.json cannot be read now")?;
         st.trial = None;

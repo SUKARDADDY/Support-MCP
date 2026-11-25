@@ -666,6 +666,116 @@ fn a_rollback_with_no_old_copy_ends_the_trial_on_the_new_version() {
     assert_eq!(w.updater(A).rollback_locked("1.1.1"), Ok(Rolled::NoTrial));
 }
 
+/// A switch from A to 1.1.1 whose rollback was decided: 1.1.1 is in /Applications, A in previous/, the record in its
+/// rollback phase with 1.1.1 failed.
+fn decided_rollback(name: &str) -> World {
+    let w = World::new(name);
+    w.updater(A).attempt(&w.publish("1.1.1", "A"), &idle).unwrap();
+    let mut st = w.state();
+    st.trial.as_mut().unwrap().phase = Phase::Rollback;
+    st.add_failed("1.1.1");
+    save(&w.places.data, &st).unwrap();
+    w
+}
+
+#[test]
+fn bundle_version_reads_only_supports_own_app() {
+    let d = temp("bundlever");
+    let app = d.join("Support.app");
+    assert_eq!(bundle_version(&app), None, "missing");
+    make_app(&app, "1.1.1", paths::BUNDLE_ID, "A");
+    assert_eq!(bundle_version(&app).as_deref(), Some("1.1.1"));
+    make_app(&app, "1.1.1", "com.example.other", "A");
+    assert_eq!(bundle_version(&app), None, "another app");
+    make_app(&app, "1.1.1", paths::BUNDLE_ID, "A");
+    std::os::unix::fs::symlink(&app, d.join("Link.app")).unwrap();
+    assert_eq!(bundle_version(&d.join("Link.app")), None, "a link is not followed");
+    fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn a_rollback_put_back_by_the_watcher_swaps_once() {
+    let w = decided_rollback("rollnormal");
+    let _l = lock(&w.places.data, Duration::ZERO).unwrap();
+    assert_eq!(w.updater(A).rollback_locked("1.1.1"), Ok(Rolled::Back));
+    assert_eq!(w.installed().as_deref(), Some(A));
+    assert_eq!(w.previous(), None);
+    let st = w.state();
+    assert_eq!((st.trial, st.failed), (None, vec!["1.1.1".to_string()]));
+    assert_eq!(w.history().last().unwrap(), "Support couldn't update to version 1.1.1, so it went back to version 1.1.0.");
+    assert_eq!((w.sys.count("restart service"), w.sys.count("restart helpers")), (1, 1));
+}
+
+#[test]
+fn a_rollback_cut_short_after_its_swap_finishes_without_swapping_again() {
+    // The Mac lost power after the swap: A is back in /Applications, 1.1.1 in previous/, and the record still open.
+    let w = decided_rollback("rollresume");
+    install::swap(&w.places.previous(), &w.places.current()).unwrap();
+    assert_eq!((w.installed().as_deref(), w.previous().as_deref()), (Some(A), Some("1.1.1")));
+    let _l = lock(&w.places.data, Duration::ZERO).unwrap();
+    // The next boot's watcher runs again, here as 1.1.1's copy would on a resumed rollback.
+    assert_eq!(w.updater("1.1.1").rollback_locked("1.1.1"), Ok(Rolled::Back));
+    assert_eq!(w.installed().as_deref(), Some(A), "the good version stays");
+    assert_eq!(w.previous(), None, "the failed version is gone");
+    let st = w.state();
+    assert_eq!((st.trial, st.failed), (None, vec!["1.1.1".to_string()]));
+    assert_eq!(w.history().last().unwrap(), "Support couldn't update to version 1.1.1, so it went back to version 1.1.0.");
+    assert_eq!((w.sys.count("restart service"), w.sys.count("restart helpers")), (1, 1));
+
+    // Cut short later, after previous/ was removed but before the record closed: it only finishes.
+    let w = decided_rollback("rollresume2");
+    install::swap(&w.places.previous(), &w.places.current()).unwrap();
+    install::remove_tree(&w.places.previous());
+    let _l = lock(&w.places.data, Duration::ZERO).unwrap();
+    assert_eq!(w.updater("1.1.1").rollback_locked("1.1.1"), Ok(Rolled::Back));
+    assert_eq!(w.installed().as_deref(), Some(A));
+    assert_eq!(w.state().trial, None);
+}
+
+#[test]
+fn a_resumed_rollback_through_the_watcher_keeps_the_good_version() {
+    let w = decided_rollback("rollwatch");
+    install::swap(&w.places.previous(), &w.places.current()).unwrap();
+    // The failed version's service starts first and loads the watcher, which finishes the rollback at once.
+    assert_eq!(w.updater("1.1.1").prepare(), None);
+    let long = Timing { trial_ms: 10_000, ..timing() };
+    assert_eq!(w.updater_timed(A, long).watch(false), 0);
+    assert_eq!(w.installed().as_deref(), Some(A));
+    assert_eq!(w.previous(), None);
+    assert_eq!(w.state().trial, None);
+    assert!(!w.places.watch_plist.exists());
+}
+
+#[test]
+fn a_rollback_that_finds_an_unexpected_version_deletes_nothing_and_keeps_the_record() {
+    let check = |w: &World, current: Option<&str>, previous: Option<&str>| {
+        let before = w.state();
+        let _l = lock(&w.places.data, Duration::ZERO).unwrap();
+        let err = w.updater("1.1.1").rollback_locked("1.1.1").unwrap_err();
+        assert!(err.contains("nothing was deleted"), "{err}");
+        assert!(err.contains("update.json keeps the rollback"), "{err}");
+        assert_eq!((w.installed().as_deref(), w.previous().as_deref()), (current, previous));
+        assert_eq!(w.state(), before, "the record stays");
+        assert_eq!(w.sys.count("restart service"), 0);
+    };
+    // Something else in previous/.
+    let w = decided_rollback("rollodd1");
+    make_app(&w.places.previous(), "1.0.5", paths::BUNDLE_ID, "A");
+    check(&w, Some("1.1.1"), Some("1.0.5"));
+    // Something else in /Applications.
+    let w = decided_rollback("rollodd2");
+    make_app(&w.places.current(), "1.0.5", paths::BUNDLE_ID, "A");
+    check(&w, Some("1.0.5"), Some(A));
+    // /Applications/Support.app missing.
+    let w = decided_rollback("rollodd3");
+    install::remove_tree(&w.places.current());
+    check(&w, None, Some(A));
+    // Both hold the failed version.
+    let w = decided_rollback("rollodd4");
+    make_app(&w.places.previous(), "1.1.1", paths::BUNDLE_ID, "A");
+    check(&w, Some("1.1.1"), Some("1.1.1"));
+}
+
 #[test]
 fn an_offer_runs_on_its_own_thread_once_and_a_failure_waits_an_hour() {
     let w = World::new("offer");
