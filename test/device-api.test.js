@@ -536,14 +536,12 @@ test('the Mac has its own version line: 1.1.0 is offered to a Mac on 1.0.x whate
   }
 });
 
-test('a Windows check-in answer is byte-identical with and without the Mac settings', async () => {
+test('a Windows check-in answer is byte-identical with and without the Mac settings', async (t) => {
+  // Every answer carries values from the relay's clock (server_time, hours_until), which can tick between two
+  // calls. Stop the clock, so only the Mac settings can make the two answers differ.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const w = await bothWire({ mac: false });
-  const answer = async (body, key) => {
-    const res = await w.send('hello', { protocol: 1, ...body }, { headers: w.bearer(key) });
-    const parsed = JSON.parse(res.text);
-    delete parsed.server_time; // the relay's clock, which can tick between two calls
-    return JSON.stringify(parsed);
-  };
+  const answer = async (body, key) => (await w.send('hello', { protocol: 1, ...body }, { headers: w.bearer(key) })).text;
   for (const [os, version] of [['Windows 11 Pro', OLDER], ['Windows 11 Pro', VERSION], ['', OLDER]]) {
     const paired = await w.send('pair', { protocol: 1, code: await w.code(), name: 'x', app_version: version, ...(os ? { os } : {}) });
     const body = { app_version: version, ...(os ? { os } : {}) };
