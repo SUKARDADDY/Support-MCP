@@ -70,29 +70,59 @@ pub fn inside(procs: &[Proc], app: &str) -> Vec<i32> {
     procs.iter().filter(|p| p.pid > 1 && rules::path_inside(app, &p.path)).map(|p| p.pid).collect()
 }
 
-/// Asks the app's processes to quit, then ends what is left after `QUIT_WAIT`. Returns how many still run.
-pub fn quit(pids: &[i32], closer: &dyn Closer, stop: &support_core::stop::Stop) -> usize {
+/// What a cancelled session's uninstall returns, as install does.
+const STOPPED: &str = "stopped";
+
+/// Asks the app's processes to quit, then ends what is left after `QUIT_WAIT`. Returns how many still run, or `STOPPED`
+/// when the session stops first: then nothing more is sent to the processes, and the caller must not go on.
+pub fn quit(pids: &[i32], closer: &dyn Closer, stop: &support_core::stop::Stop) -> Result<usize, String> {
+    quit_within(pids, closer, stop, QUIT_WAIT, KILL_WAIT)
+}
+
+fn quit_within(
+    pids: &[i32],
+    closer: &dyn Closer,
+    stop: &support_core::stop::Stop,
+    quit_wait: Duration,
+    kill_wait: Duration,
+) -> Result<usize, String> {
     if pids.is_empty() {
-        return 0;
+        return Ok(0);
+    }
+    if stop.is_set() {
+        return Err(STOPPED.into());
     }
     let asked = closer.ask_quit(pids);
     for p in pids.iter().filter(|p| !asked.contains(p)) {
         closer.signal(*p, libc::SIGTERM);
     }
-    let wait = |limit: Duration| {
+    // Waits until the processes end or `limit` passes. Err when the session stops.
+    let wait = |limit: Duration| -> Result<(), String> {
         let until = Instant::now() + limit;
         while Instant::now() < until && pids.iter().any(|p| closer.alive(*p)) {
             if stop.wait(Duration::from_millis(100)) {
-                return;
+                return Err(STOPPED.into());
             }
         }
+        if stop.is_set() {
+            return Err(STOPPED.into());
+        }
+        Ok(())
     };
-    wait(QUIT_WAIT);
+    wait(quit_wait)?;
     for p in pids.iter().filter(|p| closer.alive(**p)) {
         closer.signal(*p, libc::SIGKILL);
     }
-    wait(KILL_WAIT);
-    pids.iter().filter(|p| closer.alive(**p)).count()
+    wait(kill_wait)?;
+    Ok(pids.iter().filter(|p| closer.alive(**p)).count())
+}
+
+/// `STOPPED` once the session has stopped.
+fn go_on(stop: &support_core::stop::Stop) -> Result<(), String> {
+    if stop.is_set() {
+        return Err(STOPPED.into());
+    }
+    Ok(())
 }
 
 /// Moves `app` into `into` (a folder only root can open), from its folder opened without following a link, and only if
@@ -158,7 +188,10 @@ pub fn uninstall(req: &UninstallRequest, env: &Env, procs: &dyn Fn() -> Vec<Proc
     // The receipts are read while the app is still where they say. Only those wholly inside it are forgotten.
     let owning = env.tools.receipts_owning(&[app_text.clone(), format!("{app_text}/Contents/Info.plist")]);
     let forget: Vec<String> = owning.into_iter().filter(|r| env.tools.receipt(r).is_some_and(|rc| receipt_inside(&app_text, &rc))).collect();
-    let still = quit(&inside(&procs(), &app_text), closer, env.stop);
+    // A stopped session ends the uninstall before anything that cannot be taken back: no kill, no move, no forget.
+    go_on(env.stop)?;
+    let still = quit(&inside(&procs(), &app_text), closer, env.stop)?;
+    go_on(env.stop)?;
     // The holding folder: root's, then one new folder for this app.
     crate::state::ensure_dir(env.data_dir, me())?;
     let held = env.data_dir.join(paths::REMOVED_DIR);
@@ -172,9 +205,16 @@ pub fn uninstall(req: &UninstallRequest, env: &Env, procs: &dyn Fn() -> Vec<Proc
             Err(e) => return Err(format!("{}: {e}", slot.display())),
         }
     }
+    if let Err(e) = go_on(env.stop) {
+        let _ = fs::remove_dir(&slot);
+        return Err(e);
+    }
     let moved = move_app(&app, &slot, meta.dev(), meta.ino()).inspect_err(|_| {
         let _ = fs::remove_dir(&slot);
     })?;
+    if env.stop.is_set() {
+        return Err(format!("{STOPPED} after {name} was moved to {}; its package receipts were not forgotten", moved.display()));
+    }
     let mut forgot = Vec::new();
     let mut not_forgot = Vec::new();
     for r in &forget {
@@ -362,14 +402,71 @@ mod tests {
     fn an_app_that_will_not_quit_is_ended_after_the_wait() {
         let closer = Gone { alive: Mutex::new(vec![9]), stubborn: vec![9], log: Mutex::default() };
         let stop = Stop::new();
+        assert_eq!(quit_within(&[9], &closer, &stop, Duration::from_millis(200), Duration::from_millis(200)), Ok(0));
+        assert_eq!(*closer.log.lock().unwrap(), vec!["quit [9]".to_string(), format!("sig{} 9", libc::SIGKILL)]);
+    }
+
+    #[test]
+    fn a_stop_during_the_quit_wait_sends_no_kill() {
+        let closer = Gone { alive: Mutex::new(vec![9]), stubborn: vec![9], log: Mutex::default() };
+        let stop = Stop::new();
         let s2 = stop.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
             s2.set();
         });
-        // The stop cuts the wait short; the kill still comes.
-        assert_eq!(quit(&[9], &closer, &stop), 0);
-        assert_eq!(*closer.log.lock().unwrap(), vec!["quit [9]".to_string(), format!("sig{} 9", libc::SIGKILL)]);
+        assert_eq!(quit(&[9], &closer, &stop), Err(STOPPED.to_string()));
+        assert_eq!(*closer.log.lock().unwrap(), vec!["quit [9]"]);
+        // Already stopped: not even asked.
+        let closer = Gone { alive: Mutex::new(vec![9]), stubborn: vec![9], log: Mutex::default() };
+        assert_eq!(quit(&[9], &closer, &stop), Err(STOPPED.to_string()));
+        assert!(closer.log.lock().unwrap().is_empty());
+    }
+
+    /// A world with one app, a receipt wholly inside it, and its process.
+    fn stoppable(name: &str) -> (World, Vec<Proc>) {
+        let w = World::new(name);
+        app(&w.apps, "Rectangle", "com.knollsoft.Rectangle");
+        let apps = w.apps.to_string_lossy().into_owned();
+        w.tools
+            .receipts
+            .lock()
+            .unwrap()
+            .insert("com.knollsoft.pkg".into(), receipt("/", &apps, &["Rectangle.app", "Rectangle.app/Contents/Info.plist"]));
+        let procs = vec![Proc { pid: 700, uid: 501, path: format!("{apps}/Rectangle.app/Contents/MacOS/Rectangle") }];
+        (w, procs)
+    }
+
+    fn left_in_place(w: &World, closer: &Gone) {
+        assert!(w.apps.join("Rectangle.app/Contents/Info.plist").is_file(), "the app stays");
+        assert!(w.tools.log.lock().unwrap().iter().all(|l| !l.starts_with("forget")), "no receipt forgotten");
+        assert!(w.tools.receipts.lock().unwrap().contains_key("com.knollsoft.pkg"));
+        assert!(closer.log.lock().unwrap().iter().all(|l| !l.starts_with(&format!("sig{}", libc::SIGKILL))), "no kill");
+        assert!(fs::read_dir(w.data.join("removed")).map(|mut d| d.next().is_none()).unwrap_or(true), "nothing held");
+    }
+
+    #[test]
+    fn a_session_stopped_while_the_receipts_are_read_leaves_the_app_where_it_was() {
+        let (w, procs) = stoppable("unstop1");
+        *w.tools.stop_on_receipts.lock().unwrap() = Some(w.stop.clone());
+        let closer = Gone { alive: Mutex::new(vec![700]), stubborn: vec![700], log: Mutex::default() };
+        assert_eq!(run(&w, "com.knollsoft.Rectangle", &[], &closer, procs), Err(STOPPED.to_string()));
+        left_in_place(&w, &closer);
+        assert!(closer.log.lock().unwrap().is_empty(), "not even asked to quit");
+    }
+
+    #[test]
+    fn a_session_stopped_while_the_app_is_asked_to_quit_leaves_the_app_where_it_was() {
+        let (w, procs) = stoppable("unstop2");
+        let closer = Gone { alive: Mutex::new(vec![700]), stubborn: vec![700], log: Mutex::default() };
+        let s2 = w.stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            s2.set();
+        });
+        assert_eq!(run(&w, "com.knollsoft.Rectangle", &[], &closer, procs), Err(STOPPED.to_string()));
+        left_in_place(&w, &closer);
+        assert_eq!(*closer.log.lock().unwrap(), vec!["quit [700]"], "the polite quit only");
     }
 
     #[test]

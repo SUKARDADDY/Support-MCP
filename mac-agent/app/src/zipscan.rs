@@ -4,8 +4,9 @@
 //! - names a file with an absolute path, a `..` part, a backslash or a NUL, or a name that is not UTF-8;
 //! - holds a name twice (compared as the Mac's disk compares names: NFC, no case);
 //! - holds a link and also a file inside that link (`a` a link, then `a/evil`), so expanding the second would write
-//!   through the first. A `__MACOSX/<path>/._<name>` entry, which ditto applies to `<path>/<name>`, counts as that path,
-//!   and may not land on a link either;
+//!   through the first. A `__MACOSX/<path>/._<name>` entry, which ditto applies to `<path>/<name>`, counts as that path
+//!   too, and may not land on a link either. Every entry under `__MACOSX`, that folder and its own folders included, is
+//!   also checked by its own name, which starts with `__MACOSX` and so never matches a name outside it;
 //! - has entries whose local headers do not match its directory, or data between them, so a reader that walks the local
 //!   headers sees exactly what this check saw;
 //! - is too big when expanded, or has too many entries.
@@ -62,8 +63,30 @@ struct Entry {
     zip64: bool,
 }
 
-/// The parts of a name as the Mac's disk compares them, and whether it is an AppleDouble entry ditto applies elsewhere.
-fn key_of(name: &str) -> Result<(Vec<String>, bool), String> {
+/// A name's parts as the Mac's disk compares them: the folders it sits in, then its own name. It always has its own
+/// name, so it is never empty.
+#[derive(Debug, PartialEq)]
+struct Name {
+    folders: Vec<String>,
+    own: String,
+}
+
+impl Name {
+    fn whole(&self) -> Vec<String> {
+        let mut v = self.folders.clone();
+        v.push(self.own.clone());
+        v
+    }
+}
+
+/// An entry's name, and for a `__MACOSX/<path>/._<name>` AppleDouble entry the `<path>/<name>` ditto applies it to.
+#[derive(Debug, PartialEq)]
+struct Key {
+    name: Name,
+    applies_to: Option<Name>,
+}
+
+fn key_of(name: &str) -> Result<Key, String> {
     if name.contains('\\') || name.contains('\0') {
         return Err(format!("{name} holds a backslash or a NUL"));
     }
@@ -78,19 +101,16 @@ fn key_of(name: &str) -> Result<(Vec<String>, bool), String> {
             p => parts.push(rules::nfc(p).to_lowercase()),
         }
     }
-    if parts.is_empty() {
+    let Some(own) = parts.pop() else {
         return Err(format!("the zip holds an entry with no name ({name:?})"));
-    }
-    if parts[0] == "__macosx" {
-        parts.remove(0);
-        if let Some(last) = parts.last_mut() {
-            if let Some(real) = last.strip_prefix("._") {
-                *last = real.to_string();
-                return Ok((parts, true));
-            }
+    };
+    let applies_to = match (parts.split_first(), own.strip_prefix("._")) {
+        (Some((top, folders)), Some(real)) if top == "__macosx" && !real.is_empty() => {
+            Some(Name { folders: folders.to_vec(), own: real.to_string() })
         }
-    }
-    Ok((parts, false))
+        _ => None,
+    };
+    Ok(Key { name: Name { folders: parts, own }, applies_to })
 }
 
 /// Why a zip may not be expanded as root, or Ok.
@@ -173,31 +193,32 @@ pub fn check(path: &Path) -> Result<(), String> {
         return Err(format!("the zip would expand to more than {} GB", EXPANDED_MAX >> 30));
     }
     // Names: each once, none inside a link, no AppleDouble on a link.
-    let mut keys: Vec<(Vec<String>, bool)> = Vec::with_capacity(entries.len());
+    let mut keys: Vec<Key> = Vec::with_capacity(entries.len());
     let mut seen: HashSet<Vec<String>> = HashSet::new();
     let mut links: HashMap<Vec<String>, String> = HashMap::new();
     for e in &entries {
-        let (k, double) = key_of(&e.name)?;
-        if !double && !seen.insert(k.clone()) {
+        let k = key_of(&e.name)?;
+        let whole = k.name.whole();
+        if !seen.insert(whole.clone()) {
             return Err(format!("the zip holds {} twice", e.name.trim_end_matches('/')));
         }
         if e.link {
-            if double {
+            if k.applies_to.is_some() {
                 return Err(format!("{} is a link in the place of a file's extra data", e.name));
             }
-            links.insert(k.clone(), e.name.trim_end_matches('/').to_string());
+            links.insert(whole, e.name.trim_end_matches('/').to_string());
         }
-        keys.push((k, double));
+        keys.push(k);
     }
-    for (e, (k, double)) in entries.iter().zip(&keys) {
-        let upto = if *double { k.len() } else { k.len() - 1 };
-        for i in 1..=upto {
-            if let Some(link) = links.get(&k[..i]) {
-                return Err(format!(
-                    "{} is inside {link}, which is a link in the zip; install_program does not expand a zip that writes through a link",
-                    e.name.trim_end_matches('/')
-                ));
-            }
+    for (e, k) in entries.iter().zip(&keys) {
+        // The folders the entry is written in, and for an AppleDouble entry also the path it is applied to, whole.
+        let applied = k.applies_to.as_ref().map(Name::whole).unwrap_or_default();
+        let folders = (1..=k.name.folders.len()).map(|i| &k.name.folders[..i]);
+        if let Some(link) = folders.chain((1..=applied.len()).map(|i| &applied[..i])).find_map(|p| links.get(p)) {
+            return Err(format!(
+                "{} is inside {link}, which is a link in the zip; install_program does not expand a zip that writes through a link",
+                e.name.trim_end_matches('/')
+            ));
         }
     }
     // The local headers: one at each offset the directory names, back to back from the start to the directory, each with
@@ -377,9 +398,45 @@ pub(crate) mod tests {
 
     #[test]
     fn keys_compare_as_the_macs_disk_does() {
-        assert_eq!(key_of("A/./B/").unwrap(), (vec!["a".to_string(), "b".to_string()], false));
-        assert_eq!(key_of("__MACOSX/A/._B").unwrap(), (vec!["a".to_string(), "b".to_string()], true));
-        assert_eq!(key_of("__MACOSX/A/").unwrap(), (vec!["a".to_string()], false));
+        let name = |folders: &[&str], own: &str| Name { folders: folders.iter().map(|s| s.to_string()).collect(), own: own.into() };
+        assert_eq!(key_of("A/./B/").unwrap(), Key { name: name(&["a"], "b"), applies_to: None });
+        assert_eq!(key_of("__MACOSX/A/._B").unwrap(), Key { name: name(&["__macosx", "a"], "._b"), applies_to: Some(name(&["a"], "b")) });
+        assert_eq!(key_of("__MACOSX/._B").unwrap().applies_to, Some(name(&[], "b")));
+        // The __MACOSX folders keep their own names, so they never match a real path.
+        assert_eq!(key_of("__MACOSX/A/").unwrap(), Key { name: name(&["__macosx"], "a"), applies_to: None });
+        assert_eq!(key_of("__MACOSX/").unwrap(), Key { name: name(&[], "__macosx"), applies_to: None });
+        assert_eq!(key_of("__MACOSX").unwrap(), Key { name: name(&[], "__macosx"), applies_to: None });
+        assert_eq!(key_of("__MACOSX/A/._").unwrap().applies_to, None, "applies to no name");
         assert!(key_of("./").is_err());
+    }
+
+    #[test]
+    fn macosx_folder_entries_are_not_real_paths() {
+        // The __MACOSX folder alone, with or without its slash, and as Finder and ditto --sequesterRsrc write it.
+        assert_eq!(scan(&zip(&[("__MACOSX", false)], "")), Ok(()));
+        assert_eq!(scan(&zip(&[("__MACOSX/", false)], "")), Ok(()));
+        let z = zip(&[("Foo.app/", false), ("Foo.app/Contents/Info.plist", false), ("__MACOSX/", false), ("__MACOSX/._Foo.app", false)], "");
+        assert_eq!(scan(&z), Ok(()));
+        let finder = zip(
+            &[
+                ("Foo.app/", false),
+                ("Foo.app/Contents/", false),
+                ("Foo.app/Contents/Info.plist", false),
+                ("__MACOSX/", false),
+                ("__MACOSX/Foo.app/", false),
+                ("__MACOSX/Foo.app/Contents/", false),
+                ("__MACOSX/Foo.app/Contents/._Info.plist", false),
+            ],
+            "",
+        );
+        assert_eq!(scan(&finder), Ok(()));
+        // Real duplicates, inside or outside __MACOSX, are still refused.
+        assert!(scan(&zip(&[("Foo.app/", false), ("foo.app/", false), ("__MACOSX/", false)], "")).unwrap_err().contains("holds foo.app twice"));
+        assert!(scan(&zip(&[("__MACOSX/", false), ("__MACOSX", false)], "")).unwrap_err().contains("holds __MACOSX twice"));
+        // An AppleDouble entry still counts as the path it is applied to, and a link inside __MACOSX is still a link.
+        assert!(scan(&zip(&[("Foo.app/Contents", true), ("__MACOSX/Foo.app/Contents/._Info.plist", false)], ""))
+            .unwrap_err()
+            .contains("inside Foo.app/Contents, which is a link"));
+        assert!(scan(&zip(&[("__MACOSX/d", true), ("__MACOSX/d/._a", false)], "")).unwrap_err().contains("inside __MACOSX/d, which is a link"));
     }
 }
