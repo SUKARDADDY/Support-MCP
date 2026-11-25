@@ -62,7 +62,11 @@ export function wranglerRun(prepared, args, { wrangler = defaultWrangler() } = {
 // Starts `wrangler dev` on `port` and waits for /healthz. `stop()` ends the whole process group (wrangler starts
 // workerd as a child).
 export async function startRelay(prepared, port, { wrangler = defaultWrangler(), log = () => {} } = {}) {
-  const child = spawn(wrangler[0], [...wrangler.slice(1), 'dev', '-c', prepared.config, '--persist-to', prepared.state, '--port', String(port), '--ip', '127.0.0.1'], {
+  // The devtools inspector listens on a fixed port unless told otherwise, so two runs on one machine (a CI runner
+  // running the push and the pull-request jobs at once) collided there: "Address already in use (socket
+  // direct:1:default)". Each run takes a free one.
+  const inspector = await freePort();
+  const child = spawn(wrangler[0], [...wrangler.slice(1), 'dev', '-c', prepared.config, '--persist-to', prepared.state, '--port', String(port), '--ip', '127.0.0.1', '--inspector-port', String(inspector)], {
     cwd: prepared.dir, stdio: ['ignore', 'pipe', 'pipe'], detached: true, env: { ...process.env, CI: '1', WRANGLER_SEND_METRICS: 'false' },
   });
   let output = '';
