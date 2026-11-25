@@ -774,8 +774,11 @@ impl Updater {
             _ => None,
         };
         self.trial.store(false, Ordering::SeqCst);
-        let _ = fs::remove_file(&self.places.watch_plist);
-        self.sys.unload_watcher();
+        // Only a trial this service closed ends the watcher. A rollback still pending needs it to finish.
+        if line.is_some() {
+            let _ = fs::remove_file(&self.places.watch_plist);
+            self.sys.unload_watcher();
+        }
         TrialStep { soon: None, line }
     }
 

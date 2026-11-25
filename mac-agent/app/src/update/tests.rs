@@ -777,6 +777,27 @@ fn a_rollback_that_finds_an_unexpected_version_deletes_nothing_and_keeps_the_rec
 }
 
 #[test]
+fn a_commit_leaves_the_watcher_alone_while_a_rollback_is_pending() {
+    // B is on trial, then the watcher decided the rollback but its swap failed: the record is in its rollback phase.
+    let w = World::new("commitpending");
+    w.updater(A).attempt(&w.publish("1.1.1", "A"), &idle).unwrap();
+    w.sys.running.store(true, Ordering::SeqCst);
+    let b = w.updater("1.1.1");
+    b.prepare();
+    assert!(b.on_trial());
+    let mut st = w.state();
+    st.trial.as_mut().unwrap().phase = Phase::Rollback;
+    st.add_failed("1.1.1");
+    save(&w.places.data, &st).unwrap();
+    // A healthy check-in later: no commit, and the watcher keeps its job and property list to finish the rollback.
+    assert_eq!(b.trial_pass(DeviceResult::Ok, 200), TrialStep::default());
+    assert!(!b.on_trial());
+    assert_eq!(w.sys.count("unload"), 0);
+    assert!(w.places.watch_plist.exists());
+    assert_eq!(w.state(), st, "the rollback stays pending");
+}
+
+#[test]
 fn an_offer_runs_on_its_own_thread_once_and_a_failure_waits_an_hour() {
     let w = World::new("offer");
     let a = w.updater(A);
