@@ -1,5 +1,5 @@
-//! list_programs and close_program on a saved Mac. Installing and uninstalling arrive with PR 6; the core refuses them
-//! until then.
+//! list_programs and close_program on a saved Mac, and the app lookups install_program and uninstall_program share
+//! (`install`, `remove`).
 //!
 //! - `list`: the apps in /Applications (and one level of plain folders in it, such as Utilities), each as
 //!   `{id: "bundle:<CFBundleIdentifier>", name, version, publisher: ""}`, and the running apps as `{name, pid, session}`.
@@ -54,9 +54,24 @@ pub struct Installed {
     pub version: String,
 }
 
+/// An app's Info.plist, read as root: only a regular file of at most 4 MiB, opened without following a link (the last
+/// name) and without waiting on it, so an app folder a person made cannot hang the service on a pipe or feed it a huge file.
+fn info_plist(app: &Path) -> Option<plist::Dictionary> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(app.join("Contents/Info.plist")).ok()?;
+    let m = f.metadata().ok()?;
+    if !m.is_file() || m.len() > 4 << 20 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    f.take(4 << 20).read_to_end(&mut bytes).ok()?;
+    plist::Value::from_reader(std::io::Cursor::new(bytes)).ok()?.into_dictionary()
+}
+
 /// One app folder's entry, or None when it has no bundle id.
 pub fn read_app(app: &Path) -> Option<Installed> {
-    let info = plist::Value::from_file(app.join("Contents/Info.plist")).ok()?.into_dictionary()?;
+    let info = info_plist(app)?;
     let text = |k: &str| info.get(k).and_then(|v| v.as_string()).map(|s| support_core::wire::clean(s, 200)).filter(|s| !s.is_empty());
     let id = text("CFBundleIdentifier")?;
     let stem = app.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
@@ -67,8 +82,32 @@ pub fn read_app(app: &Path) -> Option<Installed> {
     })
 }
 
-/// The apps in `root` and in its plain subfolders, by name. Links are not followed.
-pub fn installed(root: &Path) -> Vec<Installed> {
+/// What install and uninstall need to know of an app: its bare bundle id and every name it goes by (its display name,
+/// its bundle name, its folder's name without .app and its executable's name), each once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppInfo {
+    pub id: String,
+    pub version: String,
+    pub names: Vec<String>,
+}
+
+pub fn app_info(app: &Path) -> Option<AppInfo> {
+    let info = info_plist(app)?;
+    let text = |k: &str| info.get(k).and_then(|v| v.as_string()).map(|s| support_core::wire::clean(s, 200)).filter(|s| !s.is_empty());
+    let id = text("CFBundleIdentifier")?;
+    let mut names: Vec<String> = Vec::new();
+    let stem = app.file_stem().and_then(|s| s.to_str()).map(str::to_string);
+    for n in [text("CFBundleDisplayName"), text("CFBundleName"), stem, text("CFBundleExecutable")].into_iter().flatten() {
+        if !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    let version = text("CFBundleShortVersionString").or_else(|| text("CFBundleVersion")).unwrap_or_default();
+    Some(AppInfo { id, version, names })
+}
+
+/// The app folders in `root` and in its plain subfolders (such as Utilities). Links are not followed, at either level.
+pub fn app_folders(root: &Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let is_app = |p: &Path| p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("app"));
     let real_dir = |p: &Path| std::fs::symlink_metadata(p).map(|m| m.file_type().is_dir()).unwrap_or(false);
@@ -79,19 +118,30 @@ pub fn installed(root: &Path) -> Vec<Installed> {
             continue;
         }
         if is_app(&p) {
-            out.extend(read_app(&p));
+            out.push(p);
         } else if let Ok(inner) = std::fs::read_dir(&p) {
             for i in inner.flatten() {
                 let q = i.path();
                 if is_app(&q) && real_dir(&q) {
-                    out.extend(read_app(&q));
+                    out.push(q);
                 }
             }
         }
-        if out.len() >= LIST_MAX {
+        if out.len() >= LIST_MAX * 2 {
             break;
         }
     }
+    out
+}
+
+/// The apps in `root` whose bundle id is `id` (compared without ASCII case, as Launch Services does).
+pub fn find_by_id(root: &Path, id: &str) -> Vec<(std::path::PathBuf, AppInfo)> {
+    app_folders(root).into_iter().filter_map(|p| app_info(&p).filter(|i| i.id.eq_ignore_ascii_case(id)).map(|i| (p, i))).collect()
+}
+
+/// The apps in `root` and in its plain subfolders, by name. Links are not followed.
+pub fn installed(root: &Path) -> Vec<Installed> {
+    let mut out: Vec<Installed> = app_folders(root).iter().filter_map(|p| read_app(p)).collect();
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.id.cmp(&b.id)));
     out.truncate(LIST_MAX);
     out

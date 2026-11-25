@@ -992,6 +992,10 @@ impl crate::rules::Ruled for ServiceRuled {
     fn close_target(&self, frame: &Frame) -> Option<String> {
         self.svc.platform.close_target(frame)
     }
+
+    fn program_names(&self, bundle_id: &str) -> Vec<String> {
+        self.svc.platform.program_names(bundle_id)
+    }
 }
 
 #[cfg(test)]

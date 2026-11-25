@@ -200,13 +200,13 @@ export async function world(t, { time = 1_800_000_000_000, env: extra = {}, memb
     return { status: r.status, body: json };
   }
   // A saved PC, paired for real. Returns { id, key }.
-  async function addPc({ name = 'Till', access = 'ask', control = 'full', version = '1.0.0', status = 'active' } = {}) {
+  async function addPc({ name = 'Till', access = 'ask', control = 'full', version = '1.0.0', status = 'active', os = 'Windows 11' } = {}) {
     if (status === 'pending') {
       const out = await devs.requestJoin({ protocol: 1, workspace: 'default', name, access, control, app_version: version });
       return { id: out.device_id, key: out.key };
     }
     const made = await devs.createPairingCode('default', BOSS, {});
-    const out = await devs.redeemCode({ protocol: 1, code: made.code, name, access, control, os: 'Windows 11', machine: 'M1', app_version: version });
+    const out = await devs.redeemCode({ protocol: 1, code: made.code, name, access, control, os, machine: 'M1', app_version: version });
     return { id: out.device_id, key: out.key };
   }
   const sql = (text, ...p) => db.sqlite.prepare(text).all(...p);
@@ -223,10 +223,11 @@ export async function world(t, { time = 1_800_000_000_000, env: extra = {}, memb
     registryFor(name).ctx.sockets.push(ws);
     return ws;
   };
-  // Connect, as `who`, and run the PC side up to the hello. Returns { sid, welcome }.
-  async function attach(pc, who = BOSS, { control = 'full', caps = ['screen', 'lanes'], version = '1.0.0' } = {}) {
+  // Connect, as `who`, and run the PC side up to the hello. Returns { sid, welcome }. hello adds fields to the hello
+  // (a Mac's agent and os).
+  async function attach(pc, who = BOSS, { control = 'full', caps = ['screen', 'lanes'], version = '1.0.0', hello = {} } = {}) {
     const started = await tool(who, 'device_connect', { device_id: pc.id });
-    const welcome = await agent(started.session_id, pc.key, { type: 'hello', machine: 'M1', user: 'dana', control, caps, version });
+    const welcome = await agent(started.session_id, pc.key, { type: 'hello', machine: 'M1', user: 'dana', control, caps, version, ...hello });
     return { sid: started.session_id, started, welcome };
   }
   return {

@@ -540,7 +540,7 @@
  "rules.value_never": "Never",
  "rules.hours_first": "Set business hours first, or pick another value.",
  "rules.programs_title": "Protected programs",
- "rules.programs_help": "Programs the tools will not close or uninstall. A raw command is only screened for them. Use the program's file name (Outlook.exe) or the name it has in the list of installed programs.",
+ "rules.programs_help": "Programs the tools will not close or uninstall. A raw command is only screened for them. Use the program's file name (Outlook.exe) or the name it has in the list of installed programs. On a Mac, use the app's name (Rectangle) or its bundle id (com.knollsoft.Rectangle); an app with that name or bundle id is not installed over either.",
  "rules.programs_placeholder": "Outlook.exe",
  "rules.programs_add": "Add a protected program",
  "rules.folders_title": "Protected folders",

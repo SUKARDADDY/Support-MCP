@@ -39,6 +39,29 @@ pub struct RunRequest {
     pub as_system: bool,
 }
 
+/// An install_program frame the rules let through, with what the Mac checks again itself: the protected programs (an
+/// app with one of these names or bundle ids is never installed over) and the protected folders, the Support app's own
+/// included (no installer is taken from inside them, links resolved).
+#[derive(Clone, Debug, Default)]
+pub struct InstallRequest {
+    /// Absolute, `.` and `..` resolved in the text, and already checked by the relay's rules.
+    pub path: String,
+    /// 10 to 600.
+    pub timeout_s: u64,
+    pub protected_programs: Vec<String>,
+    pub protected_folders: Vec<String>,
+}
+
+/// An uninstall_program frame the rules let through.
+#[derive(Clone, Debug, Default)]
+pub struct UninstallRequest {
+    /// The bundle id from `bundle:<id>`.
+    pub bundle_id: String,
+    /// 10 to 600.
+    pub timeout_s: u64,
+    pub protected_programs: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Image {
     pub bytes: Vec<u8>,
@@ -85,6 +108,21 @@ pub trait Platform: Send + Sync + 'static {
     /// A `programs` frame that the rules let through: `list` or `close`. Returns the result fields.
     fn programs(&self, _frame: &Frame) -> Result<Value, String> {
         Err("not_supported: this action is not available here".to_string())
+    }
+
+    /// install_program. Returns the result fields: `exit_code` and `detail`.
+    fn install(&self, _req: &InstallRequest, _stop: &Stop) -> Result<Value, String> {
+        Err("not_supported: this action is not available here".to_string())
+    }
+
+    /// uninstall_program. Returns the result fields: `exit_code` and `detail`.
+    fn uninstall(&self, _req: &UninstallRequest, _stop: &Stop) -> Result<Value, String> {
+        Err("not_supported: this action is not available here".to_string())
+    }
+
+    /// The names of the installed app with this bundle id (see `Ruled::program_names`).
+    fn program_names(&self, _bundle_id: &str) -> Vec<String> {
+        Vec::new()
     }
 
     /// The name of the running program a `close` frame means.
@@ -135,6 +173,8 @@ pub struct FakePlatform {
     /// Every key chord list it was given.
     pub key_log: Mutex<Vec<Vec<KeyCombo>>>,
     pub power_log: Mutex<Vec<(String, i64)>>,
+    /// Every install and uninstall it was given: "install <path>" or "uninstall <bundle id>".
+    pub program_log: Mutex<Vec<String>>,
     pub asked: AtomicUsize,
     pub answer_yes: AtomicBool,
 }
@@ -153,6 +193,7 @@ impl FakePlatform {
             screen_log: Mutex::new(vec![]),
             key_log: Mutex::new(vec![]),
             power_log: Mutex::new(vec![]),
+            program_log: Mutex::new(vec![]),
             asked: AtomicUsize::new(0),
             answer_yes: AtomicBool::new(true),
         }
@@ -203,6 +244,17 @@ impl Platform for FakePlatform {
             "close" => Ok(json!({ "closed": 1 })),
             _ => Err("unknown programs action".to_string()),
         }
+    }
+
+    /// Records the request and installs nothing.
+    fn install(&self, req: &InstallRequest, _stop: &Stop) -> Result<Value, String> {
+        self.program_log.lock().unwrap().push(format!("install {}", req.path));
+        Ok(json!({ "exit_code": 0, "detail": format!("the fake platform installs nothing: {}", req.path) }))
+    }
+
+    fn uninstall(&self, req: &UninstallRequest, _stop: &Stop) -> Result<Value, String> {
+        self.program_log.lock().unwrap().push(format!("uninstall {}", req.bundle_id));
+        Ok(json!({ "exit_code": 0, "detail": format!("the fake platform removes nothing: {}", req.bundle_id) }))
     }
 
     fn ask(&self, _by: &str, _team: &str, _full: bool, _stop: &Stop) -> bool {

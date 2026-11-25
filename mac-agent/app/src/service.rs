@@ -6,7 +6,8 @@
 //! - files as the person (the `file-op` role) under limited control, or as root through `safe_files`;
 //! - the screen through the helper of the person at the console (or the login window's, as root), with this Mac's
 //!   own error when there is no helper or a permission is missing, never a black image;
-//! - restart and shut down (refused while FileVault is on), and list and close programs.
+//! - restart and shut down (refused while FileVault is on), list and close programs, and install and uninstall them
+//!   (`install`, `remove`) under full control.
 //!
 //! Under limited control a session is pinned to the person who allowed it (or who was signed in when it started):
 //! once someone else is at the console, nothing runs, no file is opened and no screen is touched until they are back.
@@ -17,10 +18,12 @@
 
 use crate::as_user;
 use crate::ax_plan;
+use crate::install;
 use crate::ipc::{self, SetupRequest, ToHelper};
 use crate::peer::{Inspector, Peer};
 use crate::power::{self, FileVault, PowerLatch};
 use crate::programs::{self, Proc};
+use crate::remove;
 use crate::role::FileOp;
 use crate::safe_files;
 use crate::server::{Api, BoxFuture, HelperError, Helpers, Server};
@@ -38,7 +41,7 @@ use support_core::device::{DeviceConfig, DeviceLink, DeviceService, DoorbellConf
 use support_core::exec::{self, RunOutput};
 use support_core::files::FileChunk;
 use support_core::keys::KeyCombo;
-use support_core::platform::{Desktop, Platform, RunRequest, ScreenOutput, ASK_MARGIN_MS, ASK_MS};
+use support_core::platform::{Desktop, InstallRequest, Platform, RunRequest, ScreenOutput, UninstallRequest, ASK_MARGIN_MS, ASK_MS};
 use support_core::session::Target;
 use support_core::stop::Stop;
 use support_core::wire::{Control, Frame, HostInfo, ScreenAction};
@@ -62,9 +65,13 @@ pub trait Os: Send + Sync + 'static {
     /// Restarts or shuts down now.
     fn power(&self, restart: bool) -> Result<(), String>;
     fn processes(&self) -> Vec<Proc>;
-    /// Where list_programs looks.
+    /// Where list_programs looks, and where install_program puts an app.
     fn apps_dir(&self) -> PathBuf {
         PathBuf::from("/Applications")
+    }
+    /// The tools install_program and uninstall_program use: macOS's own.
+    fn tools(&self) -> Arc<dyn install::Tools> {
+        Arc::new(install::SystemTools)
     }
     /// The external form of an AuthorizationRef holds `system.privilege.admin`, and (for a person's peer) an
     /// administrator authenticated for it. Checked by this process, never taken on the word of whoever sent it.
@@ -109,6 +116,8 @@ pub struct MacPlatform {
     control: Mutex<String>,
     latch: Arc<PowerLatch>,
     own_pid: i32,
+    /// Root's data folder: install_program stages under it, uninstall_program holds removed apps in it.
+    data_dir: PathBuf,
 }
 
 fn now_ms() -> i64 {
@@ -148,7 +157,7 @@ fn screen_timeout(a: &ScreenAction) -> Duration {
 }
 
 impl MacPlatform {
-    pub fn new(os: Arc<dyn Os>, helpers: Arc<Helpers>, control: &str) -> Arc<MacPlatform> {
+    pub fn new(os: Arc<dyn Os>, helpers: Arc<Helpers>, control: &str, data_dir: PathBuf) -> Arc<MacPlatform> {
         Arc::new(MacPlatform {
             os,
             helpers,
@@ -158,6 +167,7 @@ impl MacPlatform {
             control: Mutex::new(control.to_string()),
             latch: PowerLatch::new(),
             own_pid: std::process::id() as i32,
+            data_dir,
         })
     }
 
@@ -398,6 +408,30 @@ impl Platform for MacPlatform {
         }
     }
 
+    fn install(&self, req: &InstallRequest, stop: &Stop) -> Result<Value, String> {
+        // The core refused this under limited control already. An installer runs as root, so it is not left to that alone.
+        if self.limited() {
+            return Err(support_core::rules::refuse("needs_full_control").error().unwrap_or_default());
+        }
+        let tools = self.os.tools();
+        let apps = self.os.apps_dir();
+        install::install(req, &install::Env { tools: &*tools, data_dir: &self.data_dir, apps_dir: &apps, stop })
+    }
+
+    fn uninstall(&self, req: &UninstallRequest, stop: &Stop) -> Result<Value, String> {
+        if self.limited() {
+            return Err(support_core::rules::refuse("needs_full_control").error().unwrap_or_default());
+        }
+        let tools = self.os.tools();
+        let apps = self.os.apps_dir();
+        let env = install::Env { tools: &*tools, data_dir: &self.data_dir, apps_dir: &apps, stop };
+        remove::uninstall(req, &env, &|| self.os.processes(), &HelperCloser { p: self }, now_ms() / 1000)
+    }
+
+    fn program_names(&self, bundle_id: &str) -> Vec<String> {
+        programs::find_by_id(&self.os.apps_dir(), bundle_id).into_iter().flat_map(|(_, info)| info.names).collect()
+    }
+
     fn close_target(&self, frame: &Frame) -> Option<String> {
         match programs::target_of(frame) {
             (Some(name), _) => Some(name),
@@ -470,7 +504,7 @@ impl Service {
         let saved = state::load(&dir);
         let history = state::load_history(&dir);
         let control = saved.as_ref().map(|s| s.control.clone()).unwrap_or_else(|| "limited".into());
-        let platform = MacPlatform::new(os.clone(), helpers, &control);
+        let platform = MacPlatform::new(os.clone(), helpers, &control, dir.clone());
         Arc::new(Service {
             os,
             dir,
@@ -723,6 +757,13 @@ impl Api for Service {
 /// its owner under limited control. An uninstall ends the session itself first.
 pub async fn run(os: Arc<dyn Os>, inspector: Arc<dyn Inspector>, dir: PathBuf, owner: u32) -> Result<(), String> {
     state::ensure_dir(&dir, owner)?;
+    // Apps uninstall_program holds go after 7 days, and a stage an install left behind after a day: checked now and every
+    // 6 hours.
+    let sweep_dir = dir.clone();
+    std::thread::spawn(move || loop {
+        remove::sweep(&sweep_dir, now_ms() / 1000);
+        std::thread::sleep(Duration::from_secs(6 * 3600));
+    });
     let helpers = Helpers::new();
     let svc = Service::new(os, helpers.clone(), dir, tokio::runtime::Handle::current());
     let listener = crate::server::bind(std::path::Path::new(crate::paths::SOCKET_DIR), std::path::Path::new(crate::paths::SOCKET_PATH), owner)?;
@@ -754,6 +795,8 @@ mod tests {
         powered: Mutex<Vec<bool>>,
         admin_ok: AtomicBool,
         files: Mutex<Vec<String>>,
+        apps: Mutex<PathBuf>,
+        tools: Mutex<Option<Arc<dyn install::Tools>>>,
     }
 
     impl Os for FakeOs {
@@ -803,6 +846,12 @@ mod tests {
         fn uninstall_finish(&self) -> Result<(), String> {
             Ok(())
         }
+        fn apps_dir(&self) -> PathBuf {
+            self.apps.lock().unwrap().clone()
+        }
+        fn tools(&self) -> Arc<dyn install::Tools> {
+            self.tools.lock().unwrap().clone().unwrap_or_else(|| Arc::new(install::SystemTools))
+        }
     }
 
     fn fake_os() -> Arc<FakeOs> {
@@ -812,6 +861,8 @@ mod tests {
             powered: Mutex::default(),
             admin_ok: AtomicBool::new(false),
             files: Mutex::default(),
+            apps: Mutex::new(PathBuf::from("/nonexistent-applications")),
+            tools: Mutex::new(None),
         })
     }
 
@@ -849,6 +900,8 @@ mod tests {
         let dir = PathBuf::from(format!("/tmp/smcp-svc-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // On a Mac /tmp is a link to /private/tmp, and root's file code never follows links.
+        let dir = std::fs::canonicalize(&dir).unwrap();
         let os = fake_os();
         let helpers = Helpers::new();
         let data = dir.join("data");
@@ -1334,6 +1387,45 @@ mod tests {
         assert_eq!(list["running"][0]["name"], "TextEdit");
         let f = Frame::parse(&json!({"type":"programs","id":"1","action":"close","pid":4000})).unwrap();
         assert_eq!(r.svc.platform.close_target(&f).as_deref(), Some("TextEdit"));
+    }
+
+    #[tokio::test]
+    async fn install_and_uninstall_run_under_full_control_through_the_data_folder_and_only_there() {
+        use crate::install::tests::{app, build, plist, FakeTools, Node};
+        let r = rig("inst", "full").await;
+        let apps = r.dir.join("Applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        app(&apps, "Old", "x.old");
+        *r.os.apps.lock().unwrap() = apps.clone();
+        let tools = Arc::new(FakeTools::default());
+        let content = r.dir.join("image");
+        build(&content, &[("New.app/Contents/Info.plist", Node::File(Box::leak(plist("x.new", "New").into_boxed_str())))]);
+        tools.images.lock().unwrap().insert("New.dmg".into(), content);
+        *r.os.tools.lock().unwrap() = Some(tools.clone());
+        let dmg = r.dir.join("New.dmg");
+        std::fs::write(&dmg, "New.dmg").unwrap();
+        let p = r.svc.platform.clone();
+        assert_eq!(p.program_names("X.OLD"), vec!["Old".to_string()]);
+        let req = InstallRequest { path: dmg.to_string_lossy().into_owned(), timeout_s: 60, ..Default::default() };
+        let (p2, req2) = (p.clone(), req.clone());
+        let out = on_thread(move || p2.install(&req2, &Stop::new())).await.unwrap().unwrap();
+        assert!(out["detail"].as_str().unwrap().starts_with("installed New.app"), "{out}");
+        assert!(apps.join("New.app/Contents/Info.plist").is_file());
+        assert!(std::fs::read_dir(r.dir.join("data").join(crate::paths::STAGING_DIR)).unwrap().next().is_none());
+        let un = UninstallRequest { bundle_id: "x.old".into(), timeout_s: 60, protected_programs: vec![] };
+        let (p3, un3) = (p.clone(), un.clone());
+        let out = on_thread(move || p3.uninstall(&un3, &Stop::new())).await.unwrap().unwrap();
+        assert!(out["detail"].as_str().unwrap().contains("data/removed/x.old-"), "{out}");
+        assert!(!apps.join("Old.app").exists());
+        // Under limited control neither runs, whatever reached the platform.
+        *p.control.lock().unwrap() = "limited".into();
+        let (p4, req4) = (p.clone(), req.clone());
+        assert_eq!(
+            on_thread(move || p4.install(&req4, &Stop::new())).await.unwrap().unwrap_err(),
+            "needs_full_control: this action needs a PC set to full control"
+        );
+        let p5 = p.clone();
+        assert!(on_thread(move || p5.uninstall(&un, &Stop::new())).await.unwrap().unwrap_err().starts_with("needs_full_control"));
     }
 
     #[tokio::test]

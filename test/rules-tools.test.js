@@ -469,3 +469,105 @@ test('a team on the built-in agent only refuses the six tools for an MCP client'
   await w.api(BOSS, 'PATCH', '/agent', { mode: 'both' });
   assert.equal((await w.tool(TECH, 'restart_pc', { session_id: sid })).ok, true);
 });
+
+// ---- a saved Mac (PR 6): the Mac's install checks and program ids ---------------------------------------------
+const MAC_PROGRAMS = {
+  installed: [
+    { id: 'bundle:com.knollsoft.Rectangle', name: 'Rectangle', version: '0.84', publisher: '' },
+    { id: 'bundle:com.tinyspeck.slackmacgap', name: 'Slack', version: '4.41', publisher: '' },
+  ],
+  running: [],
+};
+const macFrame = (frame) => (frame.type === 'programs' && frame.action === 'list' ? MAC_PROGRAMS : answerFrame(frame));
+
+test('a saved Mac: a .pkg, .mpkg, .dmg or .zip installs with no arguments, and the frame carries the path as given', async (t) => {
+  const w = await agentWorld(t);
+  const { sid, frames } = await savedPc(w, t, { mac: true, handler: macFrame });
+  await setRules(w, ALLOW);
+  for (const path of ['/Users/ariel/Downloads/Rectangle0.84.dmg', '/Users/Shared/Suite.mpkg', '/private/tmp/x.pkg', '/Users/ariel/Downloads/Foo.zip']) {
+    assert.deepEqual(await w.tool(TECH, 'install_program', { session_id: sid, path }), { ok: true, exit_code: 0 }, path);
+  }
+  const [first] = ofType(frames, 'programs');
+  assert.deepEqual([first.action, first.path, first.args, first.timeout_s], ['install', '/Users/ariel/Downloads/Rectangle0.84.dmg', undefined, 300]);
+  assert.ok(first.rules_tag && first.decided_at);
+  // Empty arguments are no arguments.
+  assert.equal((await w.tool(TECH, 'install_program', { session_id: sid, path: '/Users/a/x.pkg', args: '  ' })).ok, true);
+});
+
+test('a saved Mac: what is not a Mac installer, a system folder, a relative path and any argument are refused before anyone is asked', async (t) => {
+  const w = await agentWorld(t);
+  const { sid, frames, session } = await savedPc(w, t, { mac: true, handler: macFrame });
+  await setRules(w, { ...ALLOW, install: 'approve' });
+  for (const [args, match] of [
+    [{ path: '/System/x.pkg' }, /macOS's own folders/],
+    [{ path: '/usr/local/bin/x.pkg' }, /macOS's own folders/],
+    [{ path: '/Library/Apple/x.dmg' }, /macOS's own folders/],
+    [{ path: '//SYSTEM/x.pkg' }, /macOS's own folders/],
+    [{ path: 'Downloads/x.pkg' }, /path is required: .*\/Users\/Shared\/Rectangle\.dmg on a Mac/],
+    [{ path: '/Users/a/../../System/x.pkg' }, /path is required/],
+    [{ path: 'C:\\Temp\\setup.msi' }, /path is required/],
+    [{ path: '/Users/a/Foo.app' }, /only a \.pkg or \.mpkg package, a \.dmg disk image or a \.zip/],
+    [{ path: '/Users/a/setup.exe' }, /only a \.pkg/],
+    [{ path: '/Users/a/x.pkg', args: '-target /' }, /takes no arguments/],
+  ]) {
+    assert.match((await w.tool(TECH, 'install_program', { session_id: sid, ...args })).error, match, JSON.stringify(args));
+  }
+  assert.equal(frames.length, 0, 'nothing was queued');
+  assert.equal(session().approval ?? null, null, 'and no technician was asked');
+});
+
+test('a saved Mac: Support, the join app and Apple\'s apps are never uninstalled, and an id must be a bundle id', async (t) => {
+  const w = await agentWorld(t);
+  const { sid, frames } = await savedPc(w, t, { mac: true, handler: macFrame });
+  await setRules(w, ALLOW);
+  for (const id of ['bundle:io.github.sukardaddy.supportmcp', 'bundle:io.github.sukardaddy.supportmcp.join', 'bundle:IO.GITHUB.SUKARDADDY.SUPPORTMCP']) {
+    assert.match((await w.tool(TECH, 'uninstall_program', { session_id: sid, program_id: id })).error, /^protected_program: the Support app/, id);
+  }
+  assert.match((await w.tool(TECH, 'uninstall_program', { session_id: sid, program_id: 'bundle:com.apple.TextEdit' })).error, /^protected_program: Apple's own apps/);
+  for (const id of ['com.knollsoft.Rectangle', '64:acrobat', 'bundle:', 'bundle:a/b', 'bundle:a b']) {
+    assert.match((await w.tool(TECH, 'uninstall_program', { session_id: sid, program_id: id })).error, /program_id on a Mac is bundle:<bundle id>/, id);
+  }
+  // Support's folders are protected for an installer too.
+  assert.match((await w.tool(TECH, 'install_program', { session_id: sid, path: '/Applications/Support.app/Contents/Resources/x.pkg' })).error, /^protected_folder: /);
+  assert.equal(frames.length, 0);
+  assert.deepEqual(await w.tool(TECH, 'uninstall_program', { session_id: sid, program_id: 'bundle:com.knollsoft.Rectangle' }), { ok: true, exit_code: 3010 });
+  assert.equal(ofType(frames, 'programs')[0].program_id, 'bundle:com.knollsoft.Rectangle');
+});
+
+test('a saved Mac: a protected program matches the app\'s name from the list or its bundle id, before an approval is spent', async (t) => {
+  const w = await agentWorld(t);
+  const { sid, frames, session } = await savedPc(w, t, { mac: true, handler: macFrame });
+  await setRules(w, { ...ALLOW, uninstall: 'approve', protected_programs: ['Rectangle', 'com.tinyspeck.slackmacgap'] });
+  // By bundle id, with no list yet.
+  assert.match((await w.tool(TECH, 'uninstall_program', { session_id: sid, program_id: 'bundle:com.tinyspeck.slackmacgap' })).error, /^protected_program: /);
+  assert.match((await w.tool(TECH, 'uninstall_program', { session_id: sid, program_id: 'bundle:COM.TINYSPECK.SLACKMACGAP' })).error, /^protected_program: /);
+  // By name, once the list says what the id is.
+  await w.tool(TECH, 'list_programs', { session_id: sid });
+  assert.match((await w.tool(TECH, 'uninstall_program', { session_id: sid, program_id: 'bundle:com.knollsoft.Rectangle' })).error, /^protected_program: /);
+  assert.deepEqual(frames.map((f) => f.action), ['list']);
+  assert.equal(session().approval ?? null, null, 'no technician was asked');
+});
+
+test('a saved Mac: protected Mac folders, /private spellings included, refuse an installer inside them', async (t) => {
+  const w = await agentWorld(t);
+  const { sid, frames } = await savedPc(w, t, { mac: true, handler: macFrame });
+  await setRules(w, { ...ALLOW, protected_folders: ['/Users/ariel/Customer Data', '/var/db/Customer', 'C:\\Data'] });
+  for (const path of ['/Users/ariel/Customer Data/x.pkg', '/users/ARIEL/customer data/x.dmg', '/private/var/db/Customer/x.zip']) {
+    assert.match((await w.tool(TECH, 'install_program', { session_id: sid, path })).error, /^protected_folder: /, path);
+  }
+  assert.equal(frames.length, 0);
+  assert.equal((await w.tool(TECH, 'install_program', { session_id: sid, path: '/Data/x.pkg' })).ok, true, 'a Windows folder never protects a Mac path');
+});
+
+test('a Windows PC is judged as before: a Mac path is not its installer, and a bundle: id is only an id', async (t) => {
+  const w = await agentWorld(t);
+  const { sid, frames } = await savedPc(w, t);
+  await setRules(w, ALLOW);
+  assert.match((await w.tool(TECH, 'install_program', { session_id: sid, path: '/Users/a/x.pkg' })).error, /^path is required/);
+  assert.match((await w.tool(TECH, 'install_program', { session_id: sid, path: 'C:\\Temp\\x.pkg' })).error, /only \.msi, \.msu or \.exe/);
+  assert.match((await w.tool(TECH, 'install_program', { session_id: sid, path: 'C:\\Temp\\setup.exe', args: '/S' })).error ?? '', /^$/);
+  // The Support Mac app's id is the app on any PC; another bundle id goes to the PC, which answers for it.
+  assert.match((await w.tool(TECH, 'uninstall_program', { session_id: sid, program_id: 'bundle:io.github.sukardaddy.supportmcp' })).error, /^protected_program: /);
+  assert.equal((await w.tool(TECH, 'uninstall_program', { session_id: sid, program_id: 'bundle:com.apple.TextEdit' })).ok, true);
+  assert.deepEqual(ofType(frames, 'programs').map((f) => f.action), ['install', 'uninstall']);
+});

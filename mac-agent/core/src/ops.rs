@@ -4,7 +4,7 @@
 
 use crate::files;
 use crate::keys;
-use crate::platform::{Platform, RunRequest, ScreenOutput};
+use crate::platform::{InstallRequest, Platform, RunRequest, ScreenOutput, UninstallRequest};
 use crate::rules::{self, Ruled};
 use crate::stop::Stop;
 use crate::wire::{self, b64, error_result, Control, Frame, ScreenAction, GET_LENGTH_MAX, IMAGE_B64_MAX, OUTPUT_MAX, PUT_B64_MAX, TYPE_MAX};
@@ -60,19 +60,47 @@ fn power(frame: &Frame, ctx: &Ctx) -> Result<Map<String, Value>, String> {
     Ok(m)
 }
 
-fn programs(frame: &Frame, ctx: &Ctx) -> Result<Map<String, Value>, String> {
-    match frame.text("action").as_str() {
-        // Rules::check already answered install and uninstall; this is the same refusal for a caller that skips it.
-        "install" | "uninstall" => Err(rules::err("not_supported", rules::NOT_SUPPORTED_PROGRAMS)),
-        _ => {
-            let fields = ctx.platform.programs(frame)?;
-            let mut m = ok_map();
-            if let Value::Object(extra) = fields {
-                m.extend(extra);
-            }
-            Ok(m)
-        }
+/// The timeout of an install or uninstall: 10 to 600 seconds, 300 when none is given (the relay always sends one).
+pub fn program_timeout(frame: &Frame) -> u64 {
+    match frame.number("timeout_s") {
+        0 => 300,
+        t => t.clamp(10, 600) as u64,
     }
+}
+
+fn programs(frame: &Frame, ctx: &Ctx) -> Result<Map<String, Value>, String> {
+    let action = frame.text("action");
+    let fields = match action.as_str() {
+        "install" | "uninstall" => {
+            // rules::check has judged these. They run as root, so the Mac's own checks need the rules' lists, and a
+            // session without rules (a one-off one) or under limited control never gets here: that is refused again.
+            let Some(ruled) = ctx.ruled else { return Err(rules::err("not_saved_pc", "this works only in a session on a saved PC")) };
+            if ctx.platform.info().control != Control::Full {
+                return Err(rules::refuse("needs_full_control").error().unwrap_or_default());
+            }
+            let doc = ruled.state().doc;
+            if action == "install" {
+                let mut folders = doc.folders.clone();
+                folders.extend(ruled.app_folders());
+                let path = files::absolute_path(rules::js_trim(&frame.text("path")))?;
+                let req =
+                    InstallRequest { path, timeout_s: program_timeout(frame), protected_programs: doc.programs.clone(), protected_folders: folders };
+                ctx.platform.install(&req, ctx.stop)?
+            } else {
+                let id = frame.text("program_id");
+                let bundle = rules::bundle_id_of(rules::js_trim(&id)).ok_or_else(|| rules::NEEDS_BUNDLE_ID.to_string())?;
+                let req =
+                    UninstallRequest { bundle_id: bundle.to_string(), timeout_s: program_timeout(frame), protected_programs: doc.programs.clone() };
+                ctx.platform.uninstall(&req, ctx.stop)?
+            }
+        }
+        _ => ctx.platform.programs(frame)?,
+    };
+    let mut m = ok_map();
+    if let Value::Object(extra) = fields {
+        m.extend(extra);
+    }
+    Ok(m)
 }
 
 fn run(frame: &Frame, ctx: &Ctx, limited: bool) -> Result<Map<String, Value>, String> {
@@ -184,6 +212,7 @@ mod tests {
     use super::*;
     use crate::platform::{FakePlatform, FAKE_SCREEN_JPEG};
     use crate::wire::Frame;
+    use std::sync::Mutex;
 
     fn frame(v: Value) -> Frame {
         Frame::parse(&v).unwrap()
@@ -312,6 +341,84 @@ mod tests {
         assert_eq!(exec(&p, json!({"type":"get_file","id":"1","lane":"cmd","path":"rel/x"}))["error"], files::NEEDS_ABSOLUTE);
         assert_eq!(exec(&p, json!({"type":"put_file","id":"1","lane":"cmd","path":path,"data_b64":"!!"}))["ok"], false);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A saved Mac's rules: everything allowed, with these protected lists.
+    struct Open(crate::rules::RulesDoc);
+    impl Ruled for Open {
+        fn state(&self) -> crate::rules::View {
+            crate::rules::View { doc: self.0.clone(), tag: String::new(), stale: false, timed: true, now_s: 1, hours: Default::default() }
+        }
+        fn catch_up(&self, _: u64, _: &Stop) -> bool {
+            true
+        }
+        fn close_target(&self, _: &Frame) -> Option<String> {
+            None
+        }
+    }
+
+    fn open_rules() -> Open {
+        Open(
+            crate::rules::parse_doc(&json!({
+                "rev": 1, "time_zone": null, "hours": null, "restart": "allow", "shutdown": "allow", "install": "allow", "uninstall": "allow",
+                "close_program": "allow", "protected_programs": ["Slack"], "protected_folders": ["/Users/a/Data"],
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn an_install_and_an_uninstall_reach_the_platform_with_the_rules_lists_and_answer_its_fields() {
+        struct Recording(FakePlatform, Mutex<Vec<String>>);
+        impl Platform for Recording {
+            fn info(&self) -> crate::wire::HostInfo {
+                self.0.info()
+            }
+            fn run(&self, r: &RunRequest, s: &Stop) -> Result<crate::exec::RunOutput, String> {
+                self.0.run(r, s)
+            }
+            fn put_file(&self, p: &str, d: &[u8], a: bool) -> Result<usize, String> {
+                self.0.put_file(p, d, a)
+            }
+            fn get_file(&self, p: &str, o: u64, l: usize) -> Result<crate::files::FileChunk, String> {
+                self.0.get_file(p, o, l)
+            }
+            fn screen(&self, a: &ScreenAction, k: &[keys::KeyCombo], s: &Stop) -> Result<ScreenOutput, String> {
+                self.0.screen(a, k, s)
+            }
+            fn install(&self, req: &InstallRequest, _: &Stop) -> Result<Value, String> {
+                self.1.lock().unwrap().push(format!("{} {} {:?} {:?}", req.path, req.timeout_s, req.protected_programs, req.protected_folders));
+                Ok(json!({"exit_code": 0, "detail": "installed"}))
+            }
+            fn uninstall(&self, req: &UninstallRequest, _: &Stop) -> Result<Value, String> {
+                self.1.lock().unwrap().push(format!("{} {} {:?}", req.bundle_id, req.timeout_s, req.protected_programs));
+                Err("not_found: no app".into())
+            }
+        }
+        let p = Recording(FakePlatform::new(Control::Full), Mutex::default());
+        let rules = open_rules();
+        let stop = Stop::new();
+        let exec = |v: Value| Value::Object(execute(&frame(v), &Ctx { platform: &p, ruled: Some(&rules), stop: &stop }));
+        let r = exec(json!({"type":"programs","id":"1","lane":"cmd","action":"install","path":"/Users/a//Downloads/./R.dmg","timeout_s":9999}));
+        assert_eq!(r, json!({"ok": true, "exit_code": 0, "detail": "installed"}));
+        let r = exec(json!({"type":"programs","id":"1","lane":"cmd","action":"uninstall","program_id":"bundle:com.x","timeout_s":1}));
+        assert_eq!(r, json!({"ok": false, "error": "not_found: no app"}));
+        assert_eq!(
+            *p.1.lock().unwrap(),
+            vec![
+                "/Users/a/Downloads/R.dmg 600 [\"Slack\"] [\"/Users/a/Data\", \"/Applications/Support.app\", \"/Library/Application Support/SupportMCP\"]".to_string(),
+                "com.x 10 [\"Slack\"]".to_string()
+            ]
+        );
+        // Refused before the platform: limited control, a one-off session.
+        let limited = Recording(FakePlatform::new(Control::Normal), Mutex::default());
+        let f = frame(json!({"type":"programs","id":"1","lane":"cmd","action":"install","path":"/Users/a/R.dmg"}));
+        let r = execute(&f, &Ctx { platform: &limited, ruled: Some(&rules), stop: &stop });
+        assert_eq!(r["error"], "needs_full_control: this action needs a PC set to full control");
+        let r = execute(&f, &Ctx { platform: &p, ruled: None, stop: &stop });
+        assert_eq!(r["error"], "not_saved_pc: this works only in a session on a saved PC");
+        assert_eq!(p.1.lock().unwrap().len(), 2);
+        assert_eq!(program_timeout(&frame(json!({"type":"programs","id":"1"}))), 300);
     }
 
     #[test]
