@@ -1,4 +1,5 @@
 //! The show-request marker: how an app launch asks a helper that is not running yet to show its window.
+//! The permission window's Restart Support uses the same mechanism under its own name ([`REOPEN_PERMISSIONS`]).
 //!
 //! A signal cannot do this. launchd starts the helper after `launchctl kickstart` returns, and a SIGINFO that arrives
 //! before the helper installs its handler is dropped (it is ignored by default). So the app launch writes an empty
@@ -15,17 +16,30 @@ use std::path::{Path, PathBuf};
 /// The marker's file name, after the helper's bundle id.
 pub const MARKER_NAME: &str = "io.github.sukardaddy.supportmcp.show";
 
+/// The marker Restart Support leaves so the next helper opens the permission window again.
+pub const REOPEN_PERMISSIONS: &str = "io.github.sukardaddy.supportmcp.reopen-permissions";
+
 pub fn marker_path(dir: &Path) -> PathBuf {
     dir.join(MARKER_NAME)
 }
 
-fn c_path(dir: &Path) -> Option<CString> {
-    CString::new(marker_path(dir).as_os_str().as_bytes()).ok()
+fn c_path(dir: &Path, name: &str) -> Option<CString> {
+    CString::new(dir.join(name).as_os_str().as_bytes()).ok()
 }
 
-/// Writes the marker in `dir`: created if missing (mode 0600), never through a link. Err names the cause.
+/// Writes the show marker in `dir`: created if missing (mode 0600), never through a link. Err names the cause.
 pub fn request(dir: &Path) -> Result<(), String> {
-    let path = c_path(dir).ok_or("the temp folder's path is not usable")?;
+    request_named(dir, MARKER_NAME)
+}
+
+/// Whether a show request is waiting in `dir`, as [`consume_named`] decides it.
+pub fn consume(dir: &Path) -> bool {
+    consume_named(dir, MARKER_NAME)
+}
+
+/// Writes the marker `name` in `dir`: created if missing (mode 0600), never through a link. Err names the cause.
+pub fn request_named(dir: &Path, name: &str) -> Result<(), String> {
+    let path = c_path(dir, name).ok_or("the temp folder's path is not usable")?;
     // SAFETY: a NUL-terminated path; the descriptor is closed below.
     let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o600 as libc::c_uint) };
     if fd < 0 {
@@ -36,11 +50,11 @@ pub fn request(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether a request is waiting in `dir`. A request is a regular file, owned by this user, that can be opened
+/// Whether the marker `name` is waiting in `dir`. A request is a regular file, owned by this user, that can be opened
 /// without following a link. It is removed (unlink removes a name, it never follows one), so it counts once. A link
 /// at the path is left alone and is not a request.
-pub fn consume(dir: &Path) -> bool {
-    let Some(path) = c_path(dir) else { return false };
+pub fn consume_named(dir: &Path, name: &str) -> bool {
+    let Some(path) = c_path(dir, name) else { return false };
     // SAFETY: a NUL-terminated path; the descriptor is closed below.
     let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK) };
     if fd < 0 {
@@ -88,6 +102,31 @@ mod tests {
         assert_eq!(marker_path(&d).file_name().unwrap(), "io.github.sukardaddy.supportmcp.show");
         let mode = std::fs::metadata(marker_path(&d)).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode & 0o077, 0, "mode is {mode:o}");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_reopen_marker_is_separate_from_the_show_marker() {
+        let d = dir("reopen");
+        request_named(&d, REOPEN_PERMISSIONS).unwrap();
+        assert!(!consume(&d), "a reopen request is not a show request");
+        request(&d).unwrap();
+        assert!(consume_named(&d, REOPEN_PERMISSIONS));
+        assert!(!consume_named(&d, REOPEN_PERMISSIONS));
+        assert!(consume(&d));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_link_at_the_reopen_marker_is_not_a_request() {
+        use std::os::unix::fs::symlink;
+        let d = dir("reopen-link");
+        let target = d.join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        symlink(&target, d.join(REOPEN_PERMISSIONS)).unwrap();
+        assert!(!consume_named(&d, REOPEN_PERMISSIONS));
+        assert!(request_named(&d, REOPEN_PERMISSIONS).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
         std::fs::remove_dir_all(&d).unwrap();
     }
 

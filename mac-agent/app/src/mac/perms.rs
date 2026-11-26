@@ -15,6 +15,7 @@
 use super::ui::{label, rect, s};
 use crate::paths;
 use crate::permissions::{self, Kind, Perm, Preview, State, Tracker};
+use crate::show_request;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{sel, MainThreadOnly};
@@ -248,7 +249,9 @@ impl PermPanel {
             return;
         };
         // The new helper opens this window again if a permission is still missing, even one that was just switched on.
-        let _ = std::fs::write(reopen_marker(), b"");
+        if let Some(dir) = super::helper::user_temp_dir() {
+            let _ = show_request::request_named(&dir, show_request::REOPEN_PERMISSIONS);
+        }
         let mut c = Command::new(program);
         c.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         // SAFETY: setsid is async-signal-safe. The child leaves this process's group, so launchd stopping the helper (or
@@ -268,14 +271,10 @@ impl PermPanel {
     }
 }
 
-/// A file in the person's temporary folder that says "open the permission window at start": Restart Support leaves it.
-fn reopen_marker() -> std::path::PathBuf {
-    std::env::temp_dir().join("support-reopen-permissions")
-}
-
-/// Whether the last run asked for the permission window to open again. Reading it removes it.
+/// Whether the last run asked for the permission window to open again: Restart Support leaves a marker in the
+/// person's own temp folder (`show_request`, never through a link). Reading it removes it.
 pub fn take_reopen() -> bool {
-    std::fs::remove_file(reopen_marker()).is_ok()
+    super::helper::user_temp_dir().is_some_and(|d| show_request::consume_named(&d, show_request::REOPEN_PERMISSIONS))
 }
 
 /// Puts the app in the list of the permission's pane, so the person only flips its switch. These calls must come from the
