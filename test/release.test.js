@@ -535,7 +535,15 @@ test('sign-release --product mac signs a six-line note with a throwaway key and 
     const misnamed = join(dir, 'Support-9.9.9.pkg');
     writeFileSync(misnamed, bytes);
     assert.match(run(['--file', misnamed, '--url', MAC_URL]).stderr, /does not carry version/);
-    for (const url of ['https://example.com/a/releases/download/v${V}/Support-${V}.pkg', 'https://github.com/a/b/releases/download/v9.9.9/Support-9.9.9.pkg', 'https://github.com/a/b/releases/download/v1.0.0/Support-1.0.0.pkg', 'http://github.com/a/b/releases/download/v${V}/Support-${V}.pkg', 'https://github.com/a/b/releases/download/v${V}/Support-${V}.pkg?x=1']) {
+    for (const url of [
+      'https://example.com/a/releases/download/mac-v${V}/Support-${V}.pkg',
+      'https://github.com/a/b/releases/download/mac-v9.9.9/Support-9.9.9.pkg',
+      'https://github.com/a/b/releases/download/mac-v1.0.0/Support-1.0.0.pkg',
+      'http://github.com/a/b/releases/download/mac-v${V}/Support-${V}.pkg',
+      'https://github.com/a/b/releases/download/mac-v${V}/Support-${V}.pkg?x=1',
+      // The relay's and the Windows app's tag scheme: never a Mac release's.
+      'https://github.com/a/b/releases/download/v${V}/Support-${V}.pkg',
+    ]) {
       assert.notEqual(run(['--file', pkg, '--url', url.replaceAll('${V}', MAC_VERSION)]).status, 0, url);
     }
     assert.match(run(['--file', pkg]).stderr, /needs --version <semver>, --file <package> and --url/);

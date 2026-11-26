@@ -588,8 +588,20 @@ pub trait Hooks: Send + Sync {
     fn history(&self, _line: &str) {}
     /// The display state changed (active, pending, offline, removed, expired, update_needed).
     fn state(&self, _state: &str) {}
-    /// A verified update is on offer (`release::check_update` passed). Installing it is the app's job.
+    /// A verified update is on offer (`release::check_update` passed against the built-in key and `failed_updates`), in
+    /// a 200 or a 426, and no session is running or pointed to. Downloading and installing it is the app's job. It is
+    /// never called while a session runs (src/agent-app.cs `HoldUpdates`).
     fn update_offered(&self, _note: &release::MacNote) {}
+    /// The versions that failed their trial on this Mac: never offered to `update_offered` again.
+    fn failed_updates(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Every check-in's outcome: the result and the HTTP status (0 when there was no answer). A version on trial decides
+    /// here whether it commits or rolls back. Returns how soon to check in again (ms) when that must be sooner than the
+    /// schedule: a trial that retries its hello, or a commit that found the update lock busy.
+    fn checked_in(&self, _result: DeviceResult, _status: u16) -> Option<u64> {
+        None
+    }
     /// A session started or ended.
     fn session(&self, _by: Option<&str>) {}
 }
@@ -618,7 +630,6 @@ struct Shared {
     control: String,
     last_refresh_ms: i64,
     accepted: String,
-    failed_updates: Vec<String>,
     session: Option<RunningSession>,
     /// The session the person at the Mac ended. A pointer to it is not followed again (the relay may still name it
     /// until its `end` arrives), so ending a session never starts it over.
@@ -639,8 +650,12 @@ pub struct DeviceService {
     hooks: Arc<dyn Hooks>,
     rules: Arc<RulesState>,
     clock: Arc<dyn Clock>,
+    /// The key an offered release must be signed with: the built-in one (tests put their own).
+    release_key: Mutex<Option<p256::ecdsa::VerifyingKey>>,
     shared: Mutex<Shared>,
     last: Mutex<Schedule>,
+    /// A check-in asked for sooner than the schedule (`Hooks::checked_in`), in ms.
+    soon: Mutex<Option<u64>>,
     bell: Mutex<Option<Doorbell>>,
     /// Wakes the loop: a ring, a refresh, or a frame that needs fresh rules.
     wake: Arc<Notify>,
@@ -668,7 +683,6 @@ impl DeviceService {
             control: cfg.control.clone(),
             last_refresh_ms: i64::MIN / 2,
             accepted: cfg.accepted_session.clone().unwrap_or_default(),
-            failed_updates: vec![],
             session: None,
             ended_by_owner: String::new(),
         };
@@ -679,8 +693,10 @@ impl DeviceService {
             hooks,
             rules,
             clock,
+            release_key: Mutex::new(release::release_key().ok()),
             shared: Mutex::new(shared),
             last: Mutex::new(Schedule::Normal),
+            soon: Mutex::new(None),
             bell: Mutex::new(None),
             wake: Arc::new(Notify::new()),
             catch_up: Arc::new(Notify::new()),
@@ -738,6 +754,11 @@ impl DeviceService {
         true
     }
 
+    /// Whether a session is running now (asked, declined or hosted, and not yet over).
+    pub fn session_running(&self) -> bool {
+        self.shared.lock().unwrap().session.as_ref().is_some_and(|r| !r.done.is_finished())
+    }
+
     pub fn stop_signal(&self) -> Arc<Stop> {
         self.stop.clone()
     }
@@ -767,6 +788,14 @@ impl DeviceService {
             Schedule::Backoff => *backoff = next_backoff(*backoff),
             _ => {}
         }
+        *self.soon.lock().unwrap() = self.hooks.checked_in(answer.result, answer.status);
+        // A 426 carries the release that speaks the relay's protocol, as on Windows.
+        if answer.result == DeviceResult::UpdateNeeded {
+            if let Some(body) = &answer.body {
+                self.consider_update(body, false);
+            }
+            return schedule;
+        }
         if answer.result != DeviceResult::Ok {
             return schedule;
         }
@@ -791,8 +820,10 @@ impl DeviceService {
                     self.hooks.rules_changed(&saved);
                 }
             }
-            self.consider_update(&body);
-            self.consider_session(read_session(&body)).await;
+            let pointer = read_session(&body);
+            let pointed = pointer.is_some();
+            self.consider_session(pointer).await;
+            self.consider_update(&body, pointed);
         }
         schedule
     }
@@ -809,11 +840,15 @@ impl DeviceService {
         }
     }
 
-    /// An offered update is checked against the project's key before anyone is told of it.
-    fn consider_update(&self, body: &Value) {
+    /// An offered update is checked against the project's key before anyone is told of it, and never while a session
+    /// runs or the answer points to one (`pointed`): an update never cuts a session.
+    fn consider_update(&self, body: &Value, pointed: bool) {
         let Some(update) = body.get("update") else { return };
-        let Ok(key) = release::release_key() else { return };
-        let failed = self.shared.lock().unwrap().failed_updates.clone();
+        if pointed || self.session_running() {
+            return;
+        }
+        let Some(key) = *self.release_key.lock().unwrap() else { return };
+        let failed = self.hooks.failed_updates();
         if let Ok(note) = release::check_update(update, &self.cfg.identity.app_version, &failed, &key) {
             self.hooks.update_offered(&note);
         }
@@ -929,7 +964,10 @@ impl DeviceService {
             }
             if !first {
                 let (status, up) = (self.shared.lock().unwrap().status.clone(), self.doorbell_connected());
-                let delay = next_delay(self.last_schedule(), up, &status, backoff, &mut Self::jitter);
+                let mut delay = next_delay(self.last_schedule(), up, &status, backoff, &mut Self::jitter);
+                if let Some(soon) = self.soon.lock().unwrap().take() {
+                    delay = delay.min(soon as i64);
+                }
                 tokio::select! {
                     _ = sleep(Duration::from_millis(delay.max(0) as u64)) => {}
                     _ = self.wake.notified() => {}
@@ -991,6 +1029,10 @@ impl crate::rules::Ruled for ServiceRuled {
 
     fn close_target(&self, frame: &Frame) -> Option<String> {
         self.svc.platform.close_target(frame)
+    }
+
+    fn program_names(&self, bundle_id: &str) -> Vec<String> {
+        self.svc.platform.program_names(bundle_id)
     }
 }
 
@@ -1422,6 +1464,129 @@ mod tests {
         assert!(svc.shared.lock().unwrap().session.is_some());
         svc.stop();
         assert!(svc.end_session());
+    }
+
+    /// Hooks that record what the service told them, with a failed list to give.
+    #[derive(Default)]
+    struct UpdateHooks {
+        offered: Mutex<Vec<String>>,
+        checked: Mutex<Vec<(DeviceResult, u16)>>,
+        failed: Mutex<Vec<String>>,
+        soon: Mutex<Option<u64>>,
+    }
+
+    impl Hooks for UpdateHooks {
+        fn update_offered(&self, note: &release::MacNote) {
+            self.offered.lock().unwrap().push(note.version.clone());
+        }
+        fn failed_updates(&self) -> Vec<String> {
+            self.failed.lock().unwrap().clone()
+        }
+        fn checked_in(&self, result: DeviceResult, status: u16) -> Option<u64> {
+            self.checked.lock().unwrap().push((result, status));
+            *self.soon.lock().unwrap()
+        }
+    }
+
+    fn update_service(origin: &str, hooks: Arc<UpdateHooks>) -> Arc<DeviceService> {
+        let cfg = DeviceConfig {
+            origin: origin.into(),
+            key: "k".into(),
+            identity: Identity { os: os_string("26.1", "25B78"), machine: "M".into(), app_version: "1.0.0".into() },
+            access: "any".into(),
+            control: "full".into(),
+            accepted_session: None,
+            doorbell: DoorbellConfig::default(),
+        };
+        let platform = Arc::new(crate::platform::FakePlatform::new(crate::wire::Control::Full));
+        let svc = DeviceService::new(cfg, platform, hooks, crate::clock::SystemClock::new(), None).unwrap();
+        // The note vectors are signed by a throwaway key, not the project's.
+        let v: Value = serde_json::from_str(include_str!("../tests/data/vectors.json")).unwrap();
+        *svc.release_key.lock().unwrap() = Some(release::load_key(v["public_key_xy_b64"].as_str().unwrap()).unwrap());
+        svc
+    }
+
+    fn offer() -> Value {
+        let v: Value = serde_json::from_str(include_str!("../tests/data/vectors.json")).unwrap();
+        json!({"version": "1.2.3", "note": v["notes"]["valid"]["note"], "signature": v["notes"]["valid"]["signature"]})
+    }
+
+    #[tokio::test]
+    async fn an_update_is_offered_only_outside_a_session_and_never_a_failed_version() {
+        let hooks = Arc::new(UpdateHooks::default());
+        let svc = update_service("http://127.0.0.1:9", hooks.clone());
+        let body = json!({"device": {"status": "active"}, "update": offer()});
+        // The answer also points to a session: no update.
+        svc.consider_update(&body, true);
+        assert!(hooks.offered.lock().unwrap().is_empty());
+        // No session: offered.
+        svc.consider_update(&body, false);
+        assert_eq!(*hooks.offered.lock().unwrap(), vec!["1.2.3".to_string()]);
+        // A version that failed its trial here: never.
+        *hooks.failed.lock().unwrap() = vec!["1.2.3".into()];
+        svc.consider_update(&body, false);
+        assert_eq!(hooks.offered.lock().unwrap().len(), 1);
+        hooks.failed.lock().unwrap().clear();
+        // A forged signature, or no update at all: nothing.
+        let mut forged = offer();
+        forged["note"] = json!(forged["note"].as_str().unwrap().replace("1.2.3", "1.2.4"));
+        svc.consider_update(&json!({"update": forged}), false);
+        svc.consider_update(&json!({}), false);
+        assert_eq!(hooks.offered.lock().unwrap().len(), 1);
+        // A running session holds it back.
+        let pointer = SessionPointer { id: "c".repeat(64), by: "Dana".into(), team: "T".into(), ask: false, expires_at: i64::MAX / 2 };
+        svc.consider_session(Some(pointer)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(svc.session_running());
+        svc.consider_update(&body, false);
+        assert_eq!(hooks.offered.lock().unwrap().len(), 1, "never during a session");
+        svc.stop();
+        svc.end_session();
+    }
+
+    #[tokio::test]
+    async fn every_check_in_is_reported_and_a_426_carries_its_update() {
+        let hooks = Arc::new(UpdateHooks::default());
+        *hooks.soon.lock().unwrap() = Some(1234);
+        let body = serde_json::to_vec(&json!({"protocol": 1, "error": {"code": "protocol_unsupported", "message": "x"}, "update": offer()})).unwrap();
+        let (origin, seen) = one_shot("HTTP/1.1 426 Upgrade Required", body, 0).await;
+        let svc = update_service(&origin, hooks.clone());
+        let mut backoff = 0;
+        assert_eq!(svc.check_in(&mut backoff).await, Schedule::Update);
+        seen.await.unwrap();
+        assert_eq!(*hooks.checked.lock().unwrap(), vec![(DeviceResult::UpdateNeeded, 426)]);
+        assert_eq!(*hooks.offered.lock().unwrap(), vec!["1.2.3".to_string()]);
+        assert_eq!(*svc.soon.lock().unwrap(), Some(1234), "the hook's sooner check-in is kept for the loop");
+        // No answer at all: reported with status 0.
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", dead.local_addr().unwrap());
+        drop(dead);
+        let svc = update_service(&origin, hooks.clone());
+        svc.check_in(&mut backoff).await;
+        assert_eq!(hooks.checked.lock().unwrap().last(), Some(&(DeviceResult::Offline, 0)));
+    }
+
+    #[tokio::test]
+    async fn an_active_answer_with_a_session_pointer_offers_no_update() {
+        let hooks = Arc::new(UpdateHooks::default());
+        let answer = json!({"protocol": 1, "device": {"status": "active", "access": "any", "control": "full"}, "update": offer(),
+            "session": {"id": "d".repeat(64), "by": "Dana", "team": "T", "ask": false, "expires_at": i64::MAX / 2}});
+        let (origin, seen) = one_shot("HTTP/1.1 200 OK", serde_json::to_vec(&answer).unwrap(), 0).await;
+        let svc = update_service(&origin, hooks.clone());
+        let mut backoff = 0;
+        assert_eq!(svc.check_in(&mut backoff).await, Schedule::Normal);
+        seen.await.unwrap();
+        assert_eq!(*hooks.checked.lock().unwrap(), vec![(DeviceResult::Ok, 200)]);
+        assert!(hooks.offered.lock().unwrap().is_empty());
+        svc.stop();
+        svc.end_session();
+        // The same answer without the pointer offers it.
+        let answer = json!({"protocol": 1, "device": {"status": "active", "access": "any", "control": "full"}, "update": offer()});
+        let (origin, seen) = one_shot("HTTP/1.1 200 OK", serde_json::to_vec(&answer).unwrap(), 0).await;
+        let svc = update_service(&origin, hooks.clone());
+        svc.check_in(&mut backoff).await;
+        seen.await.unwrap();
+        assert_eq!(*hooks.offered.lock().unwrap(), vec!["1.2.3".to_string()]);
     }
 
     #[tokio::test]

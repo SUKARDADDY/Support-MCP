@@ -384,6 +384,11 @@ pub trait Ruled: Send + Sync {
     fn app_folders(&self) -> Vec<String> {
         app_folders()
     }
+    /// The names of the installed app with this bundle id (its name, its folder's name, its executable's), for the
+    /// protected-program check of an uninstall. Empty when no such app is installed.
+    fn program_names(&self, _bundle_id: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// The Mac app and its data folder (src/rules.js isAppPath holds the same two).
@@ -444,9 +449,9 @@ pub fn path_parts(path: &str) -> Vec<String> {
 /// A Mac path as components, as the relay reads it (src/rules.js posixParts). Only / separates: a backslash, a
 /// trailing dot or a trailing space is part of a Mac name, so "..\\x" and "x." are names, never a step up or another
 /// spelling of "x". There is no drive, so .. may take away the first component. Names are compared in NFC and lower
-/// case, as the Mac's usual case-insensitive disk does.
-fn posix_parts(path: &str) -> Vec<String> {
-    let nfc = icu_normalizer::ComposingNormalizerBorrowed::new_nfc();
+/// case, as the Mac's usual case-insensitive disk does. /private/var, /private/tmp and /private/etc are /var, /tmp and
+/// /etc: on a Mac those are links to them, so a folder written either way covers both.
+pub fn posix_parts(path: &str) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     for raw in path.trim().split('/') {
         if raw.is_empty() || raw == "." {
@@ -456,9 +461,17 @@ fn posix_parts(path: &str) -> Vec<String> {
             parts.pop();
             continue;
         }
-        parts.push(nfc.normalize(raw).to_lowercase());
+        parts.push(nfc(raw).to_lowercase());
+    }
+    if parts.len() >= 2 && parts[0] == "private" && matches!(parts[1].as_str(), "var" | "tmp" | "etc") {
+        parts.remove(0);
     }
     parts
+}
+
+/// The text in Unicode NFC, the form names are compared in (a Mac's disk keeps names as written, NFD or NFC).
+pub fn nfc(text: &str) -> String {
+    icu_normalizer::ComposingNormalizerBorrowed::new_nfc().normalize(text).into_owned()
 }
 
 /// Whether `path` is the folder or inside it, by whole components: /Users/a/Database is not inside /Users/a/Data. A
@@ -481,6 +494,109 @@ pub fn is_app_program(name: &str) -> bool {
         && rest.as_bytes()[n - 9] == b'-'
         && rest.as_bytes()[n - 8..].iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
         && !rest[..n - 9].contains('\n')
+}
+
+/// Whether a list_programs id is the Support app's: its Windows registry key, or the bundle id of the Mac app or of the
+/// one-off join app (src/rules.js isAppProgramId).
+pub fn is_app_program_id(id: &str) -> bool {
+    let id = js_trim(id).to_ascii_lowercase();
+    matches!(
+        id.as_str(),
+        "64:supportmcpdevice" | "32:supportmcpdevice" | "bundle:io.github.sukardaddy.supportmcp" | "bundle:io.github.sukardaddy.supportmcp.join"
+    )
+}
+
+/// Whether a Mac program id names one of Apple's own apps (src/rules.js isAppleProgramId).
+pub fn is_apple_program_id(id: &str) -> bool {
+    js_trim(id).get(..17).is_some_and(|p| p.eq_ignore_ascii_case("bundle:com.apple."))
+}
+
+/// The text with the white space JavaScript's trim() takes away taken away, so both sides read a path the same.
+pub fn js_trim(text: &str) -> &str {
+    text.trim_matches(|c: char| {
+        matches!(
+            c,
+            '\t' | '\n'
+                | '\u{b}'
+                | '\u{c}'
+                | '\r'
+                | ' '
+                | '\u{a0}'
+                | '\u{1680}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+        ) || ('\u{2000}'..='\u{200a}').contains(&c)
+    })
+}
+
+/// A path the Mac accepts for install_program, as the relay's localAbsolutePath(path, 'mac'): trimmed, from /, with no ..
+/// part, no NUL and at most 1,000 characters (counted as JavaScript counts them). None for anything else.
+pub fn local_absolute_path_mac(path: &str) -> Option<String> {
+    let text = js_trim(path);
+    (text.starts_with('/') && text.encode_utf16().count() <= 1000 && !text.contains('\0') && !text.split('/').any(|p| p == ".."))
+        .then(|| text.to_string())
+}
+
+pub const MAC_INSTALLER_TYPES: &str = "install_program on a Mac installs only a .pkg or .mpkg package, a .dmg disk image or a .zip";
+pub const MAC_SYSTEM_FOLDER: &str = "install_program does not install files from macOS's own folders (/System, /usr, /bin, /sbin, /Library/Apple)";
+pub const MAC_NO_ARGS: &str = "install_program on a Mac takes no arguments: leave args out";
+pub const MAC_NEEDS_PATH: &str =
+    "path is required: the absolute path of the package, disk image or zip on this Mac, such as /Users/Shared/Rectangle.dmg";
+
+/// The kinds of file install_program takes on a Mac.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MacInstaller {
+    /// .pkg or .mpkg
+    Package,
+    Image,
+    Zip,
+}
+
+/// What kind of installer a file name (lower case or not) is, as the relay's `/.\.(?:pkg|mpkg|dmg|zip)$/`: the type at
+/// the end, after at least one character that is not a line end.
+pub fn mac_installer_kind(name: &str) -> Option<MacInstaller> {
+    let lower = name.to_lowercase();
+    for (ext, kind) in [(".pkg", MacInstaller::Package), (".mpkg", MacInstaller::Package), (".dmg", MacInstaller::Image), (".zip", MacInstaller::Zip)]
+    {
+        if let Some(head) = lower.strip_suffix(ext) {
+            if head.chars().next_back().is_some_and(|c| !matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')) {
+                return Some(kind);
+            }
+        }
+    }
+    None
+}
+
+/// Why a file may not be installed on a Mac, or None (src/rules.js installerProblemMac): only a package, a disk image or a
+/// zip, and none from inside /System, /usr, /bin, /sbin or /Library/Apple, compared as Mac paths.
+pub fn installer_problem_mac(path: &str) -> Option<String> {
+    let parts = posix_parts(path);
+    if mac_installer_kind(parts.last().map_or("", String::as_str)).is_none() {
+        return Some(MAC_INSTALLER_TYPES.to_string());
+    }
+    let system: [&[&str]; 5] = [&["system"], &["usr"], &["bin"], &["sbin"], &["library", "apple"]];
+    if system.iter().any(|f| parts.len() > f.len() && f.iter().zip(&parts).all(|(a, b)| a == b)) {
+        return Some(MAC_SYSTEM_FOLDER.to_string());
+    }
+    None
+}
+
+/// Why installer arguments are refused on a Mac, or None: a Mac install takes none (src/rules.js installArgsProblemMac).
+pub fn install_args_problem_mac(args: &str) -> Option<String> {
+    (!js_trim(args).is_empty()).then(|| MAC_NO_ARGS.to_string())
+}
+
+/// Every check the relay makes on a Mac install before it decides: the path, the file, the arguments. The shared
+/// installers_posix cases run this.
+pub fn mac_install_problem(path: &str, args: &str) -> Option<String> {
+    match local_absolute_path_mac(path) {
+        None => Some(MAC_NEEDS_PATH.to_string()),
+        Some(p) => installer_problem_mac(&p).or_else(|| install_args_problem_mac(args)),
+    }
 }
 
 pub fn is_app_path(path: &str) -> bool {
@@ -689,12 +805,13 @@ fn verb(token: &str) -> &str {
     &token[token.rfind('/').map_or(0, |i| i + 1)..]
 }
 
-/// The guarded action a verb stands for, from its own token and the rest of its statement, or None. Only the actions
-/// that have a tool on a Mac are here: restart_pc, shutdown_pc and close_program. Installing and uninstalling have no
-/// tool on a Mac yet (they answer not_supported), so a raw installer is not sent to a tool that would refuse it.
+/// The guarded action a verb stands for, from its own token and the rest of its statement, or None: restart_pc,
+/// shutdown_pc, close_program, and install_program for `installer -pkg` (as the Windows screen sends msiexec /i to it).
+/// Removing an app is a plain move of a folder on a Mac, which no verb gives away, so no verb stands for uninstall.
 fn verb_action(v: &str, statement: &[String], from: usize) -> Option<&'static str> {
     let rest = &statement[from.min(statement.len())..];
     match v {
+        "installer" => rest.iter().any(|t| t == "-pkg" || t == "-package").then_some("install"),
         "reboot" => Some("restart"),
         "halt" | "poweroff" => Some("shutdown"),
         "kill" | "killall" | "pkill" | "skill" => Some("close_program"),
@@ -731,6 +848,7 @@ fn use_tool(action: &str) -> String {
     let (what, tool) = match action {
         "restart" => ("restarts the PC", "restart_pc"),
         "shutdown" => ("shuts the PC down", "shutdown_pc"),
+        "install" => ("installs a program", "install_program"),
         _ => ("closes a program", "close_program"),
     };
     err("use_tool", &format!("this command {what}, which the team's rules govern. Use the {tool} tool, not a raw command"))
@@ -785,7 +903,15 @@ pub fn power_delay(frame: &Frame) -> i64 {
     }
 }
 
-pub const NOT_SUPPORTED_PROGRAMS: &str = "installing and uninstalling programs is not available on a Mac yet";
+pub const APP_NEVER_UNINSTALLED: &str = "the Support app is never uninstalled through its own tools";
+pub const APPLE_NEVER_UNINSTALLED: &str = "Apple's own apps are part of macOS and are never uninstalled";
+pub const NEEDS_BUNDLE_ID: &str = "program_id on a Mac is bundle:<bundle id> from list_programs, such as bundle:com.knollsoft.Rectangle";
+
+/// The bundle id in a Mac program id (`bundle:<id>`), or None: no white space, no slash, not empty (the relay's check).
+pub fn bundle_id_of(program_id: &str) -> Option<&str> {
+    let id = program_id.strip_prefix("bundle:")?;
+    (!id.is_empty() && !id.chars().any(|c| c.is_whitespace() || c == '/')).then_some(id)
+}
 
 /// The frame's decided_at in Unix seconds (a value in milliseconds is read as such), 0 when it has none.
 fn decided_at(frame: &Frame) -> i64 {
@@ -815,7 +941,8 @@ fn hour_value(value: &str) -> bool {
 /// the result's error. A frame whose `rules_tag` differs from the stored one first gets a check-in it waits on (at most
 /// `CATCH_UP_MS`), and is decided with the new rules or refused `rules_stale`. An action that needs approval must carry
 /// `approved_by`. A raw `run` gets the screen only. A one-off session (`ruled` None) refuses the frames that exist for
-/// saved Macs only. `install` and `uninstall` are refused first: there is no such tool on a Mac yet.
+/// saved Macs only. `install` gets the relay's Mac checks of its path and arguments first, and `uninstall` its checks of
+/// the program id; an uninstall is judged by every name of the app (its bundle id, and its names on this Mac).
 pub fn check(ruled: Option<&dyn Ruled>, limited: bool, frame: &Frame, stop: &Stop) -> Option<String> {
     let kind = frame.kind.as_str();
     let Some(ruled) = ruled else {
@@ -834,6 +961,8 @@ pub fn check(ruled: Option<&dyn Ruled>, limited: bool, frame: &Frame, stop: &Sto
         return run_screen(&frame.text("command"), &current.doc, &ruled.app_folders());
     }
     let mut program: Option<String> = None;
+    // More names of the same program, each judged by the protected-program check (an app's bundle id and names).
+    let mut other_programs: Vec<String> = Vec::new();
     let mut path: Option<String> = None;
     let mut delay_s = 0;
     let action = match kind {
@@ -851,7 +980,32 @@ pub fn check(ruled: Option<&dyn Ruled>, limited: bool, frame: &Frame, stop: &Sto
         }
         "programs" => match sub.as_str() {
             "list" => return None,
-            "install" | "uninstall" => return Some(err("not_supported", NOT_SUPPORTED_PROGRAMS)),
+            "install" => {
+                // The relay made the same checks; they are not left to it alone, since an installer runs as root.
+                if let Some(problem) = mac_install_problem(&frame.text("path"), &frame.text("args")) {
+                    return Some(problem);
+                }
+                // A path that cannot be made whole is refused, never let through without its approval check.
+                match files::absolute_path(js_trim(&frame.text("path"))) {
+                    Ok(p) => path = Some(p),
+                    Err(_) => return Some(MAC_NEEDS_PATH.to_string()),
+                }
+                "install".to_string()
+            }
+            "uninstall" => {
+                let id = frame.text("program_id");
+                let id = js_trim(&id);
+                if is_app_program_id(id) {
+                    return Some(err("protected_program", APP_NEVER_UNINSTALLED));
+                }
+                let Some(bundle) = bundle_id_of(id) else { return Some(NEEDS_BUNDLE_ID.to_string()) };
+                if is_apple_program_id(id) {
+                    return Some(err("protected_program", APPLE_NEVER_UNINSTALLED));
+                }
+                program = Some(bundle.to_string());
+                other_programs = ruled.program_names(bundle);
+                "uninstall".to_string()
+            }
             "close" => {
                 if frame.text("name").trim().is_empty() && frame.number("pid") <= 0 {
                     return Some("close needs a name or a pid".to_string());
@@ -883,8 +1037,17 @@ pub fn check(ruled: Option<&dyn Ruled>, limited: bool, frame: &Frame, stop: &Sto
     if guarded && view.stale {
         return Some(err("rules_stale", "this PC could not read the team's rules from its last check-in; try again in a minute"));
     }
-    let what = Action { name: &action, program: program.as_deref(), path: path.as_deref(), delay_s };
-    let verdict = decide(&view.doc, &view.hours, at, if limited { "limited" } else { "full" }, &what);
+    let control = if limited { "limited" } else { "full" };
+    let mut verdict =
+        decide(&view.doc, &view.hours, at, control, &Action { name: &action, program: program.as_deref(), path: path.as_deref(), delay_s });
+    // Each other name of the program is judged too. Only the protected-program check differs between them, so the first
+    // refusal stands.
+    for other in &other_programs {
+        if verdict.error().is_some() {
+            break;
+        }
+        verdict = decide(&view.doc, &view.hours, at, control, &Action { name: &action, program: Some(&nfc(other)), path: path.as_deref(), delay_s });
+    }
     if let Some(e) = verdict.error() {
         return Some(e);
     }
@@ -1345,13 +1508,20 @@ mod tests {
         for c in ["reboot", "shutdown -h now", "killall Safari"] {
             assert_eq!(screen(c, &open), None, "{c}");
         }
-        // Installing and uninstalling have no tool on a Mac, so a raw installer is not sent to one.
+        // A package run by hand is sent to install_program, as msiexec /i is on Windows. installer without a package is not.
         let never = doc(|v| {
             v["install"] = json!("never");
             v["uninstall"] = json!("never");
             v["protected_programs"] = json!([]);
         });
-        assert_eq!(screen("installer -pkg /tmp/x.pkg -target /", &never), None);
+        assert_eq!(screen("installer -pkg /tmp/x.pkg -target /", &never), tool("installs a program", "install_program"));
+        assert_eq!(screen("sudo /usr/sbin/installer -package /tmp/x.pkg -target /", &never), tool("installs a program", "install_program"));
+        assert_eq!(screen("installer -help", &never), None);
+        let allow = doc(|v| {
+            v["install"] = json!("allow");
+            v["protected_programs"] = json!([]);
+        });
+        assert_eq!(screen("installer -pkg /tmp/x.pkg -target /", &allow), None);
     }
 
     // ---- the check at the top of every command -----------------------------------------------------------------------------------
@@ -1472,12 +1642,25 @@ mod tests {
     }
 
     #[test]
-    fn programs_list_and_close_are_judged_and_install_and_uninstall_are_not_supported() {
+    fn programs_list_close_install_and_uninstall_are_judged() {
         let r = FakeRuled::new(doc(|_| {}));
-        let ns = Some(err("not_supported", "installing and uninstalling programs is not available on a Mac yet"));
         assert_eq!(chk(&r, false, json!({"type":"programs","id":"1","action":"list"})), None);
-        assert_eq!(chk(&r, false, json!({"type":"programs","id":"1","action":"install","path":"/tmp/a.pkg"})), ns);
-        assert_eq!(chk(&r, false, json!({"type":"programs","id":"1","action":"uninstall","program_id":"x"})), ns);
+        let approval =
+            Some(err("approval_unavailable", "this action needs a technician's approval in the technician app, and the request carries none"));
+        assert_eq!(chk(&r, false, json!({"type":"programs","id":"1","action":"install","path":"/tmp/a.pkg","rules_tag":"tagA"})), approval);
+        assert_eq!(
+            chk(&r, false, json!({"type":"programs","id":"1","action":"install","path":"/tmp/a.pkg","rules_tag":"tagA","approved_by":"boss"})),
+            None
+        );
+        assert_eq!(chk(&r, false, json!({"type":"programs","id":"1","action":"uninstall","program_id":"bundle:x.y","rules_tag":"tagA"})), approval);
+        assert_eq!(
+            chk(
+                &r,
+                false,
+                json!({"type":"programs","id":"1","action":"uninstall","program_id":"bundle:x.y","rules_tag":"tagA","approved_by":"boss"})
+            ),
+            None
+        );
         assert_eq!(chk(&r, false, json!({"type":"programs","id":"1","action":"dance"})), Some("unknown programs action".to_string()));
         assert_eq!(chk(&r, false, json!({"type":"programs","id":"1","action":"close"})), Some("close needs a name or a pid".to_string()));
         assert_eq!(chk(&r, false, json!({"type":"programs","id":"1","action":"close","name":"Safari","rules_tag":"tagA"})), None);
@@ -1500,6 +1683,113 @@ mod tests {
             chk(&gone, false, json!({"type":"programs","id":"1","action":"close","pid":9})),
             Some(err("not_found", "no running program has that name or pid"))
         );
+    }
+
+    #[test]
+    fn an_install_gets_the_relays_mac_checks_again_before_the_rules() {
+        let r = FakeRuled::new(doc(|v| v["install"] = json!("allow")));
+        let install = |path: &str, args: &str| {
+            chk(&r, false, json!({"type":"programs","id":"1","action":"install","path":path,"args":args,"rules_tag":"tagA"}))
+        };
+        for ok in ["/Users/a/Downloads/Rectangle.dmg", "/Users/a/x.PKG", "/private/tmp/x.zip", "/Users/Shared/Suite.mpkg", "/Users/a/./x.pkg"] {
+            assert_eq!(install(ok, ""), None, "{ok}");
+        }
+        assert_eq!(install("/Users/a/x.pkg", "  "), None, "white space is no argument");
+        assert_eq!(install("/System/x.pkg", ""), Some(MAC_SYSTEM_FOLDER.to_string()));
+        assert_eq!(install("//usr/local/x.pkg", ""), Some(MAC_SYSTEM_FOLDER.to_string()));
+        assert_eq!(install("/Library/Apple/x.dmg", ""), Some(MAC_SYSTEM_FOLDER.to_string()));
+        assert_eq!(install("/Users/a/Foo.app", ""), Some(MAC_INSTALLER_TYPES.to_string()));
+        assert_eq!(install("Downloads/x.pkg", ""), Some(MAC_NEEDS_PATH.to_string()));
+        assert_eq!(install("/Users/a/../../System/x.pkg", ""), Some(MAC_NEEDS_PATH.to_string()));
+        assert_eq!(install("/Users/a/x.pkg", "-target /"), Some(MAC_NO_ARGS.to_string()));
+        // Then the folders: the Support app's, and a protected one, also through its /private spelling.
+        let folder = Some(err("protected_folder", "the team's rules protect this folder"));
+        assert_eq!(install("/Applications/Support.app/Contents/x.pkg", ""), folder);
+        assert_eq!(install("/Users/a/Customer Data/x.pkg", ""), folder);
+        let tmp = FakeRuled::new(doc(|v| {
+            v["install"] = json!("allow");
+            v["protected_folders"] = json!(["/tmp/Shared"]);
+        }));
+        assert_eq!(
+            chk(&tmp, false, json!({"type":"programs","id":"1","action":"install","path":"/private/tmp/Shared/a.pkg","rules_tag":"tagA"})),
+            folder
+        );
+        // Limited control never installs.
+        assert_eq!(
+            chk(&r, true, json!({"type":"programs","id":"1","action":"install","path":"/Users/a/x.pkg","rules_tag":"tagA"})),
+            Some(err("needs_full_control", "this action needs a PC set to full control"))
+        );
+    }
+
+    #[test]
+    fn an_uninstall_names_a_bundle_and_is_judged_by_every_name_of_the_app() {
+        struct Named(FakeRuled, Vec<String>);
+        impl Ruled for Named {
+            fn state(&self) -> View {
+                self.0.state()
+            }
+            fn catch_up(&self, w: u64, s: &Stop) -> bool {
+                self.0.catch_up(w, s)
+            }
+            fn close_target(&self, f: &Frame) -> Option<String> {
+                self.0.close_target(f)
+            }
+            fn program_names(&self, _: &str) -> Vec<String> {
+                self.1.clone()
+            }
+        }
+        let rules = |programs: Value| {
+            doc(|v| {
+                v["uninstall"] = json!("allow");
+                v["protected_programs"] = programs;
+            })
+        };
+        let un = |r: &dyn Ruled, id: &str| {
+            check(Some(r), false, &frame(json!({"type":"programs","id":"1","action":"uninstall","program_id":id,"rules_tag":"tagA"})), &Stop::new())
+        };
+        let protected = Some(err("protected_program", "the team's rules protect this program"));
+        let plain = Named(FakeRuled::new(rules(json!(["Slack", "com.knollsoft.Rectangle"]))), vec!["Rectangle".into()]);
+        assert_eq!(un(&plain, "bundle:com.knollsoft.Rectangle"), protected, "by bundle id");
+        assert_eq!(un(&plain, "bundle:COM.KNOLLSOFT.RECTANGLE"), protected, "any case");
+        let slack = Named(FakeRuled::new(rules(json!(["Slack"]))), vec!["Slack".into(), "Slack.app".into()]);
+        assert_eq!(un(&slack, "bundle:com.tinyspeck.slackmacgap"), protected, "by the app's name on this Mac");
+        // A decomposed name on the Mac still matches the protected name as typed.
+        let cafe = Named(FakeRuled::new(rules(json!(["Caf\u{e9}"]))), vec!["Cafe\u{301}".into()]);
+        assert_eq!(un(&cafe, "bundle:x.cafe"), protected, "NFD against NFC");
+        let other = Named(FakeRuled::new(rules(json!(["Slack"]))), vec!["Rectangle".into()]);
+        assert_eq!(un(&other, "bundle:com.knollsoft.Rectangle"), None);
+        // The app itself, Apple's apps and an id that is not a bundle.
+        for id in ["bundle:io.github.sukardaddy.supportmcp", "bundle:io.github.sukardaddy.supportmcp.join", "64:SupportMcpDevice"] {
+            assert_eq!(un(&other, id), Some(err("protected_program", APP_NEVER_UNINSTALLED)), "{id}");
+        }
+        assert_eq!(un(&other, "bundle:com.apple.TextEdit"), Some(err("protected_program", APPLE_NEVER_UNINSTALLED)));
+        for id in ["com.knollsoft.Rectangle", "bundle:", "bundle:a b", "bundle:a/b", "64:acrobat"] {
+            assert_eq!(un(&other, id), Some(NEEDS_BUNDLE_ID.to_string()), "{id}");
+        }
+    }
+
+    #[test]
+    fn mac_paths_compare_in_nfc_and_private_is_the_same_as_its_short_form() {
+        assert!(path_inside("/Users/a/Caf\u{e9}", "/Users/a/Cafe\u{301}/x"));
+        assert!(path_inside("/Users/a/Cafe\u{301}", "/users/a/CAF\u{c9}/x"));
+        assert!(path_inside("/var/folders", "/private/var/folders/x"));
+        assert!(path_inside("/private/tmp/a", "/tmp/a/b"));
+        assert!(path_inside("/etc", "/PRIVATE/etc/hosts"));
+        assert!(!path_inside("/private", "/var/x"));
+        assert!(!path_inside("/db", "/private/db/x"));
+        assert!(!path_inside("/var", "/x/private/var"));
+        assert_eq!(installer_problem_mac("/private/var/root/x.pkg"), None);
+        assert!(is_app_program_id(" bundle:IO.github.sukardaddy.SUPPORTMCP "));
+        assert!(!is_app_program_id("bundle:io.github.sukardaddy.supportmcpx"));
+        assert!(is_apple_program_id("bundle:COM.APPLE.Safari"));
+        assert!(!is_apple_program_id("bundle:com.applesauce"));
+        assert_eq!(mac_installer_kind("a.MPKG"), Some(MacInstaller::Package));
+        assert_eq!(mac_installer_kind(".pkg"), None);
+        assert_eq!(mac_installer_kind("\n.dmg"), None);
+        assert_eq!(js_trim("\u{feff} /x \u{3000}"), "/x");
+        assert_eq!(js_trim("\u{85}/x"), "\u{85}/x", "JavaScript's trim keeps U+0085");
+        assert_eq!(local_absolute_path_mac(&format!("/{}", "\u{1F600}".repeat(499))).map(|p| p.len()), Some(1 + 4 * 499), "999 UTF-16 units");
+        assert_eq!(local_absolute_path_mac(&format!("/{}", "\u{1F600}".repeat(500))), None, "1001 UTF-16 units");
     }
 
     #[test]

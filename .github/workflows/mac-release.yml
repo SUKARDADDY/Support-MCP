@@ -1,0 +1,197 @@
+name: mac-release
+
+# Builds, signs and publishes a release of the Mac app (docs/development.md, "Releasing the Mac app"). Mac releases have
+# their own version line (approved call 7) and their own tags, `mac-v<version>` (mac-v1.1.0), so they never collide with
+# the relay's and the Windows app's `v<version>` tags. It runs on such a tag, or by hand with the version (which then
+# makes the tag at the commit it runs on). It never runs for a pull request or in a fork.
+#
+# It signs the app with the project's self-signed code signing identity (approved call 1), kept as two secrets of the
+# `mac-release` environment: MAC_SIGNING_P12 (the identity, a .p12 file in base64) and MAC_SIGNING_PASSWORD (its
+# password). The environment's variable SUPPORT_JOIN_RELAY_ORIGIN is the one relay Support Join may join. It attaches
+# Support-<version>.pkg (the saved Mac's installer) and Support-<version>.zip (Support Join.app, for one-off links) to the
+# GitHub release, never marked as the latest release (the technician app reads the latest release for its own update),
+# and prints each file's size and SHA-256. The update note is signed afterwards, offline, with the release key
+# (scripts/sign-release.mjs --product mac): this workflow never sees that key.
+on:
+  push:
+    tags:
+      - 'mac-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'The Mac version to release, for example 1.1.0 (it must be the version in mac-agent/app/Cargo.toml)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Only this repository, never a fork, and never a pull request (there is no pull_request trigger either).
+    if: github.event.repository.fork == false && github.event_name != 'pull_request'
+    runs-on: macos-15
+    timeout-minutes: 45
+    environment: mac-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Work out the version
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "push" ]; then
+            case "$REF_NAME" in mac-v*) v="${REF_NAME#mac-v}" ;; *) echo "not a mac-v tag: $REF_NAME" >&2; exit 1 ;; esac
+          else
+            v="$INPUT_VERSION"
+          fi
+          # SemVer, at most 32 characters (src/version.js).
+          if [ "${#v}" -gt 32 ] || ! printf '%s' "$v" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'; then
+            echo "not a version: $v" >&2; exit 1
+          fi
+          for crate in mac-agent/app/Cargo.toml mac-agent/core/Cargo.toml; do
+            have="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$crate" | head -n 1)"
+            [ "$have" = "$v" ] || { echo "$crate is $have, not $v" >&2; exit 1; }
+          done
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=mac-v$v" >> "$GITHUB_OUTPUT"
+      # The test-only build variables would not compile without the test-release feature; this says so earlier.
+      - name: Check the build has no test overrides
+        run: |
+          for name in SUPPORT_TEST_RELEASE_KEY SUPPORT_TEST_VERSION SUPPORT_TEST_DOWNLOAD_ORIGIN SUPPORT_TEST_BROKEN SUPPORT_CARGO_FEATURES SUPPORT_CARGO_PROFILE SUPPORT_SKIP_JOIN; do
+            if [ -n "${!name:-}" ]; then echo "$name is set in the environment of a release build" >&2; exit 1; fi
+          done
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --target aarch64-apple-darwin
+          (cd mac-agent && rustc --version && cargo --version)
+      - name: Test the workspace
+        working-directory: mac-agent
+        run: cargo test --locked
+      - name: Import the signing identity
+        id: identity
+        env:
+          MAC_SIGNING_P12: ${{ secrets.MAC_SIGNING_P12 }}
+          MAC_SIGNING_PASSWORD: ${{ secrets.MAC_SIGNING_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [ -n "$MAC_SIGNING_P12" ] && [ -n "$MAC_SIGNING_PASSWORD" ] || { echo "MAC_SIGNING_P12 and MAC_SIGNING_PASSWORD must be set in the mac-release environment" >&2; exit 1; }
+          work="$RUNNER_TEMP/signing"
+          mkdir -p "$work"
+          keychain="$work/support-release.keychain-db"
+          kpass="$(/usr/bin/openssl rand -hex 24)"
+          printf '%s' "$MAC_SIGNING_P12" | base64 -D > "$work/identity.p12"
+          security create-keychain -p "$kpass" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$kpass" "$keychain"
+          security import "$work/identity.p12" -k "$keychain" -P "$MAC_SIGNING_PASSWORD" -T /usr/bin/codesign
+          rm -f "$work/identity.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kpass" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          # A self-signed certificate is not trusted by the system, so it is listed without -v. Exactly one identity.
+          ids="$(security find-identity -p codesigning "$keychain" | grep -Eo '[0-9A-F]{40}' | sort -u)"
+          [ "$(printf '%s\n' "$ids" | grep -c .)" = "1" ] || { echo "the .p12 must hold exactly one code signing identity" >&2; exit 1; }
+          echo "keychain=$keychain" >> "$GITHUB_OUTPUT"
+          echo "sha1=$ids" >> "$GITHUB_OUTPUT"
+      - name: Build and sign Support.app, the package and Support Join.app
+        env:
+          SUPPORT_SIGN_IDENTITY: ${{ steps.identity.outputs.sha1 }}
+          SUPPORT_SIGN_KEYCHAIN: ${{ steps.identity.outputs.keychain }}
+          SUPPORT_JOIN_RELAY_ORIGIN: ${{ vars.SUPPORT_JOIN_RELAY_ORIGIN }}
+        run: |
+          set -euo pipefail
+          [ -n "$SUPPORT_JOIN_RELAY_ORIGIN" ] || { echo "set the variable SUPPORT_JOIN_RELAY_ORIGIN in the mac-release environment" >&2; exit 1; }
+          mac-agent/packaging/build.sh "$RUNNER_TEMP/support-release"
+      - name: Check what was built
+        env:
+          V: ${{ steps.version.outputs.version }}
+          SHA1: ${{ steps.identity.outputs.sha1 }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/support-release"
+          app="$out/Support.app"
+          join="$out/Support Join.app"
+          test -f "$out/Support-$V.pkg" && test -f "$out/Support-$V.zip"
+          test "$(lipo -archs "$app/Contents/MacOS/support")" = "arm64"
+          test "$(lipo -archs "$join/Contents/MacOS/support-join")" = "arm64"
+          test "$("$app/Contents/MacOS/support" version)" = "Support $V"
+          test "$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")" = "$V"
+          for bundle in "$app" "$join"; do
+            codesign --verify --strict --verbose=2 "$bundle"
+            req="$(codesign -d -r- "$bundle" 2>&1)"
+            echo "$req"
+            echo "$req" | grep -Ei "certificate (leaf|root) = H\"$SHA1\""
+            if echo "$req" | grep -q "cdhash"; then echo "ad-hoc designated requirement" >&2; exit 1; fi
+            codesign -d --verbose=4 "$bundle" 2>&1 | grep -F "flags=0x10000(runtime)"
+          done
+          # The project's release key is built in, and nothing of the update test is.
+          grep -qF "$(tr -d '\n' < release-key.pub)" "$app/Contents/MacOS/support"
+          if grep -qF "127.0.0.1:8791" "$app/Contents/MacOS/support"; then echo "the app holds the update test's origin" >&2; exit 1; fi
+          rm -rf "$out/expanded"
+          pkgutil --expand-full "$out/Support-$V.pkg" "$out/expanded"
+          codesign --verify --strict "$out/expanded/Support-component.pkg/Payload/Applications/Support.app"
+          grep -F 'hostArchitectures="arm64"' "$out/expanded/Distribution"
+      - name: Print the files for the update note
+        id: files
+        env:
+          V: ${{ steps.version.outputs.version }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+          KEYCHAIN: ${{ steps.identity.outputs.keychain }}
+          SHA1: ${{ steps.identity.outputs.sha1 }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/support-release"
+          {
+            echo "## Support for Mac $V"
+            echo
+            echo '| File | Size (bytes) | SHA-256 |'
+            echo '|---|---|---|'
+            for f in "Support-$V.pkg" "Support-$V.zip"; do
+              echo "| $f | $(stat -f %z "$out/$f") | $(shasum -a 256 "$out/$f" | cut -d' ' -f1) |"
+            done
+            echo
+            # The keychain holds the one certificate of the identity: its SHA-256 fingerprint goes in SECURITY.md.
+            fp="$(security find-certificate -a -p "$KEYCHAIN" | /usr/bin/openssl x509 -noout -fingerprint -sha256 | cut -d= -f2)"
+            echo "Signing certificate: SHA-1 $SHA1, SHA-256 $fp"
+            echo
+            echo "Sign the note with the release key, offline:"
+            echo
+            echo '```sh'
+            echo "node scripts/sign-release.mjs --product mac --version $V --file Support-$V.pkg \\"
+            echo "  --url https://github.com/$REPO/releases/download/$TAG/Support-$V.pkg --out release-files-mac"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/support-release"
+          notes="Support for Mac $V: Support-$V.pkg installs a saved Mac (Apple silicon, macOS 14 or later). Support-$V.zip is Support Join.app, for one-off support links. The update note and its signature are added after release. Check the files against the SHA-256 values in the workflow run's summary, and the signing certificate against SECURITY.md."
+          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            # A release that exists keeps its files: a rebuilt package would no longer match a note already signed.
+            gh release upload "$TAG" "$out/Support-$V.pkg" "$out/Support-$V.zip" --repo "$REPO"
+          else
+            gh release create "$TAG" "$out/Support-$V.pkg" "$out/Support-$V.zip" --repo "$REPO" --target "$SHA" \
+              --title "Support for Mac $V" --notes "$notes" --latest=false
+          fi
+      - name: Delete the keychain
+        if: always()
+        run: |
+          if [ -n "${{ steps.identity.outputs.keychain }}" ]; then security delete-keychain "${{ steps.identity.outputs.keychain }}" || true; fi

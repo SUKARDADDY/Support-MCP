@@ -67,7 +67,9 @@ import { assertPersonActive, assertSecondFactor } from './oauth.js';
 import { agentStoreFromEnv } from './agent-store.js';
 import { UNATTENDED_PERMISSION } from './permissions.js';
 import { compareVersions, validVersion } from './release.js';
-import { REFUSALS, decide, installArgsProblem, installerProblem, isAppProgramId, localAbsolutePath, powerDelay } from './rules.js';
+import {
+  REFUSALS, decide, installArgsProblem, installArgsProblemMac, installerProblem, installerProblemMac, isAppProgramId, isAppleProgramId, localAbsolutePath, powerDelay,
+} from './rules.js';
 import { OPERATOR_END_REASONS } from './device-sessions.js';
 import { VERSION_PATTERN } from './version.js';
 import {
@@ -755,14 +757,18 @@ export class Session {
   // { fields, ruleAction, program, path, log, summary, waitMs, hash }: ruleAction is the rule that governs it
   // (none for a list), program and path are what the rules' name and folder checks compare, summary is what an
   // approver reads, built here from the frame and never from text the caller supplies apart from the action's
-  // own arguments, and hash binds an approval to exactly this action on this PC.
+  // own arguments, and hash binds an approval to exactly this action on this PC. A Mac (the stored agent from its hello
+  // starts with macos-, which the hello made agree with its os) gets the Mac's install checks and program ids; every
+  // other client gets the Windows ones, as before. otherPrograms holds more names the protected-program check compares
+  // (a Mac app's bundle id beside its name).
   async prepareRuled(b) {
     const num = (v, def, lo, hi) => {
       const n = v === undefined || v === null ? NaN : Number(v);
       return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.floor(n))) : def;
     };
     const plain = (v, max) => truncate(String(v).replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim(), max);
-    const out = { fields: null, ruleAction: null, program: undefined, path: undefined, log: '', summary: '', waitMs: 60 * 1000 + RESULT_SLACK_MS };
+    const out = { fields: null, ruleAction: null, program: undefined, otherPrograms: [], path: undefined, log: '', summary: '', waitMs: 60 * 1000 + RESULT_SLACK_MS };
+    const mac = (b.action === 'install' || b.action === 'uninstall') && String((await this.get('agent', '')) ?? '').startsWith('macos-');
     if (b.op === 'power') {
       if (b.action !== 'restart' && b.action !== 'shutdown') return { error: 'action must be restart or shutdown' };
       const delay = powerDelay(b.delay_s);
@@ -776,11 +782,13 @@ export class Session {
     } else if (b.action === 'install') {
       // The same checks as the PC's, before a technician is asked: a path it would refuse, a file that is not an
       // installer, or arguments that restart or uninstall are refused here and spend no approval.
-      const path = localAbsolutePath(b.path) ?? '';
-      if (!path || path.length > 1000 || CONTROL_TEXT.test(path)) return { error: 'path is required: the absolute path of the installer on the PC, such as C:\\Temp\\setup.exe' };
+      const path = localAbsolutePath(b.path, mac ? 'mac' : 'windows') ?? '';
+      if (!path || path.length > 1000 || CONTROL_TEXT.test(path)) {
+        return { error: 'path is required: the absolute path of the installer on the PC, such as C:\\Temp\\setup.exe on Windows or /Users/Shared/Rectangle.dmg on a Mac' };
+      }
       if (b.args !== undefined && b.args !== null && (typeof b.args !== 'string' || b.args.length > 1000 || CONTROL_TEXT.test(b.args))) return { error: 'args must be text of at most 1000 characters, with no line breaks' };
       const args = typeof b.args === 'string' ? b.args.trim() : '';
-      const installer = installerProblem(path) ?? installArgsProblem(path, args);
+      const installer = mac ? installerProblemMac(path) ?? installArgsProblemMac(args) : installerProblem(path) ?? installArgsProblem(path, args);
       if (installer) return { error: installer };
       const timeout = num(b.timeout_s, 300, 10, 600);
       out.fields = { action: 'install', path, ...(args ? { args } : {}), timeout_s: timeout };
@@ -793,6 +801,13 @@ export class Session {
       const id = typeof b.program_id === 'string' ? b.program_id.trim() : '';
       if (!id || id.length > 200) return { error: 'program_id is required: an id from list_programs' };
       if (isAppProgramId(id)) return { refuse: 'protected_program', text: 'the Support app is never uninstalled through its own tools' };
+      if (mac) {
+        // A Mac names an app by its bundle id. Apple's own apps are part of macOS. A protected program matches the app's
+        // name (from the last list) or its bundle id, so the relay refuses it before a technician is asked.
+        if (!/^bundle:[^\s/]+$/.test(id)) return { error: 'program_id on a Mac is bundle:<bundle id> from list_programs, such as bundle:com.knollsoft.Rectangle' };
+        if (isAppleProgramId(id)) return { refuse: 'protected_program', text: 'Apple\'s own apps are part of macOS and are never uninstalled' };
+        out.otherPrograms = [id.slice('bundle:'.length)];
+      }
       const timeout = num(b.timeout_s, 300, 10, 600);
       const name = this.knownProgram('byId', id);
       out.fields = { action: 'uninstall', program_id: id, timeout_s: timeout };
@@ -840,12 +855,19 @@ export class Session {
     const base = { tag: read.tag, at };
     if (!decided) return base;
     const ruleAction = prepared ? prepared.ruleAction : b.op;
-    const verdict = decide(read.rules, ruleAction, {
-      nowMs: at, hours: read.hours, control: control === 'full' ? 'full' : 'limited', program: prepared?.program,
+    const judge = (program) => decide(read.rules, ruleAction, {
+      nowMs: at, hours: read.hours, control: control === 'full' ? 'full' : 'limited', program,
       path: prepared ? prepared.path : String(b.path ?? ''),
       // A restart or shutdown that waits is judged over the whole wait, not only at this moment.
       delay_s: b.op === 'power' ? prepared.fields.delay_s : undefined,
     });
+    // Each other name of the program (a Mac app's bundle id) is judged too. Only the protected-program check differs
+    // between them, so the first refusal stands.
+    let verdict = judge(prepared?.program);
+    for (const other of prepared?.otherPrograms ?? []) {
+      if (verdict.refuse) break;
+      verdict = judge(other);
+    }
     if (verdict.refuse) {
       this.logRow('rules', `refused ${prepared ? prepared.log : b.op}: ${verdict.refuse}`, who);
       return { response: codedRefusal(verdict.refuse, verdict.text ?? REFUSALS[verdict.refuse]) };

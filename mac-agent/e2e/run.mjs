@@ -6,7 +6,8 @@
 // applies the migrations, adds the first member, seeds one rules row and makes a pairing code through the team API.
 // The client pairs and checks in as active with a fake platform (commands run with `sh -c`, files are real, the screen
 // is one fixed JPEG). Then this script does what a technician's AI does, over MCP on HTTP: device_connect, run,
-// put_file and get_file of 1 MB, screenshot, the Mac's own refusals, a power action and session_end. Then the one-off
+// put_file and get_file of 1 MB, screenshot, the Mac's own refusals, a power action, install_program and
+// uninstall_program (one .dmg install that reaches the fake platform, and the relay's Mac refusals) and session_end. Then the one-off
 // link for a Mac: session_create, the redeem route's refusals, the core's redeem client joining with Auth::Attach, a
 // command, the Windows button on a fresh code, and "Don't allow" on a second session. Any failed check
 // exits non-zero. The relay and the client are always stopped and the run's folder removed.
@@ -23,6 +24,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '../..');
 const agent = resolve(here, '..');
 const checks = [];
+// The version the client reports: the core crate's (the Mac app's own version line).
+const CORE_VERSION = /^version = "([^"]+)"/m.exec(readFileSync(join(agent, 'core/Cargo.toml'), 'utf8'))[1];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function check(name, ok, detail = '') {
@@ -64,7 +67,7 @@ async function main() {
   protectedDir = join(tmpdir(), `support-mac-e2e-protected-${process.pid}`);
   mkdirSync(protectedDir, { recursive: true });
   const doc = {
-    time_zone: null, hours: null, restart: 'allow', shutdown: 'never', install: 'approve', uninstall: 'approve', close_program: 'allow',
+    time_zone: null, hours: null, restart: 'allow', shutdown: 'never', install: 'allow', uninstall: 'approve', close_program: 'allow',
     protected_programs: ['Finder'], protected_folders: [protectedDir, 'C:\\E2E\\Data'],
   };
   wranglerRun(prepared, ['d1', 'execute', 'support-mcp', '--local', '--command',
@@ -125,7 +128,7 @@ async function main() {
 
   const list = await call('device_list');
   const mac = (list.data.devices ?? list.data).find((d) => d.id === deviceId);
-  check('device_list shows the Mac as macOS, active, online and at the client version', !!mac && mac.os === 'macOS 26.1 (25B78)' && mac.status === 'active' && mac.online === true && mac.app_version === '1.0.0', JSON.stringify(mac));
+  check('device_list shows the Mac as macOS, active, online and at the client version', !!mac && mac.os === 'macOS 26.1 (25B78)' && mac.status === 'active' && mac.online === true && mac.app_version === CORE_VERSION, JSON.stringify(mac));
 
   const connected = await call('device_connect', { device_id: deviceId });
   check('device_connect starts a session', !connected.isError && /^[0-9a-f]{64}$/.test(connected.data.session_id ?? ''), JSON.stringify(connected));
@@ -204,6 +207,30 @@ async function main() {
   check('and the same path as written is refused by the relay first', JSON.stringify(direct).includes('protected_folder'), JSON.stringify(direct));
   const programs = await call('list_programs', { session_id: sid });
   check('list_programs answers (the Mac is at least 1.0.0)', !programs.isError && Array.isArray(programs.data.running), JSON.stringify(programs));
+
+  // install_program and uninstall_program on a saved Mac (PR 6): the relay picks the Mac's checks by the hello's agent.
+  const dmgPath = '/Users/Shared/Rectangle0.84.dmg';
+  const dmg = await call('install_program', { session_id: sid, path: dmgPath });
+  check('install_program with a .dmg path passes the relay\'s and the Mac\'s checks and reaches the fake platform', !dmg.isError && dmg.data.exit_code === 0 && String(dmg.data.detail).includes(dmgPath), JSON.stringify(dmg));
+  await until('the platform to report the install', () => event('program'), 10_000, 100);
+  for (const [what, args, want] of [
+    ['a package in /System', { path: '/System/x.pkg' }, 'macOS\'s own folders'],
+    ['a relative path', { path: 'Downloads/x.pkg' }, 'path is required: the absolute path of the installer on the PC'],
+    ['an app bundle, which is no installer', { path: '/Users/Shared/Foo.app' }, 'installs only a .pkg or .mpkg package'],
+    ['installer arguments', { path: '/Users/Shared/x.pkg', args: '-target /' }, 'takes no arguments'],
+  ]) {
+    const r = await call('install_program', { session_id: sid, ...args });
+    check(`the relay refuses a Mac install of ${what}`, r.isError && JSON.stringify(r).includes(want), JSON.stringify(r));
+  }
+  for (const id of ['bundle:io.github.sukardaddy.supportmcp', 'bundle:io.github.sukardaddy.supportmcp.join']) {
+    const r = await call('uninstall_program', { session_id: sid, program_id: id });
+    check(`the relay refuses to uninstall ${id}`, r.isError && JSON.stringify(r).includes('protected_program: the Support app is never uninstalled'), JSON.stringify(r));
+  }
+  const apple = await call('uninstall_program', { session_id: sid, program_id: 'bundle:com.apple.TextEdit' });
+  check('the relay refuses to uninstall one of Apple\'s apps', apple.isError && JSON.stringify(apple).includes('protected_program: Apple'), JSON.stringify(apple));
+  await sleep(500);
+  const reached = events.filter((e) => e.event === 'program').map((e) => e.line);
+  check('only the allowed install reached the Mac; every refusal was the relay\'s', JSON.stringify(reached) === JSON.stringify([`install ${dmgPath}`]), JSON.stringify(reached));
 
   // End.
   const ended = await call('session_end', { session_id: sid });

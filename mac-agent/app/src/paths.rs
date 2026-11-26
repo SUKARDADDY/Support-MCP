@@ -8,7 +8,8 @@ pub const APP_PATH: &str = "/Applications/Support.app";
 /// The one binary, with every role. `support` is a name the relay already protects (`isAppProgram`).
 pub const BINARY_PATH: &str = "/Applications/Support.app/Contents/MacOS/support";
 
-/// Root's data: device.json, history.json and later update.json, previous/ and staging/. Root only, 0700.
+/// Root's data: device.json, history.json, update.json and update.lock, previous/ (the app before an update) and staging/.
+/// Root only, 0700.
 pub const DATA_DIR: &str = "/Library/Application Support/SupportMCP";
 pub const DEVICE_FILE: &str = "device.json";
 pub const HISTORY_FILE: &str = "history.json";
@@ -21,12 +22,22 @@ pub const AGENT_LABEL: &str = "io.github.sukardaddy.supportmcp.helper";
 pub const AGENT_PLIST: &str = "/Library/LaunchAgents/io.github.sukardaddy.supportmcp.helper.plist";
 /// The package id pkgbuild gives the payload, for `pkgutil --forget`.
 pub const PKG_ID: &str = "io.github.sukardaddy.supportmcp.pkg";
+/// The update watcher (src/update.rs): a one-shot LaunchDaemon, run from the old app's copy during an update's trial.
+/// Its property list is in /Library/LaunchDaemons only while a trial is open, so a restart of the Mac starts it again.
+pub const WATCH_LABEL: &str = "io.github.sukardaddy.supportmcp.update";
+pub const WATCH_PLIST: &str = "/Library/LaunchDaemons/io.github.sukardaddy.supportmcp.update.plist";
 
 /// The socket between the service and its helpers. The folder is root's (0755), so only root can make a socket in it,
 /// and a helper that finds one there knows root made it. The socket itself is 0666: who may talk is decided per
 /// connection by the peer check (src/peer.rs), not by file modes.
 pub const SOCKET_DIR: &str = "/var/run/io.github.sukardaddy.supportmcp";
 pub const SOCKET_PATH: &str = "/var/run/io.github.sukardaddy.supportmcp/helper.sock";
+
+/// Under the data folder: install_program's copies (one root-only folder per install, removed when it ends), and the
+/// apps uninstall_program took away (`removed/<bundle id>-<Unix seconds>/`, deleted after `REMOVED_KEEP_S`).
+pub const STAGING_DIR: &str = "staging";
+pub const REMOVED_DIR: &str = "removed";
+pub const REMOVED_KEEP_S: i64 = 7 * 86_400;
 
 /// Where a run as root starts.
 pub const ROOT_HOME: &str = "/var/root";
@@ -44,6 +55,11 @@ pub const PKGUTIL: &str = "/usr/sbin/pkgutil";
 pub const SW_VERS: &str = "/usr/bin/sw_vers";
 pub const SCUTIL: &str = "/usr/sbin/scutil";
 pub const PS: &str = "/bin/ps";
+pub const SPCTL: &str = "/usr/sbin/spctl";
+pub const INSTALLER: &str = "/usr/sbin/installer";
+pub const HDIUTIL: &str = "/usr/bin/hdiutil";
+pub const DITTO: &str = "/usr/bin/ditto";
+pub const CODESIGN: &str = "/usr/bin/codesign";
 
 /// System Settings, Privacy & Security, at the two switches Support needs.
 pub const SETTINGS_SCREEN: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
