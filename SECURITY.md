@@ -35,7 +35,7 @@ Developer ID, so macOS asks the person to choose **Open Anyway** once. Check a
 download against the certificate's SHA-256 fingerprint:
 
 ```text
-SHA-256 fingerprint: (filled in at release)
+SHA-256 fingerprint: 7F:A1:A0:76:A6:9A:89:97:BD:CD:4D:29:02:55:68:48:03:32:3D:41:FF:9C:87:0C:9E:A2:20:91:E9:BD:66:64
 ```
 
 `codesign -dr- "Support Join.app"` shows the certificate the app is signed with.
