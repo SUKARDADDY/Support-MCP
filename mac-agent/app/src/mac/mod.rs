@@ -10,6 +10,7 @@ pub mod join;
 pub mod join_ui;
 pub mod os;
 pub mod peer;
+pub mod perms;
 pub mod ui;
 pub mod update;
 
@@ -77,6 +78,11 @@ pub fn open_app() -> i32 {
 
 /// Runs a role that needs macOS. Returns the exit code.
 pub fn run(role: Role) -> i32 {
+    // The permission window's screenshot build is the helper window and nothing else: no service, setup, uninstall or update.
+    if helper::PREVIEW_BUILD && !matches!(role, Role::Helper) {
+        eprintln!("support: this is the permission window's preview build; it runs only the helper role.");
+        return 2;
+    }
     match role {
         Role::DeviceService => {
             // SAFETY: a getter.
@@ -122,6 +128,6 @@ pub fn run(role: Role) -> i32 {
         Role::Uninstall { finish: true } => cli::finish(),
         Role::UpdateWatch { restart } => update::watch(restart),
         // Handled before this is called.
-        Role::Version | Role::FileOp { .. } | Role::RunAs { .. } => 2,
+        Role::Version | Role::FdaProbe | Role::FileOp { .. } | Role::RunAs { .. } => 2,
     }
 }

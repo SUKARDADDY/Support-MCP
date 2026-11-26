@@ -9,6 +9,7 @@
 //! | `uninstall` | an administrator (the CLI under sudo); `--finish` as root, by the service | a person, the service |
 //! | `file-op` | root, which drops to the user first | the service |
 //! | `run-as` | root, which drops to the user first | the service, through `launchctl asuser` |
+//! | `fda-probe` | root, or any user | the service, to read whether Full Disk Access is given (src/permissions.rs) |
 //! | `update-watch` | root, from the old app's copy in the data folder | launchd, for an update's trial (src/update.rs) |
 //!
 //! While the helper runs, Finder, Launchpad and `open` do not start this binary: the helper is the bundle's running
@@ -57,6 +58,8 @@ pub enum Role {
     UpdateWatch {
         restart: bool,
     },
+    /// Opens, and never reads, a file only Full Disk Access allows, and says so in its exit code.
+    FdaProbe,
     Version,
 }
 
@@ -205,6 +208,7 @@ pub fn parse(args: &[String]) -> Result<Role, String> {
     match first.as_str() {
         "device-service" if rest.is_empty() => Ok(Role::DeviceService),
         "helper" if rest.is_empty() => Ok(Role::Helper),
+        "fda-probe" if rest.is_empty() => Ok(Role::FdaProbe),
         "version" | "--version" if rest.is_empty() => Ok(Role::Version),
         "setup" => {
             only(rest, &["--link", "--code", "--name", "--access", "--control"], &[])?;
@@ -272,6 +276,8 @@ mod tests {
     fn the_system_roles_take_no_arguments() {
         assert_eq!(p(&["device-service"]), Ok(Role::DeviceService));
         assert_eq!(p(&["helper"]), Ok(Role::Helper));
+        assert_eq!(p(&["fda-probe"]), Ok(Role::FdaProbe));
+        assert!(p(&["fda-probe", "/etc"]).is_err());
         assert_eq!(p(&["version"]), Ok(Role::Version));
         assert!(p(&["device-service", "--x"]).is_err());
         assert!(p(&["helper", "extra"]).is_err());
