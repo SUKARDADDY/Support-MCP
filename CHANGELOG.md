@@ -9,7 +9,7 @@ The Mac app has its own version line, apart from the relay's. Its entries are he
 "Mac" and its releases are tagged `mac-v<version>`. Every other entry is the relay's
 version, which the Windows app and the technician app share, tagged `v<version>`.
 
-## [Mac 1.1.0] - Unreleased
+## [Mac 1.1.0] - 2026-11-27
 
 The first release of the Mac app, a native client of the relay's protocol 1 for Apple silicon Macs with macOS 14 or
 later. It starts at 1.1.0 so it passes the relay's 1.0.0 minimum for sessions. The relay stays at 1.0.0: this
